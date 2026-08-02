@@ -60,6 +60,9 @@ _base_math_pc:
     wandb_project: debate-rebuild
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}   # GRPO = this + group-normalized advantages
     ppo_epochs: 1
+    # equal gradient mass per (seat, debate): a seat with more slots or bigger
+    # token budgets gets no extra pull on the shared self-play adapter
+    adv_length_norm: trajectory
     steps: 100
     batch_size: 8
     group_size: 4
@@ -107,3 +110,5 @@ math_pc_gspo:
   _extends: _base_math_pc
   training:
     loss: {kind: gspo, clip_low: 0.9997, clip_high: 1.0004}
+    # gspo is already one loss term per sequence; seat balance = count only
+    adv_length_norm: count

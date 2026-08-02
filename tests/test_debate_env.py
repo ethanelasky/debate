@@ -302,3 +302,41 @@ def test_format_reward_targets_solution_datum():
     # proposal datum gets +0.25 (boxed present); defense datum only the base +1
     assert t.datum_rewards == [1.25, 1.0]
     assert t.reward == pytest.approx(1.125)  # mean, for logging
+
+
+def test_length_normalize_balances_seats():
+    from infra.backend.base import Datum
+    from infra.envs.base import Trajectory
+    from infra.rl.datums import grpo_pack
+
+    def datum(n):
+        return Datum(
+            tokens=list(range(n + 2)), prompt_len=2,
+            sampler_logprobs=[-0.1] * n, advantages=[0.0] * n,
+        )
+
+    # alice: 2 datums of 10 tokens; bob: 1 datum of 2 tokens; zero-sum rewards
+    alice = [Trajectory(datums=[datum(10), datum(10)], reward=r) for r in (1.0, 0.0)]
+    bob = [Trajectory(datums=[datum(2)], reward=r) for r in (0.0, 1.0)]
+
+    def total_mass(groups, mode):
+        datums, _ = grpo_pack(groups, length_normalize=mode, drop_zero_advantage=False)
+        return sum(sum(abs(a) for a in d.advantages) for d in datums)
+
+    # token-sum semantics: alice's mass is 10x bob's (20 tokens x 2 datums vs 2)
+    raw_alice = total_mass([alice], "none")
+    raw_bob = total_mass([bob], "none")
+    assert raw_alice == pytest.approx(10 * raw_bob)
+
+    # trajectory mode: equal mass per trajectory regardless of slots/lengths
+    norm_alice = total_mass([alice], "trajectory")
+    norm_bob = total_mass([bob], "trajectory")
+    assert norm_alice == pytest.approx(norm_bob)
+
+    # datum mode: mass proportional to datum COUNT only
+    assert total_mass([alice], "datum") == pytest.approx(2 * total_mass([bob], "datum"))
+
+    # count mode: no token scaling, equal per-trajectory datum weighting
+    datums, _ = grpo_pack([alice], length_normalize="count", drop_zero_advantage=False)
+    assert abs(datums[0].advantages[0]) == pytest.approx(abs(datums[0].advantages[0]))
+    assert total_mass([bob], "count") == pytest.approx(raw_bob)  # 1 datum: /1

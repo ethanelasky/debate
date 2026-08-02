@@ -154,6 +154,7 @@ def main() -> None:
         lr=float(tr.get("lr", 1e-5)),
         loss=LossSpec(**(tr.get("loss") or {})),
         ppo_epochs=int(tr.get("ppo_epochs", 1)),
+        adv_length_norm=str(tr.get("adv_length_norm", "none")),
         kl_coef=float(tr.get("kl_coef", 0.0)),
         kl_discount_factor=float(tr.get("kl_discount_factor", 0.0)),
         sampling=SamplingParams(

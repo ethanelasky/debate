@@ -27,6 +27,7 @@ class Config:
     sampling: SamplingParams = field(default_factory=lambda: SamplingParams(max_tokens=512))
     chat_template_kwargs: dict | None = None
     norm_adv_by_std: bool = True
+    adv_length_norm: str = "none"   # none|datum|trajectory|count — see grpo_pack
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
@@ -85,7 +86,10 @@ def train(env: Env, backend: Backend, cfg: Config) -> None:
         metrics.update(_rollout_info_metrics(env, "train"))
 
         datums, pack_stats = grpo_pack(
-            groups, norm_by_std=cfg.norm_adv_by_std, shuffle_seed=cfg.seed + step
+            groups,
+            norm_by_std=cfg.norm_adv_by_std,
+            length_normalize=cfg.adv_length_norm,
+            shuffle_seed=cfg.seed + step,
         )
         metrics.update(pack_stats)
 
