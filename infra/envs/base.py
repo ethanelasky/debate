@@ -1,0 +1,256 @@
+"""Env layer: one rollout path for training AND evaluation.
+
+Training calls rollout(train tasks, temp>0, group_size=G); evaluation is
+rollout(test tasks, temp 0, group_size=1) plus aggregation. There is no other
+eval machinery.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Optional
+
+from infra.backend.base import Backend, Datum, Region, Sample, SamplingParams
+
+Message = dict[str, str]
+
+THINK_CLOSE = "</think>"
+FORCED_CLOSE_TEXT = "</think>\n\n"
+
+
+@dataclass(frozen=True)
+class SlotLimits:
+    """The three hard per-slot token caps (DESIGN-debate-env.md §3)."""
+
+    max_think_tokens: Optional[int] = None
+    max_visible_tokens: Optional[int] = None
+    max_total_tokens: Optional[int] = None
+
+    @property
+    def two_phase(self) -> bool:
+        return self.max_think_tokens is not None or self.max_visible_tokens is not None
+
+
+@dataclass
+class Task:
+    messages: list[Message]
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Trajectory:
+    datums: list[Datum]  # one per policy turn; advantages filled by grpo_pack
+    reward: float
+    info: dict[str, Any] = field(default_factory=dict)
+    # Optional per-datum rewards (slot-specific bonuses on top of the shared
+    # outcome). When set, grpo_pack normalizes each datum position against the
+    # same position across its group, giving every slot its own baseline.
+    # None = every datum shares `reward` (identical to the uniform case).
+    datum_rewards: Optional[list[float]] = None
+
+    def __post_init__(self) -> None:
+        if self.datum_rewards is not None and len(self.datum_rewards) != len(self.datums):
+            raise ValueError(
+                f"datum_rewards has {len(self.datum_rewards)} entries for {len(self.datums)} datums"
+            )
+
+
+class Policy:
+    """Chat-template rendering over backend.sample().
+
+    Presents a batch predict() so multi-turn env code (the salvaged debate
+    round loop) can treat it like the old repo's Model interface. Samples come
+    back with prompt_tokens attached so envs can build Datums directly.
+    """
+
+    def __init__(self, backend: Backend, params: SamplingParams, chat_template_kwargs: dict | None = None):
+        self.backend = backend
+        self.tokenizer = backend.tokenizer
+        self.params = params
+        self.chat_template_kwargs = chat_template_kwargs or {}
+
+    def render(self, messages: list[Message]) -> list[int]:
+        out = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True, **self.chat_template_kwargs
+        )
+        if not isinstance(out, list):  # BatchEncoding from some tokenizer wrappers
+            out = out["input_ids"]
+        if out and isinstance(out[0], list):
+            out = out[0]
+        return list(out)
+
+    def predict(
+        self, convos: list[list[Message]], n: int = 1, limits: Optional[SlotLimits] = None
+    ) -> list[list[Sample]]:
+        """result[i] holds the n samples for convos[i]. With two-phase limits
+        set, runs budget-forced sampling (think capped at max_think_tokens with
+        a forced </think> injection; visible capped separately)."""
+        prompts = [self.render(c) for c in convos]
+        params = self.params
+        if limits is not None and limits.max_total_tokens is not None:
+            params = replace(params, max_tokens=min(params.max_tokens, limits.max_total_tokens))
+        if limits is not None and limits.two_phase:
+            results = budget_forced_sample(
+                self.backend.sample, self.tokenizer, prompts, params, limits, n=n
+            )
+        else:
+            results = self.backend.sample(prompts, params, n=n)
+        for prompt, samples in zip(prompts, results):
+            for s in samples:
+                s.prompt_tokens = prompt
+        return results
+
+    def greedy(self) -> "Policy":
+        return Policy(self.backend, replace(self.params, temperature=0.0), self.chat_template_kwargs)
+
+
+class Env(ABC):
+    @abstractmethod
+    def tasks(self, n: int, split: str = "train") -> list[Task]: ...
+
+    @abstractmethod
+    def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        """One group of rewarded trajectories per task. Samples failing
+        fidelity checks are dropped (and counted in info), not trained on."""
+
+
+def datum_from_sample(s: Sample) -> Datum:
+    assert s.prompt_tokens is not None, "sample must come from Policy.predict"
+    mask = None
+    if s.regions is not None and any(r.kind == "forced_close" for r in s.regions):
+        mask = [1.0] * len(s.tokens)
+        for r in s.regions:
+            if r.kind == "forced_close":
+                for i in range(r.start, r.end):
+                    mask[i] = 0.0  # injected, unsampled: never trained on
+    return Datum(
+        tokens=s.prompt_tokens + s.tokens,
+        prompt_len=len(s.prompt_tokens),
+        sampler_logprobs=s.logprobs,
+        advantages=[0.0] * len(s.tokens),
+        mask=mask,
+    )
+
+
+# ------------------------------------------------ budget-forced sampling
+
+
+SampleFn = Callable[..., list[list[Sample]]]  # Backend.sample signature
+
+
+def _close_ids(tokenizer) -> list[int]:
+    ids = tokenizer.encode(FORCED_CLOSE_TEXT, add_special_tokens=False)
+    if tokenizer.decode(ids) != FORCED_CLOSE_TEXT:
+        raise ValueError("forced-close text does not round-trip through this tokenizer")
+    return list(ids)
+
+
+def budget_forced_sample(
+    sample_fn: SampleFn,
+    tokenizer,
+    prompts: list[list[int]],
+    params: SamplingParams,
+    limits: SlotLimits,
+    n: int = 1,
+) -> list[list[Sample]]:
+    """Two-phase sampling enforcing hard think/visible caps.
+
+    Phase 1 samples with stop </think> capped at the think budget; a cap hit
+    gets </think> force-injected (logprob 0.0, datum mask 0.0 via regions).
+    Phase 2 continues from the extended prefix under the visible/total caps.
+    A model that never opens <think> (and wasn't given one by the template)
+    is passed through as all-visible — think caps only bind on thinking.
+    """
+    close = _close_ids(tokenizer)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    inf = 10**9
+    total = min(limits.max_total_tokens or inf, params.max_tokens)
+    p1_cap = min(limits.max_think_tokens or inf, max(1, total - len(close) - 1))
+
+    phase1 = sample_fn(prompts, replace(params, max_tokens=p1_cap, stop=[THINK_CLOSE]), n=n)
+
+    # Flatten, decide per sample, bucket phase-2 continuations by their cap.
+    flat: list[dict] = []
+    for pi, samples in enumerate(phase1):
+        for s in samples:
+            prompt_tail = tokenizer.decode(prompts[pi][-16:])
+            decoded = s.text or tokenizer.decode(s.tokens)
+            in_think = "<think>" in decoded or ("<think>" in prompt_tail and THINK_CLOSE not in prompt_tail)
+            entry: dict = {"pi": pi, "p1": s, "close": [], "p2": None, "forced": False}
+            if not in_think:
+                # never thought: everything visible, single-phase semantics
+                entry["all_visible"] = True
+            elif decoded.rstrip().endswith(THINK_CLOSE):
+                pass  # natural close (sampled, real logprobs); phase 2 continues
+            elif s.tokens and eos_id is not None and s.tokens[-1] == eos_id:
+                entry["died_in_think"] = True
+            else:
+                entry["close"] = close
+                entry["forced"] = True
+            flat.append(entry)
+
+    buckets: dict[int, list[int]] = {}
+    for j, e in enumerate(flat):
+        if e.get("all_visible") or e.get("died_in_think"):
+            continue
+        p2_cap = min(limits.max_visible_tokens or inf, total - len(e["p1"].tokens) - len(e["close"]))
+        if p2_cap <= 0:
+            e["exhausted"] = True
+            continue
+        e["p2_cap"] = p2_cap
+        buckets.setdefault(p2_cap, []).append(j)
+
+    for p2_cap, idxs in buckets.items():
+        prefixes = [prompts[flat[j]["pi"]] + flat[j]["p1"].tokens + flat[j]["close"] for j in idxs]
+        outs = sample_fn(prefixes, replace(params, max_tokens=p2_cap), n=1)
+        for j, out in zip(idxs, outs):
+            flat[j]["p2"] = out[0]
+
+    results: list[list[Sample]] = [[] for _ in prompts]
+    for e in flat:
+        p1: Sample = e["p1"]
+        if e.get("all_visible"):
+            results[e["pi"]].append(
+                Sample(
+                    tokens=p1.tokens,
+                    logprobs=p1.logprobs,
+                    text=tokenizer.decode(p1.tokens),
+                    stop_reason=p1.stop_reason,
+                    regions=(Region("visible", 0, len(p1.tokens)),),
+                )
+            )
+            continue
+        n1 = len(p1.tokens)
+        if e.get("died_in_think"):
+            results[e["pi"]].append(
+                Sample(
+                    tokens=p1.tokens,
+                    logprobs=p1.logprobs,
+                    text=tokenizer.decode(p1.tokens),
+                    stop_reason="stop",
+                    regions=(Region("think", 0, n1),),
+                )
+            )
+            continue
+        close_toks: list[int] = e["close"]
+        p2: Optional[Sample] = e["p2"]
+        tokens = p1.tokens + close_toks + (p2.tokens if p2 else [])
+        logprobs = p1.logprobs + [0.0] * len(close_toks) + (p2.logprobs if p2 else [])
+        regions = [Region("think", 0, n1)]
+        if close_toks:
+            regions.append(Region("forced_close", n1, n1 + len(close_toks)))
+        if p2 and p2.tokens:
+            start = n1 + len(close_toks)
+            regions.append(Region("visible", start, start + len(p2.tokens)))
+        stop_reason = p2.stop_reason if p2 is not None else "length"  # exhausted: no room for phase 2
+        results[e["pi"]].append(
+            Sample(
+                tokens=tokens,
+                logprobs=logprobs,
+                text=tokenizer.decode(tokens),
+                stop_reason=stop_reason,
+                regions=tuple(regions),
+            )
+        )
+    return results

@@ -1,0 +1,240 @@
+import pytest
+
+from infra.envs.debate.prompts import (
+    PromptLibrary,
+    RenderedPrompts,
+    load_prompt_library,
+    render,
+    slot_template,
+    validate_prompts,
+)
+from infra.envs.debate.topology import Topology
+
+MATH_YAML = "infra/envs/debate/prompt_configs/hendrycks_math.yaml"
+
+# DESIGN-debate-env.md §1, proposer_critic_2round.
+PC_TOPOLOGY = {
+    "turns": [
+        {"alice": [{"name": "proposal", "kind": "solution"}]},
+        {"bob": [{"name": "critique"}]},
+        {"alice": [{"name": "defense"}]},
+        {"bob": [{"name": "rebuttal"}]},
+        {"alice": [{"name": "closing"}], "bob": [{"name": "closing"}]},
+        {"judge": [{"name": "verdict", "kind": "decision"}]},
+    ]
+}
+
+BINDINGS = {
+    "NAME": "Alice",
+    "OPPONENT_NAME": "Bob",
+    "TOPIC": "What is 2+2?",
+    "POSITION": "4",
+    "OPPONENT_POSITION": "5",
+}
+
+
+@pytest.fixture
+def lib():
+    return load_prompt_library(MATH_YAML, "math_proposer_critic")
+
+
+@pytest.fixture
+def topology():
+    return Topology.parse(PC_TOPOLOGY)
+
+
+# ------------------------------------------------------------------ loading
+
+
+def test_extends_merges_vars_over_parent(lib, tmp_path):
+    assert "\\boxed{...}" in lib.vars["ANSWER_FORMAT_INSTRUCTION"]
+    assert set(lib.system) == {"alice", "bob", "judge"}
+    assert set(lib.slots) == {"proposal", "critique", "defense", "rebuttal", "closing", "verdict"}
+
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        "_base:\n"
+        "  vars: {A: '1', B: '2'}\n"
+        "  system: {alice: 'base <A>'}\n"
+        "  slots: {s: 'x'}\n"
+        "child:\n"
+        "  _extends: _base\n"
+        "  vars: {B: 'two'}\n"
+        "  slots: {t: 'y'}\n"
+    )
+    child = load_prompt_library(path, "child")
+    assert child.vars == {"A": "1", "B": "two"}
+    assert child.system == {"alice": "base <A>"}
+    assert child.slots == {"s": "x", "t": "y"}
+
+
+def test_unknown_entry_raises(lib):
+    with pytest.raises(KeyError, match="math_proposer_critic"):
+        load_prompt_library(MATH_YAML, "nope")
+
+
+# ---------------------------------------------------------- slot_template
+
+
+def test_string_template_serves_any_speaker(lib):
+    assert slot_template(lib, "proposal", "alice") is slot_template(lib, "proposal", "zebra")
+
+
+def test_map_template_is_per_speaker(lib):
+    assert "your boxed" in slot_template(lib, "closing", "alice")
+    assert "Proposer's answer is wrong" in slot_template(lib, "closing", "bob")
+
+
+def test_missing_slot_and_speaker_name_both_in_message(lib):
+    with pytest.raises(KeyError, match="ghost"):
+        slot_template(lib, "ghost", "alice")
+    with pytest.raises(KeyError) as e:
+        slot_template(lib, "closing", "judge")
+    assert "closing" in str(e.value) and "judge" in str(e.value)
+
+
+# ------------------------------------------------------------------ render
+
+
+def test_vars_applied_and_bindings_override(lib):
+    out = render("<TOPIC> | <ANSWER_FORMAT_INSTRUCTION>", {"TOPIC": "t"}, lib.vars)
+    assert out == "t | " + lib.vars["ANSWER_FORMAT_INSTRUCTION"]
+    assert render("<A>", {"A": "binding"}, {"A": "var"}) == "binding"
+
+
+def test_unbound_uppercase_placeholder_raises():
+    with pytest.raises(ValueError, match="MISSING"):
+        render("hello <MISSING>", {"OTHER": "x"})
+
+
+def test_lowercase_tags_pass_through(lib):
+    out = render(slot_template(lib, "proposal", "alice"), {"TOPIC": "2+2"}, lib.vars)
+    assert "<problem>2+2</problem>" in out
+    assert "<TOPIC>" not in out
+    crit = render(slot_template(lib, "critique", "bob"), {"OPPONENT_POSITION": "4"}, lib.vars)
+    assert "<proposer-solution>4</proposer-solution>" in crit
+
+
+def test_substituted_text_is_not_rescanned():
+    assert render("<A>", {"A": "<NOT_A_PLACEHOLDER>"}) == "<NOT_A_PLACEHOLDER>"
+
+
+# --------------------------------------------------------- validate_prompts
+
+
+def test_validate_passes_for_math_pc(lib, topology):
+    validate_prompts(lib, topology, fresh_positions=True)
+    validate_prompts(lib, topology, fresh_positions=False)
+
+
+def test_validate_fails_on_missing_slot_template(lib, topology):
+    lib.slots.pop("rebuttal")
+    with pytest.raises(ValueError, match="rebuttal"):
+        validate_prompts(lib, topology)
+
+
+def test_validate_fails_on_missing_system_prompt(lib, topology):
+    lib.system.pop("judge")
+    with pytest.raises(ValueError, match="judge"):
+        validate_prompts(lib, topology)
+
+
+def test_validate_fails_bindability_when_position_in_solution_slot(lib, topology):
+    lib.slots["proposal"] = lib.slots["proposal"] + "\nYour answer is <POSITION>."
+    with pytest.raises(ValueError, match="POSITION"):
+        validate_prompts(lib, topology, fresh_positions=True)
+    validate_prompts(lib, topology, fresh_positions=False)  # assigned mode: fine
+
+
+def test_validate_fails_when_critic_needs_position_before_any_solution(lib):
+    topo = Topology.parse({"turns": [{"bob": [{"name": "critique"}]}]})
+    lib.system = {"bob": lib.system["bob"]}
+    with pytest.raises(ValueError, match="OPPONENT_POSITION"):
+        validate_prompts(lib, topo, fresh_positions=True)
+
+
+def test_bindability_ignores_placeholders_covered_by_vars(topology):
+    lib = PromptLibrary(
+        system={s: "sys" for s in topology.speakers},
+        slots={
+            "proposal": "<POSITION>",
+            "critique": "c",
+            "defense": "d",
+            "rebuttal": "r",
+            "closing": "cl",
+            "verdict": "v",
+        },
+        vars={"POSITION": "static"},
+    )
+    validate_prompts(lib, topology, fresh_positions=True)
+
+
+# ------------------------------------------------------------ RenderedPrompts
+
+
+def test_rendered_prompts_protocol(lib):
+    rp = RenderedPrompts(lib)
+    assert rp.system("alice", BINDINGS).startswith("You are Alice, the PROPOSER")
+    assert "<problem>What is 2+2?</problem>" in rp.instruction("proposal", "alice", BINDINGS)
+    assert "your boxed\nanswer 4 is correct" in rp.instruction("closing", "alice", BINDINGS)
+    verdict = rp.instruction("verdict", "judge", BINDINGS)
+    assert '{"winner": "Alice" | "Bob", "confidence": 0.5-1.0}' in verdict
+
+
+def test_attributed_format_golden(lib):
+    assert RenderedPrompts(lib).attributed("Bob", "critique", "you erred") == "Bob said:\nyou erred"
+
+
+def test_rendered_prompts_missing_system_speaker(lib):
+    with pytest.raises(KeyError, match="carol"):
+        RenderedPrompts(lib).system("carol", BINDINGS)
+
+
+def test_block_lists_join_and_extend_by_index(tmp_path):
+    import yaml as _yaml
+
+    from infra.envs.debate.prompts import load_prompt_library
+
+    p = tmp_path / "p.yaml"
+    p.write_text(
+        _yaml.safe_dump(
+            {
+                "_base": {
+                    "system": {"alice": ["identity block", "rules block", "format block"]},
+                    "slots": {"speech": ["do the thing"]},
+                },
+                "child": {
+                    "_extends": "_base",
+                    # override ONLY block 1; keep 0 and 2; append block 3
+                    "system": {"alice": ["identity block", "CHILD RULES", "format block", "extra"]},
+                },
+            }
+        )
+    )
+    base = load_prompt_library(p, "_base")
+    assert base.system["alice"] == "identity block\n\nrules block\n\nformat block"
+    child = load_prompt_library(p, "child")
+    assert child.system["alice"] == "identity block\n\nCHILD RULES\n\nformat block\n\nextra"
+    assert child.slots["speech"] == "do the thing"  # inherited untouched
+
+
+def test_preview_shows_block_placement():
+    import yaml as _yaml
+
+    from infra.envs.debate.prompts import load_prompt_library, preview
+    from infra.envs.debate.topology import Topology
+
+    lib = load_prompt_library(
+        "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
+    )
+    topo = Topology.parse(
+        _yaml.safe_load(
+            "turns: [{alice: [{name: proposal, kind: solution}]}, {bob: [{name: critique}]},"
+            " {alice: [{name: defense}]}, {judge: [{name: verdict, kind: decision}]}]"
+        )
+    )
+    out = preview(lib, topo)
+    assert "<alice/proposal output>" in out          # stubbed prior slots
+    assert "<TOPIC>" in out                          # runtime placeholders kept visible
+    assert "EXACTLY one \\boxed{...}" in out         # var-bound placeholders render for real
+    assert "== judge — context for its final slot (verdict)" in out

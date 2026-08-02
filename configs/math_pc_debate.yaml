@@ -1,0 +1,73 @@
+# MATH proposer-critic debate RL (new-style experiment: topology in YAML).
+# Run: debate-rl --experiment-file configs/math_pc_debate.yaml --experiment <name>
+
+_base_math_pc:
+  topology:
+    turns:
+      - alice: [{name: proposal, kind: solution, max_think_tokens: 1024, max_total_tokens: 3072}]
+      - bob:   [{name: critique, max_total_tokens: 768}]
+      - alice: [{name: defense, max_total_tokens: 768}]
+      - judge: [{name: verdict, kind: decision, max_total_tokens: 512}]
+  prompt_config:
+    file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
+    entry: math_proposer_critic
+  trained: [alice]
+  fresh_positions: true
+  agents:
+    bob:
+      model_settings:
+        model_type: tinker
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: critic-bob
+        enable_thinking: false
+        max_new_tokens: 768
+        sampling: {train: {temperature: 0.7, top_p: 0.95}}
+    judge:
+      model_settings:
+        model_type: tinker
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        enable_thinking: false
+        max_new_tokens: 512
+        # temp/top_p 1.0: the logit confidence channel is only honest here
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      # +0.1 on the proposal DATUM (not the whole trajectory) when the answer
+      # was strictly \boxed — trajectory-specific reward via per-datum GRPO.
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+  dataset: {levels: [1, 2], relaxed_extraction: true, seed: 0}
+  training:
+    wandb_project: debate-rebuild
+    base_model: Qwen/Qwen3.5-4B
+    lora_rank: 32
+    steps: 100
+    batch_size: 8
+    group_size: 4
+    lr: 1.0e-5
+    kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
+                         # (tinker-cookbook incorporate_kl_penalty semantics;
+                         #  k1/k2/k3 values all logged for monitoring)
+    kl_discount_factor: 0.0
+    max_tokens: 3072
+    enable_thinking: true
+    eval_every: 20
+    eval_n: 32
+    save_every: 50
+
+# 2-step live verification arm: tiny sizes, no eval/save.
+math_pc_smoke:
+  _extends: _base_math_pc
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 2
+    eval_every: 0
+    save_every: 0
+
+# The real arm.
+math_pc_debate:
+  _extends: _base_math_pc

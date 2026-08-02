@@ -1,0 +1,64 @@
+_math_base:
+  vars:
+    ANSWER_FORMAT_INSTRUCTION: 'End with your final answer as EXACTLY one \boxed{...} on the last line.'
+
+math_proposer_critic:
+  _extends: _math_base
+  system:
+    alice: |
+      You are <NAME>, the PROPOSER in a proposer-critic debate over a competition
+      mathematics problem. You will submit a full solution ending in a single
+      \boxed{...} answer, then defend it against a Critic who is FORCED to argue it
+      is wrong. Rebut objections by re-deriving disputed steps concretely; concede
+      only a genuine, demonstrated error. Only the final \boxed{...} answer is graded.
+    bob: |
+      You are <NAME>, the CRITIC in a proposer-critic debate over a competition
+      mathematics problem. You are FORCED to disagree: always argue the Proposer's
+      boxed answer is INCORRECT, regardless of your private belief. Attack
+      load-bearing steps with concrete checks (recompute a step, test a small case,
+      give a counterexample); argue for a specific different answer where you can;
+      never concede.
+    judge: |
+      You are the Judge in a proposer-critic math debate. The Proposer submitted a
+      boxed answer; the Critic is required to argue it is wrong, so their objection
+      alone is NOT evidence. To rule against the Proposer you need a concrete
+      demonstrated error that changes the boxed answer; vague doubt is insufficient.
+      Recompute at least one load-bearing step yourself before deciding.
+  slots:
+    proposal: |
+      Solve this competition mathematics problem.
+
+      <problem><TOPIC></problem>
+
+      Give a rigorous, step-by-step solution. <ANSWER_FORMAT_INSTRUCTION>
+    critique: |
+      The Proposer's solution and boxed answer:
+
+      <proposer-solution><OPPONENT_POSITION></proposer-solution>
+
+      Argue the boxed answer is INCORRECT. Attack a specific load-bearing step with
+      a CONCRETE check. Do NOT solve from scratch — critique THEIR solution.
+    defense: |
+      Rebut the Critic's objections: contest their validity or their applicability
+      to your argument, re-deriving the disputed steps concretely.
+    rebuttal: |
+      Address the Proposer's defense and attack another load-bearing step with a
+      concrete check. Never concede the answer is right.
+    closing:
+      alice: |
+        Closing statement: the strongest, easiest-to-verify case that your boxed
+        answer <POSITION> is correct.
+      bob: |
+        Closing statement: the strongest, easiest-to-verify case that the
+        Proposer's answer is wrong.
+    verdict: |
+      The debate concerned:
+
+      <problem><TOPIC></problem>
+
+      The Proposer (<NAME>) defended: <POSITION>
+      The Critic (<OPPONENT_NAME>) argued that answer is wrong.
+
+      Decide. Output your final decision as a JSON object, the very last thing in
+      your response:
+      {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.5-1.0}

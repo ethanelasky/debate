@@ -1,0 +1,330 @@
+"""DebateEnv: topology-driven debate rollouts as an Env.
+
+One rollout path (train + eval). Reward is judge-only (DESIGN-debate-env.md
+§5); gt correctness from solution slots lands in info as metrics.
+
+Trajectory granularity: one Trajectory per (debate, trained seat); datums are
+that seat's slot datums in flat order; reward = seat ladder/score value plus
+shaping deltas. NOTE: per_slot shaping deltas are folded into the trajectory
+reward sum for now — grpo_pack computes one advantage per trajectory, so
+slot-targeted penalties are totalized rather than per-datum. Upgrade path:
+per-datum advantage offsets in grpo_pack.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from infra.envs.base import Env, Policy, Task, Trajectory
+from infra.envs.debate.judge import JudgeConfig, Verdict, parse_verdict, verdict_from_slot
+from infra.envs.debate.prompts import (
+    PromptLibrary,
+    RenderedPrompts,
+    load_prompt_library,
+    validate_prompts,
+)
+from infra.envs.debate.rewards import (
+    RoundTokenReport,
+    ScoringConfig,
+    SlotTokenCounts,
+    build_shaping,
+    score,
+    validate_scoring,
+)
+from infra.envs.debate.round import (
+    DebateRound,
+    DebateState,
+    FrozenSeat,
+    PolicySeat,
+    SeatRunner,
+    SlotRecord,
+)
+from infra.envs.debate.topology import Kind, Topology
+from infra.models.base import Model
+
+DISPLAY_NAMES = ("Debater_A", "Debater_B")
+
+
+@dataclass
+class DebateEnvConfig:
+    topology: Topology
+    prompt_file: str
+    prompt_entry: str
+    trained_speakers: list[str]                 # subset of debater speakers; [] = pure eval
+    frozen_models: dict[str, Model]             # speaker -> model (must cover judge + untrained debaters)
+    judge: JudgeConfig = field(default_factory=JudgeConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    fresh_positions: bool = True
+    flip: bool = False                          # assigned mode only: mirrored second arm
+    verdict_retries: int = 4
+
+
+class DebateEnv(Env):
+    """task_source supplies problems: any object with tasks(n, split) whose
+    Task.meta carries {"gt", "question"} (MathEnv qualifies)."""
+
+    def __init__(self, config: DebateEnvConfig, task_source, solution_extractor):
+        self.config = config
+        self.task_source = task_source
+        self.solution_extractor = solution_extractor
+
+        self.topology = config.topology
+        speakers = self.topology.speakers
+        self.judge_speaker = self._find_judge_speaker()
+        self.debaters = [s for s in speakers if s != self.judge_speaker]
+        if len(self.debaters) > 2:
+            raise ValueError("at most two debater speakers supported")
+        unknown = set(config.trained_speakers) - set(self.debaters)
+        if unknown:
+            raise ValueError(f"trained_speakers not in topology: {sorted(unknown)}")
+        missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
+        if missing:
+            raise ValueError(f"speakers without models: {sorted(missing)}")
+        if config.flip and config.fresh_positions:
+            raise ValueError("flip requires assigned positions (fresh mode has no sides)")
+
+        self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
+        self.prompts = RenderedPrompts(self.lib)
+        validate_prompts(self.lib, self.topology, fresh_positions=config.fresh_positions)
+        self.shaping = build_shaping(config.scoring.shaping)
+        self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
+
+    def _find_judge_speaker(self) -> str:
+        d = self.topology.decision_slot
+        if d is None:
+            raise ValueError("debate topology needs a decision slot (judge-only rewards)")
+        return d.speaker
+
+    # ------------------------------------------------------------------ env
+
+    def tasks(self, n: int, split: str = "train") -> list[Task]:
+        return self.task_source.tasks(n, split)
+
+    def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        cfg = self.config
+        seats: dict[str, SeatRunner] = {}
+        for speaker in self.topology.speakers:
+            if speaker in cfg.trained_speakers:
+                seats[speaker] = PolicySeat(policy)
+            else:
+                seats[speaker] = FrozenSeat(cfg.frozen_models[speaker])
+
+        arms = [False, True] if cfg.flip else [False]
+        # group id = (task index, arm): flip arms are separate GRPO groups
+        states: list[DebateState] = []
+        state_group: list[int] = []
+        group_count = 0
+        for ti, task in enumerate(tasks):
+            for arm in arms:
+                gid = group_count
+                group_count += 1
+                for _ in range(group_size):
+                    states.append(self._build_state(task, flipped=arm))
+                    state_group.append(gid)
+
+        round_ = DebateRound(
+            self.topology,
+            seats,
+            self.prompts,
+            verdict_parser=lambda text: parse_verdict(
+                text, cfg.judge.schema_name, list(self.display.values())
+            ),
+            verdict_retries=cfg.verdict_retries,
+            solution_extractor=self.solution_extractor,
+            fresh_positions=cfg.fresh_positions,
+        )
+        round_.run(states)
+
+        groups: list[list[Trajectory]] = [[] for _ in range(group_count)]
+        fail_reasons: dict[str, int] = {}
+        n_failed = 0
+        n_unscoreable = 0
+        for st, gid in zip(states, state_group):
+            if st.failed is not None:
+                n_failed += 1
+                fail_reasons[st.failed.split(":")[0]] = fail_reasons.get(st.failed.split(":")[0], 0) + 1
+                continue
+            trajs = self._trajectories(st)
+            if trajs is None:
+                n_unscoreable += 1
+                continue
+            groups[gid].extend(trajs)
+        # Always recorded, even when everything dropped (else failure is mute).
+        self.last_rollout_info = {
+            "debates": len(states),
+            "debates_failed": n_failed,
+            "debates_unscoreable": n_unscoreable,
+            "fail_reasons": fail_reasons,
+        }
+        self.last_states = states  # retained for transcript export (docent)
+        for g in groups:
+            if g:
+                g[0].info["debates_failed"] = float(n_failed)
+                g[0].info["debates_unscoreable"] = float(n_unscoreable)
+                break
+        return groups
+
+    # ------------------------------------------------------------- internals
+
+    def _build_state(self, task: Task, flipped: bool) -> DebateState:
+        cfg = self.config
+        question = task.meta.get("question") or (task.messages[-1]["content"] if task.messages else "")
+        bindings: dict[str, dict[str, str]] = {}
+        a, b = (self.debaters + [None, None])[:2]
+        names = {s: self.display[s] for s in self.debaters}
+        positions: dict[str, str] = {}
+        if not cfg.fresh_positions:
+            gold, distractor = str(task.meta["gold"]), str(task.meta["distractor"])
+            first, second = (distractor, gold) if flipped else (gold, distractor)
+            positions = {a: first} if b is None else {a: first, b: second}
+
+        for s in self.debaters:
+            other = b if s == a else a
+            bindings[s] = {
+                "NAME": names[s],
+                "TOPIC": question,
+                "POSITION": positions.get(s, ""),
+                "OPPONENT_NAME": names.get(other, "") if other else "",
+                "OPPONENT_POSITION": positions.get(other, "") if other else "",
+            }
+        bindings[self.judge_speaker] = {
+            "NAME": names.get(a, ""),
+            "OPPONENT_NAME": names.get(b, "") if b else "",
+            "TOPIC": question,
+            "POSITION": positions.get(a, ""),
+            "OPPONENT_POSITION": positions.get(b, "") if b else "",
+        }
+        state = DebateState(bindings=bindings)
+        state.meta.update({"task": task.meta, "flipped": flipped})
+        return state
+
+    def _verdict(self, st: DebateState) -> Optional[Verdict]:
+        rec = next(
+            (r for r in reversed(st.records) if r.slot.slot.kind == Kind.DECISION), None
+        )
+        if rec is None:
+            return None
+        decode_fn = None
+        seat = self.config.frozen_models.get(self.judge_speaker)
+        if seat is not None:
+            try:
+                decode_fn = seat.decode_tokens
+            except NotImplementedError:
+                decode_fn = None
+        return verdict_from_slot(
+            rec.text,
+            rec.response if rec.response is not None else rec.sample,
+            decode_fn,
+            self.config.judge,
+            list(self.display.values()),
+        )
+
+    def _token_report(self, st: DebateState) -> RoundTokenReport:
+        from infra.envs.answer_parsing import extract_number_from_boxed_answer
+
+        counts: dict[tuple[str, str], SlotTokenCounts] = {}
+        for r in st.records:
+            if r.sample is None:
+                continue
+            think = visible = 0
+            if r.sample.regions:
+                for reg in r.sample.regions:
+                    if reg.kind == "think":
+                        think += reg.end - reg.start
+                    elif reg.kind == "visible":
+                        visible += reg.end - reg.start
+            else:
+                visible = len(r.sample.tokens)
+            flags: dict[str, float] = {}
+            if r.slot.slot.kind == Kind.SOLUTION:
+                # strict format flag, independent of the (possibly relaxed)
+                # extractor used for position binding
+                flags["strict_boxed"] = float(extract_number_from_boxed_answer(r.text) is not None)
+                flags["extracted"] = float(r.extracted is not None)
+            counts[(r.slot.speaker, r.slot.slot.name)] = SlotTokenCounts(
+                think=think,
+                visible=visible,
+                total=len(r.sample.tokens),
+                cap_total=r.slot.slot.max_total_tokens,
+                flags=flags,
+            )
+        return RoundTokenReport(counts=counts)
+
+    def _trajectories(self, st: DebateState) -> Optional[list[Trajectory]]:
+        cfg = self.config
+        verdict = self._verdict(st)
+        if verdict is None:
+            return None
+        mode = cfg.judge.schema_name
+        seat_rewards = score(verdict, mode, cfg.scoring)
+        if any(not sr.scoreable for sr in seat_rewards.values()):
+            return None
+
+        report = self._token_report(st)
+        # shaping terms key on report's speaker names; give them a speaker-keyed
+        # view of the seat rewards (score() keys by display name)
+        scored_by_speaker = {
+            sp: seat_rewards[self.display[sp]] for sp in self.debaters if self.display[sp] in seat_rewards
+        }
+        deltas = [term.apply(scored_by_speaker, report) for term in self.shaping]
+
+        gt = st.meta.get("task", {}).get("gt")
+        solutions = {
+            r.slot.speaker: r.extracted
+            for r in st.records
+            if r.slot.slot.kind == Kind.SOLUTION
+        }
+
+        trajs = []
+        for speaker in cfg.trained_speakers:
+            display = self.display[speaker]
+            base = seat_rewards[display].value if display in seat_rewards else 0.0
+            seat_delta = sum(d.per_seat.get(speaker, 0.0) for d in deltas)
+            slot_records = [r for r in st.records if r.slot.speaker == speaker and r.datum is not None]
+            datums = [r.datum for r in slot_records]
+            if not datums:
+                continue
+            # Per-datum rewards: shared outcome + seat-level deltas on every
+            # datum, slot-targeted deltas only on their own slot's datum.
+            datum_rewards = [
+                base
+                + seat_delta
+                + sum(d.per_slot.get((speaker, r.slot.slot.name), 0.0) for d in deltas)
+                for r in slot_records
+            ]
+            shaped = sum(datum_rewards) / len(datum_rewards)
+            info: dict[str, Any] = {
+                "reward_base": float(base),
+                "reward_shaped": float(shaped),
+                "cell": seat_rewards[display].cell if display in seat_rewards else "none",
+                "source": seat_rewards[display].source if display in seat_rewards else "none",
+                "verdict_ok": float(verdict.ok),
+                "flipped": float(st.meta.get("flipped", False)),
+            }
+            for src in ("json", "logit"):
+                conf = verdict.confidence.get(display)
+                if conf is not None:
+                    v = getattr(conf, src)
+                    if v is not None:
+                        info[f"judge_conf_{src}"] = float(v)
+            if gt is not None and solutions.get(speaker) is not None:
+                try:
+                    info["solution_correct"] = float(abs(float(solutions[speaker]) - float(gt)) < 1e-6)
+                except (TypeError, ValueError):
+                    pass
+            trajs.append(
+                Trajectory(datums=datums, reward=shaped, info=info, datum_rewards=datum_rewards)
+            )
+        if not trajs and not cfg.trained_speakers:
+            # pure-eval mode: emit a datum-less trajectory carrying metrics
+            display = self.display[self.debaters[0]]
+            base = seat_rewards.get(display)
+            trajs.append(
+                Trajectory(
+                    datums=[],
+                    reward=base.value if base else 0.0,
+                    info={"transcript": st.transcript(), "verdict_ok": float(verdict.ok)},
+                )
+            )
+        return trajs
