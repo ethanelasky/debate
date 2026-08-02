@@ -74,6 +74,11 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     # Per-trained-seat sampling + template kwargs; trained seats must sample
     # UNBIASED (temp/top_p 1.0) — anything else corrupts the ratio anchor
     # (the old repo's §6 gate, kept hard).
+    # Token budgets are the TOPOLOGY's job (per-slot caps); the seat's base
+    # max_tokens is just a ceiling derived from its largest slot cap.
+    caps_by_speaker: dict[str, list] = {}
+    for cs in topology.compile():
+        caps_by_speaker.setdefault(cs.speaker, []).append(cs.slot.max_total_tokens)
     trained_sampling: dict[str, SamplingParams] = {}
     trained_chat_kwargs: dict[str, dict] = {}
     for speaker, settings in trained.items():
@@ -86,9 +91,13 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
                 "trained seats must use 1.0/1.0 (sampler logprobs anchor the PPO ratio — "
                 "biased sampling corrupts the anchor)"
             )
-        trained_sampling[speaker] = SamplingParams(
-            max_tokens=settings.resolved_max_new_tokens, temperature=temp, top_p=top_p
-        )
+        caps = caps_by_speaker.get(speaker, [])
+        if any(c is None for c in caps):
+            raise ValueError(
+                f"trained seat {speaker!r} has topology slot(s) without max_total_tokens; "
+                "set per-slot budgets in the topology (speech budgets are format-specific)"
+            )
+        trained_sampling[speaker] = SamplingParams(max_tokens=max(caps), temperature=temp, top_p=top_p)
         if settings.enable_thinking is not None:
             trained_chat_kwargs[speaker] = {"enable_thinking": bool(settings.enable_thinking)}
 
@@ -158,7 +167,9 @@ def main() -> None:
         kl_coef=float(tr.get("kl_coef", 0.0)),
         kl_discount_factor=float(tr.get("kl_discount_factor", 0.0)),
         sampling=SamplingParams(
-            max_tokens=lead.resolved_max_new_tokens,
+            # no ceiling here: budgets are the topology's per-slot caps, and
+            # Policy hard-errors on any generation left unbounded
+            max_tokens=None,
             temperature=profile.temperature if profile.temperature is not None else 1.0,
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),

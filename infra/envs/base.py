@@ -89,7 +89,18 @@ class Policy:
         prompts = [self.render(c) for c in convos]
         params = self.params
         if limits is not None and limits.max_total_tokens is not None:
-            params = replace(params, max_tokens=min(params.max_tokens, limits.max_total_tokens))
+            ceiling = params.max_tokens
+            params = replace(
+                params,
+                max_tokens=(
+                    limits.max_total_tokens if ceiling is None else min(ceiling, limits.max_total_tokens)
+                ),
+            )
+        if params.max_tokens is None and not (limits is not None and limits.two_phase and limits.max_visible_tokens):
+            raise ValueError(
+                "no token budget for this generation: set the slot's max_total_tokens "
+                "(or SamplingParams.max_tokens)"
+            )
         if limits is not None and limits.two_phase:
             results = budget_forced_sample(
                 self.backend.sample, self.tokenizer, prompts, params, limits, n=n
@@ -165,7 +176,12 @@ def budget_forced_sample(
     close = _close_ids(tokenizer)
     eos_id = getattr(tokenizer, "eos_token_id", None)
     inf = 10**9
-    total = min(limits.max_total_tokens or inf, params.max_tokens)
+    total = min(limits.max_total_tokens or inf, params.max_tokens or inf)
+    if total >= inf and (limits.max_think_tokens is None or limits.max_visible_tokens is None):
+        raise ValueError(
+            "unbounded two-phase generation: set max_total_tokens, or both "
+            "max_think_tokens and max_visible_tokens"
+        )
     p1_cap = min(limits.max_think_tokens or inf, max(1, total - len(close) - 1))
 
     phase1 = sample_fn(prompts, replace(params, max_tokens=p1_cap, stop=[THINK_CLOSE]), n=n)

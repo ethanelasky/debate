@@ -28,7 +28,9 @@ Tokens = list[int]
 
 @dataclass
 class SamplingParams:
-    max_tokens: int
+    # None = no ceiling here; the per-slot topology caps must then bound every
+    # generation (Policy raises if a generation ends up with no budget at all).
+    max_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 1.0
     stop: list[str] | None = None

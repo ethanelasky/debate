@@ -107,16 +107,27 @@ class DebateEnv(Env):
         return self.task_source.tasks(n, split)
 
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        from dataclasses import replace as _replace
+
         cfg = self.config
         seats: dict[str, SeatRunner] = {}
         for speaker in self.topology.speakers:
             if speaker in cfg.trained_speakers:
                 seat_policy = policy
                 if speaker in cfg.trained_sampling or speaker in cfg.trained_chat_kwargs:
-                    # same backend/adapter; per-seat sampling + template kwargs
+                    # same backend/adapter. The seat override owns the token
+                    # ceiling; the INCOMING policy owns the sampling mode
+                    # (train temp vs greedy eval) — composing them keeps
+                    # policy.greedy() greedy on override seats.
+                    override = cfg.trained_sampling.get(speaker)
+                    params = (
+                        _replace(policy.params, max_tokens=override.max_tokens)
+                        if override is not None
+                        else policy.params
+                    )
                     seat_policy = Policy(
                         policy.backend,
-                        cfg.trained_sampling.get(speaker, policy.params),
+                        params,
                         cfg.trained_chat_kwargs.get(speaker, policy.chat_template_kwargs),
                     )
                 seats[speaker] = PolicySeat(seat_policy)
