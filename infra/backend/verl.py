@@ -101,8 +101,21 @@ class VerlBackendConfig:
         eps_high = round(self.loss.clip_high - 1.0, 6)
         if self.loss.kind == "importance_sampling":
             eps_low, eps_high = 1.0, 1000.0  # effectively unclipped
+        loss_mode = {
+            "ppo": "vanilla",
+            "importance_sampling": "vanilla",
+            "gspo": "gspo",
+            "cispo": "cispo",
+            "reinforce": "gpg",  # verl's gpg IS -logp*adv (verified: core_algos.py:1723)
+        }.get(self.loss.kind)
+        if loss_mode is None:
+            raise NotImplementedError(f"loss {self.loss.kind!r} not supported on verl (use tinker)")
+        mode_override = (
+            [f"actor_rollout_ref.actor.policy_loss.loss_mode={loss_mode}"] if loss_mode != "vanilla" else []
+        )
         return [
             *self._strategy_overrides(),
+            *mode_override,
             f"actor_rollout_ref.model.path={self.model_path}",
             "actor_rollout_ref.model.use_remove_padding=True",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",

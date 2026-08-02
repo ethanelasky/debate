@@ -19,8 +19,8 @@ PC_TOPOLOGY = {
         {"bob": [{"name": "critique"}]},
         {"alice": [{"name": "defense"}]},
         {"bob": [{"name": "rebuttal"}]},
-        {"alice": [{"name": "closing"}], "bob": [{"name": "closing"}]},
-        {"judge": [{"name": "verdict", "kind": "decision"}]},
+        {"judge": [{"name": "deliberation", "visibility": "private"},
+                   {"name": "verdict", "kind": "decision"}]},
     ]
 }
 
@@ -49,7 +49,7 @@ def topology():
 def test_extends_merges_vars_over_parent(lib, tmp_path):
     assert "\\boxed{...}" in lib.vars["ANSWER_FORMAT_INSTRUCTION"]
     assert set(lib.system) == {"alice", "bob", "judge"}
-    assert set(lib.slots) == {"proposal", "critique", "defense", "rebuttal", "closing", "verdict"}
+    assert set(lib.slots) == {"proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
 
     path = tmp_path / "p.yaml"
     path.write_text(
@@ -80,17 +80,18 @@ def test_string_template_serves_any_speaker(lib):
     assert slot_template(lib, "proposal", "alice") is slot_template(lib, "proposal", "zebra")
 
 
-def test_map_template_is_per_speaker(lib):
-    assert "your boxed" in slot_template(lib, "closing", "alice")
-    assert "Proposer's answer is wrong" in slot_template(lib, "closing", "bob")
-
-
-def test_missing_slot_and_speaker_name_both_in_message(lib):
-    with pytest.raises(KeyError, match="ghost"):
-        slot_template(lib, "ghost", "alice")
+def test_map_template_is_per_speaker():
+    lib = PromptLibrary(slots={"closing": {"alice": "case FOR", "bob": "case AGAINST"}})
+    assert slot_template(lib, "closing", "alice") == "case FOR"
+    assert slot_template(lib, "closing", "bob") == "case AGAINST"
     with pytest.raises(KeyError) as e:
         slot_template(lib, "closing", "judge")
     assert "closing" in str(e.value) and "judge" in str(e.value)
+
+
+def test_missing_slot_named_in_message(lib):
+    with pytest.raises(KeyError, match="ghost"):
+        slot_template(lib, "ghost", "alice")
 
 
 # ------------------------------------------------------------------ render
@@ -112,7 +113,7 @@ def test_lowercase_tags_pass_through(lib):
     assert "<problem>2+2</problem>" in out
     assert "<TOPIC>" not in out
     crit = render(slot_template(lib, "critique", "bob"), {"OPPONENT_POSITION": "4"}, lib.vars)
-    assert "<proposer-solution>4</proposer-solution>" in crit
+    assert "boxed answer is 4" in crit
 
 
 def test_substituted_text_is_not_rescanned():
@@ -161,7 +162,7 @@ def test_bindability_ignores_placeholders_covered_by_vars(topology):
             "critique": "c",
             "defense": "d",
             "rebuttal": "r",
-            "closing": "cl",
+            "deliberation": "del",
             "verdict": "v",
         },
         vars={"POSITION": "static"},
@@ -174,11 +175,11 @@ def test_bindability_ignores_placeholders_covered_by_vars(topology):
 
 def test_rendered_prompts_protocol(lib):
     rp = RenderedPrompts(lib)
-    assert rp.system("alice", BINDINGS).startswith("You are Alice, the PROPOSER")
+    assert rp.system("alice", BINDINGS).startswith("<role>You are Alice, the PROPOSER")
     assert "<problem>What is 2+2?</problem>" in rp.instruction("proposal", "alice", BINDINGS)
-    assert "your boxed\nanswer 4 is correct" in rp.instruction("closing", "alice", BINDINGS)
+    assert "boxed answer: 4" in rp.instruction("deliberation", "judge", BINDINGS)
     verdict = rp.instruction("verdict", "judge", BINDINGS)
-    assert '{"winner": "Alice" | "Bob", "confidence": 0.5-1.0}' in verdict
+    assert '{"winner": "Alice" | "Bob", "confidence": 0.50-1.00}' in verdict
 
 
 def test_attributed_format_golden(lib):

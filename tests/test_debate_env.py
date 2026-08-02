@@ -251,8 +251,12 @@ def test_self_play_both_seats_harvested():
         extract_number,
     )
     groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
-    trajs = groups[0]
+    # seat-split groups: proposer and critic rewards are anti-correlated and
+    # must never share a GRPO baseline
+    assert len(groups) == 2
+    trajs = [t for g in groups for t in g]
     assert len(trajs) == 2                                # both seats harvested
+    assert {t.info["seat"] for t in trajs} == {"alice", "bob"}
     rewards = sorted(t.reward for t in trajs)
     assert rewards == [-1.0, 1.0]                         # zero-sum competitive
     assert {len(t.datums) for t in trajs} == {1, 2}       # bob 1 slot, alice 2

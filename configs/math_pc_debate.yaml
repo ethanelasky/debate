@@ -1,4 +1,6 @@
-# MATH proposer-critic debate RL (new-style experiment: topology in YAML).
+# MATH proposer-critic debate RL (format per DESIGN-pc-format.md).
+# Flow: proposal (public, graded) -> critique -> defense -> rebuttal (critic's
+# last word, as in the old PC arm) -> judge deliberation (private) + verdict.
 # Run: debate-rl --experiment-file configs/math_pc_debate.yaml --experiment <name>
 
 _base_math_pc:
@@ -6,29 +8,43 @@ _base_math_pc:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 1024, max_total_tokens: 3072}]
       - bob:   [{name: critique, max_total_tokens: 768}]
-      - alice: [{name: defense, max_total_tokens: 768}]
-      - judge: [{name: verdict, kind: decision, max_total_tokens: 512}]
+      - alice: [{name: defense,  max_total_tokens: 768}]
+      - bob:   [{name: rebuttal, max_total_tokens: 768}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 768},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
     file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
     entry: math_proposer_critic
-  trained: [alice]
   fresh_positions: true
   agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: tinker
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: proposer-alice
+        lora_rank: 32
+        enable_thinking: true
+        max_new_tokens: 3072
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
     bob:
+      trained: true
       model_settings:
         model_type: tinker
         model_file_path: Qwen/Qwen3.5-4B
         alias: critic-bob
         enable_thinking: false
         max_new_tokens: 768
-        sampling: {train: {temperature: 0.7, top_p: 0.95}}
+        # trained seats sample UNBIASED (1.0/1.0): sampler logprobs anchor the
+        # PPO ratio; the runner hard-rejects anything else
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
     judge:
       model_settings:
         model_type: tinker
         model_file_path: Qwen/Qwen3.5-4B
         alias: judge
         enable_thinking: false
-        max_new_tokens: 512
+        max_new_tokens: 768
         # temp/top_p 1.0: the logit confidence channel is only honest here
         sampling: {train: {temperature: 1.0, top_p: 1.0}}
   judge_config: {schema_name: competitive, retries: 4}
@@ -42,18 +58,14 @@ _base_math_pc:
   dataset: {levels: [1, 2], relaxed_extraction: true, seed: 0}
   training:
     wandb_project: debate-rebuild
-    base_model: Qwen/Qwen3.5-4B
-    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}   # GRPO = this + group-normalized advantages
+    ppo_epochs: 1
     steps: 100
     batch_size: 8
     group_size: 4
     lr: 1.0e-5
     kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
-                         # (tinker-cookbook incorporate_kl_penalty semantics;
-                         #  k1/k2/k3 values all logged for monitoring)
     kl_discount_factor: 0.0
-    max_tokens: 3072
-    enable_thinking: true
     eval_every: 20
     eval_n: 32
     save_every: 50
@@ -68,6 +80,30 @@ math_pc_smoke:
     eval_every: 0
     save_every: 0
 
-# The real arm.
+# The elicited-confidence arm.
 math_pc_debate:
   _extends: _base_math_pc
+
+# The judge-logit arm (the old MATH_Debate_Logit comparison): one-line diff.
+math_pc_debate_logit:
+  _extends: _base_math_pc
+  scoring:
+    confidence_source: logit
+
+# Loss ablations: same debate, different objective.
+math_pc_reinforce:
+  _extends: _base_math_pc
+  training:
+    loss: {kind: reinforce}
+
+math_pc_grpo_2epoch:
+  _extends: _base_math_pc
+  training:
+    ppo_epochs: 2
+
+# GSPO: sequence-level ratio via tinker forward_backward_custom. Sequence
+# ratios concentrate near 1 — clips are MUCH tighter than PPO's (paper values).
+math_pc_gspo:
+  _extends: _base_math_pc
+  training:
+    loss: {kind: gspo, clip_low: 0.9997, clip_high: 1.0004}

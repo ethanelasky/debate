@@ -139,6 +139,7 @@ class ModelSettings(BaseModel):
     thinking_budget_tokens: Optional[int] = None
     max_new_tokens: Optional[int] = None
     peft_base_model: Optional[str] = None
+    lora_rank: Optional[int] = None  # trained seats: adapter rank for the backend
     enable_thinking: Optional[bool] = None
     base_url: Optional[str] = None
     require_token_fidelity: bool = False

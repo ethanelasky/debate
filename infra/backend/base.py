@@ -108,7 +108,19 @@ class Datum:
 
 @dataclass
 class LossSpec:
-    kind: Literal["ppo", "importance_sampling", "cross_entropy"] = "ppo"
+    """Policy-loss selection. Backend support:
+      ppo                  clipped ratio surrogate (GRPO = this + group-normalized
+                           advantages from grpo_pack)        [tinker + verl]
+      importance_sampling  unclipped ratio * advantage        [tinker + verl(wide clip)]
+      reinforce            -logprob * advantage (no ratio)    [tinker via weighted CE,
+                                                              verl via loss_mode=gpg]
+      cispo                clipped-IS variant                 [tinker + verl]
+      gspo                 sequence-level ratio               [verl only]
+      cross_entropy        SFT                                [tinker + verl]
+    Unsupported (kind, backend) pairs raise at forward_backward time.
+    """
+
+    kind: Literal["ppo", "importance_sampling", "reinforce", "cispo", "gspo", "cross_entropy"] = "ppo"
     clip_low: float = 0.8
     clip_high: float = 1.2
 

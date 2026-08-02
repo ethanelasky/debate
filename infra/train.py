@@ -22,6 +22,7 @@ class Config:
     micro_batch: int = 64      # datums per forward_backward call
     lr: float = 1e-5
     loss: LossSpec = field(default_factory=LossSpec)
+    ppo_epochs: int = 1  # passes over each rollout batch (one optim_step per epoch)
     optim: OptimParams | None = None
     sampling: SamplingParams = field(default_factory=lambda: SamplingParams(max_tokens=512))
     chat_template_kwargs: dict | None = None
@@ -96,9 +97,15 @@ def train(env: Env, backend: Backend, cfg: Config) -> None:
                 metrics.update(
                     apply_kl_penalty(backend, datums, cfg.kl_coef, cfg.kl_discount_factor)
                 )
-            for i in range(0, len(datums), cfg.micro_batch):
-                backend.forward_backward(datums[i : i + cfg.micro_batch], cfg.loss)
-            metrics.update(backend.optim_step(optim))
+            import random as _random
+
+            for epoch in range(max(1, cfg.ppo_epochs)):
+                # later epochs go off-policy; the ratio in ppo/importance losses
+                # corrects against the stored sampler logprobs
+                _random.Random(cfg.seed * 1000 + step * 10 + epoch).shuffle(datums)
+                for i in range(0, len(datums), cfg.micro_batch):
+                    backend.forward_backward(datums[i : i + cfg.micro_batch], cfg.loss)
+                metrics.update(backend.optim_step(optim))
 
         if cfg.eval_every and step % cfg.eval_every == 0:
             metrics.update(evaluate(env, policy, cfg.eval_n))

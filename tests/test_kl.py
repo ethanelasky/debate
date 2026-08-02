@@ -65,3 +65,39 @@ def test_discounted_future_sum():
 def test_entropy_proxy_masked_mean():
     d = mk([-2.0, -4.0], mask=[1.0, 0.0])
     assert entropy_proxy([d]) == pytest.approx(2.0)
+
+
+def test_gspo_loss_fn_math():
+    import torch
+
+    from infra.backend.tinker import make_gspo_loss_fn
+
+    # one datum: ob_len=1, 2 completion tokens, uniform mask
+    q = [-1.0, -1.0]
+    adv = [2.0, 2.0]
+    metas = [(1, 2, q, adv, [1.0, 1.0])]
+    fn = make_gspo_loss_fn(metas, clip_low=0.8, clip_high=1.2)
+    # new logprobs at positions [1:3] = [-0.5, -0.5]: s = exp(mean(0.5)) ~ 1.6487 -> clipped to 1.2
+    lp = torch.tensor([-9.0, -0.5, -0.5], requires_grad=True)
+    loss, metrics = fn(None, [lp])
+    s = torch.exp(torch.tensor(0.5))
+    expected = -min(s.item() * 2.0, 1.2 * 2.0)
+    assert loss.item() == pytest.approx(expected)
+    assert metrics["gspo/seq_clip_frac"] == 1.0
+    loss.backward()
+    assert lp.grad is not None and lp.grad[0].item() == 0.0  # prompt position untouched
+
+
+def test_gspo_mask_excludes_forced_close():
+    import torch
+
+    from infra.backend.tinker import make_gspo_loss_fn
+
+    q = [-1.0, 0.0]
+    metas = [(0, 2, q, [1.0, 1.0], [1.0, 0.0])]  # 2nd token masked (injected close)
+    fn = make_gspo_loss_fn(metas, clip_low=0.5, clip_high=2.0)
+    lp = torch.tensor([-1.0, -5.0], requires_grad=True)
+    loss, _ = fn(None, [lp])
+    assert loss.item() == pytest.approx(-1.0)  # s=exp(0)=1, a=1 -> -1; masked token ignored
+    loss.backward()
+    assert lp.grad[1].item() == 0.0

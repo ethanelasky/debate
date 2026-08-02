@@ -53,6 +53,11 @@ class DebateEnvConfig:
     prompt_entry: str
     trained_speakers: list[str]                 # subset of debater speakers; [] = pure eval
     frozen_models: dict[str, Model]             # speaker -> model (must cover judge + untrained debaters)
+    # Per-trained-seat overrides applied on top of the rollout policy (one
+    # shared adapter, per-seat sampling params / chat-template kwargs, e.g.
+    # enable_thinking differing between proposer and critic).
+    trained_sampling: dict[str, Any] = field(default_factory=dict)      # speaker -> SamplingParams
+    trained_chat_kwargs: dict[str, dict] = field(default_factory=dict)  # speaker -> template kwargs
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     fresh_positions: bool = True
@@ -106,12 +111,23 @@ class DebateEnv(Env):
         seats: dict[str, SeatRunner] = {}
         for speaker in self.topology.speakers:
             if speaker in cfg.trained_speakers:
-                seats[speaker] = PolicySeat(policy)
+                seat_policy = policy
+                if speaker in cfg.trained_sampling or speaker in cfg.trained_chat_kwargs:
+                    # same backend/adapter; per-seat sampling + template kwargs
+                    seat_policy = Policy(
+                        policy.backend,
+                        cfg.trained_sampling.get(speaker, policy.params),
+                        cfg.trained_chat_kwargs.get(speaker, policy.chat_template_kwargs),
+                    )
+                seats[speaker] = PolicySeat(seat_policy)
             else:
                 seats[speaker] = FrozenSeat(cfg.frozen_models[speaker])
 
         arms = [False, True] if cfg.flip else [False]
-        # group id = (task index, arm): flip arms are separate GRPO groups
+        # base group id = (task index, arm): flip arms are separate GRPO groups.
+        # Final groups additionally split BY TRAINED SEAT (below): proposer and
+        # critic rewards are anti-correlated, so normalizing them together
+        # would manufacture advantage out of the seat identity.
         states: list[DebateState] = []
         state_group: list[int] = []
         group_count = 0
@@ -136,7 +152,8 @@ class DebateEnv(Env):
         )
         round_.run(states)
 
-        groups: list[list[Trajectory]] = [[] for _ in range(group_count)]
+        # one GRPO group per (task, arm, trained seat)
+        by_seat_group: dict[tuple[int, str], list[Trajectory]] = {}
         fail_reasons: dict[str, int] = {}
         n_failed = 0
         n_unscoreable = 0
@@ -149,7 +166,9 @@ class DebateEnv(Env):
             if trajs is None:
                 n_unscoreable += 1
                 continue
-            groups[gid].extend(trajs)
+            for traj in trajs:
+                by_seat_group.setdefault((gid, traj.info.get("seat", "")), []).append(traj)
+        groups: list[list[Trajectory]] = [g for _, g in sorted(by_seat_group.items())] or [[]]
         # Always recorded, even when everything dropped (else failure is mute).
         self.last_rollout_info = {
             "debates": len(states),
@@ -295,6 +314,7 @@ class DebateEnv(Env):
             ]
             shaped = sum(datum_rewards) / len(datum_rewards)
             info: dict[str, Any] = {
+                "seat": speaker,
                 "reward_base": float(base),
                 "reward_shaped": float(shaped),
                 "cell": seat_rewards[display].cell if display in seat_rewards else "none",
