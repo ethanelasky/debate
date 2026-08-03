@@ -13,6 +13,7 @@ from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.topology import Topology
+from infra.envs.tasks.math import MathFamily
 from infra.models.base import Model, ModelResponse
 
 import yaml
@@ -110,13 +111,6 @@ class TaskSource:
         ]
 
 
-def extract_number(text):
-    import re
-
-    m = re.search(r"\\boxed\{([-\d.]+)\}", text)
-    return float(m.group(1)) if m else None
-
-
 def make_env(trained, judge_script, scoring=None):
     return DebateEnv(
         DebateEnvConfig(
@@ -133,7 +127,7 @@ def make_env(trained, judge_script, scoring=None):
             fresh_positions=True,
         ),
         TaskSource(),
-        extract_number,
+        MathFamily(),
     )
 
 
@@ -248,7 +242,7 @@ def test_self_play_both_seats_harvested():
             fresh_positions=True,
         ),
         TaskSource(),
-        extract_number,
+        MathFamily(),
     )
     groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
     # seat-split groups: proposer and critic rewards are anti-correlated and
@@ -340,3 +334,4 @@ def test_length_normalize_balances_seats():
     datums, _ = grpo_pack([alice], length_normalize="count", drop_zero_advantage=False)
     assert abs(datums[0].advantages[0]) == pytest.approx(abs(datums[0].advantages[0]))
     assert total_mass([bob], "count") == pytest.approx(raw_bob)  # 1 datum: /1
+

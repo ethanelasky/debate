@@ -11,6 +11,7 @@ from infra.envs.debate.prompts import (
 from infra.envs.debate.topology import Topology
 
 MATH_YAML = "infra/envs/debate/prompt_configs/hendrycks_math.yaml"
+CODECONTESTS_YAML = "infra/envs/debate/prompt_configs/codecontests.yaml"
 
 # DESIGN-debate-env.md §1, proposer_critic_2round.
 PC_TOPOLOGY = {
@@ -49,7 +50,7 @@ def topology():
 def test_extends_merges_vars_over_parent(lib, tmp_path):
     assert "\\boxed{...}" in lib.vars["ANSWER_FORMAT_INSTRUCTION"]
     assert set(lib.system) == {"alice", "bob", "judge"}
-    assert set(lib.slots) == {"proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
+    assert set(lib.slots) == {"scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
 
     path = tmp_path / "p.yaml"
     path.write_text(
@@ -128,6 +129,15 @@ def test_validate_passes_for_math_pc(lib, topology):
     validate_prompts(lib, topology, fresh_positions=False)
 
 
+def test_validate_passes_for_codecontests_pc(topology):
+    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    assert set(cc.system) == {"alice", "bob", "judge"}
+    assert set(cc.slots) == set(load_prompt_library(MATH_YAML, "math_proposer_critic").slots)
+    assert "```python" in cc.vars["ANSWER_FORMAT_INSTRUCTION"]
+    validate_prompts(cc, topology, fresh_positions=True)
+    validate_prompts(cc, topology, fresh_positions=False)
+
+
 def test_validate_fails_on_missing_slot_template(lib, topology):
     lib.slots.pop("rebuttal")
     with pytest.raises(ValueError, match="rebuttal"):
@@ -177,7 +187,9 @@ def test_rendered_prompts_protocol(lib):
     rp = RenderedPrompts(lib)
     assert rp.system("alice", BINDINGS).startswith("<role>You are Alice, the PROPOSER")
     assert "<problem>What is 2+2?</problem>" in rp.instruction("proposal", "alice", BINDINGS)
-    assert "boxed answer: 4" in rp.instruction("deliberation", "judge", BINDINGS)
+    # judge reads the proposer's answer via OPPONENT_POSITION — the key the
+    # round loop actually rebinds for non-solvers when a solution lands
+    assert "boxed answer: 5" in rp.instruction("deliberation", "judge", BINDINGS)
     verdict = rp.instruction("verdict", "judge", BINDINGS)
     assert '{"winner": "Alice" | "Bob", "confidence": 0.50-1.00}' in verdict
 

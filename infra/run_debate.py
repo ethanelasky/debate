@@ -5,23 +5,24 @@ model_settings drive the training backend AND its sampling; `training:` holds
 optimization/loop knobs only):
 
     math_pc:
-      topology: {turns: [...]}
+      topology: {turns: [...]}                # per-slot token budgets live HERE
       prompt_config: {file_path: ..., entry: ...}
       agents:
         alice:
           trained: true
           model_settings: {model_type: tinker, model_file_path: Qwen/Qwen3.5-4B,
-                           lora_rank: 32, enable_thinking: true,
-                           max_new_tokens: 3072,
+                           enable_thinking: true,
                            sampling: {train: {temperature: 1.0, top_p: 1.0}}}
         bob:   {model_settings: {...}}       # frozen, built by the factory
         judge: {model_settings: {...}}
       judge_config: {schema_name: competitive, retries: 4}
       scoring: {scoring: continuous, confidence_source: json, shaping: [...]}
-      dataset: {levels: [1, 2], relaxed_extraction: true}
-      training: {loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}, ppo_epochs: 1,
-                 steps: 100, batch_size: 8, group_size: 4, lr: 1e-5,
-                 kl_coef: 0.02, wandb_project: ..., eval_every: 20, ...}
+      dataset: {type: math, levels: [3, 4], relaxed_extraction: true}
+      training: {lora_rank: 32,               # the SHARED adapter's rank
+                 loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}, ppo_epochs: 1,
+                 adv_length_norm: trajectory, steps: 100, batch_size: 8,
+                 group_size: 4, lr: 1e-5, kl_coef: 0.02,
+                 wandb_project: ..., eval_every: 5, ...}
 """
 
 from __future__ import annotations
@@ -30,24 +31,14 @@ import argparse
 
 from infra.backend.base import LossSpec, SamplingParams
 from infra.config import load_experiment, parse_model_settings
-from infra.envs.answer_parsing import extract_last_number, extract_number_from_boxed_answer
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.topology import Topology
-from infra.envs.math_env import MathEnv
+from infra.envs.tasks import get_family
 from infra.models.base import ModelSettings, resolved_sampling_profile
 from infra.models.factory import instantiate_model
 from infra.train import Config, train
-
-
-def strict_extract(text):
-    return extract_number_from_boxed_answer(text)
-
-
-def relaxed_extract(text):
-    v = extract_number_from_boxed_answer(text)
-    return v if v is not None else extract_last_number(text)
 
 
 def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSettings]]:
@@ -101,7 +92,8 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         if settings.enable_thinking is not None:
             trained_chat_kwargs[speaker] = {"enable_thinking": bool(settings.enable_thinking)}
 
-    ds = exp.get("dataset") or {}
+    ds = dict(exp.get("dataset") or {})
+    family = get_family(ds.pop("type", None))
     config = DebateEnvConfig(
         topology=topology,
         prompt_file=exp["prompt_config"]["file_path"],
@@ -115,13 +107,41 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         fresh_positions=exp.get("fresh_positions", True),
         flip=exp.get("flip", False),
     )
-    task_source = MathEnv(
-        seed=int(ds.get("seed", 0)),
-        levels=tuple(ds.get("levels", (5,))),
-        eval_subset_size=int(ds.get("eval_subset_size", 512)),
-    )
-    extractor = relaxed_extract if ds.get("relaxed_extraction", True) else strict_extract
-    return DebateEnv(config, task_source, extractor)
+    relaxed = bool(ds.pop("relaxed_extraction", True))
+    task_source = family.source(ds)
+    return DebateEnv(config, task_source, family, relaxed_extraction=relaxed)
+
+
+def build_backend(tr: dict, model_path: str, lr_override: float | None = None):
+    """training block -> Backend. Shared by the debate and RLVR runners."""
+    backend_kind = str(tr.get("backend", "tinker"))
+    if backend_kind == "tinker":
+        from infra.backend.tinker import TinkerBackend
+
+        return TinkerBackend(model_path, lora_rank=int(tr.get("lora_rank", 32)))
+    if backend_kind == "verl":
+        from infra.backend.verl import VerlBackend, VerlBackendConfig
+
+        v = dict(tr.get("verl") or {})
+        return VerlBackend(
+            VerlBackendConfig(
+                model_path=model_path,
+                n_gpus=int(v.get("n_gpus", 1)),
+                strategy=str(v.get("strategy", "fsdp2")),
+                gpu_memory_utilization=float(v.get("gpu_memory_utilization", 0.6)),
+                prompt_length=int(v.get("prompt_length", 4096)),
+                response_length=int(v.get("response_length", 2048)),
+                max_token_len_per_gpu=int(v.get("max_token_len_per_gpu", 16384)),
+                rollout_tp=int(v.get("rollout_tp", 1)),
+                use_remove_padding=bool(v.get("use_remove_padding", True)),
+                lora_rank=int(tr.get("lora_rank", 32)),
+                lr=float(lr_override if lr_override is not None else tr.get("lr", 1e-5)),
+                loss=LossSpec(**(tr.get("loss") or {})),
+                checkpoint_dir=str(v.get("checkpoint_dir", "checkpoints/verl")),
+                extra_overrides=tuple(v.get("extra_overrides") or ()),
+            )
+        )
+    raise ValueError(f"training.backend must be tinker|verl, got {backend_kind!r}")
 
 
 def main() -> None:
@@ -131,10 +151,16 @@ def main() -> None:
     parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     parser.add_argument("--steps", type=int, default=None, help="override training.steps")
+    parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
+    parser.add_argument("--levels", default=None, help="override dataset.levels (e.g. 4 or 3-4)")
+    parser.add_argument("--group-size", type=int, default=None, help="override training.group_size (sweeps)")
+    parser.add_argument("--batch-size", type=int, default=None, help="override training.batch_size (sweeps)")
     parser.add_argument("--load", default=None)
     args = parser.parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
+    if args.levels is not None:
+        exp.setdefault("dataset", {})["levels"] = args.levels
     trained, frozen = split_agents(exp)
     if not trained:
         raise ValueError("no agent has trained: true")
@@ -145,11 +171,9 @@ def main() -> None:
 
     env = build_env(exp, trained, frozen)
     tr = exp.get("training") or {}
-
-    from infra.backend.tinker import TinkerBackend
-
     lead = trained_settings[0]
-    backend = TinkerBackend(lead.model_file_path, lora_rank=int(lead.lora_rank or 32))
+
+    backend = build_backend(tr, lead.model_file_path, lr_override=args.lr)
     if args.load:
         backend.load(args.load)
 
@@ -157,10 +181,10 @@ def main() -> None:
     cfg = Config(
         base_model=lead.model_file_path,
         steps=args.steps if args.steps is not None else int(tr.get("steps", 100)),
-        batch_size=int(tr.get("batch_size", 8)),
-        group_size=int(tr.get("group_size", 4)),
+        batch_size=(args.batch_size if args.batch_size is not None else int(tr.get("batch_size", 8))),
+        group_size=(args.group_size if args.group_size is not None else int(tr.get("group_size", 4))),
         micro_batch=int(tr.get("micro_batch", 64)),
-        lr=float(tr.get("lr", 1e-5)),
+        lr=float(args.lr if args.lr is not None else tr.get("lr", 1e-5)),
         loss=LossSpec(**(tr.get("loss") or {})),
         ppo_epochs=int(tr.get("ppo_epochs", 1)),
         adv_length_norm=str(tr.get("adv_length_norm", "none")),
@@ -174,17 +198,35 @@ def main() -> None:
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),
         eval_every=int(tr.get("eval_every", 20)),
+        eval_max_tokens=(int(tr["eval_max_tokens"]) if "eval_max_tokens" in tr else None),
         eval_n=int(tr.get("eval_n", 64)),
         save_every=int(tr.get("save_every", 50)),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
-        run_name=args.experiment,
+        run_name=args.experiment
+        + (f"-lr{args.lr:g}" if args.lr is not None else "")
+        + (f"-L{args.levels}" if args.levels is not None else "")
+        + (f"-g{args.group_size}" if args.group_size is not None else "")
+        + (f"-b{args.batch_size}" if args.batch_size is not None else ""),
         chat_template_kwargs=(
             {"enable_thinking": bool(lead.enable_thinking)} if lead.enable_thinking is not None else None
         ),
     )
-    train(env, backend, cfg)
+    # Comprehensive docent capture: every training rollout's debates -> JSONL
+    import os
+
+    def _export_docent(step: int, env_) -> None:
+        from infra.envs.debate.docent_export import agent_runs, export_jsonl
+
+        os.makedirs("docent", exist_ok=True)
+        export_jsonl(agent_runs(env_), f"docent/step-{step:05d}.jsonl")
+
+    cfg.on_rollout = _export_docent
+
+    # RLVR evals: measure proposal accuracy on the held-out split via the
+    # task source itself (MathEnv), not a debate
+    train(env, backend, cfg, eval_env=env.task_source)
 
 
 if __name__ == "__main__":

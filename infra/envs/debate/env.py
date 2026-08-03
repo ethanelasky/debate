@@ -67,12 +67,17 @@ class DebateEnvConfig:
 
 class DebateEnv(Env):
     """task_source supplies problems: any object with tasks(n, split) whose
-    Task.meta carries {"gt", "question"} (MathEnv qualifies)."""
+    Task.meta carries {"question"} plus whatever the family's grade() reads
+    (any TaskFamily.source() qualifies). `family` (a TaskFamily, duck-typed
+    to keep this module import-light) owns everything task-specific:
+    extractor() binds solution slots to positions, grade() scores them,
+    format_flags() feeds shaping terms."""
 
-    def __init__(self, config: DebateEnvConfig, task_source, solution_extractor):
+    def __init__(self, config: DebateEnvConfig, task_source, family, relaxed_extraction: bool = True):
         self.config = config
         self.task_source = task_source
-        self.solution_extractor = solution_extractor
+        self.family = family
+        self.solution_extractor = family.extractor(relaxed_extraction)
 
         self.topology = config.topology
         speakers = self.topology.speakers
@@ -150,6 +155,21 @@ class DebateEnv(Env):
                     states.append(self._build_state(task, flipped=arm))
                     state_group.append(gid)
 
+        # Grammar-force the verdict on servers that support it (vLLM): a
+        # free-text judge mid-thought at the deliberation cap keeps reasoning
+        # into the verdict slot and never emits JSON (smoke: 15/16 debates
+        # lost to verdict_unparseable). Confidence bounds stay parser-side.
+        decision_json_schema = None
+        if cfg.judge.schema_name == "competitive":
+            decision_json_schema = {
+                "type": "object",
+                "properties": {
+                    "winner": {"type": "string", "enum": [*self.display.values(), "Tie"]},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["winner", "confidence"],
+                "additionalProperties": False,
+            }
         round_ = DebateRound(
             self.topology,
             seats,
@@ -157,9 +177,10 @@ class DebateEnv(Env):
             verdict_parser=lambda text: parse_verdict(
                 text, cfg.judge.schema_name, list(self.display.values())
             ),
-            verdict_retries=cfg.verdict_retries,
+            verdict_retries=cfg.judge.retries,
             solution_extractor=self.solution_extractor,
             fresh_positions=cfg.fresh_positions,
+            decision_json_schema=decision_json_schema,
         )
         round_.run(states)
 
@@ -251,8 +272,6 @@ class DebateEnv(Env):
         )
 
     def _token_report(self, st: DebateState) -> RoundTokenReport:
-        from infra.envs.answer_parsing import extract_number_from_boxed_answer
-
         counts: dict[tuple[str, str], SlotTokenCounts] = {}
         for r in st.records:
             if r.sample is None:
@@ -268,9 +287,7 @@ class DebateEnv(Env):
                 visible = len(r.sample.tokens)
             flags: dict[str, float] = {}
             if r.slot.slot.kind == Kind.SOLUTION:
-                # strict format flag, independent of the (possibly relaxed)
-                # extractor used for position binding
-                flags["strict_boxed"] = float(extract_number_from_boxed_answer(r.text) is not None)
+                flags.update(self.family.format_flags(r.text))
                 flags["extracted"] = float(r.extracted is not None)
             counts[(r.slot.speaker, r.slot.slot.name)] = SlotTokenCounts(
                 think=think,
@@ -299,7 +316,6 @@ class DebateEnv(Env):
         }
         deltas = [term.apply(scored_by_speaker, report) for term in self.shaping]
 
-        gt = st.meta.get("task", {}).get("gt")
         solutions = {
             r.slot.speaker: r.extracted
             for r in st.records
@@ -339,11 +355,10 @@ class DebateEnv(Env):
                     v = getattr(conf, src)
                     if v is not None:
                         info[f"judge_conf_{src}"] = float(v)
-            if gt is not None and solutions.get(speaker) is not None:
-                try:
-                    info["solution_correct"] = float(abs(float(solutions[speaker]) - float(gt)) < 1e-6)
-                except (TypeError, ValueError):
-                    pass
+            if solutions.get(speaker) is not None:
+                correct = self.family.grade(st.meta.get("task", {}), solutions[speaker])
+                if correct is not None:
+                    info["solution_correct"] = float(correct)
             trajs.append(
                 Trajectory(datums=datums, reward=shaped, info=info, datum_rewards=datum_rewards)
             )
