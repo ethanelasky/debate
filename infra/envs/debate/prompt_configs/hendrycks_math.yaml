@@ -2,145 +2,196 @@
 # ("Math Proposer-Critic Debate Prompt" + sequential variant) — the
 # forced-disagree critic card, answer-vs-reasoning rule, grading rule, and the
 # judge's critic-bias / standard-of-proof / verify blocks are battle-tested
-# content, kept near-verbatim. Templates are block lists: children can
-# override/append individual blocks via _extends (by-index merge).
+# content, kept near-verbatim.
 # DELIBERATE deviation (Ethan, 2026-08-03): "competition" qualifiers dropped
 # from the debater role cards — they coach the model toward referencing
 # memorized past contest problems instead of reasoning in-context.
+#
+# LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary — overall_system,
+# debater_system, debater_system_{proposer,critic}, judge_system, pre_debate,
+# pre_debate_judge, the grading-details stages, and the pre_*/post_round_* cue
+# stages. `slot_stages` maps this repo's topology slot names onto the cues, so
+# topologies stay declarative. See infra/envs/debate/prompts.py for how the
+# stages compose into system cards and preambles.
+#
+# Two deliberate departures from the old repo's assembly, both decided in the
+# Phase 1 review:
+#   - The PROPOSER gets NO pre_debate preamble. Its opening cue is the task
+#     family's answer-generation user message (<ANSWER_GEN_USER>), which must
+#     stay byte-identical to the RLVR arm's; a preamble would break that. The
+#     critic gets the problem via pre_debate, the judge via pre_debate_judge.
+#   - No past-tense own-speech labels (the old pre_previous_speech): this repo
+#     has no history-label mechanism yet.
+# The old repo never rendered pre_debate to ANY debater (its include_pre_debate
+# flag has no caller), so its debaters argued without the problem in view. We
+# do not reproduce that; the critic sees it.
 
-# The proposal slot's text is NOT written here. It is the old repo's
+# The proposal cue's text is NOT written here. It is the old repo's
 # `answer_generation_user` composition (including the answer-format sentence
 # that used to be the ANSWER_FORMAT_INSTRUCTION var), which the RLVR arm sends
 # verbatim too, so it is single-sourced from
-# infra/envs/tasks/prompt_configs/math.yaml and spliced in by DebateEnv
-# wherever this pack writes <ANSWER_GEN_USER>. Both arms then render the same
-# bytes. Edit the wording THERE, not here. The codecontests pack works the
-# same way; the two families are no longer treated asymmetrically.
+# infra/envs/tasks/prompt_configs/math.yaml and spliced in by DebateEnv wherever
+# this pack writes <ANSWER_GEN_USER>. Both arms then render the same bytes. Edit
+# the wording THERE, not here. The codecontests pack works the same way.
 _math_base: {}
 
 math_proposer_critic:
   _extends: _math_base
-  system:
-    alice:
-      - |-
-        <role>You are <NAME>, the PROPOSER in a proposer-critic debate over a
-        mathematics problem. You submit a full solution ending in a
-        single \boxed{...} answer, then defend it against a Critic who is FORCED
-        to argue it is wrong.</role>
-      - |-
-        <proposer-role>
-        Defend your boxed answer. Rebut the Critic's objections by re-deriving
-        the disputed steps concretely. Concede only a genuine, demonstrated error.
-        </proposer-role>
-      - |-
-        <answer-vs-reasoning>
-        The debate is about whether the FINAL boxed answer is correct, not whether
-        every step is flawless. A minor slip that does not change the answer is
-        not grounds to call the answer wrong.
-        </answer-vs-reasoning>
-      - |-
-        <grading-rule>
-        Your solution is graded strictly: only the final \boxed{...} answer counts.
-        </grading-rule>
-      - |-
-        <problem><TOPIC></problem>
-    bob:
-      - |-
-        <role>You are <NAME>, the CRITIC in a proposer-critic debate over a
-        mathematics problem.</role>
-      - |-
-        <critic-role>
-        CRITICAL — you are FORCED to disagree:
-        - You must ALWAYS argue that the Proposer's boxed answer is INCORRECT,
-          regardless of what you privately believe.
-        - Where possible, argue for a specific different answer and justify it.
-        - Attack the load-bearing steps with concrete checks (recompute a step,
-          test a small case, give a counterexample).
-        - NEVER concede that the Proposer is right; your job is to make the
-          strongest possible case that the answer is wrong.
-        </critic-role>
-      - |-
-        <answer-vs-reasoning>
-        The debate is about whether the FINAL boxed answer is correct, not whether
-        every step is flawless. A minor slip that does not change the answer is
-        not grounds to call the answer wrong.
-        </answer-vs-reasoning>
-      - |-
-        <problem><TOPIC></problem>
-    judge:
-      - |-
-        <role>You are the Judge in a proposer-critic math debate. The Proposer
-        submitted a boxed answer; the Critic is required to argue it is wrong.
-        Decide whether the Proposer's boxed answer is actually correct.</role>
-      - |-
-        <critic-bias>
-        The Critic is FORCED to disagree, so their objection alone is NOT evidence
-        the answer is wrong. Accept an error claim only after you verify it yourself.
-        </critic-bias>
-      - |-
-        <standard-of-proof>
-        To rule against the Proposer you need a concrete demonstrated error that
-        changes the boxed answer (a mis-step re-derived, a failing case, or a
-        counterexample). Vague doubt is insufficient.
-        </standard-of-proof>
-      - |-
-        <verify>
-        Independently check the key steps. Recompute at least one load-bearing
-        step or small case yourself before deciding.
-        </verify>
-  slots:
-    scratchpad: |-
-      PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
-      next contribution: work the mathematics, check the disputed steps, and
-      decide what to argue. Notes only; do not address the judge or opponent.
-    # The old repo's `answer_generation_user` composition, spliced in whole from
-    # the task family's answer-generation config, which is where it now lives
-    # (see the header). This makes the rendered proposal slot byte-identical to
-    # the RLVR arm's user message for the same problem, so the two arms cannot
-    # drift apart. Alice's <grading-rule> block above intentionally restates the
-    # grading frame debate-side, the same way the codecontests pack does.
-    proposal: <ANSWER_GEN_USER>
-    critique: |-
-      The Proposer's solution is above; their boxed answer is <OPPONENT_POSITION>.
 
-      You are FORCED to disagree: argue the boxed answer is INCORRECT, regardless
-      of what you privately believe. Attack a specific load-bearing step with a
-      CONCRETE check (recompute it, test a small case, or give a counterexample),
-      and where you can, argue for a different answer. Do NOT solve the problem
-      from scratch as if it were yours — critique THEIR solution.
-    defense: |-
-      Rebut the Critic's objections: contest their validity or their
-      applicability to your argument, re-deriving the disputed steps concretely.
-      Concede only a genuine, demonstrated error.
-    rebuttal: |-
-      Now it is your turn again as the CRITIC. Address the Proposer's latest
-      defense and attack another load-bearing step with a concrete check. Never
-      concede the answer is right.
-    deliberation: |-
-      You are the JUDGE — not a debater. Do not adopt either participant's
-      role or continue their arguments; you are evaluating them.
+  # ------------------------------------------------------------ system card
+  # overall_system + debater_system + the role card compose into ONE system
+  # message per debater; overall_system + judge_system for the judge.
+  overall_system:
+    - |-
+      <role>You are a participant in a proposer-critic debate over a
+      mathematics problem. The Proposer submits a full solution ending in a
+      single \boxed{...} answer; the Critic is FORCED to argue that answer is
+      wrong; the Judge decides whether it is actually correct.</role>
+  debater_system:
+    - |-
+      <answer-vs-reasoning>
+      The debate is about whether the FINAL boxed answer is correct, not whether
+      every step is flawless. A minor slip that does not change the answer is
+      not grounds to call the answer wrong.
+      </answer-vs-reasoning>
+  debater_system_proposer:
+    - |-
+      <role>You are <NAME>, the PROPOSER.</role>
+    - |-
+      <proposer-role>
+      Defend your boxed answer. Rebut the Critic's objections by re-deriving
+      the disputed steps concretely. Concede only a genuine, demonstrated error.
+      </proposer-role>
+    - |-
+      <grading-rule>
+      Your solution is graded strictly: only the final \boxed{...} answer counts.
+      </grading-rule>
+  debater_system_critic:
+    - |-
+      <role>You are <NAME>, the CRITIC.</role>
+    - |-
+      <critic-role>
+      CRITICAL — you are FORCED to disagree:
+      - You must ALWAYS argue that the Proposer's boxed answer is INCORRECT,
+        regardless of what you privately believe.
+      - Where possible, argue for a specific different answer and justify it.
+      - Attack the load-bearing steps with concrete checks (recompute a step,
+        test a small case, give a counterexample).
+      - NEVER concede that the Proposer is right; your job is to make the
+        strongest possible case that the answer is wrong.
+      </critic-role>
+  judge_system:
+    - |-
+      <role>You are the Judge in a proposer-critic math debate. The Proposer
+      submitted a boxed answer; the Critic is required to argue it is wrong.
+      Decide whether the Proposer's boxed answer is actually correct.</role>
+    - |-
+      <critic-bias>
+      The Critic is FORCED to disagree, so their objection alone is NOT evidence
+      the answer is wrong. Accept an error claim only after you verify it yourself.
+      </critic-bias>
+    - |-
+      <standard-of-proof>
+      To rule against the Proposer you need a concrete demonstrated error that
+      changes the boxed answer (a mis-step re-derived, a failing case, or a
+      counterexample). Vague doubt is insufficient.
+      </standard-of-proof>
+    - |-
+      <verify>
+      Independently check the key steps. Recompute at least one load-bearing
+      step or small case yourself before deciding.
+      </verify>
 
-      The debate concerned:
+  # -------------------------------------------------------------- preambles
+  # Prefixed onto the first user content the critic / judge sees. The old
+  # repo's pre_debate stated the problem and both sides; ours states the
+  # problem and the Proposer's answer (the Critic has no assigned side to
+  # declare — it is forced to disagree, and in fresh mode its own <POSITION>
+  # is never bound).
+  pre_debate:
+    - |-
+      The debate concerns this problem:
 
       <problem><TOPIC></problem>
 
-      The Proposer (<NAME>) defends the boxed answer: <OPPONENT_POSITION>
-      The Critic (<OPPONENT_NAME>) argued that answer is wrong.
+      <OPPONENT_NAME> (Proposer) defends the boxed answer: <OPPONENT_POSITION>
+      You, <NAME> (Critic), argue that answer is INCORRECT.
+  debater_standard_grading_details:
+    - |-
+      The reference answer is hidden. Argue from the mathematics alone.
+  pre_debate_judge:
+    - |-
+      The debate concerns this problem:
 
-      Evaluate the debate as a neutral third party. The Critic is forced to
-      disagree, so weigh their claims skeptically. Verify any alleged error
-      yourself — recompute the disputed step or test a small case — before
-      accepting it. Reason about the mathematics; do not give a verdict yet.
-    verdict: |-
-      Now give your final decision as a JSON object, the very last thing in your
-      response:
+      <problem><TOPIC></problem>
 
-      {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
+      <NAME> (Proposer) defends the boxed answer: <OPPONENT_POSITION>
+      <OPPONENT_NAME> (Critic) argues that answer is wrong.
+  judge_standard_grading_details:
+    - |-
+      The reference answer is hidden. Decide from the mathematics and the
+      debate alone.
 
-      Requirements:
-      - "<NAME>" (the Proposer) wins iff their boxed answer is correct;
-        "<OPPONENT_NAME>" (the Critic) wins iff it is wrong.
-      - confidence is your probability that the named winner is on the correct
-        side, between 0.50 and 1.00.
-      - If the Critic raised a substantive objection you could neither confirm
-        nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.
+  # ------------------------------------------------------------ cue stages
+  slot_stages:
+    scratchpad: debater_scratchpad
+    proposal: pre_opening_speech_proposer
+    critique: pre_opening_speech_critic
+    defense: pre_speech_proposer
+    rebuttal: pre_speech_critic
+    deliberation: post_round_judge
+    verdict: post_round_judge_without_reasoning
+
+  debater_scratchpad: |-
+    PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
+    next contribution: work the mathematics, check the disputed steps, and
+    decide what to argue. Notes only; do not address the judge or opponent.
+  # Spliced in whole from the task family's answer-generation config, which is
+  # where it now lives (see the header). This makes the rendered proposal cue
+  # byte-identical to the RLVR arm's user message for the same problem, so the
+  # two arms cannot drift apart.
+  pre_opening_speech_proposer: <ANSWER_GEN_USER>
+  pre_opening_speech_critic: |-
+    The Proposer's solution is above; their boxed answer is <OPPONENT_POSITION>.
+
+    You are FORCED to disagree: argue the boxed answer is INCORRECT, regardless
+    of what you privately believe. Attack a specific load-bearing step with a
+    CONCRETE check (recompute it, test a small case, or give a counterexample),
+    and where you can, argue for a different answer. Do NOT solve the problem
+    from scratch as if it were yours — critique THEIR solution.
+  pre_speech_proposer: |-
+    Rebut the Critic's objections: contest their validity or their
+    applicability to your argument, re-deriving the disputed steps concretely.
+    Concede only a genuine, demonstrated error.
+  pre_speech_critic: |-
+    Now it is your turn again as the CRITIC. Address the Proposer's latest
+    defense and attack another load-bearing step with a concrete check. Never
+    concede the answer is right.
+  post_round_judge: |-
+    You are the JUDGE — not a debater. Do not adopt either participant's
+    role or continue their arguments; you are evaluating them.
+
+    The debate concerned:
+
+    <problem><TOPIC></problem>
+
+    The Proposer (<NAME>) defends the boxed answer: <OPPONENT_POSITION>
+    The Critic (<OPPONENT_NAME>) argued that answer is wrong.
+
+    Evaluate the debate as a neutral third party. The Critic is forced to
+    disagree, so weigh their claims skeptically. Verify any alleged error
+    yourself — recompute the disputed step or test a small case — before
+    accepting it. Reason about the mathematics; do not give a verdict yet.
+  post_round_judge_without_reasoning: |-
+    Now give your final decision as a JSON object, the very last thing in your
+    response:
+
+    {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
+
+    Requirements:
+    - "<NAME>" (the Proposer) wins iff their boxed answer is correct;
+      "<OPPONENT_NAME>" (the Critic) wins iff it is wrong.
+    - confidence is your probability that the named winner is on the correct
+      side, between 0.50 and 1.00.
+    - If the Critic raised a substantive objection you could neither confirm
+      nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.

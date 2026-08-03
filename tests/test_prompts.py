@@ -42,6 +42,11 @@ BINDINGS = {
 }
 
 
+def load_pack(path: str, entry: str, topo=None):
+    """Packs are role-conditioned, so loading one needs a topology."""
+    return load_prompt_library(path, entry, topo or Topology.parse(PC_TOPOLOGY))
+
+
 def splice_task_prompts(lib, name):
     """What DebateEnv does before rendering: splice the task family's
     answer_gen_user into slots that ask for it by <ANSWER_GEN_USER>, with
@@ -63,7 +68,7 @@ def splice_task_prompts(lib, name):
 @pytest.fixture
 def lib():
     return splice_task_prompts(
-        load_prompt_library(MATH_YAML, "math_proposer_critic"), "math.yaml"
+        load_pack(MATH_YAML, "math_proposer_critic"), "math.yaml"
     )
 
 
@@ -75,30 +80,66 @@ def topology():
 # ------------------------------------------------------------------ loading
 
 
+MINIMAL_ENTRY = (
+    "_base:\n"
+    "  vars: {A: '1', B: '2'}\n"
+    "  overall_system: 'shared <A>'\n"
+    "  slot_stages: {proposal: pre_opening_speech_proposer}\n"
+    "  pre_opening_speech_proposer: 'x'\n"
+    "child:\n"
+    "  _extends: _base\n"
+    "  vars: {B: 'two'}\n"
+    "  debater_system_proposer: 'proposer card'\n"
+)
+
+
 def test_extends_merges_vars_over_parent(lib, tmp_path):
     assert set(lib.system) == {"alice", "bob", "judge"}
     assert set(lib.slots) == {"scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
 
     path = tmp_path / "p.yaml"
-    path.write_text(
-        "_base:\n"
-        "  vars: {A: '1', B: '2'}\n"
-        "  system: {alice: 'base <A>'}\n"
-        "  slots: {s: 'x'}\n"
-        "child:\n"
-        "  _extends: _base\n"
-        "  vars: {B: 'two'}\n"
-        "  slots: {t: 'y'}\n"
-    )
-    child = load_prompt_library(path, "child")
+    path.write_text(MINIMAL_ENTRY)
+    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    child = load_prompt_library(path, "child", topo)
     assert child.vars == {"A": "1", "B": "two"}
-    assert child.system == {"alice": "base <A>"}
-    assert child.slots == {"s": "x", "t": "y"}
+    assert child.system == {"alice": "shared <A>\n\nproposer card"}
+    assert child.slots == {"proposal": "x"}
 
 
 def test_unknown_entry_raises(lib):
     with pytest.raises(KeyError, match="math_proposer_critic"):
-        load_prompt_library(MATH_YAML, "nope")
+        load_pack(MATH_YAML, "nope")
+
+
+def test_load_without_topology_refuses(tmp_path):
+    """Stages are role-conditioned; there is nothing to compose without the
+    topology that says which seat proposes, critiques and judges."""
+    path = tmp_path / "p.yaml"
+    path.write_text(MINIMAL_ENTRY)
+    with pytest.raises(ValueError, match="needs the topology"):
+        load_prompt_library(path, "child")
+
+
+def test_unrendered_stage_key_rejected(tmp_path):
+    """A typo'd role stage, or a cue stage slot_stages stopped naming, is dead
+    prompt text — which is exactly how the old repo's pre_debate went dark."""
+    path = tmp_path / "p.yaml"
+    path.write_text(MINIMAL_ENTRY + "  pre_debate_typo: 'oops'\n")
+    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    with pytest.raises(ValueError, match="pre_debate_typo"):
+        load_prompt_library(path, "child", topo)
+
+
+def test_slot_stages_naming_undefined_stage_rejected(tmp_path):
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        "solo:\n"
+        "  overall_system: 'sys'\n"
+        "  slot_stages: {proposal: nope}\n"
+    )
+    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    with pytest.raises(ValueError, match="nope"):
+        load_prompt_library(path, "solo", topo)
 
 
 # ---------------------------------------------------------- slot_template
@@ -157,9 +198,9 @@ def test_validate_passes_for_math_pc(lib, topology):
 
 
 def test_validate_passes_for_codecontests_pc(topology):
-    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    cc = load_pack(CODECONTESTS_YAML, "codecontests_proposer_critic")
     assert set(cc.system) == {"alice", "bob", "judge"}
-    assert set(cc.slots) == set(load_prompt_library(MATH_YAML, "math_proposer_critic").slots)
+    assert set(cc.slots) == set(load_pack(MATH_YAML, "math_proposer_critic").slots)
     # The proposal slot is single-sourced from the task family's
     # answer-generation config (the RLVR arm sends the same composition) and is
     # spliced in by DebateEnv, so the debate yaml must NOT restate the wording.
@@ -173,7 +214,7 @@ def test_codecontests_pc_is_forced_disagree_with_old_pack_methodology():
     """Competitive forced-disagree format (Ethan, 2026-08-03), carrying the old
     code-review pack's two-phase tracing methodology but none of its
     collaborative stance machinery."""
-    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    cc = load_pack(CODECONTESTS_YAML, "codecontests_proposer_critic")
     critique = slot_template(cc, "critique", "bob")
     assert "You are FORCED to disagree" in critique
     assert "PHASE 1 — PLAN YOUR TEST INPUTS" in critique
@@ -196,8 +237,8 @@ def test_codecontests_verdict_slot_matches_competitive_parser():
     as the math pack, so no judge_config override is needed."""
     from infra.envs.debate.judge import JudgeConfig, SeatVerdict, parse_verdict, verdict_from_slot
 
-    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
-    math = load_prompt_library(MATH_YAML, "math_proposer_critic")
+    cc = load_pack(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    math = load_pack(MATH_YAML, "math_proposer_critic")
     seats = ["Debater_A", "Debater_B"]
     tmpl = render(
         slot_template(cc, "verdict", "judge"),
@@ -242,6 +283,14 @@ def test_validate_fails_on_missing_system_prompt(lib, topology):
         validate_prompts(lib, topology)
 
 
+def test_validate_fails_on_empty_composed_system_card(lib, topology):
+    """Cards are COMPOSED from stages, so 'defines no stage for this role'
+    surfaces as an empty string rather than a missing key."""
+    lib.system["bob"] = ""
+    with pytest.raises(ValueError, match="empty system prompt for speaker 'bob'"):
+        validate_prompts(lib, topology)
+
+
 def test_validate_fails_bindability_when_position_in_solution_slot(lib, topology):
     lib.slots["proposal"] = lib.slots["proposal"] + "\nYour answer is <POSITION>."
     with pytest.raises(ValueError, match="POSITION"):
@@ -277,7 +326,10 @@ def test_bindability_ignores_placeholders_covered_by_vars(topology):
 
 def test_rendered_prompts_protocol(lib):
     rp = RenderedPrompts(lib)
-    assert rp.system("alice", BINDINGS).startswith("<role>You are Alice, the PROPOSER")
+    # composed card: overall_system, then the role card
+    card = rp.system("alice", BINDINGS)
+    assert card.startswith("<role>You are a participant in a proposer-critic debate")
+    assert "<role>You are Alice, the PROPOSER.</role>" in card
     assert "<problem>What is 2+2?</problem>" in rp.instruction("proposal", "alice", BINDINGS)
     # judge reads the proposer's answer via OPPONENT_POSITION — the key the
     # round loop actually rebinds for non-solvers when a solution lands
@@ -305,20 +357,22 @@ def test_block_lists_join_and_extend_by_index(tmp_path):
         _yaml.safe_dump(
             {
                 "_base": {
-                    "system": {"alice": ["identity block", "rules block", "format block"]},
-                    "slots": {"speech": ["do the thing"]},
+                    "overall_system": ["identity block", "rules block", "format block"],
+                    "slot_stages": {"speech": "pre_speech_proposer"},
+                    "pre_speech_proposer": ["do the thing"],
                 },
                 "child": {
                     "_extends": "_base",
                     # override ONLY block 1; keep 0 and 2; append block 3
-                    "system": {"alice": ["identity block", "CHILD RULES", "format block", "extra"]},
+                    "overall_system": ["identity block", "CHILD RULES", "format block", "extra"],
                 },
             }
         )
     )
-    base = load_prompt_library(p, "_base")
+    topo = Topology.parse({"turns": [{"alice": [{"name": "speech"}]}]})
+    base = load_prompt_library(p, "_base", topo)
     assert base.system["alice"] == "identity block\n\nrules block\n\nformat block"
-    child = load_prompt_library(p, "child")
+    child = load_prompt_library(p, "child", topo)
     assert child.system["alice"] == "identity block\n\nCHILD RULES\n\nformat block\n\nextra"
     assert child.slots["speech"] == "do the thing"  # inherited untouched
 
@@ -329,17 +383,17 @@ def test_preview_shows_block_placement():
     from infra.envs.debate.prompts import load_prompt_library, preview
     from infra.envs.debate.topology import Topology
 
-    lib = splice_task_prompts(
-        load_prompt_library(
-            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
-        ),
-        "math.yaml",
-    )
     topo = Topology.parse(
         _yaml.safe_load(
             "turns: [{alice: [{name: proposal, kind: solution}]}, {bob: [{name: critique}]},"
             " {alice: [{name: defense}]}, {judge: [{name: verdict, kind: decision}]}]"
         )
+    )
+    lib = splice_task_prompts(
+        load_prompt_library(
+            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic", topo
+        ),
+        "math.yaml",
     )
     out = preview(lib, topo)
     assert "<alice/proposal output>" in out          # stubbed prior slots

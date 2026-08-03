@@ -61,6 +61,24 @@ questions (a judge turn mid-debate with a `questions` slot).
 | 9 | think budgets | soft/absent (first_round_think_budget machinery) | hard per-slot caps (topology above); tune per model |
 | 10 | proposal generation context | proposal generated under the debater system card (debate-aware: the proposer knows a forced critic is coming before writing a token) | `first_speech_non_debate_aware: true` (experiment config, default false): the opening solution slot's context is the task source's own messages (`Task.messages`) — byte-identical to the RLVR arm — with no debate framing. The speech still enters the transcript as a public record and its datum trains under judge reward in that solo context, so the debate and RLVR arms share one proposal distribution and differ only in reward channel. Requires fresh positions (an assigned position to defend is inherently debate-aware), a PUBLIC opening solution slot as the topology's FIRST slot, and a task source emitting ≥1 user message. Deliberately incompatible with pre-proposal scratchpads: a debate-framed scratchpad before a non-debate-aware proposal would contaminate the isolation AND be absent from the solo context that follows it. The proposer's later turns keep the debate system card; their own history renders the actual solo user message, not the library's proposal cue |
 
+## Prompt layout (Ethan, 2026-08-03)
+
+Prompt packs use the OLD repo's stage vocabulary: `overall_system`,
+`debater_system`, `debater_system_{proposer,critic}`, `judge_system`,
+`pre_debate`, `pre_debate_judge`, the grading-details stages, and the
+`pre_*`/`post_round_*` cue stages, with a per-pack `slot_stages` map from
+topology slot names onto cues (topologies stay declarative). Stages compose
+per the old repo's real assembly (verified against its speech_format.py +
+rendering goldens): one system message per seat (overall + debater + role
+card, or overall + judge), preamble user content for the critic
+(`pre_debate` + grading details) and judge (`pre_debate_judge` + grading
+details). Two deliberate departures: the PROPOSER gets no preamble — its
+opening cue is `<ANSWER_GEN_USER>`, byte-identical to the RLVR arm (the old
+repo's `pre_debate` was dead code and its debaters never saw the problem;
+we don't reproduce that hole) — and there are no past-tense own-speech
+labels. Structural guard: the renderer has no proposer preamble stage at
+all, so a pack cannot break the RLVR byte-identity by convention drift.
+
 ## Prompts (port the run-verified wording)
 
 Upgrade `math_proposer_critic` in `infra/envs/debate/prompt_configs/hendrycks_math.yaml`

@@ -40,6 +40,8 @@ class PromptLibrary(Protocol):
 
     def system(self, speaker: str, bindings: dict[str, str]) -> str: ...
 
+    def preamble(self, speaker: str, bindings: dict[str, str]) -> Optional[str]: ...
+
     def instruction(self, slot_name: str, speaker: str, bindings: dict[str, str]) -> str: ...
 
     def attributed(self, author_name: str, slot_name: str, text: str) -> str: ...
@@ -276,7 +278,13 @@ def render_context(
     solo_cue = _solo_cue(solo) if solo is not None else None
 
     msgs: list[Message] = [{"role": "system", "content": prompts.system(S, state.bindings[S])}]
-    pending: list[str] = []
+    # The old repo's pre_debate[_judge] + grading details: a preamble riding the
+    # FIRST user content this speaker sees, whatever that turns out to be. It
+    # joins `pending` rather than becoming its own message, so the alternation
+    # invariant is untouched. The proposer has no preamble, which is what keeps
+    # its opening cue byte-identical to the RLVR arm's user message.
+    preamble = prompts.preamble(S, state.bindings[S])
+    pending: list[str] = [preamble] if preamble else []
     for rec in visible_records(state, current):
         if rec.slot.speaker == S:
             if solo_cue is not None and rec.slot.index == 0:

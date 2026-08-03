@@ -164,6 +164,46 @@ def test_full_rollout_trained_alice():
     assert "\\boxed{2}" in defense_ctx                   # own earlier speech present
 
 
+def test_preamble_carries_the_problem_to_critic_and_judge_not_the_system_card():
+    """Old-repo layout (Ethan, 2026-08-03): the problem reaches the critic via
+    pre_debate and the judge via pre_debate_judge — a preamble on their FIRST
+    user message — not via the debater system cards, which are now pure role
+    material. The proposer gets NO preamble: its opening cue is the RLVR
+    answer-generation message and must stay byte-identical to it."""
+    backend = ScriptedBackend(["Thinking. \\boxed{7}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [GOOD_VERDICT])
+    problem = "What is 1+1?"
+
+    seen: dict[str, list[list]] = {"bob": [], "judge": []}
+    for name in ("bob", "judge"):
+        model = env.config.frozen_models[name]
+        model.predict = (
+            lambda inputs, _n=name, _orig=model.predict, **kw: (
+                seen[_n].append([{"role": m.role.name.lower(), "content": m.content} for m in inputs[0]]),
+                _orig(inputs, **kw),
+            )[1]
+        )
+    env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+    # no debater system card states the problem any more
+    for speaker in ("alice", "bob", "judge"):
+        assert problem not in env.prompts.system(speaker, env._build_state(
+            TaskSource().tasks(1)[0], flipped=False
+        ).bindings[speaker])
+
+    for name in ("bob", "judge"):
+        msgs = seen[name][0]
+        first_user = next(m["content"] for m in msgs if m["role"] == "user")
+        assert "The debate concerns this problem:" in first_user, name
+        assert problem in first_user, name
+        assert first_user.index("The debate concerns this problem:") == 0, name
+
+    # the proposer's first user message is the answer-generation cue, unprefixed
+    proposal_ctx = backend.contexts[0]
+    assert "The debate concerns this problem:" not in proposal_ctx
+
+
 def test_fresh_position_binds_into_critique_and_verdict():
     backend = ScriptedBackend(["Thinking. \\boxed{7}", "Defense."])
     policy = Policy(backend, SamplingParams(max_tokens=128))

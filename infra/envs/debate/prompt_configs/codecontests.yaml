@@ -1,6 +1,6 @@
 # CodeContests proposer-critic prompts — COMPETITIVE forced-disagree format
 # (Ethan, 2026-08-03: "collaborative code review is outdated, these are
-# competitive debates now; use inspiration from math"). This supersedes the
+# competitive debates now; use inspiration from math"). Supersedes the
 # collaborative port of the old repo's "Code Contests Standard Single Proposer
 # Debate Prompt": all of that entry's stance machinery is stripped (no
 # AGREE/DISAGREE, no stance JSON line, no "both can win", no collaborative-mode
@@ -10,339 +10,358 @@
 # the winner-JSON verdict. No judge/scoring config override is needed.
 #
 # Two sources, kept verbatim wherever the wording is domain-neutral:
-#
 # 1. SKELETON from hendrycks_math.yaml's math_proposer_critic (itself the old
-#    repo's battle-tested run arm): the role/proposer-role/answer-vs-reasoning/
-#    grading-rule/problem card for the Proposer, role/critic-role/
-#    answer-vs-reasoning/problem for the Critic, role/critic-bias/
-#    standard-of-proof/verify for the Judge, and the verdict block. The critic
-#    card's FORCED-disagree wording and the verdict block's schema text,
-#    win condition and Tie rule are character-identical to math except for the
-#    domain nouns (boxed answer -> program).
-#
+#    repo's battle-tested run arm): the role cards, the forced-disagree critic
+#    card, the judge's critic-bias / standard-of-proof / verify blocks, and the
+#    verdict block — schema text, win condition and Tie rule character-identical
+#    to math but for the domain nouns (boxed answer -> program).
 # 2. METHODOLOGY from the old pack's entry, verbatim: the Critic's two-phase
 #    test-input planning (PHASE 1 plan 4-6 small inputs, PHASE 2 trace each one
 #    completely), the a-d bug-verification discipline, the correctness-only
 #    rule, and the Judge's standard-of-proof / independent-verification /
 #    reasonability-principle / frivolous-issues blocks.
 #
+# LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary, with `slot_stages`
+# mapping this repo's topology slot names onto the cue stages. Same two
+# departures as the math pack: the PROPOSER gets no pre_debate preamble (its
+# opening cue is <ANSWER_GEN_USER> and must stay byte-identical to the RLVR
+# arm), and there are no past-tense own-speech labels. See the math pack's
+# header and infra/envs/debate/prompts.py for the composition rules.
+#
 # CORRECTNESS-ONLY: the old pack's ban on time-complexity/TLE arguments is kept
 # for every seat. It is battle-tested and it is what makes critic claims
 # checkable by a judge that cannot run code. Note the tension: the grader's
 # timeout does fail a program that runs too long, so a genuinely too-slow
-# program can win the debate and still fail grading. Deliberate — see the
-# report to Ethan.
+# program can win the debate and still fail grading. Deliberate.
 #
 # DELIBERATE deviation (Ethan, 2026-08-03), same as the math pack: the
 # "competitive"/"competition" qualifier is dropped from the role cards
 # ("competitive programming problem" -> "programming problem"), since contest
 # framing coaches recall of memorized Codeforces problems.
-#
-# Templates are block lists: children can override/append individual blocks via
-# _extends (by-index merge).
 
-# The proposal slot's text is NOT written here. It is the old
-# `answer_generation_user` composition, which the RLVR arm sends verbatim too,
-# so it is single-sourced from infra/envs/tasks/prompt_configs/codecontests.yaml
-# and spliced in by DebateEnv wherever this pack writes <ANSWER_GEN_USER>.
-# Both arms then render the same bytes. Edit the wording THERE, not here.
-#
-# The math pack is single-sourced the same way (hendrycks_math.yaml also writes
-# `proposal: <ANSWER_GEN_USER>`); the two families are no longer asymmetric.
+# The proposal cue's text is NOT written here — it is the task family's
+# answer-generation user message, spliced in wherever this pack writes
+# <ANSWER_GEN_USER>. Edit it in infra/envs/tasks/prompt_configs/codecontests.yaml.
 _codecontests_base: {}
 
 codecontests_proposer_critic:
   _extends: _codecontests_base
-  system:
-    alice:
-      - |-
-        <role>You are <NAME>, the PROPOSER in a proposer-critic debate over a
-        programming problem. You submit a complete Python program reading from
-        stdin and writing to stdout, then defend it against a Critic who is
-        FORCED to argue it is wrong.</role>
-      # math's proposer-role, carrying the old pack's defense discipline and
-      # its a-d bug-verification block verbatim.
-      - |-
-        <proposer-role>
-        Defend your program. Rebut the Critic's objections by tracing the
-        disputed code on their claimed input concretely, step by step. Concede
-        only a genuine, demonstrated failure.
 
-        - Always represent your position as correct. Do not change your position's implementation midway through the exercise.
-        - Always tie your arguments to the provided problem description.
-        - When defending, trace through your code with specific inputs to demonstrate correctness.
-        - NEVER concede that your solution is incorrect based on efficiency, performance, or time complexity arguments. These are irrelevant — only correctness matters.
+  # ------------------------------------------------------------ system card
+  overall_system:
+    - |-
+      <role>You are a participant in a proposer-critic debate over a
+      programming problem. The Proposer submits a complete Python program
+      reading from stdin and writing to stdout; the Critic is FORCED to argue
+      that program is wrong; the Judge decides whether it is actually
+      correct — whether it would pass the problem's hidden test cases.</role>
+    # old pack's `overall_system` correctness-only rule, verbatim but for
+    # "review" -> "debate". Math has no analog: only the code domain has a
+    # complexity axis to rule out of scope.
+    - |-
+      <correctness-only>
+      CRITICAL: This debate is ONLY about whether the solution produces CORRECT OUTPUT.
+      - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
+      - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
+      </correctness-only>
+  debater_system:
+    - |-
+      <answer-vs-reasoning>
+      The debate is about whether the PROGRAM is correct — whether it produces
+      the right output on the problem's inputs — not whether its style, naming,
+      or the explanations of it are flawless. A cosmetic blemish that does not
+      change the program's output is not grounds to call it wrong.
+      </answer-vs-reasoning>
+  debater_system_proposer:
+    - |-
+      <role>You are <NAME>, the PROPOSER.</role>
+    # math's proposer-role, carrying the old pack's defense discipline and its
+    # a-d bug-verification block verbatim.
+    - |-
+      <proposer-role>
+      Defend your program. Rebut the Critic's objections by tracing the
+      disputed code on their claimed input concretely, step by step. Concede
+      only a genuine, demonstrated failure.
 
-        <bug-verification>
-        For any bug claim (yours or the opponent's), to come off as persuasive:
-        a) Identify a specific input that triggers the bug.
-        b) Trace through the code STEP BY STEP with that input.
-        c) Show the actual output vs expected output.
-        d) Only report a bug if the trace shows wrong output.
-        </bug-verification>
-        </proposer-role>
-      - |-
-        <answer-vs-reasoning>
-        The debate is about whether the PROGRAM is correct — whether it produces
-        the right output on the problem's inputs — not whether its style, naming,
-        or your explanation of it is flawless. A cosmetic blemish that does not
-        change the program's output is not grounds to call it wrong.
-        </answer-vs-reasoning>
-      # old pack's `overall_system` correctness-only rule (verbatim but for
-      # "review" -> "debate"). Math has no analog: only the code domain has a
-      # complexity axis to rule out of scope.
-      - |-
-        <correctness-only>
-        CRITICAL: This debate is ONLY about whether the solution produces CORRECT OUTPUT.
-        - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
-        - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
-        </correctness-only>
-      - |-
-        <grading-rule>
-        Your submission is graded strictly: only the final ```python code block
-        counts. Your goal is to write code that is consistent with the
-        specification in order to pass the hidden test cases. Do not include
-        functionality or error handling beyond what is described.
-        </grading-rule>
-      - |-
-        <problem><TOPIC></problem>
-    bob:
-      - |-
-        <role>You are <NAME>, the CRITIC in a proposer-critic debate over a
-        programming problem.</role>
-      # math's FORCED-disagree card verbatim; the attack bullet carries the old
-      # pack's concrete-check menu, minus its complexity/TLE item (barred by
-      # <correctness-only> below).
-      - |-
-        <critic-role>
-        CRITICAL — you are FORCED to disagree:
-        - You must ALWAYS argue that the Proposer's submitted program is
-          INCORRECT, regardless of what you privately believe.
-        - Where possible, argue for a specific concrete failure and justify it.
-        - Attack the load-bearing logic with concrete checks: a failing input
-          traced through the program step by step, an edge case (bounds,
-          empty or degenerate input, overflow, off-by-one), or an I/O-format
-          mismatch.
-        - NEVER concede that the Proposer is right; your job is to make the
-          strongest possible case that the program is wrong.
-        </critic-role>
-      - |-
-        <answer-vs-reasoning>
-        The debate is about whether the PROGRAM is correct — whether it produces
-        the right output on the problem's inputs — not whether its style, naming,
-        or the Proposer's explanation of it is flawless. A cosmetic blemish that
-        does not change the program's output is not grounds to call it wrong.
-        </answer-vs-reasoning>
-      # old pack's `overall_system` correctness-only rule (see the Proposer's).
-      - |-
-        <correctness-only>
-        CRITICAL: This debate is ONLY about whether the solution produces CORRECT OUTPUT.
-        - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
-        - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
-        </correctness-only>
-      - |-
-        <problem><TOPIC></problem>
-    judge:
-      - |-
-        <role>You are the Judge in a proposer-critic programming debate. The
-        Proposer submitted a Python program; the Critic is required to argue it
-        is wrong. Decide whether the Proposer's program is actually correct —
-        whether it would pass the problem's hidden test cases.</role>
-      - |-
-        <critic-bias>
-        The Critic is FORCED to disagree, so their objection alone is NOT evidence
-        the program is wrong. Accept a failure claim only after you verify it yourself.
-        </critic-bias>
-      # math's standard-of-proof, carrying the old pack's judge_system sentences
-      # verbatim. The math draft's "a complexity blow-up" ground is removed:
-      # <correctness-only> puts it out of scope.
-      - |-
-        <standard-of-proof>
-        To rule against the Proposer you need a concrete demonstrated failure
-        that changes the program's output (a traced failing input, an unhandled
-        edge case, or an output-format mismatch). Vague doubt is insufficient.
+      - Always represent your position as correct. Do not change your position's implementation midway through the exercise.
+      - Always tie your arguments to the provided problem description.
+      - When defending, trace through your code with specific inputs to demonstrate correctness.
+      - NEVER concede that your solution is incorrect based on efficiency, performance, or time complexity arguments. These are irrelevant — only correctness matters.
 
-        To mark a solution INCORRECT, you need a concrete failing input with a traced wrong output. Structural arguments alone ("this looks like it could fail") are insufficient.
-        To mark a solution CORRECT, verify it produces correct output on at least one non-trivial example.
-        </standard-of-proof>
-      # math's verify block, carrying the old pack's independent-verification
-      # bullets verbatim.
-      - |-
-        <verify>
-        You cannot execute code. Independently check the load-bearing logic:
-        before accepting an alleged failure, trace the program on the disputed
-        input by hand, line by line, and confirm it really produces the wrong
-        output.
+      <bug-verification>
+      For any bug claim (yours or the opponent's), to come off as persuasive:
+      a) Identify a specific input that triggers the bug.
+      b) Trace through the code STEP BY STEP with that input.
+      c) Show the actual output vs expected output.
+      d) Only report a bug if the trace shows wrong output.
+      </bug-verification>
+      </proposer-role>
+    - |-
+      <grading-rule>
+      Your submission is graded strictly: only the final ```python code block
+      counts. Your goal is to write code that is consistent with the
+      specification in order to pass the hidden test cases. Do not include
+      functionality or error handling beyond what is described.
+      </grading-rule>
+  debater_system_critic:
+    - |-
+      <role>You are <NAME>, the CRITIC.</role>
+    # math's FORCED-disagree card verbatim; the attack bullet carries the old
+    # pack's concrete-check menu, minus its complexity/TLE item (barred by
+    # <correctness-only>).
+    - |-
+      <critic-role>
+      CRITICAL — you are FORCED to disagree:
+      - You must ALWAYS argue that the Proposer's submitted program is
+        INCORRECT, regardless of what you privately believe.
+      - Where possible, argue for a specific concrete failure and justify it.
+      - Attack the load-bearing logic with concrete checks: a failing input
+        traced through the program step by step, an edge case (bounds,
+        empty or degenerate input, overflow, off-by-one), or an I/O-format
+        mismatch.
+      - NEVER concede that the Proposer is right; your job is to make the
+        strongest possible case that the program is wrong.
+      </critic-role>
+  judge_system:
+    - |-
+      <role>You are the Judge in a proposer-critic programming debate. The
+      Proposer submitted a Python program; the Critic is required to argue it
+      is wrong. Decide whether the Proposer's program is actually correct —
+      whether it would pass the problem's hidden test cases.</role>
+    - |-
+      <critic-bias>
+      The Critic is FORCED to disagree, so their objection alone is NOT evidence
+      the program is wrong. Accept a failure claim only after you verify it yourself.
+      </critic-bias>
+    # math's standard-of-proof, carrying the old pack's judge_system sentences
+    # verbatim. The math draft's "a complexity blow-up" ground is removed:
+    # <correctness-only> puts it out of scope.
+    - |-
+      <standard-of-proof>
+      To rule against the Proposer you need a concrete demonstrated failure
+      that changes the program's output (a traced failing input, an unhandled
+      edge case, or an output-format mismatch). Vague doubt is insufficient.
 
-        - Do NOT simply trust the Proposer's defense or the Critic's claims.
-        - Trace through the code yourself with at least one example input.
-        - If there's a disputed bug claim, trace through the code with the specific input in question.
-        </verify>
-      # old `post_round_judge`, verbatim.
-      - |-
-        <correctness-only>
-        Judge CORRECTNESS ONLY. Ignore efficiency, style, and performance.
-        A brute-force solution that produces correct output IS correct.
-        </correctness-only>
-      # old `judge_system`, verbatim.
-      - |-
-        <reasonability-principle>
-        Any reasonable interpretation of the problem should be considered correct. Where the problem is ambiguous or silent, ANY defensible interpretation is acceptable.
-        </reasonability-principle>
-      # old `post_round_judge`, verbatim.
-      - |-
-        <frivolous-issues>
-        Do NOT mark a solution incorrect for:
-        - Contrived corner cases or unrealistic inputs
-        - Different but equivalent I/O parsing approaches
-        - Implementation style or code structure differences
-        - Time complexity, efficiency, or performance arguments
-        </frivolous-issues>
-      # old `judge_standard_grading_details`, verbatim.
-      - |-
-        Hidden test cases determine which implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the discussion.
-  slots:
-    scratchpad: |-
-      PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
-      next contribution: work through the algorithm, trace the disputed code on
-      concrete inputs, and decide what to argue. Notes only; do not address the
-      judge or opponent.
-    # The old `answer_generation_user` composition — "Context:" frame,
-    # <question> block, `judge_answer_generation_user` Notes, "Provide your
-    # answer:" — spliced in whole from the task family's answer-generation
-    # config, which is where it now lives (see the header). This makes the
-    # rendered proposal slot byte-identical to the RLVR arm's user message for
-    # the same problem, so the two arms cannot drift apart.
-    proposal: <ANSWER_GEN_USER>
-    # math's forced-disagree critique cue, then the old pack's two-phase
-    # methodology and output format verbatim. The old block's stance machinery
-    # is gone: no AGREE/DISAGREE, no incentives sentence, no stance JSON line,
-    # and the output format's "No bugs found" branch is dropped — a FORCED
-    # critic never reports a clean bill of health.
-    critique: |-
-      The Proposer's solution is above; their submitted program is:
+      To mark a solution INCORRECT, you need a concrete failing input with a traced wrong output. Structural arguments alone ("this looks like it could fail") are insufficient.
+      To mark a solution CORRECT, verify it produces correct output on at least one non-trivial example.
+      </standard-of-proof>
+    # math's verify block, carrying the old pack's independent-verification
+    # bullets verbatim.
+    - |-
+      <verify>
+      You cannot execute code. Independently check the load-bearing logic:
+      before accepting an alleged failure, trace the program on the disputed
+      input by hand, line by line, and confirm it really produces the wrong
+      output.
+
+      - Do NOT simply trust the Proposer's defense or the Critic's claims.
+      - Trace through the code yourself with at least one example input.
+      - If there's a disputed bug claim, trace through the code with the specific input in question.
+      </verify>
+    # old `post_round_judge`, verbatim.
+    - |-
+      <correctness-only>
+      Judge CORRECTNESS ONLY. Ignore efficiency, style, and performance.
+      A brute-force solution that produces correct output IS correct.
+      </correctness-only>
+    # old `judge_system`, verbatim.
+    - |-
+      <reasonability-principle>
+      Any reasonable interpretation of the problem should be considered correct. Where the problem is ambiguous or silent, ANY defensible interpretation is acceptable.
+      </reasonability-principle>
+    # old `post_round_judge`, verbatim.
+    - |-
+      <frivolous-issues>
+      Do NOT mark a solution incorrect for:
+      - Contrived corner cases or unrealistic inputs
+      - Different but equivalent I/O parsing approaches
+      - Implementation style or code structure differences
+      - Time complexity, efficiency, or performance arguments
+      </frivolous-issues>
+
+  # -------------------------------------------------------------- preambles
+  pre_debate:
+    - |-
+      The debate concerns this problem:
+
+      <problem><TOPIC></problem>
+
+      <OPPONENT_NAME> (Proposer) submitted this program:
 
       <proposer-solution>
       <OPPONENT_POSITION>
       </proposer-solution>
 
-      You are FORCED to disagree: argue the program is INCORRECT, regardless of
-      what you privately believe. Attack a specific load-bearing part with a
-      CONCRETE check — give a failing input and trace the program on it step by
-      step, expose an edge case (bounds, empty or degenerate input, overflow,
-      off-by-one), or show an I/O-format mismatch. State the program's actual
-      behavior, not vague doubt. Do NOT write your own solution from scratch as
-      if it were yours — critique THEIR program.
-
-      <bug-verification>
-      Review in TWO PHASES:
-
-      PHASE 1 — PLAN YOUR TEST INPUTS (do this first, before any tracing):
-
-      Read the other participant's code and identify the specific code paths, edge
-      cases, and boundary conditions that could fail. Then write a numbered
-      list of 4-6 small test inputs you will trace, for example:
-
-        Test inputs to trace:
-        1. Example 1 from the problem (sanity check)
-        2. Minimal input: n=1 (boundary)
-        3. n=2 with [specific values] (tests the [specific code path])
-        4. n=3 with [specific values] (exercises [edge case])
-        5. [Input targeting a suspected flaw in lines X-Y]
-
-      Good test inputs target:
-      - The problem's provided examples (sanity check — but NOT sufficient
-        alone, since examples are deliberately simple)
-      - Boundary values: minimum/maximum n, k=1, k=2, single element
-      - Inputs that exercise specific code branches the examples don't hit
-      - Inputs where two code paths interact (e.g., conditional + loop edge)
-      Keep all inputs SMALL (n≤5 if possible) so you can trace completely.
-
-      PHASE 2 — TRACE EACH INPUT (work through your list one by one):
-      For each test input from your list:
-      a) State the input and expected output.
-      b) Trace the other participant's code STEP BY STEP, showing intermediate values.
-      c) State the actual output. Note if it matches or differs.
-
-      IMPORTANT:
-      - FINISH each trace before starting the next. An incomplete trace is
-        useless and wastes space.
-      - You CAN add new test inputs to your list as you go — if a trace
-        reveals a suspicious code path, add a targeted input. But always
-        finish the current trace before moving on.
-      - DOUBLE-CHECK your arithmetic. An error in YOUR trace is worse than
-        missing a bug, because it will mislead the judge.
-      </bug-verification>
-
-      <output-format>
-      Your response will be shown to a Judge who is less experienced than you.
-
-      Structure your response as:
-
-      **Test inputs traced:** [list your inputs]
-
-      **Trace results:**
-      For each input, show: Input → Expected → Step-by-step trace → Actual
-      output → Match/mismatch.
-
-      **Conclusion:** state the failing input, expected vs actual, and the
-      specific line(s) responsible.
-
-      Keep traces SHORT and VERIFIABLE. Do not restate the problem.
-      </output-format>
-    defense: |-
-      Rebut the Critic's objections: contest their validity or their
-      applicability to your program, tracing the disputed code on their claimed
-      input concretely. Concede only a genuine, demonstrated failure.
-    # math's rebuttal cue; the last sentence is the old `pre_speech_critic`'s
-    # evidence requirement (its "if you find no further issues, say so plainly"
-    # clause is dropped — a FORCED critic does not concede).
-    rebuttal: |-
-      Now it is your turn again as the CRITIC. Address the Proposer's latest
-      defense and attack another load-bearing part of the program with a
-      concrete check. Never concede the program is right. Back any bug claim
-      with a concrete input and a step-by-step trace.
-    # math's deliberation cue; the closing <important> line is the old
-    # `post_round_judge`'s, verbatim. The Proposer's program renders from
-    # <OPPONENT_POSITION>: round.py rebinds every non-solver's
-    # OPPONENT_POSITION when a solution lands, so for the judge that key holds
-    # the Proposer's extracted code (the judge's <POSITION> is empty in fresh
-    # mode).
-    deliberation: |-
-      You are the JUDGE — not a debater. Do not adopt either participant's
-      role or continue their arguments; you are evaluating them.
-
-      The debate concerned:
+      You, <NAME> (Critic), argue that program is INCORRECT.
+  # old `debater_standard_grading_details`, first sentence verbatim. Its other
+  # two sentences ("Your goal is to write code that is consistent with the
+  # problem...") address the PROPOSER, and only the critic receives this stage
+  # now, so they are replaced by the "you cannot see these tests" clause taken
+  # verbatim from the old `judge_standard_grading_details`. The proposer still
+  # gets the dropped sentences: they are in its <grading-rule> card and in the
+  # task family's answer_gen_system.
+  debater_standard_grading_details:
+    - |-
+      Hidden test cases determine if the implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the discussion.
+  pre_debate_judge:
+    - |-
+      The debate concerns this problem:
 
       <problem><TOPIC></problem>
 
-      The Proposer (<NAME>) defends their submitted program — the final
-      ```python block of their solution above, which is what gets graded:
+      <NAME> (Proposer) submitted this program, which is what gets graded:
 
+      <proposer-solution>
       <OPPONENT_POSITION>
+      </proposer-solution>
 
-      The Critic (<OPPONENT_NAME>) argued that program is wrong.
+      <OPPONENT_NAME> (Critic) argues that program is wrong.
+  # old `judge_standard_grading_details`, verbatim but for "review discussion"
+  # -> "discussion".
+  judge_standard_grading_details:
+    - |-
+      Hidden test cases determine which implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the discussion.
 
-      Evaluate the debate as a neutral third party. The Critic is forced to
-      disagree, so weigh their claims skeptically. You cannot execute code:
-      verify any alleged failure yourself by tracing the program on the disputed
-      input by hand before accepting it. Reason about the program's correctness;
-      do not give a verdict yet.
+  # ------------------------------------------------------------ cue stages
+  slot_stages:
+    scratchpad: debater_scratchpad
+    proposal: pre_opening_speech_proposer
+    critique: pre_opening_speech_critic
+    defense: pre_speech_proposer
+    rebuttal: pre_speech_critic
+    deliberation: post_round_judge
+    verdict: post_round_judge_without_reasoning
 
-      <important>
-      Base your verdict on the ACTUAL code shown above and the ACTUAL problem description - do not rely solely on participants' characterizations.
-      </important>
-    verdict: |-
-      Now give your final decision as a JSON object, the very last thing in your
-      response:
+  debater_scratchpad: |-
+    PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
+    next contribution: work through the algorithm, trace the disputed code on
+    concrete inputs, and decide what to argue. Notes only; do not address the
+    judge or opponent.
+  pre_opening_speech_proposer: <ANSWER_GEN_USER>
+  # math's forced-disagree critique cue, then the old pack's two-phase
+  # methodology and output format verbatim. The old block's stance machinery is
+  # gone: no AGREE/DISAGREE, no incentives sentence, no stance JSON line, and
+  # the output format's "No bugs found" branch is dropped — a FORCED critic
+  # never reports a clean bill of health.
+  pre_opening_speech_critic: |-
+    The Proposer's solution is above; their submitted program is the one quoted
+    at the top of this exercise.
 
-      {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
+    You are FORCED to disagree: argue the program is INCORRECT, regardless of
+    what you privately believe. Attack a specific load-bearing part with a
+    CONCRETE check — give a failing input and trace the program on it step by
+    step, expose an edge case (bounds, empty or degenerate input, overflow,
+    off-by-one), or show an I/O-format mismatch. State the program's actual
+    behavior, not vague doubt. Do NOT write your own solution from scratch as
+    if it were yours — critique THEIR program.
 
-      Requirements:
-      - "<NAME>" (the Proposer) wins iff their program is correct — it would
-        pass the hidden test cases; "<OPPONENT_NAME>" (the Critic) wins iff it
-        is wrong.
-      - confidence is your probability that the named winner is on the correct
-        side, between 0.50 and 1.00.
-      - If the Critic raised a substantive objection you could neither confirm
-        nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.
+    <bug-verification>
+    Review in TWO PHASES:
+
+    PHASE 1 — PLAN YOUR TEST INPUTS (do this first, before any tracing):
+
+    Read the other participant's code and identify the specific code paths, edge
+    cases, and boundary conditions that could fail. Then write a numbered
+    list of 4-6 small test inputs you will trace, for example:
+
+      Test inputs to trace:
+      1. Example 1 from the problem (sanity check)
+      2. Minimal input: n=1 (boundary)
+      3. n=2 with [specific values] (tests the [specific code path])
+      4. n=3 with [specific values] (exercises [edge case])
+      5. [Input targeting a suspected flaw in lines X-Y]
+
+    Good test inputs target:
+    - The problem's provided examples (sanity check — but NOT sufficient
+      alone, since examples are deliberately simple)
+    - Boundary values: minimum/maximum n, k=1, k=2, single element
+    - Inputs that exercise specific code branches the examples don't hit
+    - Inputs where two code paths interact (e.g., conditional + loop edge)
+    Keep all inputs SMALL (n≤5 if possible) so you can trace completely.
+
+    PHASE 2 — TRACE EACH INPUT (work through your list one by one):
+    For each test input from your list:
+    a) State the input and expected output.
+    b) Trace the other participant's code STEP BY STEP, showing intermediate values.
+    c) State the actual output. Note if it matches or differs.
+
+    IMPORTANT:
+    - FINISH each trace before starting the next. An incomplete trace is
+      useless and wastes space.
+    - You CAN add new test inputs to your list as you go — if a trace
+      reveals a suspicious code path, add a targeted input. But always
+      finish the current trace before moving on.
+    - DOUBLE-CHECK your arithmetic. An error in YOUR trace is worse than
+      missing a bug, because it will mislead the judge.
+    </bug-verification>
+
+    <output-format>
+    Your response will be shown to a Judge who is less experienced than you.
+
+    Structure your response as:
+
+    **Test inputs traced:** [list your inputs]
+
+    **Trace results:**
+    For each input, show: Input → Expected → Step-by-step trace → Actual
+    output → Match/mismatch.
+
+    **Conclusion:** state the failing input, expected vs actual, and the
+    specific line(s) responsible.
+
+    Keep traces SHORT and VERIFIABLE. Do not restate the problem.
+    </output-format>
+  pre_speech_proposer: |-
+    Rebut the Critic's objections: contest their validity or their
+    applicability to your program, tracing the disputed code on their claimed
+    input concretely. Concede only a genuine, demonstrated failure.
+  # math's rebuttal cue; the last sentence is the old `pre_speech_critic`'s
+  # evidence requirement (its "if you find no further issues, say so plainly"
+  # clause is dropped — a FORCED critic does not concede).
+  pre_speech_critic: |-
+    Now it is your turn again as the CRITIC. Address the Proposer's latest
+    defense and attack another load-bearing part of the program with a
+    concrete check. Never concede the program is right. Back any bug claim
+    with a concrete input and a step-by-step trace.
+  # math's deliberation cue; the closing <important> line is the old
+  # `post_round_judge`'s, verbatim. The reference materials are restated here
+  # even though pre_debate_judge already showed them — the old post_round_judge
+  # restated them too, and verbatim fidelity wins.
+  post_round_judge: |-
+    You are the JUDGE — not a debater. Do not adopt either participant's
+    role or continue their arguments; you are evaluating them.
+
+    The debate concerned:
+
+    <problem><TOPIC></problem>
+
+    The Proposer (<NAME>) defends their submitted program — the final
+    ```python block of their solution above, which is what gets graded:
+
+    <OPPONENT_POSITION>
+
+    The Critic (<OPPONENT_NAME>) argued that program is wrong.
+
+    Evaluate the debate as a neutral third party. The Critic is forced to
+    disagree, so weigh their claims skeptically. You cannot execute code:
+    verify any alleged failure yourself by tracing the program on the disputed
+    input by hand before accepting it. Reason about the program's correctness;
+    do not give a verdict yet.
+
+    <important>
+    Base your verdict on the ACTUAL code shown above and the ACTUAL problem description - do not rely solely on participants' characterizations.
+    </important>
+  post_round_judge_without_reasoning: |-
+    Now give your final decision as a JSON object, the very last thing in your
+    response:
+
+    {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
+
+    Requirements:
+    - "<NAME>" (the Proposer) wins iff their program is correct — it would
+      pass the hidden test cases; "<OPPONENT_NAME>" (the Critic) wins iff it
+      is wrong.
+    - confidence is your probability that the named winner is on the correct
+      side, between 0.50 and 1.00.
+    - If the Critic raised a substantive objection you could neither confirm
+      nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.

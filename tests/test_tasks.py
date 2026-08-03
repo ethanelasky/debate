@@ -112,9 +112,20 @@ def test_math_debate_pack_splices_the_rlvr_prompt():
     shared composition). The byte-identity of the two arms is enforced in
     test_math_debate_proposal_slot_equals_rlvr_user_message below."""
     from infra.envs.debate.prompts import load_prompt_library, slot_template
+    from infra.envs.debate.topology import Topology
 
     lib = load_prompt_library(
-        "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
+        "infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+        "math_proposer_critic",
+        Topology.parse(
+            {
+                "turns": [
+                    {"alice": [{"name": "proposal", "kind": "solution"}]},
+                    {"bob": [{"name": "critique"}]},
+                    {"judge": [{"name": "verdict", "kind": "decision"}]},
+                ]
+            }
+        ),
     )
     assert slot_template(lib, "proposal", "alice").strip() == "<ANSWER_GEN_USER>"
     assert "ANSWER_FORMAT_INSTRUCTION" not in lib.vars

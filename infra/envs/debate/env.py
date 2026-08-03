@@ -127,7 +127,9 @@ class DebateEnv(Env):
                     "the transcript as a public record (DESIGN-pc-format.md row 10)"
                 )
 
-        self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
+        self.lib: PromptLibrary = load_prompt_library(
+            config.prompt_file, config.prompt_entry, self.topology
+        )
         self._inject_task_prompt_templates()
         self.prompts = RenderedPrompts(self.lib)
         validate_prompts(self.lib, self.topology, fresh_positions=config.fresh_positions)
@@ -173,6 +175,7 @@ class DebateEnv(Env):
 
         subs = {k: available[k] for k in requested}
         self.lib.system = {s: _splice(t, subs) for s, t in self.lib.system.items()}
+        self.lib.preamble = {s: _splice(t, subs) for s, t in self.lib.preamble.items()}
         self.lib.slots = {
             name: (
                 {sp: _splice(t, subs) for sp, t in entry.items()}
@@ -184,6 +187,8 @@ class DebateEnv(Env):
 
     def _all_templates(self):
         for tmpl in self.lib.system.values():
+            yield tmpl
+        for tmpl in self.lib.preamble.values():
             yield tmpl
         for entry in self.lib.slots.values():
             yield from (entry.values() if isinstance(entry, dict) else [entry])
