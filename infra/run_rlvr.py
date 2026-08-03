@@ -18,10 +18,26 @@ from __future__ import annotations
 import argparse
 
 from infra.backend.base import LossSpec, SamplingParams
-from infra.config import load_experiment
+from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
-from infra.run_debate import build_backend
+from infra.run_debate import TRAINING_KEYS, VERL_KEYS, build_backend
 from infra.train import Config, train
+
+EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
+
+
+def validate_experiment(exp: dict) -> None:
+    """Reject config keys this runner never reads, before anything is built.
+
+    Same contract as run_debate.validate_experiment: a typo must fail at
+    launch instead of silently falling back to a default. Adding a new
+    `exp.get(...)`/`tr.get(...)` read means adding the key here (or to
+    run_debate.TRAINING_KEYS / VERL_KEYS, which this shares).
+    """
+    reject_unknown_keys(exp, EXPERIMENT_KEYS, "rlvr experiment")
+    tr = exp.get("training") or {}
+    reject_unknown_keys(tr, TRAINING_KEYS, "training")
+    reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
 
 
 def main() -> None:
@@ -39,6 +55,7 @@ def main() -> None:
     args = parser.parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
+    validate_experiment(exp)
     if args.levels is not None:
         exp.setdefault("dataset", {})["levels"] = args.levels
 

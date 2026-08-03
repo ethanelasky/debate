@@ -153,6 +153,23 @@ def resolve_experiments_from_file(config_path: str | Path) -> dict:
     return resolve_all_experiments(load_config_with_includes(config_path))
 
 
+def reject_unknown_keys(
+    d: dict, known: set[str], context: str, ignore_private: bool = True
+) -> None:
+    """Raise if `d` has keys outside `known`.
+
+    The repo-wide guard against typo'd config keys silently reading a default
+    (a misspelled `first_speech_non_debate_aware` trains the wrong arm and says
+    nothing). `ignore_private` skips '_'-prefixed keys, which are this module's
+    template plumbing (_extends, _preset, _topologies, ...) rather than values
+    any consumer reads.
+    """
+    keys = set(d) if not ignore_private else {k for k in d if not str(k).startswith("_")}
+    unknown = sorted(keys - known)
+    if unknown:
+        raise ValueError(f"unknown {context} key(s) {unknown} (known: {sorted(known)})")
+
+
 def runnable_experiments(data: dict) -> list[str]:
     """Names not starting with '_' (templates aren't directly runnable)."""
     return [n for n in data if not n.startswith("_") and isinstance(data.get(n), dict)]

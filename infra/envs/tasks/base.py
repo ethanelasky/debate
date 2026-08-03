@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
+from infra.config import reject_unknown_keys as _reject_unknown_keys
 from infra.envs.base import Env
 
 
@@ -43,6 +44,5 @@ class TaskFamily(ABC):
 
 
 def reject_unknown_keys(ds: dict, known: set[str], family: str) -> None:
-    unknown = sorted(set(ds) - known)
-    if unknown:
-        raise ValueError(f"dataset keys {unknown} unknown to task family {family!r} (known: {sorted(known)})")
+    """Dataset-block flavour of infra.config.reject_unknown_keys."""
+    _reject_unknown_keys(ds, known, f"dataset block for task family {family!r}")

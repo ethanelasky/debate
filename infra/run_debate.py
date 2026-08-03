@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 
 from infra.backend.base import LossSpec, SamplingParams
-from infra.config import load_experiment, parse_model_settings
+from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
@@ -39,6 +39,80 @@ from infra.envs.tasks import get_family
 from infra.models.base import ModelSettings, resolved_sampling_profile
 from infra.models.factory import instantiate_model
 from infra.train import Config, train
+
+
+# Every key the runners actually read out of `training:` — the union of
+# run_debate.main, run_rlvr.main, and build_backend. run_rlvr imports these.
+TRAINING_KEYS = {
+    "backend",
+    "verl",
+    "lora_rank",
+    "loss",
+    "lr",
+    "steps",
+    "batch_size",
+    "group_size",
+    "micro_batch",
+    "ppo_epochs",
+    "adv_length_norm",
+    "kl_coef",
+    "kl_discount_factor",
+    "eval_every",
+    "eval_max_tokens",
+    "eval_n",
+    "save_every",
+    "wandb_project",
+}
+
+# training.verl — read only in build_backend.
+VERL_KEYS = {
+    "n_gpus",
+    "strategy",
+    "gpu_memory_utilization",
+    "prompt_length",
+    "response_length",
+    "max_token_len_per_gpu",
+    "rollout_tp",
+    "use_remove_padding",
+    "checkpoint_dir",
+    "extra_overrides",
+}
+
+EXPERIMENT_KEYS = {
+    "topology",
+    "prompt_config",
+    "agents",
+    "judge_config",
+    "scoring",
+    "dataset",
+    "training",
+    "fresh_positions",
+    "flip",
+    "first_speech_non_debate_aware",
+}
+
+AGENT_KEYS = {"trained", "model_settings"}
+
+
+def validate_experiment(exp: dict) -> None:
+    """Reject config keys no runner reads, before anything is built.
+
+    Without this a typo reads a default in silence — a misspelled
+    `first_speech_non_debate_aware` trains the standard arm for 100 steps and
+    reports it as the solo-context one. Nested blocks with typed constructors
+    (judge_config, scoring, model_settings, dataset) already reject their own
+    unknown keys; this covers the dict-shaped remainder.
+
+    Error direction: adding a new `exp.get("new_key")` read to this file means
+    adding "new_key" here too, or every run dies at launch with a one-line fix.
+    """
+    reject_unknown_keys(exp, EXPERIMENT_KEYS, "experiment")
+    for speaker, agent in (exp.get("agents") or {}).items():
+        if isinstance(agent, dict):
+            reject_unknown_keys(agent, AGENT_KEYS, f"agents.{speaker}")
+    tr = exp.get("training") or {}
+    reject_unknown_keys(tr, TRAINING_KEYS, "training")
+    reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
 
 
 def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSettings]]:
@@ -160,6 +234,7 @@ def main() -> None:
     args = parser.parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
+    validate_experiment(exp)
     if args.levels is not None:
         exp.setdefault("dataset", {})["levels"] = args.levels
     trained, frozen = split_agents(exp)
