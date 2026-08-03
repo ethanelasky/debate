@@ -22,10 +22,16 @@
 # <PROBLEM> is substituted with the row's problem text. The lowercase <problem>
 # tags are literal prompt markup, not placeholders (the debate template layer
 # only ever binds UPPERCASE tags), and are part of the old repo's wording.
+#
+# DELIBERATE deviation from old-repo verbatim (Ethan, 2026-08-03): the
+# "competition" qualifiers are dropped ("expert competition mathematician" ->
+# "expert mathematician", "competition mathematics problem" -> "mathematics
+# problem") — they coach the model toward referencing memorized past contest
+# problems instead of reasoning in-context.
 answer_gen_system: |-
-  You are an expert competition mathematician. Solve rigorously and end with one boxed answer.
+  You are an expert mathematician. Solve rigorously and end with one boxed answer.
 answer_gen_user: |-
-  Solve this competition mathematics problem.
+  Solve this mathematics problem.
 
   <problem><PROBLEM></problem>
 

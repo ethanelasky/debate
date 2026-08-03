@@ -82,10 +82,10 @@ def test_math_source_rejects_unknown_key_before_loading():
 # a stray edit to the YAML (reflow, smart quote, lost backslash) silently
 # changes the experiment.
 
-MATH_SYSTEM = "You are an expert competition mathematician. Solve rigorously and end with one boxed answer."
+MATH_SYSTEM = "You are an expert mathematician. Solve rigorously and end with one boxed answer."
 
 MATH_USER = (
-    "Solve this competition mathematics problem.\n"
+    "Solve this mathematics problem.\n"
     "\n"
     "<problem>What is $1 + 1$?</problem>\n"
     "\n"

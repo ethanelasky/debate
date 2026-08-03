@@ -4,6 +4,9 @@
 # judge's critic-bias / standard-of-proof / verify blocks are battle-tested
 # content, kept near-verbatim. Templates are block lists: children can
 # override/append individual blocks via _extends (by-index merge).
+# DELIBERATE deviation (Ethan, 2026-08-03): "competition" qualifiers dropped
+# from the debater role cards — they coach the model toward referencing
+# memorized past contest problems instead of reasoning in-context.
 
 # The proposal slot's text is NOT written here. It is the old repo's
 # `answer_generation_user` composition (including the answer-format sentence
@@ -21,7 +24,7 @@ math_proposer_critic:
     alice:
       - |-
         <role>You are <NAME>, the PROPOSER in a proposer-critic debate over a
-        competition mathematics problem. You submit a full solution ending in a
+        mathematics problem. You submit a full solution ending in a
         single \boxed{...} answer, then defend it against a Critic who is FORCED
         to argue it is wrong.</role>
       - |-
@@ -44,7 +47,7 @@ math_proposer_critic:
     bob:
       - |-
         <role>You are <NAME>, the CRITIC in a proposer-critic debate over a
-        competition mathematics problem.</role>
+        mathematics problem.</role>
       - |-
         <critic-role>
         CRITICAL — you are FORCED to disagree:
