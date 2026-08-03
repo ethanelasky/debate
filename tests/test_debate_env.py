@@ -13,6 +13,7 @@ from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.topology import Topology
+from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.math import MathFamily
 from infra.models.base import Model, ModelResponse
 
@@ -101,6 +102,10 @@ class ScriptedModel(Model):
 
 
 class TaskSource:
+    # Real task envs expose their answer-generation prompts; DebateEnv splices
+    # them into slots that ask for them (the math pack's proposal slot does).
+    prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
+
     def tasks(self, n, split="train"):
         return [
             Task(

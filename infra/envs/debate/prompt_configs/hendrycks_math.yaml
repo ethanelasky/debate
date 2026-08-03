@@ -5,9 +5,15 @@
 # content, kept near-verbatim. Templates are block lists: children can
 # override/append individual blocks via _extends (by-index merge).
 
-_math_base:
-  vars:
-    ANSWER_FORMAT_INSTRUCTION: 'End with your final answer as EXACTLY one \boxed{...} on the last line.'
+# The proposal slot's text is NOT written here. It is the old repo's
+# `answer_generation_user` composition (including the answer-format sentence
+# that used to be the ANSWER_FORMAT_INSTRUCTION var), which the RLVR arm sends
+# verbatim too, so it is single-sourced from
+# infra/envs/tasks/prompt_configs/math.yaml and spliced in by DebateEnv
+# wherever this pack writes <ANSWER_GEN_USER>. Both arms then render the same
+# bytes. Edit the wording THERE, not here. The codecontests pack works the
+# same way; the two families are no longer treated asymmetrically.
+_math_base: {}
 
 math_proposer_critic:
   _extends: _math_base
@@ -84,13 +90,13 @@ math_proposer_critic:
       PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
       next contribution: work the mathematics, check the disputed steps, and
       decide what to argue. Notes only; do not address the judge or opponent.
-    proposal: |-
-      Solve this competition mathematics problem.
-
-      <problem><TOPIC></problem>
-
-      Give a rigorous, step-by-step solution, making the reasoning easy for a
-      non-expert judge to verify. <ANSWER_FORMAT_INSTRUCTION>
+    # The old repo's `answer_generation_user` composition, spliced in whole from
+    # the task family's answer-generation config, which is where it now lives
+    # (see the header). This makes the rendered proposal slot byte-identical to
+    # the RLVR arm's user message for the same problem, so the two arms cannot
+    # drift apart. Alice's <grading-rule> block above intentionally restates the
+    # grading frame debate-side, the same way the codecontests pack does.
+    proposal: <ANSWER_GEN_USER>
     critique: |-
       The Proposer's solution is above; their boxed answer is <OPPONENT_POSITION>.
 

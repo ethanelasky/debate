@@ -4,8 +4,6 @@ Everything here is offline: MathFamily.source() is only ever called with an
 invalid config, where reject_unknown_keys fires before any dataset loading.
 """
 
-from pathlib import Path
-
 import pytest
 import yaml
 
@@ -78,39 +76,97 @@ def test_math_source_rejects_unknown_key_before_loading():
 
 # ------------------------------------------------------- generation prompts
 #
-# The prompts moved from Python constants into
-# infra/envs/tasks/prompt_configs/*.yaml. These tests pin the rendered
-# messages against the pre-move literals: under first_speech_non_debate_aware
-# these bytes ARE the debate proposal context, so a stray edit to the YAML
-# (reflow, smart quote, lost backslash) silently changes the experiment.
+# Pinned against the OLD repo's hendrycks_math.yaml `answer_generation_user`,
+# which is the shape both arms now render. Under
+# first_speech_non_debate_aware these bytes ARE the debate proposal context, so
+# a stray edit to the YAML (reflow, smart quote, lost backslash) silently
+# changes the experiment.
 
-MATH_SYSTEM_BEFORE_YAML_MOVE = (
-    "Solve the competition-level math problem.\n"
-    "Return the final answer in this exact format: \\boxed{NUMBER}\n"
-    "Do not output XML, ####, or extra prose.\n"
-    "Output only the boxed final answer."
+MATH_SYSTEM = "You are an expert competition mathematician. Solve rigorously and end with one boxed answer."
+
+MATH_USER = (
+    "Solve this competition mathematics problem.\n"
+    "\n"
+    "<problem>What is $1 + 1$?</problem>\n"
+    "\n"
+    "Requirements:\n"
+    "- Give a rigorous, step-by-step solution.\n"
+    "- End with your final answer as EXACTLY one \\boxed{...} on the last line.\n"
+    "\n"
+    "Provide your solution:"
 )
-MATH_USER_SUFFIX_BEFORE_YAML_MOVE = "\n\nReturn only: \\boxed{NUMBER}"
 
 
-def test_math_default_prompts_are_byte_identical():
+def test_math_prompt_matches_old_repo_composition():
     prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
-    problem = "What is $1 + 1$?"
-    assert prompts.messages(problem) == [
-        {"role": "system", "content": MATH_SYSTEM_BEFORE_YAML_MOVE},
-        {"role": "user", "content": problem + MATH_USER_SUFFIX_BEFORE_YAML_MOVE},
+    assert prompts.messages("What is $1 + 1$?") == [
+        {"role": "system", "content": MATH_SYSTEM},
+        {"role": "user", "content": MATH_USER},
     ]
 
 
-def test_math_debate_pack_does_not_splice_the_rlvr_prompt():
-    """Math is the deliberate non-unified case: its debate instruction
-    ("EXACTLY one \\boxed{...}") is different wording from its RLVR prompt, so
-    hendrycks_math.yaml writes its own proposal slot and never references
-    <ANSWER_GEN_USER>. (codecontests is the opposite: both arms render the
-    same composition, enforced in tests/test_codecontests.py.)"""
-    pack = Path("infra/envs/debate/prompt_configs/hendrycks_math.yaml").read_text()
-    assert "<ANSWER_GEN_USER>" not in pack
-    assert "ANSWER_FORMAT_INSTRUCTION" in pack  # its own, unshared wording
+def test_math_debate_pack_splices_the_rlvr_prompt():
+    """Math is single-sourced like codecontests: the debate pack references
+    <ANSWER_GEN_USER> instead of restating the wording, and no longer carries
+    its own ANSWER_FORMAT_INSTRUCTION var (that sentence is now part of the
+    shared composition). The byte-identity of the two arms is enforced in
+    test_math_debate_proposal_slot_equals_rlvr_user_message below."""
+    from infra.envs.debate.prompts import load_prompt_library, slot_template
+
+    lib = load_prompt_library(
+        "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
+    )
+    assert slot_template(lib, "proposal", "alice").strip() == "<ANSWER_GEN_USER>"
+    assert "ANSWER_FORMAT_INSTRUCTION" not in lib.vars
+
+
+def test_math_debate_proposal_slot_equals_rlvr_user_message():
+    """The invariant the single-sourcing exists to guarantee, math side: the
+    rendered debate proposal slot and the RLVR user message are the SAME
+    composition, byte for byte, for the same problem. Built through a real
+    DebateEnv so the splice path is what gets exercised. (The codecontests
+    equivalent lives in tests/test_codecontests.py.)"""
+    from infra.envs.base import Task
+    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
+    from infra.envs.debate.judge import JudgeConfig
+    from infra.envs.debate.topology import Topology
+
+    problem = "What is $1 + 1$?"
+
+    class Source:
+        prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
+
+        def tasks(self, n, split="train"):
+            return [
+                Task(messages=self.prompts.messages(problem), meta={"question": problem})
+            ] * n
+
+    debate = DebateEnv(
+        DebateEnvConfig(
+            topology=Topology.parse(
+                {
+                    "turns": [
+                        {"alice": [{"name": "proposal", "kind": "solution"}]},
+                        {"bob": [{"name": "critique"}]},
+                        {"alice": [{"name": "defense"}]},
+                        {"judge": [{"name": "verdict", "kind": "decision"}]},
+                    ]
+                }
+            ),
+            prompt_file="infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+            prompt_entry="math_proposer_critic",
+            trained_speakers=["alice"],
+            frozen_models={"bob": object(), "judge": object()},
+            judge=JudgeConfig(),
+            fresh_positions=True,
+        ),
+        Source(),
+        MathFamily(),
+    )
+    task = Source().tasks(1)[0]
+    rendered = debate.prompts.instruction("proposal", "alice", {"TOPIC": problem})
+    assert rendered == task.messages[1]["content"]
+    assert rendered == MATH_USER
 
 
 def _write_prompt_yaml(path, system="SYS", user="<PROBLEM>\n\nGo."):
@@ -132,7 +188,7 @@ def test_prompt_file_relative_path_resolves_against_repo_root():
     prompts = load_generation_prompts(
         resolve_prompt_file("infra/envs/tasks/prompt_configs/math.yaml", "codecontests.yaml")
     )
-    assert prompts.answer_gen_system == MATH_SYSTEM_BEFORE_YAML_MOVE
+    assert prompts.answer_gen_system == MATH_SYSTEM
 
 
 def test_format_notes_substituted_into_every_field(tmp_path):

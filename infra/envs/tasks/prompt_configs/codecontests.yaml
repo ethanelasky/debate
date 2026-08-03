@@ -14,6 +14,7 @@
 # infra/envs/debate/prompt_configs/codecontests.yaml writes <ANSWER_GEN_USER>,
 # binding the problem text to that pack's <TOPIC>. Editing the wording here
 # changes both arms together, which is the point — do not restate it there.
+# math.yaml works the same way; the two families are not treated differently.
 #
 # <PROBLEM> is substituted with the row's problem description. It is the only
 # placeholder the RLVR arm binds, so nothing else here may be uppercase-tagged.

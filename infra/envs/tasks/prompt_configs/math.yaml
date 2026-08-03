@@ -1,24 +1,36 @@
-# Hendrycks MATH answer-generation prompts. Ported from CS285 HW4 MathHardTask
-# (the same port that produced infra/envs/math_env.py), slimmed. This wording
-# is load-bearing beyond the RLVR arm: under first_speech_non_debate_aware the
-# resulting Task.messages IS the debate proposal context, byte-identical to
-# the RLVR prompt. Relocate, do not reword.
+# Hendrycks MATH answer-generation prompts, reproducing the OLD repo's
+# hendrycks_math.yaml `answer_generation_user` VERBATIM (working tree at
+# /Users/ethanelasky/ai-debate/ai_debate/prompts/configs/hendrycks_math.yaml,
+# entry _MATH_Base), with its <TOPIC> rebound to this layer's <PROBLEM> and its
+# <ANSWER_FORMAT_INSTRUCTION> resolved from that pack's `_answer_format_instruction`
+# template. answer_gen_system is the old pack's own `answer_generation_system`
+# line, verbatim — the pair below is the old repo's actual answer-generation
+# composition, system and user together.
 #
-# <PROBLEM> is substituted with the row's problem text.
+# The old CS285-ported system prompt that used to live here ("Output only the
+# boxed final answer", "Do not output XML, ####, or extra prose") is DROPPED:
+# it demanded answer-only output and directly contradicts the step-by-step
+# solution this user message asks for.
 #
-# This prompt is deliberately NOT shared with the math debate pack. The debate
-# prompts ask for "EXACTLY one \boxed{...}" while this asks for
-# "\boxed{NUMBER}" — two different battle-tested wordings for two different
-# formats. So hendrycks_math.yaml writes its own proposal slot and never
-# references <ANSWER_GEN_USER>, and nothing here is unified with it.
-# (codecontests is the opposite case: there the two arms were already the same
-# wording, so its config is the single source both of them render.)
+# THIS FILE IS THE SINGLE SOURCE for the math answer prompt, for BOTH arms. The
+# RLVR user message and the debate proposal slot are the SAME composition
+# rendered byte-for-byte identically: DebateEnv splices answer_gen_user into
+# the proposal slot wherever infra/envs/debate/prompt_configs/hendrycks_math.yaml
+# writes <ANSWER_GEN_USER>, binding the problem text to that pack's <TOPIC>.
+# Editing the wording here changes both arms together, which is the point.
+#
+# <PROBLEM> is substituted with the row's problem text. The lowercase <problem>
+# tags are literal prompt markup, not placeholders (the debate template layer
+# only ever binds UPPERCASE tags), and are part of the old repo's wording.
 answer_gen_system: |-
-  Solve the competition-level math problem.
-  Return the final answer in this exact format: \boxed{NUMBER}
-  Do not output XML, ####, or extra prose.
-  Output only the boxed final answer.
+  You are an expert competition mathematician. Solve rigorously and end with one boxed answer.
 answer_gen_user: |-
-  <PROBLEM>
+  Solve this competition mathematics problem.
 
-  Return only: \boxed{NUMBER}
+  <problem><PROBLEM></problem>
+
+  Requirements:
+  - Give a rigorous, step-by-step solution.
+  - End with your final answer as EXACTLY one \boxed{...} on the last line.
+
+  Provide your solution:

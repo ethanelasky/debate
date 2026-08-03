@@ -16,12 +16,11 @@ answer_gen_system/answer_gen_user are the RLVR prompt VERBATIM, and under
 first_speech_non_debate_aware they are also the debate proposal context — so
 every failure mode here is loud.
 
-A debate pack may also splice answer_gen_user in as a slot template via
+A debate pack also splices answer_gen_user in as a slot template via
 <ANSWER_GEN_USER> (see supplied_templates), which makes the two arms render the
-same composition byte-for-byte. Codecontests does exactly that. Math does NOT:
-its debate format instruction ("EXACTLY one \\boxed{...}") is deliberately
-different wording from its RLVR prompt ("\\boxed{NUMBER}"), so the math debate
-pack writes its own proposal slot and nothing is unified.
+same composition byte-for-byte. Both families do this: math used to keep a
+separate, deliberately different debate wording, but that asymmetry was dropped
+in favour of one prompt per family across both arms.
 """
 
 from __future__ import annotations

@@ -30,10 +30,8 @@
 # and spliced in by DebateEnv wherever this pack writes <ANSWER_GEN_USER>.
 # Both arms then render the same bytes. Edit the wording THERE, not here.
 #
-# The math pack is deliberately NOT single-sourced this way: its debate
-# instruction ("EXACTLY one \boxed{...}") differs from its RLVR system prompt
-# ("\boxed{NUMBER}") on purpose, so hendrycks_math.yaml writes its own
-# proposal slot and never references <ANSWER_GEN_USER>.
+# The math pack is single-sourced the same way (hendrycks_math.yaml also writes
+# `proposal: <ANSWER_GEN_USER>`); the two families are no longer asymmetric.
 _codecontests_base: {}
 
 codecontests_proposer_critic:

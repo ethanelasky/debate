@@ -42,9 +42,29 @@ BINDINGS = {
 }
 
 
+def splice_task_prompts(lib, name):
+    """What DebateEnv does before rendering: splice the task family's
+    answer_gen_user into slots that ask for it by <ANSWER_GEN_USER>, with
+    <PROBLEM> rebound to this layer's <TOPIC>. Tests that render a pack's slots
+    need the same treatment, since the packs no longer carry that wording."""
+    from infra.envs.debate.env import _splice
+
+    subs = {
+        k: v.replace("<PROBLEM>", "<TOPIC>")
+        for k, v in task_prompts(name).supplied_templates().items()
+    }
+    lib.slots = {
+        n: ({s: _splice(t, subs) for s, t in e.items()} if isinstance(e, dict) else _splice(e, subs))
+        for n, e in lib.slots.items()
+    }
+    return lib
+
+
 @pytest.fixture
 def lib():
-    return load_prompt_library(MATH_YAML, "math_proposer_critic")
+    return splice_task_prompts(
+        load_prompt_library(MATH_YAML, "math_proposer_critic"), "math.yaml"
+    )
 
 
 @pytest.fixture
@@ -56,7 +76,6 @@ def topology():
 
 
 def test_extends_merges_vars_over_parent(lib, tmp_path):
-    assert "\\boxed{...}" in lib.vars["ANSWER_FORMAT_INSTRUCTION"]
     assert set(lib.system) == {"alice", "bob", "judge"}
     assert set(lib.slots) == {"scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
 
@@ -106,9 +125,9 @@ def test_missing_slot_named_in_message(lib):
 # ------------------------------------------------------------------ render
 
 
-def test_vars_applied_and_bindings_override(lib):
-    out = render("<TOPIC> | <ANSWER_FORMAT_INSTRUCTION>", {"TOPIC": "t"}, lib.vars)
-    assert out == "t | " + lib.vars["ANSWER_FORMAT_INSTRUCTION"]
+def test_vars_applied_and_bindings_override():
+    out = render("<TOPIC> | <NOTE>", {"TOPIC": "t"}, {"NOTE": "from vars"})
+    assert out == "t | from vars"
     assert render("<A>", {"A": "binding"}, {"A": "var"}) == "binding"
 
 
@@ -296,8 +315,11 @@ def test_preview_shows_block_placement():
     from infra.envs.debate.prompts import load_prompt_library, preview
     from infra.envs.debate.topology import Topology
 
-    lib = load_prompt_library(
-        "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
+    lib = splice_task_prompts(
+        load_prompt_library(
+            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic"
+        ),
+        "math.yaml",
     )
     topo = Topology.parse(
         _yaml.safe_load(
@@ -308,5 +330,5 @@ def test_preview_shows_block_placement():
     out = preview(lib, topo)
     assert "<alice/proposal output>" in out          # stubbed prior slots
     assert "<TOPIC>" in out                          # runtime placeholders kept visible
-    assert "EXACTLY one \\boxed{...}" in out         # var-bound placeholders render for real
+    assert "EXACTLY one \\boxed{...}" in out         # spliced task wording renders for real
     assert "== judge — context for its final slot (verdict)" in out

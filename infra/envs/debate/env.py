@@ -145,10 +145,10 @@ class DebateEnv(Env):
         re-scans substituted text, so the wording has to be part of the
         template before rendering starts.
 
-        Math is deliberately NOT spliced: its debate format instruction
-        ("EXACTLY one \\boxed{...}") is different wording from its RLVR prompt
-        ("\\boxed{NUMBER}"), so hendrycks_math.yaml writes its own proposal
-        slot and never references <ANSWER_GEN_USER>."""
+        Both shipped packs splice: one answer prompt per family, rendered
+        identically by the RLVR arm and by the debate proposal slot. Math kept
+        a separate debate wording until that asymmetry was deliberately
+        dropped."""
         supplied = getattr(self.task_source, "prompts", None)
         available = supplied.supplied_templates() if supplied is not None else {}
         available = {
