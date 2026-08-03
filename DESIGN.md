@@ -12,7 +12,9 @@ infra/  (python package; repo stays ~/code/debate)
     verl.py      # VerlBackend                                       (~400–600)
   envs/
     base.py      # Env ABC + Trajectory, Policy/Model adapter        (~150)
-    math_env.py  # RLVR: port of CS285 HW4 MathHardTask              (~250)
+    tasks/       # task registry: TaskFamily per domain
+      math.py        # MathEnv (CS285 HW4 port) + MathFamily         (~250)
+      codecontests.py# CodeContestsEnv + CodeContestsFamily
     debate/      # SALVAGED from ~/ai-debate/ai_debate/debate/, slimmed
       protocol.py    # Protocol enum + TurnPlan (port ~as-is)        (~400)
       round.py       # DebateRound speaker loop, provenance/replay/

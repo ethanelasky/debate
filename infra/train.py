@@ -199,12 +199,12 @@ def main() -> None:
     )
 
     from infra.backend.tinker import TinkerBackend
-    from infra.envs.math_env import MathEnv
+    from infra.envs.tasks import get_family
 
     backend = TinkerBackend(cfg.base_model, lora_rank=cfg.lora_rank)
     if args.load:
         backend.load(args.load)
-    env = MathEnv(seed=cfg.seed)
+    env = get_family("math").source({"seed": cfg.seed})
     train(env, backend, cfg)
 
 
