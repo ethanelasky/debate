@@ -379,6 +379,38 @@ turns:
         make_solo_env(topology=topo)
 
 
+def test_non_debate_aware_requires_public_proposal():
+    # a private/ephemeral opening would silently hide the speech from the
+    # critic and judge (row 10: the solo speech is a PUBLIC record)
+    topo = Topology.parse(
+        yaml.safe_load(
+            """
+turns:
+  - alice: [{name: proposal, kind: solution, visibility: private}]
+  - bob:   [{name: critique}]
+  - judge: [{name: verdict, kind: decision}]
+"""
+        )
+    )
+    with pytest.raises(ValueError, match="public"):
+        make_solo_env(topology=topo)
+
+
+def test_non_debate_aware_requires_user_message():
+    class NoUserTaskSource:
+        def tasks(self, n, split="train"):
+            return [
+                Task(messages=[{"role": "system", "content": "solve"}], meta={"question": "q", "gt": 1.0})
+                for _ in range(n)
+            ]
+
+    backend = ScriptedBackend(["\\boxed{2}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_solo_env()
+    with pytest.raises(ValueError, match="user message"):
+        env.rollout(NoUserTaskSource().tasks(1), policy, group_size=1)
+
+
 def test_length_normalize_balances_seats():
     from infra.backend.base import Datum
     from infra.envs.base import Trajectory

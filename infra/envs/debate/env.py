@@ -40,7 +40,7 @@ from infra.envs.debate.round import (
     SeatRunner,
     SlotRecord,
 )
-from infra.envs.debate.topology import Kind, Topology
+from infra.envs.debate.topology import Kind, Topology, Visibility
 from infra.models.base import Model
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
@@ -108,6 +108,12 @@ class DebateEnv(Env):
                     "first_speech_non_debate_aware requires the first topology slot to be a "
                     f"debater solution slot (got {first.speaker}/{first.slot.name} "
                     f"kind={first.slot.kind.value})"
+                )
+            if first.slot.visibility != Visibility.PUBLIC:
+                raise ValueError(
+                    "first_speech_non_debate_aware requires the opening solution slot to be "
+                    f"public (got {first.slot.visibility.value}): the solo speech must enter "
+                    "the transcript as a public record (DESIGN-pc-format.md row 10)"
                 )
 
         self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
@@ -264,6 +270,13 @@ class DebateEnv(Env):
         }
         state = DebateState(bindings=bindings)
         if cfg.first_speech_non_debate_aware:
+            # fail loud here rather than let render_context silently fall back
+            # to the library cue in the proposer's later history (row 10)
+            if not any(m.get("role") == "user" for m in task.messages):
+                raise ValueError(
+                    "first_speech_non_debate_aware: task has no user message to serve as "
+                    "the solo cue; the task source must emit at least one user message"
+                )
             state.first_slot_messages = list(task.messages)
         state.meta.update({"task": task.meta, "flipped": flipped})
         return state
