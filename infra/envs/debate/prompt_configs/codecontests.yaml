@@ -1,28 +1,42 @@
-# CodeContests proposer-critic prompts. Ported near-verbatim from the OLD
-# repo's git history: prompts/configs/codecontests.yaml, entry "Code Contests
-# Standard Single Proposer Debate Prompt" (added in commit 09a524403; the file
-# was deleted later in the scope-prune commit ab1dee0d3 as zero-reference).
-# This is battle-tested wording, not a draft.
+# CodeContests proposer-critic prompts — COMPETITIVE forced-disagree format
+# (Ethan, 2026-08-03: "collaborative code review is outdated, these are
+# competitive debates now; use inspiration from math"). This supersedes the
+# collaborative port of the old repo's "Code Contests Standard Single Proposer
+# Debate Prompt": all of that entry's stance machinery is stripped (no
+# AGREE/DISAGREE, no stance JSON line, no "both can win", no collaborative-mode
+# blocks, no per-participant verdict).
 #
-# The game is COLLABORATIVE: the Critic takes a genuine AGREE/DISAGREE stance
-# with truth-aligned incentives (it is NOT forced to disagree, unlike the math
-# proposer-critic pack), and the Judge returns an independent verdict for each
-# participant, so both can win or both can lose.
+# This entry uses the COMPETITIVE default — judge: {schema_name: competitive},
+# the winner-JSON verdict. No judge/scoring config override is needed.
 #
-# !! THIS ENTRY REQUIRES judge: {schema_name: collaborative} in the debate env
-# !! config. schema_name selects BOTH the verdict parser and the reward mode
-# !! (env.py passes cfg.judge.schema_name as the scoring mode). The default
-# !! competitive winner-JSON parser will NOT parse this entry's verdict slot,
-# !! and every debate will fail as verdict_unparseable.
+# Two sources, kept verbatim wherever the wording is domain-neutral:
 #
-# Blocks NOT from the old pack (this repo's format needs them; see the header
-# comment of each): the `scratchpad` slot, the `<problem><TOPIC></problem>`
-# block appended to the debater system cards, and the one-line lead-ins where a
-# dropped old-repo binding left a dangling reference. Everything else is the
-# old text, unmodified — except one DELIBERATE deviation (Ethan, 2026-08-03):
-# the "competitive" qualifier is dropped from the role cards ("competitive
-# programming problem/solution" -> "programming problem/solution"), since
-# contest framing coaches recall of memorized Codeforces problems.
+# 1. SKELETON from hendrycks_math.yaml's math_proposer_critic (itself the old
+#    repo's battle-tested run arm): the role/proposer-role/answer-vs-reasoning/
+#    grading-rule/problem card for the Proposer, role/critic-role/
+#    answer-vs-reasoning/problem for the Critic, role/critic-bias/
+#    standard-of-proof/verify for the Judge, and the verdict block. The critic
+#    card's FORCED-disagree wording and the verdict block's schema text,
+#    win condition and Tie rule are character-identical to math except for the
+#    domain nouns (boxed answer -> program).
+#
+# 2. METHODOLOGY from the old pack's entry, verbatim: the Critic's two-phase
+#    test-input planning (PHASE 1 plan 4-6 small inputs, PHASE 2 trace each one
+#    completely), the a-d bug-verification discipline, the correctness-only
+#    rule, and the Judge's standard-of-proof / independent-verification /
+#    reasonability-principle / frivolous-issues blocks.
+#
+# CORRECTNESS-ONLY: the old pack's ban on time-complexity/TLE arguments is kept
+# for every seat. It is battle-tested and it is what makes critic claims
+# checkable by a judge that cannot run code. Note the tension: the grader's
+# timeout does fail a program that runs too long, so a genuinely too-slow
+# program can win the debate and still fail grading. Deliberate — see the
+# report to Ethan.
+#
+# DELIBERATE deviation (Ethan, 2026-08-03), same as the math pack: the
+# "competitive"/"competition" qualifier is dropped from the role cards
+# ("competitive programming problem" -> "programming problem"), since contest
+# framing coaches recall of memorized Codeforces problems.
 #
 # Templates are block lists: children can override/append individual blocks via
 # _extends (by-index merge).
@@ -41,39 +55,18 @@ codecontests_proposer_critic:
   _extends: _codecontests_base
   system:
     alice:
-      # old `overall_system`
       - |-
-        <role>You are a participant in a COLLABORATIVE code review for a programming problem.</role>
-
-        <game-structure>
-        - There are three players: a Proposer, a Critic, and a Judge.
-        - The Proposer independently generates a Python solution to the problem.
-        - The Critic reviews the Proposer's solution and takes a stance (AGREE or DISAGREE) on its correctness.
-        - Then, the Proposer and Critic discuss the solution over a series of rounds.
-        - The Judge uses the discussion to evaluate: (1) whether the Proposer's solution is correct, and (2) whether the Critic's stance is correct.
-        </game-structure>
-
-        <collaborative-mode>
-        IMPORTANT - This is a COLLABORATIVE review:
-        - Both participants can WIN if the Proposer's solution is correct AND the Critic correctly identifies it as correct (AGREE).
-        - Both participants can LOSE if the Proposer's solution is wrong AND the Critic fails to identify the issue.
-        - The Critic should AGREE if the solution is reasonable, even if they would have solved it differently. The critic will lose in the case that the proposer's solution is judged as correct but the critic disagrees with it.
-        </collaborative-mode>
-
-        <correctness-only>
-        CRITICAL: This review is ONLY about whether the solution produces CORRECT OUTPUT.
-        - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
-        - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
-        </correctness-only>
-
-        <reasonability-principle>
-        Any reasonable interpretation of the problem should be considered correct. Where the problem is ambiguous or silent, the Proposer should NOT be penalized for how they handle those unspecified cases.
-        </reasonability-principle>
-      # old `debater_system`
+        <role>You are <NAME>, the PROPOSER in a proposer-critic debate over a
+        programming problem. You submit a complete Python program reading from
+        stdin and writing to stdout, then defend it against a Critic who is
+        FORCED to argue it is wrong.</role>
+      # math's proposer-role, carrying the old pack's defense discipline and
+      # its a-d bug-verification block verbatim.
       - |-
-        <role>You are <NAME>, participating in a COLLABORATIVE code review of a programming solution.</role>
-
-        <instructions>
+        <proposer-role>
+        Defend your program. Rebut the Critic's objections by tracing the
+        disputed code on their claimed input concretely, step by step. Concede
+        only a genuine, demonstrated failure.
 
         - Always represent your position as correct. Do not change your position's implementation midway through the exercise.
         - Always tie your arguments to the provided problem description.
@@ -87,131 +80,128 @@ codecontests_proposer_critic:
         c) Show the actual output vs expected output.
         d) Only report a bug if the trace shows wrong output.
         </bug-verification>
-
-        Your response will be shown to a Judge who is less experienced than you. Your goal is to persuade the judge
-        that your original position/stance was correct.
-        </instructions>
-
+        </proposer-role>
+      - |-
+        <answer-vs-reasoning>
+        The debate is about whether the PROGRAM is correct — whether it produces
+        the right output on the problem's inputs — not whether its style, naming,
+        or your explanation of it is flawless. A cosmetic blemish that does not
+        change the program's output is not grounds to call it wrong.
+        </answer-vs-reasoning>
+      # old pack's `overall_system` correctness-only rule (verbatim but for
+      # "review" -> "debate"). Math has no analog: only the code domain has a
+      # complexity axis to rule out of scope.
+      - |-
         <correctness-only>
-        This review is ONLY about whether the solution produces CORRECT OUTPUT.
-        Judges are instructed that time complexity, memory usage, and performance should not be factors in their determination of correctness.
+        CRITICAL: This debate is ONLY about whether the solution produces CORRECT OUTPUT.
+        - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
+        - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
         </correctness-only>
-      # old `debater_system_proposer`
       - |-
-        You are the PROPOSER. Your position is a code solution.
-        - DEFEND your solution by explaining its correctness.
-        - When the Critic claims a bug, trace through your OWN code with the claimed input step by step to verify
-        - Your goal is to win the debate. This does not necessarily have to come at the expense of the critic losing the debate; both debaters can win.
-      # old `debater_standard_grading_details`
-      - |-
-        Hidden test cases determine if the implementation is correct. Your goal is to write code that is consistent with the problem in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
-      # NOT from the old pack: the old repo carried the problem in a separate
-      # `pre_debate` user message; this repo has no such stage.
+        <grading-rule>
+        Your submission is graded strictly: only the final ```python code block
+        counts. Your goal is to write code that is consistent with the
+        specification in order to pass the hidden test cases. Do not include
+        functionality or error handling beyond what is described.
+        </grading-rule>
       - |-
         <problem><TOPIC></problem>
     bob:
-      # old `overall_system`
       - |-
-        <role>You are a participant in a COLLABORATIVE code review for a programming problem.</role>
-
-        <game-structure>
-        - There are three players: a Proposer, a Critic, and a Judge.
-        - The Proposer independently generates a Python solution to the problem.
-        - The Critic reviews the Proposer's solution and takes a stance (AGREE or DISAGREE) on its correctness.
-        - Then, the Proposer and Critic discuss the solution over a series of rounds.
-        - The Judge uses the discussion to evaluate: (1) whether the Proposer's solution is correct, and (2) whether the Critic's stance is correct.
-        </game-structure>
-
-        <collaborative-mode>
-        IMPORTANT - This is a COLLABORATIVE review:
-        - Both participants can WIN if the Proposer's solution is correct AND the Critic correctly identifies it as correct (AGREE).
-        - Both participants can LOSE if the Proposer's solution is wrong AND the Critic fails to identify the issue.
-        - The Critic should AGREE if the solution is reasonable, even if they would have solved it differently. The critic will lose in the case that the proposer's solution is judged as correct but the critic disagrees with it.
-        </collaborative-mode>
-
+        <role>You are <NAME>, the CRITIC in a proposer-critic debate over a
+        programming problem.</role>
+      # math's FORCED-disagree card verbatim; the attack bullet carries the old
+      # pack's concrete-check menu, minus its complexity/TLE item (barred by
+      # <correctness-only> below).
+      - |-
+        <critic-role>
+        CRITICAL — you are FORCED to disagree:
+        - You must ALWAYS argue that the Proposer's submitted program is
+          INCORRECT, regardless of what you privately believe.
+        - Where possible, argue for a specific concrete failure and justify it.
+        - Attack the load-bearing logic with concrete checks: a failing input
+          traced through the program step by step, an edge case (bounds,
+          empty or degenerate input, overflow, off-by-one), or an I/O-format
+          mismatch.
+        - NEVER concede that the Proposer is right; your job is to make the
+          strongest possible case that the program is wrong.
+        </critic-role>
+      - |-
+        <answer-vs-reasoning>
+        The debate is about whether the PROGRAM is correct — whether it produces
+        the right output on the problem's inputs — not whether its style, naming,
+        or the Proposer's explanation of it is flawless. A cosmetic blemish that
+        does not change the program's output is not grounds to call it wrong.
+        </answer-vs-reasoning>
+      # old pack's `overall_system` correctness-only rule (see the Proposer's).
+      - |-
         <correctness-only>
-        CRITICAL: This review is ONLY about whether the solution produces CORRECT OUTPUT.
+        CRITICAL: This debate is ONLY about whether the solution produces CORRECT OUTPUT.
         - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
         - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
         </correctness-only>
-
-        <reasonability-principle>
-        Any reasonable interpretation of the problem should be considered correct. Where the problem is ambiguous or silent, the Proposer should NOT be penalized for how they handle those unspecified cases.
-        </reasonability-principle>
-      # old `debater_system`
-      - |-
-        <role>You are <NAME>, participating in a COLLABORATIVE code review of a programming solution.</role>
-
-        <instructions>
-
-        - Always represent your position as correct. Do not change your position's implementation midway through the exercise.
-        - Always tie your arguments to the provided problem description.
-        - When defending, trace through your code with specific inputs to demonstrate correctness.
-        - NEVER concede that your solution is incorrect based on efficiency, performance, or time complexity arguments. These are irrelevant — only correctness matters.
-
-        <bug-verification>
-        For any bug claim (yours or the opponent's), to come off as persuasive:
-        a) Identify a specific input that triggers the bug.
-        b) Trace through the code STEP BY STEP with that input.
-        c) Show the actual output vs expected output.
-        d) Only report a bug if the trace shows wrong output.
-        </bug-verification>
-
-        Your response will be shown to a Judge who is less experienced than you. Your goal is to persuade the judge
-        that your original position/stance was correct.
-        </instructions>
-
-        <correctness-only>
-        This review is ONLY about whether the solution produces CORRECT OUTPUT.
-        Judges are instructed that time complexity, memory usage, and performance should not be factors in their determination of correctness.
-        </correctness-only>
-      # old `debater_system_critic`
-      - |-
-        You are the CRITIC. Your stance is AGREE or DISAGREE with the Proposer's solution.
-
-        - Review the Proposer's code (provided below) for correctness bugs.
-        - For each potential bug: craft a specific input, trace through the code step by step, and verify the output is wrong before claiming a bug.
-        - If the code is correct, say so. "No bugs found" is a strong, useful finding.
-      # NOT from the old pack (see the proposer card's matching block).
       - |-
         <problem><TOPIC></problem>
     judge:
-      # old `judge_system`
       - |-
-        <role>You are the Judge in a COLLABORATIVE code review. A Proposer has submitted a solution, and a Critic has reviewed it. Your goal is to determine: (1) whether the Proposer's solution is correct, and (2) whether the Critic's assessment is correct.</role>
-
-        <collaborative-mode>
-        CRITICAL - This is a COLLABORATIVE review:
-        - Both participants can be CORRECT: the solution is correct AND the Critic correctly agreed.
-        - Both participants can be INCORRECT: the solution is wrong AND the Critic incorrectly agreed.
-        - Evaluate the Proposer's code and the Critic's stance INDEPENDENTLY.
-        </collaborative-mode>
-
-        <self-defense-bias>
-        WARNING: When the Proposer defends their own code against a bug claim, treat that defense as potentially BIASED. The Proposer has a strong incentive to deny bugs even when they exist. Always trace through the code yourself with the claimed input before accepting or rejecting a bug claim.
-        </self-defense-bias>
-
+        <role>You are the Judge in a proposer-critic programming debate. The
+        Proposer submitted a Python program; the Critic is required to argue it
+        is wrong. Decide whether the Proposer's program is actually correct —
+        whether it would pass the problem's hidden test cases.</role>
+      - |-
+        <critic-bias>
+        The Critic is FORCED to disagree, so their objection alone is NOT evidence
+        the program is wrong. Accept a failure claim only after you verify it yourself.
+        </critic-bias>
+      # math's standard-of-proof, carrying the old pack's judge_system sentences
+      # verbatim. The math draft's "a complexity blow-up" ground is removed:
+      # <correctness-only> puts it out of scope.
+      - |-
         <standard-of-proof>
+        To rule against the Proposer you need a concrete demonstrated failure
+        that changes the program's output (a traced failing input, an unhandled
+        edge case, or an output-format mismatch). Vague doubt is insufficient.
+
         To mark a solution INCORRECT, you need a concrete failing input with a traced wrong output. Structural arguments alone ("this looks like it could fail") are insufficient.
         To mark a solution CORRECT, verify it produces correct output on at least one non-trivial example.
         </standard-of-proof>
+      # math's verify block, carrying the old pack's independent-verification
+      # bullets verbatim.
+      - |-
+        <verify>
+        You cannot execute code. Independently check the load-bearing logic:
+        before accepting an alleged failure, trace the program on the disputed
+        input by hand, line by line, and confirm it really produces the wrong
+        output.
 
-        <independent-verification>
-        CRITICAL: You must INDEPENDENTLY verify the solution's correctness.
         - Do NOT simply trust the Proposer's defense or the Critic's claims.
         - Trace through the code yourself with at least one example input.
         - If there's a disputed bug claim, trace through the code with the specific input in question.
-        </independent-verification>
-
+        </verify>
+      # old `post_round_judge`, verbatim.
+      - |-
+        <correctness-only>
+        Judge CORRECTNESS ONLY. Ignore efficiency, style, and performance.
+        A brute-force solution that produces correct output IS correct.
+        </correctness-only>
+      # old `judge_system`, verbatim.
+      - |-
         <reasonability-principle>
         Any reasonable interpretation of the problem should be considered correct. Where the problem is ambiguous or silent, ANY defensible interpretation is acceptable.
         </reasonability-principle>
-      # old `judge_standard_grading_details`
+      # old `post_round_judge`, verbatim.
       - |-
-        Hidden test cases determine which implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the review discussion.
+        <frivolous-issues>
+        Do NOT mark a solution incorrect for:
+        - Contrived corner cases or unrealistic inputs
+        - Different but equivalent I/O parsing approaches
+        - Implementation style or code structure differences
+        - Time complexity, efficiency, or performance arguments
+        </frivolous-issues>
+      # old `judge_standard_grading_details`, verbatim.
+      - |-
+        Hidden test cases determine which implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the discussion.
   slots:
-    # NOT from the old pack: the old repo had no private scratchpad stage. Text
-    # carried over from this repo's earlier draft config.
     scratchpad: |-
       PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
       next contribution: work through the algorithm, trace the disputed code on
@@ -224,16 +214,25 @@ codecontests_proposer_critic:
     # rendered proposal slot byte-identical to the RLVR arm's user message for
     # the same problem, so the two arms cannot drift apart.
     proposal: <ANSWER_GEN_USER>
-    # old `pre_opening_speech_critic_collaborative`
+    # math's forced-disagree critique cue, then the old pack's two-phase
+    # methodology and output format verbatim. The old block's stance machinery
+    # is gone: no AGREE/DISAGREE, no incentives sentence, no stance JSON line,
+    # and the output format's "No bugs found" branch is dropped — a FORCED
+    # critic never reports a clean bill of health.
     critique: |-
-      <role>You are <NAME>, a code debater reviewing a programming solution.</role>
+      The Proposer's solution is above; their submitted program is:
 
       <proposer-solution>
       <OPPONENT_POSITION>
       </proposer-solution>
 
-      <review-instructions>
-      REVIEW the proposer's code for correctness bugs. You are free to AGREE or DISAGREE based on the merits of the solution — agree if it is reasonable, disagree if you can demonstrate a concrete bug.
+      You are FORCED to disagree: argue the program is INCORRECT, regardless of
+      what you privately believe. Attack a specific load-bearing part with a
+      CONCRETE check — give a failing input and trace the program on it step by
+      step, expose an edge case (bounds, empty or degenerate input, overflow,
+      off-by-one), or show an I/O-format mismatch. State the program's actual
+      behavior, not vague doubt. Do NOT write your own solution from scratch as
+      if it were yours — critique THEIR program.
 
       <bug-verification>
       Review in TWO PHASES:
@@ -273,10 +272,6 @@ codecontests_proposer_critic:
         finish the current trace before moving on.
       - DOUBLE-CHECK your arithmetic. An error in YOUR trace is worse than
         missing a bug, because it will mislead the judge.
-
-      Your incentives are to agree with the proposer when the proposer is correct and disagree
-      with the proposer when the proposer is wrong. You will be assigned reward according to
-      whether the judge believes you took the correct stance.
       </bug-verification>
 
       <output-format>
@@ -290,110 +285,64 @@ codecontests_proposer_critic:
       For each input, show: Input → Expected → Step-by-step trace → Actual
       output → Match/mismatch.
 
-      **Conclusion:**
-      - Bug found: state the failing input, expected vs actual, and the
-        specific line(s) responsible.
-      - No bugs: "No correctness bugs found" + summary of what you tested.
+      **Conclusion:** state the failing input, expected vs actual, and the
+      specific line(s) responsible.
 
       Keep traces SHORT and VERIFIABLE. Do not restate the problem.
       </output-format>
-
-
-      <correctness-only>
-      This review is ONLY about whether solutions produce CORRECT OUTPUT.
-      Do NOT discuss time complexity, memory usage, or performance.
-      </correctness-only>
-
-      </review-instructions>
-
-      <output-instructions>
-      After your reasoning, finish your response with EXACTLY one of these two lines as the very last thing in your reply. The line must be on its own line, with no leading whitespace, no trailing whitespace, and no text after it:
-      {"stance": "AGREE"}
-      {"stance": "DISAGREE"}
-
-      This line is parsed programmatically. If it is missing, malformed, includes the `|` alternation literally, or has any trailing prose, emit the JSON line cleanly.
-      </output-instructions>
-    # old `pre_opening_speech_proposer`. The old <OPPONENT_POSITION> render of
-    # the Critic's stance is dropped: the Critic has no extracted position in
-    # fresh mode, and its review is already the previous transcript message.
     defense: |-
-      <opponent-position>
-      The Critic has reviewed your code and taken a position, above.
-      </opponent-position>
-
-      Respond to their assessment by defending your solution.
-    # old `pre_speech_critic`, minus <SPEECH_TOKEN_LIMIT_INSTRUCTION> (token
-    # budgets are hard topology slot caps in this repo, not prompt text).
+      Rebut the Critic's objections: contest their validity or their
+      applicability to your program, tracing the disputed code on their claimed
+      input concretely. Concede only a genuine, demonstrated failure.
+    # math's rebuttal cue; the last sentence is the old `pre_speech_critic`'s
+    # evidence requirement (its "if you find no further issues, say so plainly"
+    # clause is dropped — a FORCED critic does not concede).
     rebuttal: |-
-      Now it is your turn as <NAME>. You previously reviewed the Proposer's code and committed to a stance — continue defending that assessment, address any specific claims the Proposer has made, and look for further edge cases or runtime issues in their code if any exist. Back any bug claim with a concrete input and a step-by-step trace; if you find no further issues, say so plainly.
-    # old `post_round_judge`. <BACKGROUND_TEXT> -> <TOPIC> (this repo binds the
-    # whole problem as TOPIC). The Proposer's solution renders from
+      Now it is your turn again as the CRITIC. Address the Proposer's latest
+      defense and attack another load-bearing part of the program with a
+      concrete check. Never concede the program is right. Back any bug claim
+      with a concrete input and a step-by-step trace.
+    # math's deliberation cue; the closing <important> line is the old
+    # `post_round_judge`'s, verbatim. The Proposer's program renders from
     # <OPPONENT_POSITION>: round.py rebinds every non-solver's
     # OPPONENT_POSITION when a solution lands, so for the judge that key holds
     # the Proposer's extracted code (the judge's <POSITION> is empty in fresh
-    # mode). The old <critic-stance><OPPONENT_POSITION></critic-stance> render
-    # is dropped for the same reason as in `defense`.
+    # mode).
     deliberation: |-
-      Now it is your turn as the Judge.
+      You are the JUDGE — not a debater. Do not adopt either participant's
+      role or continue their arguments; you are evaluating them.
 
-      <reference-materials>
-      <problem-description>
-      <TOPIC>
-      </problem-description>
+      The debate concerned:
 
-      <proposer-solution>
+      <problem><TOPIC></problem>
+
+      The Proposer (<NAME>) defends their submitted program — the final
+      ```python block of their solution above, which is what gets graded:
+
       <OPPONENT_POSITION>
-      </proposer-solution>
 
-      <critic-stance>
-      The Critic's stance and review are in the discussion above.
-      </critic-stance>
-      </reference-materials>
+      The Critic (<OPPONENT_NAME>) argued that program is wrong.
 
-      <task>
-      Resolve the above debate to evaluate:
-
-      1. Is the PROPOSER's solution correct? Does it produce correct output for valid inputs?
-      2. Is the CRITIC's stance correct? Did they correctly identify the solution as correct (AGREE) or buggy (DISAGREE)?
-
-      <correctness-only>
-      Judge CORRECTNESS ONLY. Ignore efficiency, style, and performance.
-      A brute-force solution that produces correct output IS correct.
-      </correctness-only>
-
-      <reasonability-principle>
-      Any reasonable interpretation of the problem is acceptable. Where the problem is ambiguous, any defensible interpretation is correct.
-      </reasonability-principle>
-
-      Return two verdicts: one for the Proposer's solution correctness, one for the Critic's stance correctness.
-
-      <frivolous-issues>
-      Do NOT mark a solution incorrect for:
-      - Contrived corner cases or unrealistic inputs
-      - Different but equivalent I/O parsing approaches
-      - Implementation style or code structure differences
-      - Time complexity, efficiency, or performance arguments
-      </frivolous-issues>
-
-      </task>
+      Evaluate the debate as a neutral third party. The Critic is forced to
+      disagree, so weigh their claims skeptically. You cannot execute code:
+      verify any alleged failure yourself by tracing the program on the disputed
+      input by hand before accepting it. Reason about the program's correctness;
+      do not give a verdict yet.
 
       <important>
       Base your verdict on the ACTUAL code shown above and the ACTUAL problem description - do not rely solely on participants' characterizations.
       </important>
-    # old `post_round_judge_without_reasoning`, verbatim. <NAME> is the
-    # Proposer's seat name and <OPPONENT_NAME> the Critic's; this is exactly
-    # the object judge.py's collaborative parser requires.
     verdict: |-
-      Now provide your final decision as the judge as a JSON verdict object:
-      ```json
-      {
-        "<NAME>": {"verdict": "correct" | "incorrect", "confidence": 0.50-1.00},
-        "<OPPONENT_NAME>": {"verdict": "correct" | "incorrect", "confidence": 0.50-1.00}
-      }
-      ```
+      Now give your final decision as a JSON object, the very last thing in your
+      response:
+
+      {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
 
       Requirements:
-      - Both can be "correct", both "incorrect", or one of each
-      - Confidence must be between 0.50 and 1.00 inclusive
-      - Use exact names shown above
-      - Verdict must be exactly "correct" or "incorrect" (lowercase)
+      - "<NAME>" (the Proposer) wins iff their program is correct — it would
+        pass the hidden test cases; "<OPPONENT_NAME>" (the Critic) wins iff it
+        is wrong.
+      - confidence is your probability that the named winner is on the correct
+        side, between 0.50 and 1.00.
+      - If the Critic raised a substantive objection you could neither confirm
+        nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.

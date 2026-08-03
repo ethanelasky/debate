@@ -169,51 +169,65 @@ def test_validate_passes_for_codecontests_pc(topology):
     validate_prompts(cc, topology, fresh_positions=False)
 
 
-def test_codecontests_pc_is_collaborative_not_forced_disagree():
-    """The ported entry is the old repo's COLLABORATIVE proposer-critic review:
-    the critic picks a genuine stance and the judge rules on each participant."""
+def test_codecontests_pc_is_forced_disagree_with_old_pack_methodology():
+    """Competitive forced-disagree format (Ethan, 2026-08-03), carrying the old
+    code-review pack's two-phase tracing methodology but none of its
+    collaborative stance machinery."""
     cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
     critique = slot_template(cc, "critique", "bob")
-    assert "You are free to AGREE or DISAGREE based on the merits" in critique
+    assert "You are FORCED to disagree" in critique
     assert "PHASE 1 — PLAN YOUR TEST INPUTS" in critique
     assert "PHASE 2 — TRACE EACH INPUT" in critique
-    assert '{"stance": "AGREE"}' in critique and '{"stance": "DISAGREE"}' in critique
-    assert "FORCED" not in critique  # the math pack's forced-disagree card
+    assert "CRITICAL — you are FORCED to disagree" in cc.system["bob"]
+    assert "NEVER concede that the Proposer is right" in cc.system["bob"]
+    # no collaborative machinery anywhere in the pack
+    whole = "\n".join(list(cc.system.values()) + [slot_template(cc, s, "judge") for s in cc.slots])
+    for banned in ("AGREE", "DISAGREE", "COLLABORATIVE", "both can win", '"stance"'):
+        assert banned not in whole, banned
     # correctness-only: TLE/complexity arguments are out of scope for everyone
     for speaker in ("alice", "bob"):
         assert "Do NOT argue about time complexity" in cc.system[speaker]
-    assert "Ignore efficiency, style, and performance" in slot_template(cc, "deliberation", "judge")
+    assert "Ignore efficiency, style, and performance" in cc.system["judge"]
+    assert "Time complexity, efficiency, or performance arguments" in cc.system["judge"]
 
 
-def test_codecontests_verdict_slot_matches_collaborative_parser():
-    """Per-participant verdicts, in the exact shape judge.py expects."""
-    from infra.envs.debate.judge import SeatVerdict, parse_verdict, verdict_from_slot
-    from infra.envs.debate.judge import JudgeConfig
+def test_codecontests_verdict_slot_matches_competitive_parser():
+    """Single winner-JSON verdict — the competitive default, same schema text
+    as the math pack, so no judge_config override is needed."""
+    from infra.envs.debate.judge import JudgeConfig, SeatVerdict, parse_verdict, verdict_from_slot
 
     cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    math = load_prompt_library(MATH_YAML, "math_proposer_critic")
     seats = ["Debater_A", "Debater_B"]
     tmpl = render(
         slot_template(cc, "verdict", "judge"),
         {"NAME": seats[0], "OPPONENT_NAME": seats[1]},
         cc.vars,
     )
-    assert f'"{seats[0]}": {{"verdict": "correct" | "incorrect"' in tmpl
-    # the schema line itself is not valid JSON, so nothing parses off the example
-    assert parse_verdict(tmpl, "collaborative", seats) is None
-    filled = (
-        'Now provide your final decision as the judge as a JSON verdict object:\n'
-        '```json\n'
-        '{\n'
-        f'  "{seats[0]}": {{"verdict": "correct", "confidence": 0.80}},\n'
-        f'  "{seats[1]}": {{"verdict": "incorrect", "confidence": 0.70}}\n'
-        '}\n'
-        '```'
+    schema_line = '{"winner": "Debater_A" | "Debater_B", "confidence": 0.50-1.00}'
+    assert schema_line in tmpl
+    # schema text is character-identical to math's, and the alternation line is
+    # not valid JSON, so nothing parses off the example
+    assert schema_line in render(
+        slot_template(math, "verdict", "judge"),
+        {"NAME": seats[0], "OPPONENT_NAME": seats[1]},
+        math.vars,
     )
-    v = verdict_from_slot(filled, None, None, JudgeConfig(schema_name="collaborative"), seats)
-    assert v.ok
+    # the Tie example in the template is itself valid JSON (inherited from
+    # math), so a judge echoing the template must be read from its LAST object
+    assert parse_verdict(tmpl + '\n{"winner": "Debater_A", "confidence": 0.9}', "competitive", seats) == {
+        "winner": "Debater_A",
+        "confidence": 0.9,
+    }
+    filled = 'The Proposer is right.\n{"winner": "Debater_A", "confidence": 0.80}'
+    v = verdict_from_slot(filled, None, None, JudgeConfig(), seats)  # competitive default
+    assert v.ok and v.winner == seats[0]
     assert v.seats == {seats[0]: SeatVerdict.CORRECT, seats[1]: SeatVerdict.INCORRECT}
-    # competitive (the default) cannot read it — hence the header warning
-    assert parse_verdict(filled, "competitive", seats) is None
+    # the Tie rule the pack documents
+    tie = verdict_from_slot('{"winner": "Tie", "confidence": 0.5}', None, None, JudgeConfig(), seats)
+    assert tie.ok and tie.winner is None
+    # the old collaborative parser cannot read it — the pack is no longer collaborative
+    assert parse_verdict(filled, "collaborative", seats) is None
 
 
 def test_validate_fails_on_missing_slot_template(lib, topology):
