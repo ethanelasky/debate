@@ -138,6 +138,53 @@ def test_validate_passes_for_codecontests_pc(topology):
     validate_prompts(cc, topology, fresh_positions=False)
 
 
+def test_codecontests_pc_is_collaborative_not_forced_disagree():
+    """The ported entry is the old repo's COLLABORATIVE proposer-critic review:
+    the critic picks a genuine stance and the judge rules on each participant."""
+    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    critique = slot_template(cc, "critique", "bob")
+    assert "You are free to AGREE or DISAGREE based on the merits" in critique
+    assert "PHASE 1 — PLAN YOUR TEST INPUTS" in critique
+    assert "PHASE 2 — TRACE EACH INPUT" in critique
+    assert '{"stance": "AGREE"}' in critique and '{"stance": "DISAGREE"}' in critique
+    assert "FORCED" not in critique  # the math pack's forced-disagree card
+    # correctness-only: TLE/complexity arguments are out of scope for everyone
+    for speaker in ("alice", "bob"):
+        assert "Do NOT argue about time complexity" in cc.system[speaker]
+    assert "Ignore efficiency, style, and performance" in slot_template(cc, "deliberation", "judge")
+
+
+def test_codecontests_verdict_slot_matches_collaborative_parser():
+    """Per-participant verdicts, in the exact shape judge.py expects."""
+    from infra.envs.debate.judge import SeatVerdict, parse_verdict, verdict_from_slot
+    from infra.envs.debate.judge import JudgeConfig
+
+    cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
+    seats = ["Debater_A", "Debater_B"]
+    tmpl = render(
+        slot_template(cc, "verdict", "judge"),
+        {"NAME": seats[0], "OPPONENT_NAME": seats[1]},
+        cc.vars,
+    )
+    assert f'"{seats[0]}": {{"verdict": "correct" | "incorrect"' in tmpl
+    # the schema line itself is not valid JSON, so nothing parses off the example
+    assert parse_verdict(tmpl, "collaborative", seats) is None
+    filled = (
+        'Now provide your final decision as the judge as a JSON verdict object:\n'
+        '```json\n'
+        '{\n'
+        f'  "{seats[0]}": {{"verdict": "correct", "confidence": 0.80}},\n'
+        f'  "{seats[1]}": {{"verdict": "incorrect", "confidence": 0.70}}\n'
+        '}\n'
+        '```'
+    )
+    v = verdict_from_slot(filled, None, None, JudgeConfig(schema_name="collaborative"), seats)
+    assert v.ok
+    assert v.seats == {seats[0]: SeatVerdict.CORRECT, seats[1]: SeatVerdict.INCORRECT}
+    # competitive (the default) cannot read it — hence the header warning
+    assert parse_verdict(filled, "competitive", seats) is None
+
+
 def test_validate_fails_on_missing_slot_template(lib, topology):
     lib.slots.pop("rebuttal")
     with pytest.raises(ValueError, match="rebuttal"):

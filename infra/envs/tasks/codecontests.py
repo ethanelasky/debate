@@ -30,12 +30,20 @@ from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 _MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "8"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
 
-# The last two sentences are verbatim from the old repo's shared.yaml
-# "Direct Code Generation" prompt (its only battle-tested code wording).
+# The format notes are the old repo's codecontests.yaml answer-generation
+# Notes, verbatim; the last two sentences are verbatim from its shared.yaml
+# "Direct Code Generation" prompt.
 SYSTEM_PROMPT = (
     "Solve the competitive programming problem.\n"
-    "The program reads from stdin and writes to stdout.\n"
-    "Return the complete program as exactly one ```python code block.\n"
+    "- Write a standalone Python script that reads from stdin and prints to stdout.\n"
+    "- Write your answer in ``` blocks. Example:\n"
+    "```python\n"
+    "# your code here\n"
+    "```\n"
+    "- Read input from stdin using input() or sys.stdin.\n"
+    "- Print output to stdout using print().\n"
+    "- Do NOT wrap your solution in a function or class unless the problem requires it.\n"
+    "- Import any libraries you use.\n"
     "Your goal is to write code that is consistent with the specification in "
     "order to pass the hidden test cases. Do not include functionality or "
     "error handling beyond what is described."
@@ -375,7 +383,7 @@ class CodeContestsEnv(Env):
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": row["problem"] + "\n\nAnswer with exactly one ```python code block.",
+                "content": row["problem"] + "\n\nProvide your answer:",
             },
         ]
         # meta["question"] is what DebateEnv binds as the debate TOPIC.
