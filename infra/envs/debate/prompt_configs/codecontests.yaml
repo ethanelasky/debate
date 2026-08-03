@@ -19,7 +19,10 @@
 # comment of each): the `scratchpad` slot, the `<problem><TOPIC></problem>`
 # block appended to the debater system cards, and the one-line lead-ins where a
 # dropped old-repo binding left a dangling reference. Everything else is the
-# old text, unmodified.
+# old text, unmodified — except one DELIBERATE deviation (Ethan, 2026-08-03):
+# the "competitive" qualifier is dropped from the role cards ("competitive
+# programming problem/solution" -> "programming problem/solution"), since
+# contest framing coaches recall of memorized Codeforces problems.
 #
 # Templates are block lists: children can override/append individual blocks via
 # _extends (by-index merge).
@@ -40,7 +43,7 @@ codecontests_proposer_critic:
     alice:
       # old `overall_system`
       - |-
-        <role>You are a participant in a COLLABORATIVE code review for a competitive programming problem.</role>
+        <role>You are a participant in a COLLABORATIVE code review for a programming problem.</role>
 
         <game-structure>
         - There are three players: a Proposer, a Critic, and a Judge.
@@ -68,7 +71,7 @@ codecontests_proposer_critic:
         </reasonability-principle>
       # old `debater_system`
       - |-
-        <role>You are <NAME>, participating in a COLLABORATIVE code review of a competitive programming solution.</role>
+        <role>You are <NAME>, participating in a COLLABORATIVE code review of a programming solution.</role>
 
         <instructions>
 
@@ -109,7 +112,7 @@ codecontests_proposer_critic:
     bob:
       # old `overall_system`
       - |-
-        <role>You are a participant in a COLLABORATIVE code review for a competitive programming problem.</role>
+        <role>You are a participant in a COLLABORATIVE code review for a programming problem.</role>
 
         <game-structure>
         - There are three players: a Proposer, a Critic, and a Judge.
@@ -137,7 +140,7 @@ codecontests_proposer_critic:
         </reasonability-principle>
       # old `debater_system`
       - |-
-        <role>You are <NAME>, participating in a COLLABORATIVE code review of a competitive programming solution.</role>
+        <role>You are <NAME>, participating in a COLLABORATIVE code review of a programming solution.</role>
 
         <instructions>
 

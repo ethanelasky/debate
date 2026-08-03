@@ -102,7 +102,7 @@ def test_tasks_carry_meta_and_hide_test_io(env):
 # first_speech_non_debate_aware these bytes ARE the debate proposal context.
 
 EXPECTED_SYSTEM = (
-    "Solve the competitive programming problem.\n"
+    "Solve the programming problem.\n"
     "Your goal is to write code that is consistent with the specification in "
     "order to pass the hidden test cases. Do not include functionality or "
     "error handling beyond what is described."

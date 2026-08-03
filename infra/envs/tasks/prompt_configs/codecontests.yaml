@@ -16,7 +16,13 @@
 # changes both arms together, which is the point — do not restate it there.
 # math.yaml works the same way; the two families are not treated differently.
 #
-# <PROBLEM> is substituted with the row's problem description. It is the only
+# <PROBLEM> is substituted with the row's problem description.
+#
+# DELIBERATE deviation from old-repo verbatim (Ethan, 2026-08-03): the
+# "competitive" qualifier is dropped ("competitive programming problem" ->
+# "programming problem") — CodeContests problems ARE named Codeforces
+# problems, and contest framing coaches the model toward recalling memorized
+# solutions instead of reasoning in-context. It is the only
 # placeholder the RLVR arm binds, so nothing else here may be uppercase-tagged.
 format_notes: |-
   - Write a standalone Python script that reads from stdin and prints to stdout.
@@ -29,7 +35,7 @@ format_notes: |-
   - Do NOT wrap your solution in a function or class unless the problem requires it.
   - Import any libraries you use.
 answer_gen_system: |-
-  Solve the competitive programming problem.
+  Solve the programming problem.
   Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
 answer_gen_user: |-
   Context:
