@@ -59,6 +59,7 @@ questions (a judge turn mid-debate with a `questions` slot).
 | 7 | judge blindness | judge never saw debater system cards (sequential variant split them into per-debater system blocks) | free under rule 4 — each speaker has its own system prompt by construction |
 | 8 | reward | judge-logit continuous (`MATH_Debate_Logit` arm) | `scoring: continuous`, source configurable `json`/`logit`; both logged regardless |
 | 9 | think budgets | soft/absent (first_round_think_budget machinery) | hard per-slot caps (topology above); tune per model |
+| 10 | proposal generation context | proposal generated under the debater system card (debate-aware: the proposer knows a forced critic is coming before writing a token) | `first_speech_non_debate_aware: true` (experiment config, default false): the opening solution slot's context is the task source's own messages (`Task.messages`) — byte-identical to the RLVR arm — with no debate framing. The speech still enters the transcript as a public record and its datum trains under judge reward in that solo context, so the debate and RLVR arms share one proposal distribution and differ only in reward channel. Requires fresh positions (an assigned position to defend is inherently debate-aware). The proposer's later turns keep the debate system card; their own history renders the actual solo user message, not the library's proposal cue |
 
 ## Prompts (port the run-verified wording)
 

@@ -63,6 +63,10 @@ class DebateState:
     records: list[SlotRecord] = field(default_factory=list)
     failed: Optional[str] = None         # fail reason; None = live
     meta: dict[str, Any] = field(default_factory=dict)
+    # first_speech_non_debate_aware: the task source's own messages, used
+    # verbatim as the context of the first compiled slot (no debate framing) so
+    # that speech shares the RLVR arm's prompt distribution exactly.
+    first_slot_messages: Optional[list[Message]] = None
 
     def transcript(self) -> list[dict[str, Any]]:
         return [
@@ -244,17 +248,39 @@ def visible_records(state: DebateState, current: CompiledSlot) -> list[SlotRecor
     return out
 
 
+def _solo_cue(messages: list[Message]) -> Optional[str]:
+    """The solo (non-debate) user turn that actually elicited the first speech."""
+    for m in reversed(messages):
+        if m["role"] == "user":
+            return m["content"]
+    return None
+
+
 def render_context(
     state: DebateState, current: CompiledSlot, prompts: PromptLibrary
 ) -> list[Message]:
     """Rule 4. Invariants: one system message first; strict user/assistant
-    alternation; ends on a user message (the current slot's instruction cue)."""
+    alternation; ends on a user message (the current slot's instruction cue).
+
+    Exception: with first_slot_messages set, the FIRST compiled slot is
+    generated under the task source's own messages verbatim — no debate system
+    card, no instruction cue — and the author's own history later renders that
+    solo user turn in place of the slot's cue, so what the author sees as the
+    thing it answered is what it actually answered."""
     S = current.speaker
+    solo = state.first_slot_messages
+    if solo is not None and current.index == 0:
+        return [dict(m) for m in solo]
+    solo_cue = _solo_cue(solo) if solo is not None else None
+
     msgs: list[Message] = [{"role": "system", "content": prompts.system(S, state.bindings[S])}]
     pending: list[str] = []
     for rec in visible_records(state, current):
         if rec.slot.speaker == S:
-            pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
+            if solo_cue is not None and rec.slot.index == 0:
+                pending.append(solo_cue)
+            else:
+                pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
             msgs.append({"role": "user", "content": "\n\n".join(pending)})
             pending = []
             msgs.append({"role": "assistant", "content": rec.text})

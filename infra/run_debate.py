@@ -106,6 +106,7 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         scoring=ScoringConfig(**(exp.get("scoring") or {})),
         fresh_positions=exp.get("fresh_positions", True),
         flip=exp.get("flip", False),
+        first_speech_non_debate_aware=bool(exp.get("first_speech_non_debate_aware", False)),
     )
     relaxed = bool(ds.pop("relaxed_extraction", True))
     task_source = family.source(ds)

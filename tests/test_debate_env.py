@@ -298,6 +298,87 @@ def test_format_reward_targets_solution_datum():
     assert t.reward == pytest.approx(1.125)  # mean, for logging
 
 
+def make_solo_env(topology=TOPOLOGY, fresh_positions=True):
+    return DebateEnv(
+        DebateEnvConfig(
+            topology=topology,
+            prompt_file=PROMPT_FILE,
+            prompt_entry="math_proposer_critic",
+            trained_speakers=["alice"],
+            frozen_models={
+                "bob": ScriptedModel("bob", ["Your step 2 is wrong."] * 64),
+                "judge": ScriptedModel("judge", [GOOD_VERDICT] * 8),
+            },
+            fresh_positions=fresh_positions,
+            first_speech_non_debate_aware=True,
+        ),
+        TaskSource(),
+        MathFamily(),
+    )
+
+
+def test_non_debate_aware_first_speech():
+    backend = ScriptedBackend(["I compute. \\boxed{2}", "My defense stands."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_solo_env()
+    bob = env.config.frozen_models["bob"]
+    seen = []
+    orig = bob.predict
+
+    def spy(inputs, **kw):
+        seen.append("\n".join(mi.content for mi in inputs[0]))
+        return orig(inputs, **kw)
+
+    bob.predict = spy
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+    # what the trained backend actually saw for the proposal (FakeTokenizer
+    # keeps only the prompt tail, so read the full contexts off the state)
+    assert "What is 1+1?" in backend.contexts[0]
+    from infra.envs.debate.round import render_context
+
+    state = env.last_states[0]
+    slots = TOPOLOGY.compile()
+    render = lambda cs: "\n".join(m["content"] for m in render_context(state, cs, env.prompts))
+    proposal_ctx, defense_ctx = render(slots[0]), render(slots[2])
+    assert proposal_ctx == "What is 1+1?"          # the task's own messages, verbatim
+    assert "PROPOSER" not in proposal_ctx          # no debate system card
+    assert "Debater_B" not in proposal_ctx         # opponent never mentioned
+    # the defense is debate-aware again, and renders the solo cue as the thing
+    # alice's own proposal answered
+    assert "PROPOSER" in defense_ctx
+    assert "Debater_B" in defense_ctx
+    assert "step 2 is wrong" in defense_ctx
+    assert "What is 1+1?" in defense_ctx
+    assert "\\boxed{2}" in defense_ctx
+
+    assert "\\boxed{2}" in seen[0]                 # critic still sees the speech
+    assert "2" in seen[0]                          # position binding intact
+
+    (t,) = groups[0]
+    assert len(t.datums) == 2 and all(d.prompt_len > 0 for d in t.datums)
+
+
+def test_non_debate_aware_requires_fresh_positions():
+    with pytest.raises(ValueError, match="fresh_positions"):
+        make_solo_env(fresh_positions=False)
+
+
+def test_non_debate_aware_requires_leading_solution_slot():
+    topo = Topology.parse(
+        yaml.safe_load(
+            """
+turns:
+  - bob:   [{name: critique}]
+  - alice: [{name: proposal, kind: solution}]
+  - judge: [{name: verdict, kind: decision}]
+"""
+        )
+    )
+    with pytest.raises(ValueError, match="debater solution slot"):
+        make_solo_env(topology=topo)
+
+
 def test_length_normalize_balances_seats():
     from infra.backend.base import Datum
     from infra.envs.base import Trajectory

@@ -62,6 +62,9 @@ class DebateEnvConfig:
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     fresh_positions: bool = True
     flip: bool = False                          # assigned mode only: mirrored second arm
+    # Opening solution slot generated under the task source's own messages
+    # (byte-identical to the RLVR arm) instead of the debater system card.
+    first_speech_non_debate_aware: bool = False
     verdict_retries: int = 4
 
 
@@ -93,6 +96,19 @@ class DebateEnv(Env):
             raise ValueError(f"speakers without models: {sorted(missing)}")
         if config.flip and config.fresh_positions:
             raise ValueError("flip requires assigned positions (fresh mode has no sides)")
+        if config.first_speech_non_debate_aware:
+            if not config.fresh_positions:
+                raise ValueError(
+                    "first_speech_non_debate_aware requires fresh_positions: an assigned "
+                    "position to defend is inherently debate-aware"
+                )
+            first = self.topology.compile()[0]
+            if first.slot.kind != Kind.SOLUTION or first.speaker == self.judge_speaker:
+                raise ValueError(
+                    "first_speech_non_debate_aware requires the first topology slot to be a "
+                    f"debater solution slot (got {first.speaker}/{first.slot.name} "
+                    f"kind={first.slot.kind.value})"
+                )
 
         self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
         self.prompts = RenderedPrompts(self.lib)
@@ -247,6 +263,8 @@ class DebateEnv(Env):
             "OPPONENT_POSITION": positions.get(b, "") if b else "",
         }
         state = DebateState(bindings=bindings)
+        if cfg.first_speech_non_debate_aware:
+            state.first_slot_messages = list(task.messages)
         state.meta.update({"task": task.meta, "flipped": flipped})
         return state
 

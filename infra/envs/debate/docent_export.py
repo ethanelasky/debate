@@ -95,6 +95,9 @@ def state_before(state: DebateState, rec) -> DebateState:
     """A shallow view of the state as it was before `rec` was generated."""
     clone = DebateState(bindings=state.bindings, meta=state.meta)
     clone.records = [r for r in state.records if r.slot.index < rec.slot.index]
+    # without this, exported proposer views render the debate card + library
+    # cue for a first speech actually generated solo
+    clone.first_slot_messages = state.first_slot_messages
     return clone
 
 
