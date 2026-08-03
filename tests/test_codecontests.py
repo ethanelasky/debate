@@ -96,49 +96,20 @@ def test_tasks_carry_meta_and_hide_test_io(env):
 
 # ------------------------------------------------------- generation prompts
 #
-# Pinned against the pre-YAML-move Python literal: under
+# Pinned against the OLD repo's `answer_generation_user` composition (the
+# "Context:" frame + <question> block + `judge_answer_generation_user` Notes +
+# "Provide your answer:" cue), which is the shape both arms now render. Under
 # first_speech_non_debate_aware these bytes ARE the debate proposal context.
 
-SYSTEM_BEFORE_YAML_MOVE = (
+EXPECTED_SYSTEM = (
     "Solve the competitive programming problem.\n"
-    "- Write a standalone Python script that reads from stdin and prints to stdout.\n"
-    "- Write your answer in ``` blocks. Example:\n"
-    "```python\n"
-    "# your code here\n"
-    "```\n"
-    "- Read input from stdin using input() or sys.stdin.\n"
-    "- Print output to stdout using print().\n"
-    "- Do NOT wrap your solution in a function or class unless the problem requires it.\n"
-    "- Import any libraries you use.\n"
     "Your goal is to write code that is consistent with the specification in "
     "order to pass the hidden test cases. Do not include functionality or "
     "error handling beyond what is described."
 )
 
-
-def test_default_prompts_are_byte_identical(env):
-    task = env.tasks(1, split="test")[0]
-    assert task.messages == [
-        {"role": "system", "content": SYSTEM_BEFORE_YAML_MOVE},
-        {"role": "user", "content": task.meta["question"] + "\n\nProvide your answer:"},
-    ]
-
-
-def test_prompt_file_override(tmp_path):
-    alt = tmp_path / "alt.yaml"
-    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
-    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
-    env = CodeContestsEnv(
-        path=path, test_path=path, timeout_seconds=TIMEOUT, prompt_file=str(alt)
-    )
-    task = env.tasks(1, split="test")[0]
-    assert task.messages == [
-        {"role": "system", "content": "Terse."},
-        {"role": "user", "content": "Q: " + task.meta["question"]},
-    ]
-
-
-PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING = (
+# The bullets live in the user message now, exactly as in the old pack.
+EXPECTED_USER = (
     "Context:\n"
     "\n"
     "<question>Read two integers on one line and print their sum.</question>\n"
@@ -158,6 +129,29 @@ PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING = (
 )
 
 
+def test_rlvr_prompt_matches_old_repo_composition(env):
+    task = env.tasks(1, split="test")[0]
+    assert task.meta["question"] == "Read two integers on one line and print their sum."
+    assert task.messages == [
+        {"role": "system", "content": EXPECTED_SYSTEM},
+        {"role": "user", "content": EXPECTED_USER},
+    ]
+
+
+def test_prompt_file_override(tmp_path):
+    alt = tmp_path / "alt.yaml"
+    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    env = CodeContestsEnv(
+        path=path, test_path=path, timeout_seconds=TIMEOUT, prompt_file=str(alt)
+    )
+    task = env.tasks(1, split="test")[0]
+    assert task.messages == [
+        {"role": "system", "content": "Terse."},
+        {"role": "user", "content": "Q: " + task.meta["question"]},
+    ]
+
+
 def _pc_topology():
     from infra.envs.debate.topology import Topology
 
@@ -174,15 +168,11 @@ def _pc_topology():
     )
 
 
-def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
-    """ANSWER_FORMAT_INSTRUCTION moved out of the debate yaml and is now
-    injected by DebateEnv from this family's answer-generation config. The
-    rendered proposal slot must be byte-identical to what the duplicated var
-    produced."""
+def _debate_env(env):
     from infra.envs.debate.env import DebateEnv, DebateEnvConfig
     from infra.envs.debate.judge import JudgeConfig
 
-    debate = DebateEnv(
+    return DebateEnv(
         DebateEnvConfig(
             topology=_pc_topology(),
             prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
@@ -195,35 +185,29 @@ def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
         env,
         CodeContestsFamily(),
     )
-    rendered = debate.prompts.instruction(
-        "proposal", "alice", {"TOPIC": env.test_rows[0]["problem"]}
+
+
+def test_debate_proposal_slot_equals_rlvr_user_message(env):
+    """The invariant the single-sourcing exists to guarantee: the rendered
+    debate proposal slot and the RLVR user message are the SAME composition,
+    byte for byte, for the same problem. Both are answer_gen_user; the debate
+    side just binds the problem through <TOPIC> instead of <PROBLEM>."""
+    task = env.tasks(1, split="test")[0]
+    rendered = _debate_env(env).prompts.instruction(
+        "proposal", "alice", {"TOPIC": task.meta["question"]}
     )
-    assert rendered == PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING
+    assert rendered == task.messages[1]["content"]
+    assert rendered == EXPECTED_USER
 
 
-def test_debate_raises_when_task_source_supplies_no_format_var(env, monkeypatch):
-    """No silent fallback: if the task config stops supplying
-    ANSWER_FORMAT_INSTRUCTION, DebateEnv fails at construction rather than
-    letting a run reach generation and die on an unbound placeholder."""
-    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
-    from infra.envs.debate.judge import JudgeConfig
-
-    monkeypatch.setattr(type(env.prompts), "prompt_vars", lambda self: {})
+def test_debate_raises_when_task_source_supplies_no_template(env, monkeypatch):
+    """No silent fallback: if the task config stops supplying ANSWER_GEN_USER,
+    DebateEnv fails at construction rather than letting a run reach generation
+    and die on an unbound placeholder."""
+    monkeypatch.setattr(type(env.prompts), "supplied_templates", lambda self: {})
     with pytest.raises(ValueError) as exc:
-        DebateEnv(
-            DebateEnvConfig(
-                topology=_pc_topology(),
-                prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
-                prompt_entry="codecontests_proposer_critic",
-                trained_speakers=["alice"],
-                frozen_models={"bob": object(), "judge": object()},
-                judge=JudgeConfig(schema_name="collaborative"),
-                fresh_positions=True,
-            ),
-            env,
-            CodeContestsFamily(),
-        )
-    assert "ANSWER_FORMAT_INSTRUCTION" in str(exc.value)
+        _debate_env(env)
+    assert "ANSWER_GEN_USER" in str(exc.value)
 
 
 def test_source_accepts_prompt_file_key(tmp_path):

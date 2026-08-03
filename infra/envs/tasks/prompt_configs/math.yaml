@@ -6,12 +6,13 @@
 #
 # <PROBLEM> is substituted with the row's problem text.
 #
-# Deliberately NO answer_format_instruction here. The math debate prompts ask
-# for "EXACTLY one \boxed{...}" while this asks for "\boxed{NUMBER}" — two
-# different battle-tested wordings for two different formats. The math debate
-# yaml keeps its own ANSWER_FORMAT_INSTRUCTION var and nothing is unified.
-# (codecontests is the opposite case: there the two were already verbatim
-# identical, so its config single-sources them via format_notes.)
+# This prompt is deliberately NOT shared with the math debate pack. The debate
+# prompts ask for "EXACTLY one \boxed{...}" while this asks for
+# "\boxed{NUMBER}" — two different battle-tested wordings for two different
+# formats. So hendrycks_math.yaml writes its own proposal slot and never
+# references <ANSWER_GEN_USER>, and nothing here is unified with it.
+# (codecontests is the opposite case: there the two arms were already the same
+# wording, so its config is the single source both of them render.)
 answer_gen_system: |-
   Solve the competition-level math problem.
   Return the final answer in this exact format: \boxed{NUMBER}

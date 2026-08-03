@@ -4,6 +4,8 @@ Everything here is offline: MathFamily.source() is only ever called with an
 invalid config, where reject_unknown_keys fires before any dataset loading.
 """
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -100,13 +102,15 @@ def test_math_default_prompts_are_byte_identical():
     ]
 
 
-def test_math_supplies_no_debate_format_var():
+def test_math_debate_pack_does_not_splice_the_rlvr_prompt():
     """Math is the deliberate non-unified case: its debate instruction
-    ("EXACTLY one \\boxed{...}") is different wording from its RLVR system
-    prompt, so hendrycks_math.yaml keeps its own ANSWER_FORMAT_INSTRUCTION."""
-    prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
-    assert prompts.answer_format_instruction is None
-    assert prompts.prompt_vars() == {}
+    ("EXACTLY one \\boxed{...}") is different wording from its RLVR prompt, so
+    hendrycks_math.yaml writes its own proposal slot and never references
+    <ANSWER_GEN_USER>. (codecontests is the opposite: both arms render the
+    same composition, enforced in tests/test_codecontests.py.)"""
+    pack = Path("infra/envs/debate/prompt_configs/hendrycks_math.yaml").read_text()
+    assert "<ANSWER_GEN_USER>" not in pack
+    assert "ANSWER_FORMAT_INSTRUCTION" in pack  # its own, unshared wording
 
 
 def _write_prompt_yaml(path, system="SYS", user="<PROBLEM>\n\nGo."):
@@ -135,11 +139,11 @@ def test_format_notes_substituted_into_every_field(tmp_path):
     path = tmp_path / "notes.yaml"
     path.write_text(
         "format_notes: |-\n  - be brief\nanswer_gen_system: |-\n  Do it.\n  <FORMAT_NOTES>\n"
-        "answer_gen_user: |-\n  <PROBLEM>\nanswer_format_instruction: |-\n  Notes:\n  <FORMAT_NOTES>\n"
+        "answer_gen_user: |-\n  <PROBLEM>\n\n  Notes:\n  <FORMAT_NOTES>\n"
     )
     prompts = load_generation_prompts(path)
     assert prompts.answer_gen_system == "Do it.\n- be brief"
-    assert prompts.answer_format_instruction == "Notes:\n- be brief"
+    assert prompts.answer_gen_user == "<PROBLEM>\n\nNotes:\n- be brief"
 
 
 @pytest.mark.parametrize(

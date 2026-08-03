@@ -24,16 +24,16 @@
 # Templates are block lists: children can override/append individual blocks via
 # _extends (by-index merge).
 
-# <ANSWER_FORMAT_INSTRUCTION> is NOT a var here. It is the old
-# `judge_answer_generation_user` / `answer_generation_user` Notes, which the
-# RLVR arm sends verbatim too, so it is single-sourced from
-# infra/envs/tasks/prompt_configs/codecontests.yaml (`format_notes` ->
-# `answer_format_instruction`) and injected by DebateEnv from the task source.
-# Editing the format wording means editing that file, not this one.
+# The proposal slot's text is NOT written here. It is the old
+# `answer_generation_user` composition, which the RLVR arm sends verbatim too,
+# so it is single-sourced from infra/envs/tasks/prompt_configs/codecontests.yaml
+# and spliced in by DebateEnv wherever this pack writes <ANSWER_GEN_USER>.
+# Both arms then render the same bytes. Edit the wording THERE, not here.
 #
 # The math pack is deliberately NOT single-sourced this way: its debate
 # instruction ("EXACTLY one \boxed{...}") differs from its RLVR system prompt
-# ("\boxed{NUMBER}") on purpose, so hendrycks_math.yaml keeps its own var.
+# ("\boxed{NUMBER}") on purpose, so hendrycks_math.yaml writes its own
+# proposal slot and never references <ANSWER_GEN_USER>.
 _codecontests_base: {}
 
 codecontests_proposer_critic:
@@ -216,16 +216,13 @@ codecontests_proposer_critic:
       next contribution: work through the algorithm, trace the disputed code on
       concrete inputs, and decide what to argue. Notes only; do not address the
       judge or opponent.
-    # old `answer_generation_user` frame + `judge_answer_generation_user` Notes
-    # (in ANSWER_FORMAT_INSTRUCTION). The old <background>/<grading_criteria>
-    # sections are dropped: this repo binds the whole problem as <TOPIC> and
-    # never shows debaters the test cases.
-    proposal: |-
-      Context:
-
-      <question><TOPIC></question>
-
-      <ANSWER_FORMAT_INSTRUCTION>
+    # The old `answer_generation_user` composition — "Context:" frame,
+    # <question> block, `judge_answer_generation_user` Notes, "Provide your
+    # answer:" — spliced in whole from the task family's answer-generation
+    # config, which is where it now lives (see the header). This makes the
+    # rendered proposal slot byte-identical to the RLVR arm's user message for
+    # the same problem, so the two arms cannot drift apart.
+    proposal: <ANSWER_GEN_USER>
     # old `pre_opening_speech_critic_collaborative`
     critique: |-
       <role>You are <NAME>, a code debater reviewing a programming solution.</role>

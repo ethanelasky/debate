@@ -1,18 +1,22 @@
-# CodeContests answer-generation prompts. `format_notes` is the old repo's
-# codecontests.yaml answer-generation Notes, verbatim; the last two sentences
-# of answer_gen_system are verbatim from its shared.yaml "Direct Code
-# Generation" prompt. This wording is load-bearing beyond the RLVR arm: under
-# first_speech_non_debate_aware the resulting Task.messages IS the debate
-# proposal context, byte-identical to the RLVR prompt. Relocate, do not reword.
+# CodeContests answer-generation prompts, reproducing the OLD repo's
+# codecontests.yaml `answer_generation_user` composition: the "Context:" frame,
+# the <question> block, the Notes (from `judge_answer_generation_user`,
+# verbatim), and the "Provide your answer:" cue. The old
+# <background>/<grading_criteria> sections are dropped: this repo binds the
+# whole problem as the question and never shows debaters the test cases. The
+# two sentences closing answer_gen_system are verbatim from the old repo's
+# shared.yaml "Direct Code Generation" prompt.
 #
-# THIS FILE IS THE SINGLE SOURCE for the codecontests format wording. The RLVR
-# arm and the debate arm both used the same Notes verbatim, so the block lives
-# here once as `format_notes` and is substituted into every field below
-# wherever <FORMAT_NOTES> appears. `answer_format_instruction` is injected by
-# DebateEnv as the ANSWER_FORMAT_INSTRUCTION prompt var, which is why
-# infra/envs/debate/prompt_configs/codecontests.yaml no longer restates it.
+# THIS FILE IS THE SINGLE SOURCE for the codecontests answer prompt, for BOTH
+# arms. The RLVR user message and the debate proposal slot are the SAME
+# composition rendered byte-for-byte identically: DebateEnv splices
+# answer_gen_user into the proposal slot wherever
+# infra/envs/debate/prompt_configs/codecontests.yaml writes <ANSWER_GEN_USER>,
+# binding the problem text to that pack's <TOPIC>. Editing the wording here
+# changes both arms together, which is the point — do not restate it there.
 #
-# <PROBLEM> is substituted with the row's problem description.
+# <PROBLEM> is substituted with the row's problem description. It is the only
+# placeholder the RLVR arm binds, so nothing else here may be uppercase-tagged.
 format_notes: |-
   - Write a standalone Python script that reads from stdin and prints to stdout.
   - Write your answer in ``` blocks. Example:
@@ -25,13 +29,12 @@ format_notes: |-
   - Import any libraries you use.
 answer_gen_system: |-
   Solve the competitive programming problem.
-  <FORMAT_NOTES>
   Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
 answer_gen_user: |-
-  <PROBLEM>
+  Context:
 
-  Provide your answer:
-answer_format_instruction: |-
+  <question><PROBLEM></question>
+
   Notes:
   <FORMAT_NOTES>
 

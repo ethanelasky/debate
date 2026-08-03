@@ -42,10 +42,19 @@ from infra.envs.debate.round import (
     SlotRecord,
 )
 from infra.envs.debate.topology import Kind, Topology, Visibility
-from infra.envs.task_prompts import TASK_SUPPLIED_VARS
+from infra.envs.task_prompts import PROBLEM_PLACEHOLDER, TASK_SUPPLIED_TEMPLATES
 from infra.models.base import Model
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
+
+
+def _splice(template: str, subs: dict[str, str]) -> str:
+    """Replace <NAME> with task-supplied template text. Unlike render(), the
+    result is still a template: what gets spliced in carries its own
+    placeholders, to be bound in the normal render pass."""
+    for name, text in subs.items():
+        template = template.replace(f"<{name}>", text)
+    return template
 
 
 @dataclass
@@ -119,36 +128,59 @@ class DebateEnv(Env):
                 )
 
         self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
-        self._inject_task_prompt_vars()
+        self._inject_task_prompt_templates()
         self.prompts = RenderedPrompts(self.lib)
         validate_prompts(self.lib, self.topology, fresh_positions=config.fresh_positions)
         self.shaping = build_shaping(config.scoring.shaping)
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
-    def _inject_task_prompt_vars(self) -> None:
-        """Let the task's answer-generation config supply prompt vars, so a
-        debate yaml can reference format wording the RLVR arm already owns
-        instead of restating it (codecontests: ANSWER_FORMAT_INSTRUCTION is the
-        same Notes block verbatim). A var set explicitly in the yaml wins —
-        math does exactly that, since its debate format instruction ("EXACTLY
-        one \\boxed{...}") is deliberately NOT the RLVR wording."""
-        supplied = getattr(self.task_source, "prompts", None)
-        if supplied is not None:
-            self.lib.vars = {**supplied.prompt_vars(), **self.lib.vars}
+    def _inject_task_prompt_templates(self) -> None:
+        """Splice the task's answer-generation prompt into any slot that asks
+        for it by <ANSWER_GEN_USER>, so the debate proposal IS the RLVR user
+        message rather than a re-typed copy that can drift from it.
 
-        used = {
+        This is a template-level splice, not a var substitution: the spliced
+        text still carries placeholders (the task config's <PROBLEM> is rebound
+        to this layer's <TOPIC>), and render() makes a single pass that never
+        re-scans substituted text, so the wording has to be part of the
+        template before rendering starts.
+
+        Math is deliberately NOT spliced: its debate format instruction
+        ("EXACTLY one \\boxed{...}") is different wording from its RLVR prompt
+        ("\\boxed{NUMBER}"), so hendrycks_math.yaml writes its own proposal
+        slot and never references <ANSWER_GEN_USER>."""
+        supplied = getattr(self.task_source, "prompts", None)
+        available = supplied.supplied_templates() if supplied is not None else {}
+        available = {
+            k: v.replace(PROBLEM_PLACEHOLDER, "<TOPIC>") for k, v in available.items()
+        }
+
+        requested = {
             m.group(1)
             for tmpl in self._all_templates()
             for m in PLACEHOLDER.finditer(tmpl)
-        }
-        unsupplied = sorted(set(TASK_SUPPLIED_VARS) & used - set(self.lib.vars))
-        if unsupplied:
+        } & set(TASK_SUPPLIED_TEMPLATES)
+        missing = sorted(requested - set(available))
+        if missing:
             raise ValueError(
-                f"prompt entry {self.config.prompt_entry!r} references {unsupplied}, which the "
-                f"task source must supply, but {type(self.task_source).__name__} provided no such "
-                "var. Set it in the task family's answer-generation config "
-                "(infra/envs/tasks/prompt_configs/<family>.yaml) or as a var in the debate yaml."
+                f"prompt entry {self.config.prompt_entry!r} references {missing}, which the task "
+                f"source must supply, but {type(self.task_source).__name__} supplied "
+                f"{sorted(available) or 'nothing'}. These come from the task family's "
+                "answer-generation config (infra/envs/tasks/prompt_configs/<family>.yaml)."
             )
+        if not requested:
+            return
+
+        subs = {k: available[k] for k in requested}
+        self.lib.system = {s: _splice(t, subs) for s, t in self.lib.system.items()}
+        self.lib.slots = {
+            name: (
+                {sp: _splice(t, subs) for sp, t in entry.items()}
+                if isinstance(entry, dict)
+                else _splice(entry, subs)
+            )
+            for name, entry in self.lib.slots.items()
+        }
 
     def _all_templates(self):
         for tmpl in self.lib.system.values():

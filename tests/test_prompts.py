@@ -141,11 +141,11 @@ def test_validate_passes_for_codecontests_pc(topology):
     cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
     assert set(cc.system) == {"alice", "bob", "judge"}
     assert set(cc.slots) == set(load_prompt_library(MATH_YAML, "math_proposer_critic").slots)
-    # ANSWER_FORMAT_INSTRUCTION is single-sourced from the task family's
-    # answer-generation config (the RLVR arm sends the same Notes verbatim) and
-    # injected by DebateEnv, so the debate yaml must NOT restate it.
-    assert "ANSWER_FORMAT_INSTRUCTION" not in cc.vars
-    assert "```python" in task_prompts("codecontests.yaml").answer_format_instruction
+    # The proposal slot is single-sourced from the task family's
+    # answer-generation config (the RLVR arm sends the same composition) and is
+    # spliced in by DebateEnv, so the debate yaml must NOT restate the wording.
+    assert slot_template(cc, "proposal", "alice").strip() == "<ANSWER_GEN_USER>"
+    assert "```python" in task_prompts("codecontests.yaml").answer_gen_user
     validate_prompts(cc, topology, fresh_positions=True)
     validate_prompts(cc, topology, fresh_positions=False)
 

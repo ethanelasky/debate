@@ -6,23 +6,22 @@ the family registry (infra.envs.tasks.__init__ imports the env modules).
 A prompt config is a flat mapping (key names follow the old repo's
 answer_generation_* naming):
 
-    format_notes              optional; the shared format block, substituted
-                              into the other fields wherever <FORMAT_NOTES>
-                              appears, so the wording exists exactly ONCE
-    answer_gen_system         required; the RLVR system card
-    answer_gen_user           required; the RLVR user turn, carrying <PROBLEM>
-    answer_format_instruction optional; the debate-side rendering of the same
-                              format wording, injected by DebateEnv as the
-                              ANSWER_FORMAT_INSTRUCTION prompt var
+    format_notes      optional; a shared block substituted into the other
+                      fields wherever <FORMAT_NOTES> appears, so wording used
+                      in more than one place exists exactly ONCE
+    answer_gen_system required; the RLVR system card
+    answer_gen_user   required; the RLVR user turn, carrying <PROBLEM>
 
 answer_gen_system/answer_gen_user are the RLVR prompt VERBATIM, and under
 first_speech_non_debate_aware they are also the debate proposal context — so
 every failure mode here is loud.
 
-Only codecontests sets answer_format_instruction. Math deliberately does NOT:
-its debate format instruction ("EXACTLY one \\boxed{...}") and its RLVR system
-prompt ("\\boxed{NUMBER}") are different battle-tested wordings for different
-formats, so the math debate yaml keeps its own var and nothing is unified.
+A debate pack may also splice answer_gen_user in as a slot template via
+<ANSWER_GEN_USER> (see supplied_templates), which makes the two arms render the
+same composition byte-for-byte. Codecontests does exactly that. Math does NOT:
+its debate format instruction ("EXACTLY one \\boxed{...}") is deliberately
+different wording from its RLVR prompt ("\\boxed{NUMBER}"), so the math debate
+pack writes its own proposal slot and nothing is unified.
 """
 
 from __future__ import annotations
@@ -39,20 +38,20 @@ PROBLEM_PLACEHOLDER = "<PROBLEM>"
 _NOTES_PLACEHOLDER = "<FORMAT_NOTES>"
 
 _REQUIRED_KEYS = {"answer_gen_system", "answer_gen_user"}
-_OPTIONAL_KEYS = {"format_notes", "answer_format_instruction"}
+_OPTIONAL_KEYS = {"format_notes"}
 
-# Debate prompt vars a task family can supply. A debate yaml referencing one of
-# these must get it from the task config: DebateEnv raises at construction if
-# the placeholder is used and nothing supplied it, rather than letting a run
-# reach generation and fail there.
-TASK_SUPPLIED_VARS = ("ANSWER_FORMAT_INSTRUCTION",)
+# Templates a debate pack can splice in from the task config instead of
+# restating. DebateEnv substitutes these into slot/system templates BEFORE
+# rendering (so placeholders they carry are bound normally), and raises at
+# construction if a pack references one and the task source supplied nothing —
+# no silent fallback, no failure deferred to generation time.
+TASK_SUPPLIED_TEMPLATES = ("ANSWER_GEN_USER",)
 
 
 @dataclass(frozen=True)
 class GenerationPrompts:
     answer_gen_system: str
     answer_gen_user: str
-    answer_format_instruction: Optional[str] = None
 
     def messages(self, problem: str) -> list[dict[str, str]]:
         return [
@@ -63,12 +62,11 @@ class GenerationPrompts:
             },
         ]
 
-    def prompt_vars(self) -> dict[str, str]:
-        """Debate prompt vars this task family supplies, so a debate yaml can
-        reference the wording instead of restating it."""
-        if self.answer_format_instruction is None:
-            return {}
-        return {"ANSWER_FORMAT_INSTRUCTION": self.answer_format_instruction}
+    def supplied_templates(self) -> dict[str, str]:
+        """Templates a debate pack may splice in, so its proposal slot can BE
+        this answer prompt rather than a re-typed copy of it. Still carries
+        <PROBLEM>: the caller rebinds that to its own topic placeholder."""
+        return {"ANSWER_GEN_USER": self.answer_gen_user}
 
 
 def resolve_prompt_file(path: str | Path | None, default_name: str) -> Path:
