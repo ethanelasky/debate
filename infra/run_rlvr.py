@@ -17,10 +17,16 @@ from __future__ import annotations
 
 import argparse
 
-from infra.backend.base import LossSpec, SamplingParams
+from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
-from infra.run_debate import TRAINING_KEYS, VERL_KEYS, build_backend
+from infra.run_debate import (
+    TRAINING_KEYS,
+    VERL_KEYS,
+    build_backend,
+    run_identity_suffix,
+    training_config_kwargs,
+)
 from infra.train import Config, train
 
 EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
@@ -66,7 +72,12 @@ def main() -> None:
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])
-    backend = build_backend(tr, model_path, lr_override=args.lr)
+    run_name = args.experiment + run_identity_suffix(
+        args.lr, args.levels, args.group_size, args.batch_size
+    )
+    backend = build_backend(
+        tr, model_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+    )
     if args.load:
         backend.load(args.load)
 
@@ -76,29 +87,12 @@ def main() -> None:
 
     cfg = Config(
         base_model=model_path,
-        steps=args.steps if args.steps is not None else int(tr.get("steps", 100)),
-        batch_size=(args.batch_size if args.batch_size is not None else int(tr.get("batch_size", 8))),
-        group_size=(args.group_size if args.group_size is not None else int(tr.get("group_size", 8))),
-        micro_batch=int(tr.get("micro_batch", 64)),
-        lr=float(args.lr if args.lr is not None else tr.get("lr", 1e-5)),
-        loss=LossSpec(**(tr.get("loss") or {})),
-        ppo_epochs=int(tr.get("ppo_epochs", 1)),
-        adv_length_norm=str(tr.get("adv_length_norm", "none")),
-        kl_coef=float(tr.get("kl_coef", 0.0)),
-        kl_discount_factor=float(tr.get("kl_discount_factor", 0.0)),
         sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
-        eval_every=int(tr.get("eval_every", 5)),
-        eval_max_tokens=(int(tr["eval_max_tokens"]) if "eval_max_tokens" in tr else None),
-        eval_n=int(tr.get("eval_n", 128)),
-        save_every=int(tr.get("save_every", 0)),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
-        run_name=args.experiment
-        + (f"-lr{args.lr:g}" if args.lr is not None else "")
-        + (f"-L{args.levels}" if args.levels is not None else "")
-        + (f"-g{args.group_size}" if args.group_size is not None else "")
-        + (f"-b{args.batch_size}" if args.batch_size is not None else ""),
+        run_name=run_name,
+        **training_config_kwargs(tr, args),
     )
     train(env, backend, cfg)
 

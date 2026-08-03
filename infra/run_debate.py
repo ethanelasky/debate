@@ -28,6 +28,7 @@ optimization/loop knobs only):
 from __future__ import annotations
 
 import argparse
+import os
 
 from infra.backend.base import LossSpec, SamplingParams
 from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
@@ -63,6 +64,39 @@ TRAINING_KEYS = {
     "save_every",
     "wandb_project",
 }
+
+# training-block keys that map 1:1 onto Config fields, with their YAML casts.
+# Values pass through ONLY when the YAML sets them; everything absent falls to
+# Config's dataclass defaults — the single source of truth. No fallback
+# literals at the call sites: a default lives in exactly one place.
+CONFIG_CASTS: tuple[tuple[str, type], ...] = (
+    ("steps", int),
+    ("batch_size", int),
+    ("group_size", int),
+    ("micro_batch", int),
+    ("lr", float),
+    ("ppo_epochs", int),
+    ("adv_length_norm", str),
+    ("kl_coef", float),
+    ("kl_discount_factor", float),
+    ("eval_every", int),
+    ("eval_max_tokens", int),
+    ("eval_n", int),
+    ("save_every", int),
+)
+
+
+def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
+    """training block + CLI sweep overrides -> Config kwargs, present keys only.
+    Shared by the debate and RLVR runners."""
+    kw: dict = {k: cast(tr[k]) for k, cast in CONFIG_CASTS if tr.get(k) is not None}
+    if tr.get("loss"):
+        kw["loss"] = LossSpec(**tr["loss"])
+    for k in ("steps", "batch_size", "group_size", "lr"):
+        if getattr(args, k) is not None:
+            kw[k] = getattr(args, k)
+    return kw
+
 
 # training.verl — read only in build_backend.
 VERL_KEYS = {
@@ -187,34 +221,140 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     return DebateEnv(config, task_source, family, relaxed_extraction=relaxed)
 
 
-def build_backend(tr: dict, model_path: str, lr_override: float | None = None):
-    """training block -> Backend. Shared by the debate and RLVR runners."""
+def run_identity_suffix(
+    lr: float | None,
+    levels: str | None,
+    group_size: int | None,
+    batch_size: int | None,
+) -> str:
+    """The `-lr…-L…-g…-b…` tail that distinguishes sweep arms of one experiment.
+
+    ONE definition, used for both the wandb run name and the checkpoint
+    namespace. Split them and two arms of an lr sweep get distinct wandb runs
+    but the same checkpoint directory, which is exactly the clobbering the
+    namespacing exists to prevent. Changing the format here changes existing
+    wandb run names too — leave it alone unless you mean to break that history.
+    """
+    return (
+        (f"-lr{lr:g}" if lr is not None else "")
+        + (f"-L{levels}" if levels is not None else "")
+        + (f"-g{group_size}" if group_size is not None else "")
+        + (f"-b{batch_size}" if batch_size is not None else "")
+    )
+
+
+def check_legacy_checkpoint_layout(root: str, namespaced: str) -> None:
+    """Refuse to run when `root` holds pre-namespacing checkpoints.
+
+    Checkpoints used to be written straight into training.verl.checkpoint_dir
+    with no experiment in the name, so two arms sharing a volume overwrote each
+    other's `final`. Now every run writes under <root>/<run name>. Leftovers
+    from the old layout are ambiguous — we cannot tell which arm produced them —
+    and leaving them where nothing will ever read them again both strands that
+    work and leaves the next arm free to overwrite it. Fail instead.
+    """
+    if not os.path.isdir(root):
+        return
+    stale = sorted(
+        e for e in os.listdir(root) if e == "final" or e.startswith("step-")
+    )
+    if not stale:
+        return
+    raise RuntimeError(
+        f"{root} contains checkpoints from the pre-namespacing layout: "
+        f"{', '.join(stale[:5])}{' ...' if len(stale) > 5 else ''}. "
+        "Checkpoints are now written per run, so these would be orphaned where "
+        "nothing reads them and a later arm could overwrite them. Move them "
+        f"into the run subdirectory they belong to (e.g. {namespaced}) or point "
+        "training.verl.checkpoint_dir somewhere else, then rerun."
+    )
+
+
+def check_fresh_run_over_existing_checkpoints(namespaced: str, load_given: bool) -> None:
+    """Refuse to start from scratch on top of a previous attempt's checkpoints.
+
+    There is no auto-resume: resume happens only when the operator passes
+    --load <path>. So the natural crash-recovery instinct — rerun the same
+    command — would train from step 0 and overwrite step-00025, step-00050,
+    final one at a time, leaving a directory whose entries come from two
+    different lineages and which no later --load can disambiguate. With --load
+    the operator has named a checkpoint deliberately, so overwrites are a
+    choice and this guard stands down.
+    """
+    if load_given or not os.path.isdir(namespaced):
+        return
+    existing = sorted(
+        e for e in os.listdir(namespaced) if e == "final" or e.startswith("step-")
+    )
+    if not existing:
+        return
+    raise RuntimeError(
+        f"{namespaced} already holds checkpoints from an earlier attempt: "
+        f"{', '.join(existing[:5])}{' ...' if len(existing) > 5 else ''}. "
+        "Starting fresh here would overwrite them one step at a time and mix "
+        "two lineages in one directory. Either pass --load <path> to continue "
+        "deliberately from an explicit checkpoint, or move/delete that "
+        "directory first, then rerun."
+    )
+
+
+def build_backend(
+    tr: dict,
+    model_path: str,
+    run_name: str,
+    lr_override: float | None = None,
+    load_given: bool = False,
+):
+    """training block -> Backend. Shared by the debate and RLVR runners.
+
+    `run_name` (experiment + sweep suffix) namespaces the checkpoint directory:
+    a shared network volume would otherwise have a 2-step smoke run's `final`
+    clobber a 100-step run's, and two arms of one sweep clobber each other's.
+    `load_given` says whether the operator passed --load, which is the only
+    form of resume there is; see check_fresh_run_over_existing_checkpoints.
+
+    Same only-if-present rule as training_config_kwargs: knobs the YAML omits
+    fall to the backend config's own dataclass defaults.
+    """
     backend_kind = str(tr.get("backend", "tinker"))
     if backend_kind == "tinker":
         from infra.backend.tinker import TinkerBackend
 
-        return TinkerBackend(model_path, lora_rank=int(tr.get("lora_rank", 32)))
+        # Tinker checkpoints live service-side under the run, not in a local
+        # directory, so there is nothing here to namespace.
+        kw = {"lora_rank": int(tr["lora_rank"])} if tr.get("lora_rank") is not None else {}
+        return TinkerBackend(model_path, **kw)
     if backend_kind == "verl":
         from infra.backend.verl import VerlBackend, VerlBackendConfig
 
         v = dict(tr.get("verl") or {})
+        ckpt_root = str(v.get("checkpoint_dir", VerlBackendConfig.checkpoint_dir))
+        ckpt_dir = os.path.join(ckpt_root, run_name)
+        check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
+        check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
+        verl_casts: tuple[tuple[str, type], ...] = (
+            ("n_gpus", int),
+            ("strategy", str),
+            ("gpu_memory_utilization", float),
+            ("prompt_length", int),
+            ("response_length", int),
+            ("max_token_len_per_gpu", int),
+            ("rollout_tp", int),
+            ("use_remove_padding", bool),
+        )
+        vkw: dict = {k: cast(v[k]) for k, cast in verl_casts if v.get(k) is not None}
+        if tr.get("lora_rank") is not None:
+            vkw["lora_rank"] = int(tr["lora_rank"])
+        if lr_override is not None:
+            vkw["lr"] = float(lr_override)
+        elif tr.get("lr") is not None:
+            vkw["lr"] = float(tr["lr"])
+        if tr.get("loss"):
+            vkw["loss"] = LossSpec(**tr["loss"])
+        if v.get("extra_overrides"):
+            vkw["extra_overrides"] = tuple(v["extra_overrides"])
         return VerlBackend(
-            VerlBackendConfig(
-                model_path=model_path,
-                n_gpus=int(v.get("n_gpus", 1)),
-                strategy=str(v.get("strategy", "fsdp2")),
-                gpu_memory_utilization=float(v.get("gpu_memory_utilization", 0.6)),
-                prompt_length=int(v.get("prompt_length", 4096)),
-                response_length=int(v.get("response_length", 2048)),
-                max_token_len_per_gpu=int(v.get("max_token_len_per_gpu", 16384)),
-                rollout_tp=int(v.get("rollout_tp", 1)),
-                use_remove_padding=bool(v.get("use_remove_padding", True)),
-                lora_rank=int(tr.get("lora_rank", 32)),
-                lr=float(lr_override if lr_override is not None else tr.get("lr", 1e-5)),
-                loss=LossSpec(**(tr.get("loss") or {})),
-                checkpoint_dir=str(v.get("checkpoint_dir", "checkpoints/verl")),
-                extra_overrides=tuple(v.get("extra_overrides") or ()),
-            )
+            VerlBackendConfig(model_path=model_path, checkpoint_dir=ckpt_dir, **vkw)
         )
     raise ValueError(f"training.backend must be tinker|verl, got {backend_kind!r}")
 
@@ -249,23 +389,18 @@ def main() -> None:
     tr = exp.get("training") or {}
     lead = trained_settings[0]
 
-    backend = build_backend(tr, lead.model_file_path, lr_override=args.lr)
+    run_name = args.experiment + run_identity_suffix(
+        args.lr, args.levels, args.group_size, args.batch_size
+    )
+    backend = build_backend(
+        tr, lead.model_file_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+    )
     if args.load:
         backend.load(args.load)
 
     profile = resolved_sampling_profile(lead, "train")
     cfg = Config(
         base_model=lead.model_file_path,
-        steps=args.steps if args.steps is not None else int(tr.get("steps", 100)),
-        batch_size=(args.batch_size if args.batch_size is not None else int(tr.get("batch_size", 8))),
-        group_size=(args.group_size if args.group_size is not None else int(tr.get("group_size", 4))),
-        micro_batch=int(tr.get("micro_batch", 64)),
-        lr=float(args.lr if args.lr is not None else tr.get("lr", 1e-5)),
-        loss=LossSpec(**(tr.get("loss") or {})),
-        ppo_epochs=int(tr.get("ppo_epochs", 1)),
-        adv_length_norm=str(tr.get("adv_length_norm", "none")),
-        kl_coef=float(tr.get("kl_coef", 0.0)),
-        kl_discount_factor=float(tr.get("kl_discount_factor", 0.0)),
         sampling=SamplingParams(
             # no ceiling here: budgets are the topology's per-slot caps, and
             # Policy hard-errors on any generation left unbounded
@@ -273,25 +408,16 @@ def main() -> None:
             temperature=profile.temperature if profile.temperature is not None else 1.0,
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),
-        eval_every=int(tr.get("eval_every", 20)),
-        eval_max_tokens=(int(tr["eval_max_tokens"]) if "eval_max_tokens" in tr else None),
-        eval_n=int(tr.get("eval_n", 64)),
-        save_every=int(tr.get("save_every", 50)),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
-        run_name=args.experiment
-        + (f"-lr{args.lr:g}" if args.lr is not None else "")
-        + (f"-L{args.levels}" if args.levels is not None else "")
-        + (f"-g{args.group_size}" if args.group_size is not None else "")
-        + (f"-b{args.batch_size}" if args.batch_size is not None else ""),
+        run_name=run_name,
         chat_template_kwargs=(
             {"enable_thinking": bool(lead.enable_thinking)} if lead.enable_thinking is not None else None
         ),
+        **training_config_kwargs(tr, args),
     )
     # Comprehensive docent capture: every training rollout's debates -> JSONL
-    import os
-
     def _export_docent(step: int, env_) -> None:
         from infra.envs.debate.docent_export import agent_runs, export_jsonl
 

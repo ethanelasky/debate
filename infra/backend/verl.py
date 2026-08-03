@@ -43,15 +43,15 @@ from infra.backend.base import (
 @dataclass
 class VerlBackendConfig:
     model_path: str
-    n_gpus: int = 8
-    prompt_length: int = 2048
+    n_gpus: int = 1
+    prompt_length: int = 4096
     response_length: int = 2048
     gpu_memory_utilization: float = 0.6
     rollout_tp: int = 1
     strategy: str = "fsdp2"  # "fsdp" | "fsdp2" | "megatron"
     max_token_len_per_gpu: int = 16384
-    lora_rank: int = 0  # 0 = full finetune; 32 matches the Tinker backend
-    lr: float = 1e-6  # initial; overridden per optim_step call
+    lora_rank: int = 32  # matches the Tinker backend; 0 = full finetune
+    lr: float = 1e-5  # initial; overridden per optim_step call
     grad_clip: float = 1.0
     checkpoint_dir: str = "checkpoints/verl"
     loss: LossSpec = field(default_factory=LossSpec)
@@ -122,8 +122,10 @@ class VerlBackendConfig:
         lora_ckpt_override = (
             # full-state checkpoints are ~55GB for a 7B (sharded model + optim)
             # and once filled a 60GB container disk mid-save; the adapter is
-            # the only trained state, so save just it (~100-200MB)
-            ["actor_rollout_ref.actor.checkpoint.save_lora_only=True"] if self.lora_rank > 0 else []
+            # the only trained state, so save just it (~100-200MB). '+' because
+            # the key is read via checkpoint_config.get() but not declared in
+            # verl's hydra struct — the bare override is a ConfigCompositionException
+            ["+actor_rollout_ref.actor.checkpoint.save_lora_only=True"] if self.lora_rank > 0 else []
         )
         return [
             *self._strategy_overrides(),

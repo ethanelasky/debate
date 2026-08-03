@@ -16,8 +16,8 @@ from infra.rl.datums import grpo_pack
 class Config:
     base_model: str = "Qwen/Qwen3-8B"
     lora_rank: int = 32
-    steps: int = 200
-    batch_size: int = 32       # tasks per step
+    steps: int = 100
+    batch_size: int = 8        # tasks per step
     group_size: int = 8        # samples per task (GRPO group)
     micro_batch: int = 64      # datums per forward_backward call
     lr: float = 1e-5
