@@ -9,6 +9,14 @@ from infra.envs.debate.prompts import (
     validate_prompts,
 )
 from infra.envs.debate.topology import Topology
+from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
+
+
+def task_prompts(name: str):
+    """The task family's answer-generation config — the single source for
+    format wording the debate yamls no longer restate."""
+    return load_generation_prompts(resolve_prompt_file(None, name))
+
 
 MATH_YAML = "infra/envs/debate/prompt_configs/hendrycks_math.yaml"
 CODECONTESTS_YAML = "infra/envs/debate/prompt_configs/codecontests.yaml"
@@ -133,7 +141,11 @@ def test_validate_passes_for_codecontests_pc(topology):
     cc = load_prompt_library(CODECONTESTS_YAML, "codecontests_proposer_critic")
     assert set(cc.system) == {"alice", "bob", "judge"}
     assert set(cc.slots) == set(load_prompt_library(MATH_YAML, "math_proposer_critic").slots)
-    assert "```python" in cc.vars["ANSWER_FORMAT_INSTRUCTION"]
+    # ANSWER_FORMAT_INSTRUCTION is single-sourced from the task family's
+    # answer-generation config (the RLVR arm sends the same Notes verbatim) and
+    # injected by DebateEnv, so the debate yaml must NOT restate it.
+    assert "ANSWER_FORMAT_INSTRUCTION" not in cc.vars
+    assert "```python" in task_prompts("codecontests.yaml").answer_format_instruction
     validate_prompts(cc, topology, fresh_positions=True)
     validate_prompts(cc, topology, fresh_positions=False)
 

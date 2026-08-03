@@ -23,31 +23,15 @@ import time
 from typing import Any, Callable, Optional
 
 from infra.envs.base import Env, Policy, Task, Trajectory, datum_from_sample
+from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
+
+PROMPT_FILE = "codecontests.yaml"
 
 # Each verifier subprocess may use up to 4GB (RLIMIT_AS in the runner script),
 # so cap concurrency to keep total memory bounded.
 _MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "8"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
-
-# The format notes are the old repo's codecontests.yaml answer-generation
-# Notes, verbatim; the last two sentences are verbatim from its shared.yaml
-# "Direct Code Generation" prompt.
-SYSTEM_PROMPT = (
-    "Solve the competitive programming problem.\n"
-    "- Write a standalone Python script that reads from stdin and prints to stdout.\n"
-    "- Write your answer in ``` blocks. Example:\n"
-    "```python\n"
-    "# your code here\n"
-    "```\n"
-    "- Read input from stdin using input() or sys.stdin.\n"
-    "- Print output to stdout using print().\n"
-    "- Do NOT wrap your solution in a function or class unless the problem requires it.\n"
-    "- Import any libraries you use.\n"
-    "Your goal is to write code that is consistent with the specification in "
-    "order to pass the hidden test cases. Do not include functionality or "
-    "error handling beyond what is described."
-)
 
 # Descriptions containing these admit multiple valid outputs, which exact
 # output comparison would mis-grade. Ported verbatim from the old loader.
@@ -356,8 +340,10 @@ class CodeContestsEnv(Env):
         timeout_seconds: int = 90,
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
+        prompt_file: Optional[str] = None,
     ):
         self.rng = random.Random(seed)
+        self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
         self.timeout_seconds = timeout_seconds
         self.correct_reward = correct_reward
         self.format_reward = format_reward
@@ -379,18 +365,11 @@ class CodeContestsEnv(Env):
             )
 
     def _task(self, row: dict[str, Any], split: str) -> Task:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": row["problem"] + "\n\nProvide your answer:",
-            },
-        ]
         # meta["question"] is what DebateEnv binds as the debate TOPIC.
         # inputs/outputs are verifier test cases only — they are NOT public
         # examples and must never be rendered into any prompt or transcript.
         return Task(
-            messages=messages,
+            messages=self.prompts.messages(row["problem"]),
             meta={
                 "question": row["problem"],
                 "name": row["name"],
@@ -471,6 +450,7 @@ class CodeContestsFamily(TaskFamily):
                 "timeout_seconds",
                 "correct_reward",
                 "format_reward",
+                "prompt_file",
             },
             "codecontests",
         )
@@ -490,6 +470,7 @@ class CodeContestsFamily(TaskFamily):
             timeout_seconds=self.timeout_seconds,
             correct_reward=float(ds.get("correct_reward", 1.0)),
             format_reward=float(ds.get("format_reward", 0.1)),
+            prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
         )
 
     def extractor(self, relaxed: bool) -> Callable[[str], Any]:

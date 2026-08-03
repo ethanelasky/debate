@@ -37,11 +37,12 @@ def _parse_levels(spec) -> tuple[int, ...]:
 
 class MathFamily(TaskFamily):
     def source(self, ds: dict) -> Env:
-        reject_unknown_keys(ds, {"levels", "seed", "eval_subset_size"}, "math")
+        reject_unknown_keys(ds, {"levels", "seed", "eval_subset_size", "prompt_file"}, "math")
         return MathEnv(
             seed=int(ds.get("seed", 0)),
             levels=_parse_levels(ds.get("levels", 5)),
             eval_subset_size=int(ds.get("eval_subset_size", 512)),
+            prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
         )
 
     def extractor(self, relaxed: bool):

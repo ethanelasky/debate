@@ -1,0 +1,38 @@
+# CodeContests answer-generation prompts. `format_notes` is the old repo's
+# codecontests.yaml answer-generation Notes, verbatim; the last two sentences
+# of answer_gen_system are verbatim from its shared.yaml "Direct Code
+# Generation" prompt. This wording is load-bearing beyond the RLVR arm: under
+# first_speech_non_debate_aware the resulting Task.messages IS the debate
+# proposal context, byte-identical to the RLVR prompt. Relocate, do not reword.
+#
+# THIS FILE IS THE SINGLE SOURCE for the codecontests format wording. The RLVR
+# arm and the debate arm both used the same Notes verbatim, so the block lives
+# here once as `format_notes` and is substituted into every field below
+# wherever <FORMAT_NOTES> appears. `answer_format_instruction` is injected by
+# DebateEnv as the ANSWER_FORMAT_INSTRUCTION prompt var, which is why
+# infra/envs/debate/prompt_configs/codecontests.yaml no longer restates it.
+#
+# <PROBLEM> is substituted with the row's problem description.
+format_notes: |-
+  - Write a standalone Python script that reads from stdin and prints to stdout.
+  - Write your answer in ``` blocks. Example:
+  ```python
+  # your code here
+  ```
+  - Read input from stdin using input() or sys.stdin.
+  - Print output to stdout using print().
+  - Do NOT wrap your solution in a function or class unless the problem requires it.
+  - Import any libraries you use.
+answer_gen_system: |-
+  Solve the competitive programming problem.
+  <FORMAT_NOTES>
+  Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
+answer_gen_user: |-
+  <PROBLEM>
+
+  Provide your answer:
+answer_format_instruction: |-
+  Notes:
+  <FORMAT_NOTES>
+
+  Provide your answer:

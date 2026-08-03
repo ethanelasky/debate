@@ -12,6 +12,11 @@ from typing import Any, Callable, Optional
 
 from infra.config import reject_unknown_keys as _reject_unknown_keys
 from infra.envs.base import Env
+from infra.envs.task_prompts import (  # re-exported for family modules
+    GenerationPrompts,
+    load_generation_prompts,
+    resolve_prompt_file,
+)
 
 
 class TaskFamily(ABC):
@@ -46,3 +51,12 @@ class TaskFamily(ABC):
 def reject_unknown_keys(ds: dict, known: set[str], family: str) -> None:
     """Dataset-block flavour of infra.config.reject_unknown_keys."""
     _reject_unknown_keys(ds, known, f"dataset block for task family {family!r}")
+
+
+__all__ = [
+    "TaskFamily",
+    "reject_unknown_keys",
+    "GenerationPrompts",
+    "load_generation_prompts",
+    "resolve_prompt_file",
+]

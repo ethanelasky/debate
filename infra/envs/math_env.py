@@ -16,15 +16,10 @@ from infra.envs.answer_parsing import (
     parse_number,
 )
 from infra.envs.base import Env, Policy, Task, Trajectory, datum_from_sample
+from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 
 DATASET_ID = "the-jb/hendrycks-math"
-
-SYSTEM_PROMPT = (
-    "Solve the competition-level math problem.\n"
-    "Return the final answer in this exact format: \\boxed{NUMBER}\n"
-    "Do not output XML, ####, or extra prose.\n"
-    "Output only the boxed final answer."
-)
+PROMPT_FILE = "math.yaml"
 
 
 def _load(dataset_id: str = DATASET_ID):
@@ -69,8 +64,10 @@ class MathEnv(Env):
         format_reward: float = 0.1,
         relaxed_correct_bonus: float = 0.1,
         shaped_reward: float = 0.0,
+        prompt_file: str | None = None,
     ):
         self.rng = random.Random(seed)
+        self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
         self.correct_reward = correct_reward
         self.format_reward = format_reward
         self.relaxed_correct_bonus = relaxed_correct_bonus
@@ -95,12 +92,8 @@ class MathEnv(Env):
             )
 
     def _task(self, row: dict[str, Any], split: str) -> Task:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": row["problem"] + "\n\nReturn only: \\boxed{NUMBER}"},
-        ]
         return Task(
-            messages=messages,
+            messages=self.prompts.messages(row["problem"]),
             meta={"gt": row["gt"], "level": row["level"], "split": split, "question": row["problem"]},
         )
 

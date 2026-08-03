@@ -24,23 +24,17 @@
 # Templates are block lists: children can override/append individual blocks via
 # _extends (by-index merge).
 
-_codecontests_base:
-  vars:
-    # Old `judge_answer_generation_user` / `answer_generation_user` Notes,
-    # verbatim.
-    ANSWER_FORMAT_INSTRUCTION: |-
-      Notes:
-      - Write a standalone Python script that reads from stdin and prints to stdout.
-      - Write your answer in ``` blocks. Example:
-      ```python
-      # your code here
-      ```
-      - Read input from stdin using input() or sys.stdin.
-      - Print output to stdout using print().
-      - Do NOT wrap your solution in a function or class unless the problem requires it.
-      - Import any libraries you use.
-
-      Provide your answer:
+# <ANSWER_FORMAT_INSTRUCTION> is NOT a var here. It is the old
+# `judge_answer_generation_user` / `answer_generation_user` Notes, which the
+# RLVR arm sends verbatim too, so it is single-sourced from
+# infra/envs/tasks/prompt_configs/codecontests.yaml (`format_notes` ->
+# `answer_format_instruction`) and injected by DebateEnv from the task source.
+# Editing the format wording means editing that file, not this one.
+#
+# The math pack is deliberately NOT single-sourced this way: its debate
+# instruction ("EXACTLY one \boxed{...}") differs from its RLVR system prompt
+# ("\boxed{NUMBER}") on purpose, so hendrycks_math.yaml keeps its own var.
+_codecontests_base: {}
 
 codecontests_proposer_critic:
   _extends: _codecontests_base

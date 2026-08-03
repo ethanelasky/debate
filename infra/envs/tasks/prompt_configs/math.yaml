@@ -1,0 +1,23 @@
+# Hendrycks MATH answer-generation prompts. Ported from CS285 HW4 MathHardTask
+# (the same port that produced infra/envs/math_env.py), slimmed. This wording
+# is load-bearing beyond the RLVR arm: under first_speech_non_debate_aware the
+# resulting Task.messages IS the debate proposal context, byte-identical to
+# the RLVR prompt. Relocate, do not reword.
+#
+# <PROBLEM> is substituted with the row's problem text.
+#
+# Deliberately NO answer_format_instruction here. The math debate prompts ask
+# for "EXACTLY one \boxed{...}" while this asks for "\boxed{NUMBER}" — two
+# different battle-tested wordings for two different formats. The math debate
+# yaml keeps its own ANSWER_FORMAT_INSTRUCTION var and nothing is unified.
+# (codecontests is the opposite case: there the two were already verbatim
+# identical, so its config single-sources them via format_notes.)
+answer_gen_system: |-
+  Solve the competition-level math problem.
+  Return the final answer in this exact format: \boxed{NUMBER}
+  Do not output XML, ####, or extra prose.
+  Output only the boxed final answer.
+answer_gen_user: |-
+  <PROBLEM>
+
+  Return only: \boxed{NUMBER}

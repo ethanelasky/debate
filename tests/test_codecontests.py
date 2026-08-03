@@ -94,6 +94,119 @@ def test_tasks_carry_meta_and_hide_test_io(env):
     assert [t.meta["name"] for t in env.tasks(2, split="test")] == ["sum", "echo"]
 
 
+# ------------------------------------------------------- generation prompts
+#
+# Pinned against the pre-YAML-move Python literal: under
+# first_speech_non_debate_aware these bytes ARE the debate proposal context.
+
+SYSTEM_BEFORE_YAML_MOVE = (
+    "Solve the competitive programming problem.\n"
+    "- Write a standalone Python script that reads from stdin and prints to stdout.\n"
+    "- Write your answer in ``` blocks. Example:\n"
+    "```python\n"
+    "# your code here\n"
+    "```\n"
+    "- Read input from stdin using input() or sys.stdin.\n"
+    "- Print output to stdout using print().\n"
+    "- Do NOT wrap your solution in a function or class unless the problem requires it.\n"
+    "- Import any libraries you use.\n"
+    "Your goal is to write code that is consistent with the specification in "
+    "order to pass the hidden test cases. Do not include functionality or "
+    "error handling beyond what is described."
+)
+
+
+def test_default_prompts_are_byte_identical(env):
+    task = env.tasks(1, split="test")[0]
+    assert task.messages == [
+        {"role": "system", "content": SYSTEM_BEFORE_YAML_MOVE},
+        {"role": "user", "content": task.meta["question"] + "\n\nProvide your answer:"},
+    ]
+
+
+def test_prompt_file_override(tmp_path):
+    alt = tmp_path / "alt.yaml"
+    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    env = CodeContestsEnv(
+        path=path, test_path=path, timeout_seconds=TIMEOUT, prompt_file=str(alt)
+    )
+    task = env.tasks(1, split="test")[0]
+    assert task.messages == [
+        {"role": "system", "content": "Terse."},
+        {"role": "user", "content": "Q: " + task.meta["question"]},
+    ]
+
+
+PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING = (
+    "Context:\n"
+    "\n"
+    "<question>Read two integers on one line and print their sum.</question>\n"
+    "\n"
+    "Notes:\n"
+    "- Write a standalone Python script that reads from stdin and prints to stdout.\n"
+    "- Write your answer in ``` blocks. Example:\n"
+    "```python\n"
+    "# your code here\n"
+    "```\n"
+    "- Read input from stdin using input() or sys.stdin.\n"
+    "- Print output to stdout using print().\n"
+    "- Do NOT wrap your solution in a function or class unless the problem requires it.\n"
+    "- Import any libraries you use.\n"
+    "\n"
+    "Provide your answer:"
+)
+
+
+def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
+    """ANSWER_FORMAT_INSTRUCTION moved out of the debate yaml and is now
+    injected by DebateEnv from this family's answer-generation config. The
+    rendered proposal slot must be byte-identical to what the duplicated var
+    produced."""
+    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
+    from infra.envs.debate.judge import JudgeConfig
+    from infra.envs.debate.topology import Topology
+
+    topology = Topology.parse(
+        {
+            "turns": [
+                {"alice": [{"name": "proposal", "kind": "solution"}]},
+                {"bob": [{"name": "critique"}]},
+                {"alice": [{"name": "defense"}]},
+                {"bob": [{"name": "rebuttal"}]},
+                {"judge": [{"name": "verdict", "kind": "decision"}]},
+            ]
+        }
+    )
+    debate = DebateEnv(
+        DebateEnvConfig(
+            topology=topology,
+            prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
+            prompt_entry="codecontests_proposer_critic",
+            trained_speakers=["alice"],
+            frozen_models={"bob": object(), "judge": object()},
+            judge=JudgeConfig(schema_name="collaborative"),
+            fresh_positions=True,
+        ),
+        env,
+        CodeContestsFamily(),
+    )
+    rendered = debate.prompts.instruction(
+        "proposal", "alice", {"TOPIC": env.test_rows[0]["problem"]}
+    )
+    assert rendered == PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING
+
+
+def test_source_accepts_prompt_file_key(tmp_path):
+    alt = tmp_path / "alt.yaml"
+    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    env = CodeContestsFamily().source(
+        {"path": path, "test_path": path, "prompt_file": str(alt)}
+    )
+    assert env.tasks(1, split="test")[0].messages[0]["content"] == "Terse."
+
+
 # ---------------------------------------------------------------- extraction
 
 

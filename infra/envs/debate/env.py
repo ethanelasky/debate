@@ -117,10 +117,23 @@ class DebateEnv(Env):
                 )
 
         self.lib: PromptLibrary = load_prompt_library(config.prompt_file, config.prompt_entry)
+        self._inject_task_prompt_vars()
         self.prompts = RenderedPrompts(self.lib)
         validate_prompts(self.lib, self.topology, fresh_positions=config.fresh_positions)
         self.shaping = build_shaping(config.scoring.shaping)
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
+
+    def _inject_task_prompt_vars(self) -> None:
+        """Let the task's answer-generation config supply prompt vars, so a
+        debate yaml can reference format wording the RLVR arm already owns
+        instead of restating it (codecontests: ANSWER_FORMAT_INSTRUCTION is the
+        same Notes block verbatim). A var set explicitly in the yaml wins —
+        math does exactly that, since its debate format instruction ("EXACTLY
+        one \\boxed{...}") is deliberately NOT the RLVR wording."""
+        supplied = getattr(self.task_source, "prompts", None)
+        if supplied is None:
+            return
+        self.lib.vars = {**supplied.prompt_vars(), **self.lib.vars}
 
     def _find_judge_speaker(self) -> str:
         d = self.topology.decision_slot
