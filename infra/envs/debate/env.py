@@ -270,15 +270,32 @@ class DebateEnv(Env):
         }
         state = DebateState(bindings=bindings)
         if cfg.first_speech_non_debate_aware:
-            # fail loud here rather than let render_context silently fall back
-            # to the library cue in the proposer's later history (row 10)
-            if not any(m.get("role") == "user" for m in task.messages):
+            # Fail loud on malformed shapes rather than let render_context emit
+            # a non-alternating context or silently fall back to the library
+            # cue in the proposer's later history (row 10). Contract shape:
+            # optional leading system, then user/assistant alternation ending
+            # on the user message that serves as the solo cue.
+            roles = [m.get("role") for m in task.messages]
+            body = roles[1:] if roles[:1] == ["system"] else roles
+            if not body or body[-1] != "user" or any(
+                r != ("user" if i % 2 == 0 else "assistant") for i, r in enumerate(body)
+            ):
                 raise ValueError(
-                    "first_speech_non_debate_aware: task has no user message to serve as "
-                    "the solo cue; the task source must emit at least one user message"
+                    "first_speech_non_debate_aware: task messages must be an optional "
+                    "system message then user/assistant alternation ending on the user "
+                    f"message that serves as the solo cue (got roles {roles})"
                 )
             state.first_slot_messages = list(task.messages)
-        state.meta.update({"task": task.meta, "flipped": flipped})
+        # ground truth about which arm produced this debate, carried into
+        # transcripts/exports (a misspelled experiment key silently reads as
+        # False — the metadata makes that visible after the fact)
+        state.meta.update(
+            {
+                "task": task.meta,
+                "flipped": flipped,
+                "solo_first_speech": cfg.first_speech_non_debate_aware,
+            }
+        )
         return state
 
     def _verdict(self, st: DebateState) -> Optional[Verdict]:

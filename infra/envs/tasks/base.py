@@ -20,7 +20,11 @@ class TaskFamily(ABC):
         task-source Env. Doubles as the RLVR env: its rollout() carries the
         verifiable reward, its tasks() feeds DebateEnv. Task.meta must carry
         {"question": str} plus whatever grade() needs; assigned-position
-        debates additionally need {"gold", "distractor"}."""
+        debates additionally need {"gold", "distractor"}. Task.messages is the
+        RLVR prompt VERBATIM (optional system, then user/assistant alternation
+        ending on a user message — the eliciting cue); solo-context debates
+        (first_speech_non_debate_aware) render it as-is, byte-identical to the
+        RLVR arm."""
 
     @abstractmethod
     def extractor(self, relaxed: bool) -> Callable[[str], Any]:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from dataclasses import replace
 from typing import Any, Optional
 
 from docent.data_models import AgentRun, Transcript
@@ -92,13 +93,10 @@ def _speaker_view(state: DebateState, speaker: str, env) -> Optional[Transcript]
 
 
 def state_before(state: DebateState, rec) -> DebateState:
-    """A shallow view of the state as it was before `rec` was generated."""
-    clone = DebateState(bindings=state.bindings, meta=state.meta)
-    clone.records = [r for r in state.records if r.slot.index < rec.slot.index]
-    # without this, exported proposer views render the debate card + library
-    # cue for a first speech actually generated solo
-    clone.first_slot_messages = state.first_slot_messages
-    return clone
+    """A shallow view of the state as it was before `rec` was generated.
+    dataclasses.replace so every field (present and future) carries over —
+    a hand-copied clone here silently dropped first_slot_messages once."""
+    return replace(state, records=[r for r in state.records if r.slot.index < rec.slot.index])
 
 
 def _verdict_metadata(env, state: DebateState) -> dict[str, Any]:

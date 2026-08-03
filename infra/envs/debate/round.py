@@ -266,7 +266,9 @@ def render_context(
     generated under the task source's own messages verbatim — no debate system
     card, no instruction cue — and the author's own history later renders that
     solo user turn in place of the slot's cue, so what the author sees as the
-    thing it answered is what it actually answered."""
+    thing it answered is what it actually answered. This is the ONE deliberate
+    exception; if a second context exception is ever needed, convert to
+    per-slot context sources instead of adding another branch here."""
     S = current.speaker
     solo = state.first_slot_messages
     if solo is not None and current.index == 0:
