@@ -30,11 +30,15 @@ from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 _MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "8"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
 
+# The last two sentences are verbatim from the old repo's shared.yaml
+# "Direct Code Generation" prompt (its only battle-tested code wording).
 SYSTEM_PROMPT = (
     "Solve the competitive programming problem.\n"
     "The program reads from stdin and writes to stdout.\n"
     "Return the complete program as exactly one ```python code block.\n"
-    "Output only that code block."
+    "Your goal is to write code that is consistent with the specification in "
+    "order to pass the hidden test cases. Do not include functionality or "
+    "error handling beyond what is described."
 )
 
 # Descriptions containing these admit multiple valid outputs, which exact

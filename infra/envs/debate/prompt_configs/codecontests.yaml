@@ -1,11 +1,14 @@
 # DRAFT — NOT battle-tested. Newly authored for the rebuild by adapting
 # hendrycks_math.yaml's battle-tested proposer-critic wording to the code
-# domain: there was no CodeContests debate prompt in the old repo to port, so
-# the skeleton (forced-disagree critic card, answer-vs-reasoning rule, grading
-# rule, the judge's critic-bias / standard-of-proof / verify blocks, and the
-# verdict JSON schema) is kept verbatim from the math config and only the
-# domain nouns changed. REQUIRES Ethan's review/approval before any training or
-# eval run uses it.
+# domain: the old repo has NO code-domain PC debate prompts (verified twice —
+# its only code prompts are shared.yaml's direct-generation/self-judge set,
+# BigCodeBench-flavored starter-code completion, wrong format for stdin/stdout
+# CodeContests). The PC skeleton (forced-disagree critic card,
+# answer-vs-reasoning rule, the judge's critic-bias / standard-of-proof /
+# verify blocks, verdict JSON schema) is verbatim from the math config with
+# only domain nouns changed; the grading-rule's last two sentences are
+# verbatim from the old repo's shared.yaml "Direct Code Generation" prompt.
+# REQUIRES Ethan's review/approval before any training or eval run uses it.
 #
 # Templates are block lists: children can override/append individual blocks via
 # _extends (by-index merge).
@@ -38,8 +41,10 @@ codecontests_proposer_critic:
         </answer-vs-reasoning>
       - |-
         <grading-rule>
-        Your submission is graded strictly by running it against hidden test
-        cases: only the final ```python code block counts.
+        Your submission is graded strictly: only the final ```python code block
+        counts. Your goal is to write code that is consistent with the
+        specification in order to pass the hidden test cases. Do not include
+        functionality or error handling beyond what is described.
         </grading-rule>
       - |-
         <problem><TOPIC></problem>
