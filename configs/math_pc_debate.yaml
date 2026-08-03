@@ -23,7 +23,6 @@ _base_math_pc:
         model_type: tinker
         model_file_path: Qwen/Qwen3.5-4B
         alias: proposer-alice
-        lora_rank: 32
         enable_thinking: true
         sampling: {train: {temperature: 1.0, top_p: 1.0}}
     bob:
@@ -52,9 +51,13 @@ _base_math_pc:
       # +0.1 on the proposal DATUM (not the whole trajectory) when the answer
       # was strictly \boxed — trajectory-specific reward via per-datum GRPO.
       - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
-  dataset: {levels: [1, 2], relaxed_extraction: true, seed: 0}
+  # L3-4: the contested band for a 4B (L1-2 ran 71-88% correct -> debates
+  # uncontested; L5-only sits near the always-wrong floor at this scale, the
+  # old repo's own warning). L5 arm below for harder runs / the 9B.
+  dataset: {type: math, levels: "3-4", relaxed_extraction: true, seed: 0}
   training:
     wandb_project: debate-rebuild
+    lora_rank: 32   # the SHARED adapter's rank (one adapter across all trained seats)
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}   # GRPO = this + group-normalized advantages
     ppo_epochs: 1
     # equal gradient mass per (seat, debate): a seat with more slots or bigger
@@ -66,8 +69,9 @@ _base_math_pc:
     lr: 1.0e-5
     kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
     kl_discount_factor: 0.0
-    eval_every: 20
+    eval_every: 5      # RLVR eval: greedy MathEnv accuracy on the held-out test split
     eval_n: 32
+    eval_max_tokens: 3072
     save_every: 50
 
 # 2-step live verification arm: tiny sizes, no eval/save.
@@ -109,3 +113,12 @@ math_pc_gspo:
     loss: {kind: gspo, clip_low: 0.9997, clip_high: 1.0004}
     # gspo is already one loss term per sequence; seat balance = count only
     adv_length_norm: count
+
+# MATH level-5 only: bigger proposal budgets (L5 derivations truncate at 3072).
+# Expect low proposal accuracy on a 4B; intended for the 9B or curriculum end.
+math_pc_l5:
+  _extends: _base_math_pc
+  topology:
+    turns:
+      - alice: [{name: proposal, kind: solution, max_think_tokens: 2048, max_total_tokens: 6144}]
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}

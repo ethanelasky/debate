@@ -120,19 +120,24 @@ class Topology:
             if d.index != slots[-1].index:
                 raise ValueError("the decision slot must be the last slot in flat order")
 
-        # One solution slot per speaker, and it must be that speaker's FIRST
-        # slot — fresh-answer binding must exist before any later own prompt.
-        first_by_speaker: dict[str, int] = {}
+        # One solution slot per speaker, and it must precede that speaker's
+        # first PUBLIC slot (fresh-answer binding must exist before anything
+        # others can react to). Private slots (e.g. a planning scratchpad) may
+        # come first — prompt bindability validation guards placeholder timing.
+        first_public: dict[str, int] = {}
         solutions_by_speaker: dict[str, list[CompiledSlot]] = {}
         for cs in slots:
-            first_by_speaker.setdefault(cs.speaker, cs.index)
+            if cs.slot.visibility == Visibility.PUBLIC:
+                first_public.setdefault(cs.speaker, cs.index)
             if cs.slot.kind == Kind.SOLUTION:
                 solutions_by_speaker.setdefault(cs.speaker, []).append(cs)
         for speaker, sols in solutions_by_speaker.items():
             if len(sols) > 1:
                 raise ValueError(f"speaker {speaker!r} has multiple solution slots")
-            if sols[0].index != first_by_speaker[speaker]:
-                raise ValueError(f"speaker {speaker!r}: solution slot must be its first slot")
+            if sols[0].index > first_public.get(speaker, sols[0].index):
+                raise ValueError(
+                    f"speaker {speaker!r}: solution slot must precede its first public slot"
+                )
 
     @property
     def decision_slot(self) -> Optional[CompiledSlot]:

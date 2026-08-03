@@ -32,9 +32,11 @@ class Config:
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
     eval_n: int = 128
+    eval_max_tokens: int | None = None  # eval env generations need an explicit budget
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
     run_name: str | None = None
+    on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
 
 
@@ -49,6 +51,16 @@ def _aggregate(trajs: list[Trajectory], prefix: str) -> dict[str, float]:
     for k in sorted(keys):
         vals = [t.info[k] for t in trajs if isinstance(t.info.get(k), (int, float))]
         out[f"{prefix}/{k}"] = sum(vals) / len(vals)
+    # Per-seat breakdown: in zero-sum self-play the cross-seat means are
+    # identities (reward 0, confidence 0.5) — the signal lives per seat.
+    seats = {t.info.get("seat") for t in trajs if isinstance(t.info.get("seat"), str)}
+    for seat in sorted(s for s in seats if s):
+        seat_trajs = [t for t in trajs if t.info.get("seat") == seat]
+        out[f"{prefix}/{seat}/reward_mean"] = sum(t.reward for t in seat_trajs) / len(seat_trajs)
+        for k in ("judge_conf_json", "judge_conf_logit", "solution_correct"):
+            vals = [t.info[k] for t in seat_trajs if isinstance(t.info.get(k), (int, float))]
+            if vals:
+                out[f"{prefix}/{seat}/{k}"] = sum(vals) / len(vals)
     return out
 
 
@@ -73,7 +85,9 @@ def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
     return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
 
 
-def train(env: Env, backend: Backend, cfg: Config) -> None:
+def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
+    """eval_env: evaluate on a DIFFERENT env than training (e.g. debate
+    training with plain-RLVR MathEnv evals). None = eval on `env`."""
     logger = _make_logger(cfg)
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     optim = cfg.optim or OptimParams(lr=cfg.lr)
@@ -82,6 +96,11 @@ def train(env: Env, backend: Backend, cfg: Config) -> None:
         t0 = time.monotonic()
         backend.sync_sampler()
         groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
+        if cfg.on_rollout is not None:
+            try:
+                cfg.on_rollout(step, env)
+            except Exception as e:  # transcript capture must never kill training
+                print(f"[on_rollout] {type(e).__name__}: {e}")
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
 
@@ -112,7 +131,16 @@ def train(env: Env, backend: Backend, cfg: Config) -> None:
                 metrics.update(backend.optim_step(optim))
 
         if cfg.eval_every and step % cfg.eval_every == 0:
-            metrics.update(evaluate(env, policy, cfg.eval_n))
+            eval_policy = policy
+            if cfg.eval_max_tokens is not None:
+                from dataclasses import replace as _replace
+
+                eval_policy = Policy(
+                    policy.backend,
+                    _replace(policy.params, max_tokens=cfg.eval_max_tokens),
+                    policy.chat_template_kwargs,
+                )
+            metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
         if cfg.save_every and step > 0 and step % cfg.save_every == 0:
             metrics["checkpoint_saved"] = 1.0
             backend.save(f"step-{step:05d}")

@@ -1,0 +1,101 @@
+# OLMo-3-7B-Instruct-DPO proposer-critic on MATH level 5, all-on-pod via verl.
+# Thinking OFF; private scratchpad slots replace <think>: proposal turn gets
+# 1000 plan + 1000 argument, later speeches 500 + 500, judge 1000 + verdict.
+# Judge = frozen Qwen3.5-4B served by a local vLLM on the pod (see
+# scripts/pod_run.sh). Standalone entry on purpose: topology turn lists
+# merge BY INDEX under _extends, which poisons mixed-shape topologies.
+#
+# Run (on the pod): debate-rl --experiment-file configs/math_pc_olmo.yaml --experiment math_pc_olmo_l5
+
+math_pc_olmo_l5:
+  topology:
+    turns:
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
+                {name: proposal, kind: solution, max_total_tokens: 1000}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: critique, max_total_tokens: 500}]
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: defense, max_total_tokens: 500}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: rebuttal, max_total_tokens: 500}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
+    entry: math_proposer_critic
+  fresh_positions: true
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local            # served by the pod's verl rollout engine
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: proposer-alice
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: critic-bob
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        # temp/top_p 1.0: the logit confidence channel is only honest here
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1                      # H100/A100-80GB: 7B LoRA FSDP + colocated vllm + judge server
+      # fsdp2 (fsdp1's full-state-dict weight sync OOMs next to the two vllm
+      # procs). Needs the modeling_olmo3 rope x.dtype patch from
+      # provision_pod.sh: transformers>=5.13 returns fp32 cos/sin, and FSDP2
+      # skips its input pre-cast on checkpoint recompute (pytorch #159359)
+      # -> CheckpointError without it.
+      strategy: fsdp2
+      # network volume: adapters are ~100-200MB with save_lora_only (which the
+      # backend forces whenever lora_rank > 0)
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.33   # judge 0.18 + rollout 0.33 + 7B FSDP init peak must fit 80GB
+      prompt_length: 8192
+      response_length: 1024          # largest slot cap
+      max_token_len_per_gpu: 16384
+    wandb_project: debate-rebuild
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    # count: per-seat mass balance WITHOUT the per-token division (verl's
+    # token-mean loss already normalizes scale; trajectory-mode would shrink
+    # advantages ~1000x and demand absurd lrs)
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 4
+    lr: 1.0e-5
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5      # RLVR eval: greedy MathEnv accuracy on held-out L5 test
+    eval_n: 256   # +-3.1pp binomial noise; 128 (+-4.4pp) made 3pp trends uncallable
+    eval_max_tokens: 2000
+    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# tiny live-verification arm
+math_pc_olmo_smoke:
+  _extends: math_pc_olmo_l5
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4   # group 2 risks all-identical verdicts -> every datum dropped
+    eval_every: 0
+    save_every: 0

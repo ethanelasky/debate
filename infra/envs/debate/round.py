@@ -88,6 +88,11 @@ class DebateState:
 class GenRequest:
     messages: list[Message]
     limits: SlotLimits
+    # Decision slots only: a JSON Schema the server should constrain decoding
+    # to (vLLM response_format). Free-text judges ramble past their token cap
+    # instead of emitting the verdict object; grammar-forcing is the only cap
+    # that binds.
+    json_schema: Optional[dict] = None
 
 
 @dataclass
@@ -192,7 +197,14 @@ class FrozenSeat(SeatRunner):
             inputs = [
                 [ModelInput(role=m["role"], content=m["content"]) for m in requests[i].messages] for i in idxs
             ]
-            responses = self.model.predict(inputs, max_new_tokens=max_tokens, num_return_sequences=1)
+            # requests come from one topology step, so json_schema is uniform
+            schemas = {id(requests[i].json_schema) for i in idxs}
+            if len(schemas) > 1:
+                raise ValueError(f"{self.model.alias}: mixed json_schema within one generate batch")
+            extra = {}
+            if requests[idxs[0]].json_schema is not None:
+                extra["json_schema"] = requests[idxs[0]].json_schema
+            responses = self.model.predict(inputs, max_new_tokens=max_tokens, num_return_sequences=1, **extra)
             if len(responses) != len(idxs):
                 raise RuntimeError(
                     f"{self.model.alias}: predict returned {len(responses)} for {len(idxs)} inputs"
@@ -271,6 +283,7 @@ class DebateRound:
         verdict_retries: int = 4,
         solution_extractor: Optional[Callable[[str], Any]] = None,
         fresh_positions: bool = False,
+        decision_json_schema: Optional[dict] = None,
     ):
         missing = set(topology.speakers) - set(seats)
         if missing:
@@ -281,6 +294,7 @@ class DebateRound:
         self.prompts = prompts
         self.verdict_parser = verdict_parser
         self.verdict_retries = verdict_retries
+        self.decision_json_schema = decision_json_schema
         self.solution_extractor = solution_extractor
         self.fresh_positions = fresh_positions
 
@@ -290,8 +304,9 @@ class DebateRound:
             if not live:
                 break
             runner = self.seats[step.speaker]
+            schema = self.decision_json_schema if step.slot.kind == Kind.DECISION else None
             requests = [
-                GenRequest(render_context(states[i], step, self.prompts), slot_limits(step))
+                GenRequest(render_context(states[i], step, self.prompts), slot_limits(step), json_schema=schema)
                 for i in live
             ]
             results = runner.generate(requests)
@@ -321,7 +336,11 @@ class DebateRound:
             if not bad:
                 break
             requests = [
-                GenRequest(render_context(states[live[j]], step, self.prompts), slot_limits(step))
+                GenRequest(
+                    render_context(states[live[j]], step, self.prompts),
+                    slot_limits(step),
+                    json_schema=self.decision_json_schema,
+                )
                 for j in bad
             ]
             fresh = runner.generate(requests)
@@ -353,7 +372,8 @@ class DebateRound:
                 if record.extracted is None:
                     state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
                     return
-                position = str(record.extracted)
+                v = record.extracted
+                position = f"{v:g}" if isinstance(v, float) else str(v)
                 state.bindings[step.speaker]["POSITION"] = position
                 for other in state.bindings:
                     if other != step.speaker:

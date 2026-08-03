@@ -33,6 +33,8 @@ math_proposer_critic:
         <grading-rule>
         Your solution is graded strictly: only the final \boxed{...} answer counts.
         </grading-rule>
+      - |-
+        <problem><TOPIC></problem>
     bob:
       - |-
         <role>You are <NAME>, the CRITIC in a proposer-critic debate over a
@@ -54,6 +56,8 @@ math_proposer_critic:
         every step is flawless. A minor slip that does not change the answer is
         not grounds to call the answer wrong.
         </answer-vs-reasoning>
+      - |-
+        <problem><TOPIC></problem>
     judge:
       - |-
         <role>You are the Judge in a proposer-critic math debate. The Proposer
@@ -76,6 +80,10 @@ math_proposer_critic:
         step or small case yourself before deciding.
         </verify>
   slots:
+    scratchpad: |-
+      PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
+      next contribution: work the mathematics, check the disputed steps, and
+      decide what to argue. Notes only; do not address the judge or opponent.
     proposal: |-
       Solve this competition mathematics problem.
 
@@ -100,17 +108,20 @@ math_proposer_critic:
       defense and attack another load-bearing step with a concrete check. Never
       concede the answer is right.
     deliberation: |-
+      You are the JUDGE — not a debater. Do not adopt either participant's
+      role or continue their arguments; you are evaluating them.
+
       The debate concerned:
 
       <problem><TOPIC></problem>
 
-      The Proposer (<NAME>) defends the boxed answer: <POSITION>
+      The Proposer (<NAME>) defends the boxed answer: <OPPONENT_POSITION>
       The Critic (<OPPONENT_NAME>) argued that answer is wrong.
 
-      Evaluate the debate. The Critic is forced to disagree, so weigh their
-      claims skeptically. Verify any alleged error yourself — recompute the
-      disputed step or test a small case — before accepting it. Reason about
-      the mathematics; do not give a verdict yet.
+      Evaluate the debate as a neutral third party. The Critic is forced to
+      disagree, so weigh their claims skeptically. Verify any alleged error
+      yourself — recompute the disputed step or test a small case — before
+      accepting it. Reason about the mathematics; do not give a verdict yet.
     verdict: |-
       Now give your final decision as a JSON object, the very last thing in your
       response:

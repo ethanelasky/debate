@@ -113,6 +113,15 @@ class LocalModel(OpenAIModel):
             extra_body["repetition_penalty"] = repetition_penalty
         if extra_body:
             request["extra_body"] = extra_body
+        json_schema = kwargs.get("json_schema")
+        if json_schema is not None:
+            # vLLM grammar-constrained decoding (xgrammar): number bounds are
+            # not reliably enforced there, so the schema should carry types and
+            # enums only — value clamping stays in the parser.
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "schema": json_schema},
+            }
         return request
 
     def call_openai(

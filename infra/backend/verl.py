@@ -61,6 +61,12 @@ class VerlBackendConfig:
     megatron_pp: int = 1
     megatron_cp: int = 1
     megatron_ep: int = 1
+    # Escape hatch to verl's padded (non-rmpad) forward. NOT needed for
+    # sliding-window models — the OLMo-3 long-context logprob skew was a
+    # transformers YaRN regression (#39847, fixed >=5.13), not rmpad. Note the
+    # engine reads this from the batch TensorDict (_pack stamps it), not from
+    # the hydra model config.
+    use_remove_padding: bool = True
     extra_overrides: tuple[str, ...] = ()
 
     @property
@@ -113,11 +119,18 @@ class VerlBackendConfig:
         mode_override = (
             [f"actor_rollout_ref.actor.policy_loss.loss_mode={loss_mode}"] if loss_mode != "vanilla" else []
         )
+        lora_ckpt_override = (
+            # full-state checkpoints are ~55GB for a 7B (sharded model + optim)
+            # and once filled a 60GB container disk mid-save; the adapter is
+            # the only trained state, so save just it (~100-200MB)
+            ["actor_rollout_ref.actor.checkpoint.save_lora_only=True"] if self.lora_rank > 0 else []
+        )
         return [
             *self._strategy_overrides(),
             *mode_override,
+            *lora_ckpt_override,
             f"actor_rollout_ref.model.path={self.model_path}",
-            "actor_rollout_ref.model.use_remove_padding=True",
+            f"actor_rollout_ref.model.use_remove_padding={self.use_remove_padding}",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",
             f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={self.max_token_len_per_gpu}",
             f"actor_rollout_ref.actor.clip_ratio_low={eps_low}",
@@ -132,6 +145,8 @@ class VerlBackendConfig:
             f"actor_rollout_ref.rollout.tensor_model_parallel_size={self.rollout_tp}",
             f"actor_rollout_ref.rollout.prompt_length={self.prompt_length}",
             f"actor_rollout_ref.rollout.response_length={self.response_length}",
+            # engine KV sizing: without this vllm sizes for the MODEL'S native max
+            f"actor_rollout_ref.rollout.max_model_len={self.prompt_length + self.response_length}",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={self.gpu_memory_utilization}",
             "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
             f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={self.max_token_len_per_gpu}",
@@ -320,7 +335,11 @@ class VerlBackend(Backend):
             meta["compute_loss"] = False
         proto = DataProto.from_single_dict(tensors, meta_info=meta)
         td = left_right_2_no_padding(proto.to_tensordict())
-        tu.assign_non_tensor(td, global_batch_size=B)
+        # The engine branches packed-vs-padded on THIS batch key (default True),
+        # not on the hydra model config — omit it and rmpad silently stays on.
+        tu.assign_non_tensor(
+            td, global_batch_size=B, use_remove_padding=self.config.use_remove_padding
+        )
         return td, resp_lens
 
     def _pad_to_world_size(self, data: list[Datum]) -> list[Datum]:

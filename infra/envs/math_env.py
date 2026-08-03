@@ -99,7 +99,10 @@ class MathEnv(Env):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": row["problem"] + "\n\nReturn only: \\boxed{NUMBER}"},
         ]
-        return Task(messages=messages, meta={"gt": row["gt"], "level": row["level"], "split": split})
+        return Task(
+            messages=messages,
+            meta={"gt": row["gt"], "level": row["level"], "split": split, "question": row["problem"]},
+        )
 
     def tasks(self, n: int, split: str = "train") -> list[Task]:
         if split == "train":
