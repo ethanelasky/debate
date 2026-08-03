@@ -41,6 +41,12 @@ _NOTES_PLACEHOLDER = "<FORMAT_NOTES>"
 _REQUIRED_KEYS = {"answer_gen_system", "answer_gen_user"}
 _OPTIONAL_KEYS = {"format_notes", "answer_format_instruction"}
 
+# Debate prompt vars a task family can supply. A debate yaml referencing one of
+# these must get it from the task config: DebateEnv raises at construction if
+# the placeholder is used and nothing supplied it, rather than letting a run
+# reach generation and fail there.
+TASK_SUPPLIED_VARS = ("ANSWER_FORMAT_INSTRUCTION",)
+
 
 @dataclass(frozen=True)
 class GenerationPrompts:

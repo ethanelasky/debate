@@ -158,16 +158,10 @@ PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING = (
 )
 
 
-def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
-    """ANSWER_FORMAT_INSTRUCTION moved out of the debate yaml and is now
-    injected by DebateEnv from this family's answer-generation config. The
-    rendered proposal slot must be byte-identical to what the duplicated var
-    produced."""
-    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
-    from infra.envs.debate.judge import JudgeConfig
+def _pc_topology():
     from infra.envs.debate.topology import Topology
 
-    topology = Topology.parse(
+    return Topology.parse(
         {
             "turns": [
                 {"alice": [{"name": "proposal", "kind": "solution"}]},
@@ -178,9 +172,19 @@ def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
             ]
         }
     )
+
+
+def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
+    """ANSWER_FORMAT_INSTRUCTION moved out of the debate yaml and is now
+    injected by DebateEnv from this family's answer-generation config. The
+    rendered proposal slot must be byte-identical to what the duplicated var
+    produced."""
+    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
+    from infra.envs.debate.judge import JudgeConfig
+
     debate = DebateEnv(
         DebateEnvConfig(
-            topology=topology,
+            topology=_pc_topology(),
             prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
             prompt_entry="codecontests_proposer_critic",
             trained_speakers=["alice"],
@@ -195,6 +199,31 @@ def test_debate_proposal_slot_unchanged_by_single_sourcing(env):
         "proposal", "alice", {"TOPIC": env.test_rows[0]["problem"]}
     )
     assert rendered == PROPOSAL_INSTRUCTION_BEFORE_SINGLE_SOURCING
+
+
+def test_debate_raises_when_task_source_supplies_no_format_var(env, monkeypatch):
+    """No silent fallback: if the task config stops supplying
+    ANSWER_FORMAT_INSTRUCTION, DebateEnv fails at construction rather than
+    letting a run reach generation and die on an unbound placeholder."""
+    from infra.envs.debate.env import DebateEnv, DebateEnvConfig
+    from infra.envs.debate.judge import JudgeConfig
+
+    monkeypatch.setattr(type(env.prompts), "prompt_vars", lambda self: {})
+    with pytest.raises(ValueError) as exc:
+        DebateEnv(
+            DebateEnvConfig(
+                topology=_pc_topology(),
+                prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
+                prompt_entry="codecontests_proposer_critic",
+                trained_speakers=["alice"],
+                frozen_models={"bob": object(), "judge": object()},
+                judge=JudgeConfig(schema_name="collaborative"),
+                fresh_positions=True,
+            ),
+            env,
+            CodeContestsFamily(),
+        )
+    assert "ANSWER_FORMAT_INSTRUCTION" in str(exc.value)
 
 
 def test_source_accepts_prompt_file_key(tmp_path):

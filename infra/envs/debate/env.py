@@ -19,6 +19,7 @@ from typing import Any, Optional
 from infra.envs.base import Env, Policy, Task, Trajectory
 from infra.envs.debate.judge import JudgeConfig, Verdict, parse_verdict, verdict_from_slot
 from infra.envs.debate.prompts import (
+    PLACEHOLDER,
     PromptLibrary,
     RenderedPrompts,
     load_prompt_library,
@@ -41,6 +42,7 @@ from infra.envs.debate.round import (
     SlotRecord,
 )
 from infra.envs.debate.topology import Kind, Topology, Visibility
+from infra.envs.task_prompts import TASK_SUPPLIED_VARS
 from infra.models.base import Model
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
@@ -131,9 +133,28 @@ class DebateEnv(Env):
         math does exactly that, since its debate format instruction ("EXACTLY
         one \\boxed{...}") is deliberately NOT the RLVR wording."""
         supplied = getattr(self.task_source, "prompts", None)
-        if supplied is None:
-            return
-        self.lib.vars = {**supplied.prompt_vars(), **self.lib.vars}
+        if supplied is not None:
+            self.lib.vars = {**supplied.prompt_vars(), **self.lib.vars}
+
+        used = {
+            m.group(1)
+            for tmpl in self._all_templates()
+            for m in PLACEHOLDER.finditer(tmpl)
+        }
+        unsupplied = sorted(set(TASK_SUPPLIED_VARS) & used - set(self.lib.vars))
+        if unsupplied:
+            raise ValueError(
+                f"prompt entry {self.config.prompt_entry!r} references {unsupplied}, which the "
+                f"task source must supply, but {type(self.task_source).__name__} provided no such "
+                "var. Set it in the task family's answer-generation config "
+                "(infra/envs/tasks/prompt_configs/<family>.yaml) or as a var in the debate yaml."
+            )
+
+    def _all_templates(self):
+        for tmpl in self.lib.system.values():
+            yield tmpl
+        for entry in self.lib.slots.values():
+            yield from (entry.values() if isinstance(entry, dict) else [entry])
 
     def _find_judge_speaker(self) -> str:
         d = self.topology.decision_slot
