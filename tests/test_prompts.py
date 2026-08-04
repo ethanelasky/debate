@@ -325,10 +325,23 @@ def test_judge_never_told_a_position_was_assigned(protocol):
             "the Proposer",
         ):
             assert banned not in seen_by_judge, f"{entry}: judge sees {banned!r}"
-        # ...while the debaters' cards keep their assigned positions
+        # ...while the debaters' cards keep their OWN assigned positions
         assert "Your role is to prove the Proposer wrong" in flat(pack.system["bob"])
         assert "NEVER concede that the Proposer is right" in flat(pack.system["bob"])
         assert "<proposer-role>" in pack.system["alice"]
+        # A seat is told its own position, never that the OTHER seat's is
+        # locked. `debater_system` is shared by both debaters, so a stance
+        # claim parked there reaches alice — the same leak overall_system had,
+        # one level down. Alice may still learn objections are coming (its own
+        # <proposer-role> says so); it may not learn they are compulsory.
+        for banned in (
+            "the Critic argues that",
+            "Critic's role is to",
+            "FORCED",
+            "forced to disagree",
+            "NEVER concede that the Proposer is right",
+        ):
+            assert banned not in flat(pack.system["alice"]), f"{entry}: alice sees {banned!r}"
         # the symmetric skepticism that replaced the one-sided <critic-bias>
         assert "Do NOT simply trust either participant's claims" in flat(pack.system["judge"])
         assert subject in flat(pack.system["judge"])
