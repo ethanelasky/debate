@@ -1,17 +1,28 @@
-# CodeContests proposer-critic prompts — COMPETITIVE forced-disagree format
+# CodeContests proposer-critic prompts — COMPETITIVE format, in which the
+# Critic's stance is to prove the Proposer wrong
 # (Ethan, 2026-08-03: "collaborative code review is outdated, these are
 # competitive debates now; use inspiration from math"). Supersedes the
 # collaborative port of the old repo's "Code Contests Standard Single Proposer
-# Debate Prompt": all of that entry's stance machinery is stripped (no
+# Debate Prompt": all of that entry's stance-CHOICE machinery is stripped (no
 # AGREE/DISAGREE, no stance JSON line, no "both can win", no collaborative-mode
 # blocks, no per-participant verdict).
+#
+# DELIBERATE deviation (Ethan, 2026-08-04): the COMPULSION framing ("you are
+# FORCED to disagree", "regardless of what you privately believe") is replaced
+# by STANCE framing ("your role is to prove the Proposer wrong"). Rationale:
+# that the critic disagrees should be obvious from its stance — disagreement is
+# definitional to the role, not something imposed on an agent that would
+# otherwise seek the truth. The judge still discounts the critic's objections,
+# but derives that discount from the ROLE rather than from compulsion. The
+# "NEVER concede" strategy lines stay: consistent with the stance, and
+# battle-tested. Applied identically in hendrycks_math.yaml.
 #
 # This entry uses the COMPETITIVE default — judge: {schema_name: competitive},
 # the winner-JSON verdict. No judge/scoring config override is needed.
 #
 # Two sources, kept verbatim wherever the wording is domain-neutral:
 # 1. SKELETON from hendrycks_math.yaml's math_proposer_critic (itself the old
-#    repo's battle-tested run arm): the role cards, the forced-disagree critic
+#    repo's battle-tested run arm): the role cards, the critic
 #    card, the judge's critic-bias / standard-of-proof / verify blocks, and the
 #    verdict block — schema text, win condition and Tie rule character-identical
 #    to math but for the domain nouns (boxed answer -> program).
@@ -52,7 +63,7 @@ codecontests_proposer_critic:
     - |-
       <role>You are a participant in a proposer-critic debate over a
       programming problem. The Proposer submits a complete Python program
-      reading from stdin and writing to stdout; the Critic is FORCED to argue
+      reading from stdin and writing to stdout; the Critic argues
       that program is wrong; the Judge decides whether it is actually
       correct — whether it would pass the problem's hidden test cases.</role>
     # old pack's `overall_system` correctness-only rule, verbatim but for
@@ -106,14 +117,13 @@ codecontests_proposer_critic:
   debater_system_critic:
     - |-
       <role>You are <NAME>, the CRITIC.</role>
-    # math's FORCED-disagree card verbatim; the attack bullet carries the old
-    # pack's concrete-check menu, minus its complexity/TLE item (barred by
+    # math's critic card verbatim; the attack bullet carries the old pack's
+    # concrete-check menu, minus its complexity/TLE item (barred by
     # <correctness-only>).
     - |-
       <critic-role>
-      CRITICAL — you are FORCED to disagree:
-      - You must ALWAYS argue that the Proposer's submitted program is
-        INCORRECT, regardless of what you privately believe.
+      Your role is to prove the Proposer wrong:
+      - Argue that the Proposer's submitted program is INCORRECT.
       - Where possible, argue for a specific concrete failure and justify it.
       - Attack the load-bearing logic with concrete checks: a failing input
         traced through the program step by step, an edge case (bounds,
@@ -125,13 +135,14 @@ codecontests_proposer_critic:
   judge_system:
     - |-
       <role>You are the Judge in a proposer-critic programming debate. The
-      Proposer submitted a Python program; the Critic is required to argue it
+      Proposer submitted a Python program; the Critic's role is to argue it
       is wrong. Decide whether the Proposer's program is actually correct —
       whether it would pass the problem's hidden test cases.</role>
     - |-
       <critic-bias>
-      The Critic is FORCED to disagree, so their objection alone is NOT evidence
-      the program is wrong. Accept a failure claim only after you verify it yourself.
+      It is the Critic's role to argue the program is wrong, so their objection
+      alone is NOT evidence the program is wrong. Accept a failure claim only
+      after you verify it yourself.
       </critic-bias>
     # math's standard-of-proof, carrying the old pack's judge_system sentences
     # verbatim. The math draft's "a complexity blow-up" ground is removed:
@@ -238,22 +249,22 @@ codecontests_proposer_critic:
     concrete inputs, and decide what to argue. Notes only; do not address the
     judge or opponent.
   pre_opening_speech_proposer: <ANSWER_GEN_USER>
-  # math's forced-disagree critique cue, then the old pack's two-phase
-  # methodology and output format verbatim. The old block's stance machinery is
-  # gone: no AGREE/DISAGREE, no incentives sentence, no stance JSON line, and
-  # the output format's "No bugs found" branch is dropped — a FORCED critic
-  # never reports a clean bill of health.
+  # math's critique cue, then the old pack's two-phase methodology and output
+  # format verbatim. The old block's AGREE/DISAGREE machinery is gone: no
+  # stance-choice framing, no incentives sentence, no stance JSON line, and the
+  # output format's "No bugs found" branch is dropped — a critic whose role is
+  # to prove the program wrong never reports a clean bill of health.
   pre_opening_speech_critic: |-
     The Proposer's solution is above; their submitted program is the one quoted
     at the top of this exercise.
 
-    You are FORCED to disagree: argue the program is INCORRECT, regardless of
-    what you privately believe. Attack a specific load-bearing part with a
-    CONCRETE check — give a failing input and trace the program on it step by
-    step, expose an edge case (bounds, empty or degenerate input, overflow,
-    off-by-one), or show an I/O-format mismatch. State the program's actual
-    behavior, not vague doubt. Do NOT write your own solution from scratch as
-    if it were yours — critique THEIR program.
+    Your role is to prove the program INCORRECT: argue that it is wrong.
+    Attack a specific load-bearing part with a CONCRETE check — give a failing
+    input and trace the program on it step by step, expose an edge case
+    (bounds, empty or degenerate input, overflow, off-by-one), or show an
+    I/O-format mismatch. State the program's actual behavior, not vague doubt.
+    Do NOT write your own solution from scratch as if it were yours — critique
+    THEIR program.
 
     <bug-verification>
     Review in TWO PHASES:
@@ -317,7 +328,8 @@ codecontests_proposer_critic:
     input concretely. Concede only a genuine, demonstrated failure.
   # math's rebuttal cue; the last sentence is the old `pre_speech_critic`'s
   # evidence requirement (its "if you find no further issues, say so plainly"
-  # clause is dropped — a FORCED critic does not concede).
+  # clause is dropped — a critic whose role is to prove the program wrong does
+  # not concede).
   pre_speech_critic: |-
     Now it is your turn again as the CRITIC. Address the Proposer's latest
     defense and attack another load-bearing part of the program with a
@@ -342,11 +354,11 @@ codecontests_proposer_critic:
 
     The Critic (<OPPONENT_NAME>) argued that program is wrong.
 
-    Evaluate the debate as a neutral third party. The Critic is forced to
-    disagree, so weigh their claims skeptically. You cannot execute code:
-    verify any alleged failure yourself by tracing the program on the disputed
-    input by hand before accepting it. Reason about the program's correctness;
-    do not give a verdict yet.
+    Evaluate the debate as a neutral third party. The Critic's role is to
+    argue the program is wrong, so weigh their claims skeptically. You cannot
+    execute code: verify any alleged failure yourself by tracing the program on
+    the disputed input by hand before accepting it. Reason about the program's
+    correctness; do not give a verdict yet.
 
     <important>
     Base your verdict on the ACTUAL code shown above and the ACTUAL problem description - do not rely solely on participants' characterizations.

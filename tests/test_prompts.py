@@ -210,16 +210,18 @@ def test_validate_passes_for_codecontests_pc(protocol):
     validate_prompts(cc, protocol, fresh_positions=False)
 
 
-def test_codecontests_pc_is_forced_disagree_with_old_pack_methodology():
-    """Competitive forced-disagree format (Ethan, 2026-08-03), carrying the old
-    code-review pack's two-phase tracing methodology but none of its
-    collaborative stance machinery."""
+def test_codecontests_pc_is_stance_framed_with_old_pack_methodology():
+    """Competitive format (Ethan, 2026-08-03) carrying the old code-review
+    pack's two-phase tracing methodology but none of its collaborative
+    stance-choice machinery. The critic's disagreement is framed as its ROLE,
+    not as compulsion (Ethan, 2026-08-04)."""
     cc = load_pack(CODECONTESTS_YAML, "codecontests_proposer_critic")
     critique = slot_template(cc, "critique", "bob")
-    assert "You are FORCED to disagree" in critique
+    assert "Your role is to prove the program INCORRECT" in critique
     assert "PHASE 1 — PLAN YOUR TEST INPUTS" in critique
     assert "PHASE 2 — TRACE EACH INPUT" in critique
-    assert "CRITICAL — you are FORCED to disagree" in cc.system["bob"]
+    assert "Your role is to prove the Proposer wrong" in cc.system["bob"]
+    # the strategy line survives the reframing: consistent with the stance
     assert "NEVER concede that the Proposer is right" in cc.system["bob"]
     # no collaborative machinery anywhere in the pack
     whole = "\n".join(list(cc.system.values()) + [slot_template(cc, s, "judge") for s in cc.slots])
@@ -281,6 +283,34 @@ def test_validate_fails_on_missing_system_prompt(lib, protocol):
     lib.system.pop("judge")
     with pytest.raises(ValueError, match="judge"):
         validate_prompts(lib, protocol)
+
+
+def test_no_compulsion_framing_in_either_pack():
+    """Ethan, 2026-08-04: the critic's disagreement is definitional to its role,
+    so neither pack may tell it to disagree against its own belief. The judge
+    keeps its discount but derives it from the ROLE."""
+    for path, entry, subject in (
+        (MATH_YAML, "math_proposer_critic", "answer"),
+        (CODECONTESTS_YAML, "codecontests_proposer_critic", "program"),
+    ):
+        pack = load_pack(path, entry)
+        # prompts are hard-wrapped prose, so compare on normalized whitespace
+        flat = lambda s: " ".join(s.split())  # noqa: E731
+        text = flat(
+            "\n".join(
+                list(pack.system.values())
+                + list(pack.preamble.values())
+                + [t for v in pack.slots.values() for t in ([v] if isinstance(v, str) else v.values())]
+            )
+        )
+        for banned in ("FORCED", "forced to disagree", "regardless of what you privately believe"):
+            assert banned not in text, f"{entry}: {banned!r}"
+        assert "Your role is to prove the Proposer wrong" in flat(pack.system["bob"])
+        # the judge still discounts the critic, now on role grounds
+        assert f"It is the Critic's role to argue the {subject} is wrong" in flat(pack.system["judge"])
+        assert f"The Critic's role is to argue the {subject} is wrong" in flat(
+            slot_template(pack, "deliberation", "judge")
+        )
 
 
 def test_validate_fails_on_empty_composed_system_card(lib, protocol):

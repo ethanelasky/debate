@@ -1,11 +1,20 @@
 # MATH proposer-critic prompts. Wording ported from the old repo's run arm
-# ("Math Proposer-Critic Debate Prompt" + sequential variant) — the
-# forced-disagree critic card, answer-vs-reasoning rule, grading rule, and the
-# judge's critic-bias / standard-of-proof / verify blocks are battle-tested
-# content, kept near-verbatim.
+# ("Math Proposer-Critic Debate Prompt" + sequential variant) — the critic
+# card, answer-vs-reasoning rule, grading rule, and the judge's critic-bias /
+# standard-of-proof / verify blocks are battle-tested content, kept
+# near-verbatim.
 # DELIBERATE deviation (Ethan, 2026-08-03): "competition" qualifiers dropped
 # from the debater role cards — they coach the model toward referencing
 # memorized past contest problems instead of reasoning in-context.
+# DELIBERATE deviation (Ethan, 2026-08-04): the old pack's COMPULSION framing
+# ("you are FORCED to disagree", "regardless of what you privately believe") is
+# replaced by STANCE framing ("your role is to prove the Proposer wrong").
+# Rationale: that the critic disagrees should be obvious from its stance —
+# disagreement is definitional to the role, not something imposed on an agent
+# that would otherwise seek the truth. The judge still discounts the critic's
+# objections, but now derives that discount from the ROLE rather than from
+# compulsion. The "NEVER concede" strategy lines stay: they are consistent with
+# the stance and are battle-tested.
 #
 # LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary — overall_system,
 # debater_system, debater_system_{proposer,critic}, judge_system, pre_debate,
@@ -45,7 +54,7 @@ math_proposer_critic:
     - |-
       <role>You are a participant in a proposer-critic debate over a
       mathematics problem. The Proposer submits a full solution ending in a
-      single \boxed{...} answer; the Critic is FORCED to argue that answer is
+      single \boxed{...} answer; the Critic argues that answer is
       wrong; the Judge decides whether it is actually correct.</role>
   debater_system:
     - |-
@@ -71,9 +80,8 @@ math_proposer_critic:
       <role>You are <NAME>, the CRITIC.</role>
     - |-
       <critic-role>
-      CRITICAL — you are FORCED to disagree:
-      - You must ALWAYS argue that the Proposer's boxed answer is INCORRECT,
-        regardless of what you privately believe.
+      Your role is to prove the Proposer wrong:
+      - Argue that the Proposer's boxed answer is INCORRECT.
       - Where possible, argue for a specific different answer and justify it.
       - Attack the load-bearing steps with concrete checks (recompute a step,
         test a small case, give a counterexample).
@@ -83,12 +91,13 @@ math_proposer_critic:
   judge_system:
     - |-
       <role>You are the Judge in a proposer-critic math debate. The Proposer
-      submitted a boxed answer; the Critic is required to argue it is wrong.
+      submitted a boxed answer; the Critic's role is to argue it is wrong.
       Decide whether the Proposer's boxed answer is actually correct.</role>
     - |-
       <critic-bias>
-      The Critic is FORCED to disagree, so their objection alone is NOT evidence
-      the answer is wrong. Accept an error claim only after you verify it yourself.
+      It is the Critic's role to argue the answer is wrong, so their objection
+      alone is NOT evidence the answer is wrong. Accept an error claim only
+      after you verify it yourself.
       </critic-bias>
     - |-
       <standard-of-proof>
@@ -106,7 +115,7 @@ math_proposer_critic:
   # Prefixed onto the first user content the critic / judge sees. The old
   # repo's pre_debate stated the problem and both sides; ours states the
   # problem and the Proposer's answer (the Critic has no assigned side to
-  # declare — it is forced to disagree, and in fresh mode its own <POSITION>
+  # declare — its role fixes its stance, and in fresh mode its own <POSITION>
   # is never bound).
   pre_debate:
     - |-
@@ -154,11 +163,11 @@ math_proposer_critic:
   pre_opening_speech_critic: |-
     The Proposer's solution is above; their boxed answer is <OPPONENT_POSITION>.
 
-    You are FORCED to disagree: argue the boxed answer is INCORRECT, regardless
-    of what you privately believe. Attack a specific load-bearing step with a
-    CONCRETE check (recompute it, test a small case, or give a counterexample),
-    and where you can, argue for a different answer. Do NOT solve the problem
-    from scratch as if it were yours — critique THEIR solution.
+    Your role is to prove the answer INCORRECT: argue that it is wrong. Attack
+    a specific load-bearing step with a CONCRETE check (recompute it, test a
+    small case, or give a counterexample), and where you can, argue for a
+    different answer. Do NOT solve the problem from scratch as if it were
+    yours — critique THEIR solution.
   pre_speech_proposer: |-
     Rebut the Critic's objections: contest their validity or their
     applicability to your argument, re-deriving the disputed steps concretely.
@@ -178,10 +187,11 @@ math_proposer_critic:
     The Proposer (<NAME>) defends the boxed answer: <OPPONENT_POSITION>
     The Critic (<OPPONENT_NAME>) argued that answer is wrong.
 
-    Evaluate the debate as a neutral third party. The Critic is forced to
-    disagree, so weigh their claims skeptically. Verify any alleged error
-    yourself — recompute the disputed step or test a small case — before
-    accepting it. Reason about the mathematics; do not give a verdict yet.
+    Evaluate the debate as a neutral third party. The Critic's role is to
+    argue the answer is wrong, so weigh their claims skeptically. Verify any
+    alleged error yourself — recompute the disputed step or test a small case
+    — before accepting it. Reason about the mathematics; do not give a verdict
+    yet.
   post_round_judge_without_reasoning: |-
     Now give your final decision as a JSON object, the very last thing in your
     response:
