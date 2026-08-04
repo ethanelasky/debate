@@ -1,0 +1,69 @@
+# RLVR baseline on CodeContests — the arm debate gets compared against.
+#
+# Reward = execute the model's program against that problem's `rlvr_tests`
+# (<=10 cases sampled from DeepMind's public+private). No judge, no debate.
+# Mirrors math_rlvr_olmo.yaml so the only difference from the MATH baseline is
+# the task family.
+#
+# Dataset: build it first, it is gitignored (132 MB):
+#   python scripts/build_codecontests_rlvr.py --out data/codecontests
+# The manifest pins revision + seed + sha256, so the build is reproducible
+# byte-for-byte rather than shipped.
+#
+# Run (on the pod): scripts/pod_run.sh rlvr codecontests_rlvr_olmo_smoke
+
+codecontests_rlvr_olmo:
+  model: allenai/Olmo-3-7B-Instruct-DPO
+  max_completion_tokens: 1536
+  dataset:
+    type: codecontests
+    path: data/codecontests/train.jsonl
+    test_path: data/codecontests/test.jsonl
+    relaxed_extraction: true   # accept a ```python fence truncated at the cap
+    seed: 0
+    # Bounds a runaway program, not honest work: the reward suite is <=10 small
+    # cases (2 MB total budget, enforced at build time), so a correct solution
+    # finishes in well under a second.
+    timeout_seconds: 30
+    # The whole held-out split: 501 problems, 109 contests, disjoint from train
+    # by contest so near-duplicates cannot straddle the boundary.
+    eval_subset_size: 501
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1
+      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
+      gpu_memory_utilization: 0.45 # no judge server here: rollout can take more than debate's 0.33
+      # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
+      # 1850 max, plus the answer-gen preamble.
+      prompt_length: 4096
+      response_length: 1536
+      max_token_len_per_gpu: 8192
+      checkpoint_dir: /workspace/checkpoints
+    wandb_project: debate-rebuild
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5
+    eval_n: 256        # +-3.1pp binomial noise
+    eval_max_tokens: 1536
+    save_every: 25
+
+# 1-step smoke: proves the whole path — dataset load, prompt render, rollout,
+# code extraction, subprocess verifier, reward, optimizer step — before
+# spending a real run.
+codecontests_rlvr_olmo_smoke:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 1
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0

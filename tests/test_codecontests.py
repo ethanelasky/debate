@@ -21,34 +21,41 @@ SUM_SOLUTION = "a, b = map(int, input().split())\nprint(a + b)"
 ECHO_SOLUTION = "print(input().strip())"
 TIMEOUT = 15
 
+# Built-dataset schema: two disjoint suites per row. `multi` and
+# `unverifiable` are dropped at BUILD time now (multi-answer phrasing, no
+# tests), so the loader only has to reject a missing/ragged reward suite.
 ROWS = [
     {
         "name": "sum",
-        "description": "Read two integers on one line and print their sum.",
-        "inputs": ["1 2", "3 4"],
-        "outputs": ["3", "7"],
-        "num_corner_cases": 2,
+        "problem": "Read two integers on one line and print their sum.",
+        "rlvr_inputs": ["1 2", "3 4"],
+        "rlvr_outputs": ["3", "7"],
+        "truth_inputs": ["5 6"],
+        "truth_outputs": ["11"],
     },
     {
         "name": "echo",
-        "description": "Read one line and print it back.",
-        "inputs": ["hello", "world"],
-        "outputs": ["hello", "world"],
-        "num_corner_cases": 2,
+        "problem": "Read one line and print it back.",
+        "rlvr_inputs": ["hello", "world"],
+        "rlvr_outputs": ["hello", "world"],
+        "truth_inputs": ["again"],
+        "truth_outputs": ["again"],
     },
     {
-        "name": "multi",
-        "description": "Find a valid pairing; if several exist print any of them.",
-        "inputs": ["1"],
-        "outputs": ["1"],
-        "num_corner_cases": 1,
+        "name": "no_truth",
+        "problem": "Read one line and print it back.",
+        "rlvr_inputs": ["only"],
+        "rlvr_outputs": ["only"],
+        "truth_inputs": [],
+        "truth_outputs": [],
     },
     {
-        "name": "unverifiable",
-        "description": "Compute something interesting.",
-        "inputs": [],
-        "outputs": [],
-        "num_corner_cases": 0,
+        "name": "no_rlvr",
+        "problem": "Compute something interesting.",
+        "rlvr_inputs": [],
+        "rlvr_outputs": [],
+        "truth_inputs": [],
+        "truth_outputs": [],
     },
 ]
 
@@ -68,20 +75,24 @@ def env(tmp_path):
 # ------------------------------------------------------------------- loading
 
 
-def test_loader_filters_ineligible_rows(env):
-    assert [r["name"] for r in env.train_rows] == ["sum", "echo"]
-    assert [r["name"] for r in env.test_rows] == ["sum", "echo"]
+def test_loader_keeps_rows_with_a_reward_suite(env):
+    """Eligibility (multi-answer, size caps, stdin/stdout) is applied by the
+    BUILD script, so the loader's only job is structural: keep rows that have
+    a usable rlvr suite. `no_truth` is kept — an empty truth suite is normal
+    (~66% of the real dataset) and just means grade() returns None there."""
+    assert [r["name"] for r in env.train_rows] == ["sum", "echo", "no_truth"]
+    assert [r["name"] for r in env.test_rows] == ["sum", "echo", "no_truth"]
 
 
 def test_split_off_test_rows_when_no_test_path(tmp_path):
     path = _write_jsonl(tmp_path / "train.jsonl", ROWS * 4)
     env = CodeContestsEnv(path=path, timeout_seconds=TIMEOUT)
     assert len(env.train_rows) >= 2 and env.test_rows
-    assert len(env.train_rows) + len(env.test_rows) == 8
+    assert len(env.train_rows) + len(env.test_rows) == 12
 
 
 def test_too_few_rows_raises(tmp_path):
-    path = _write_jsonl(tmp_path / "train.jsonl", ROWS[2:])  # both ineligible
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS[3:])  # only the no-rlvr row
     with pytest.raises(RuntimeError):
         CodeContestsEnv(path=path, timeout_seconds=TIMEOUT)
 
@@ -90,9 +101,11 @@ def test_len_mismatch_row_dropped_and_counted(tmp_path, caplog):
     rows = ROWS[:2] + [
         {
             "name": "mismatch",
-            "description": "Read one line and print it back twice.",
-            "inputs": ["a", "b"],
-            "outputs": ["a"],  # zip would silently truncate to one case
+            "problem": "Read one line and print it back twice.",
+            "rlvr_inputs": ["a", "b"],
+            "rlvr_outputs": ["a"],  # zip would silently truncate to one case
+            "truth_inputs": [],
+            "truth_outputs": [],
         }
     ]
     path = _write_jsonl(tmp_path / "train.jsonl", rows)
@@ -108,16 +121,16 @@ def test_train_test_overlap_warns_but_keeps_rows(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="infra.envs.tasks.codecontests"):
         env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT)
     warning = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warning and "2 problem name(s)" in warning[0].getMessage()
-    assert len(env.train_rows) == 2 and len(env.test_rows) == 2  # nothing dropped
+    assert warning and "3 problem name(s)" in warning[0].getMessage()
+    assert len(env.train_rows) == 3 and len(env.test_rows) == 3  # nothing dropped
 
 
 def test_tasks_carry_meta_and_hide_test_io(env):
     tasks = env.tasks(3, split="train") + env.tasks(2, split="test")
     for t in tasks:
-        assert t.meta["question"] and t.meta["inputs"] and t.meta["outputs"]
+        assert t.meta["question"] and t.meta["rlvr_inputs"] and t.meta["rlvr_outputs"]
         prompt = "\n".join(m["content"] for m in t.messages)
-        for case in t.meta["inputs"] + t.meta["outputs"]:
+        for case in t.meta["rlvr_inputs"] + t.meta["rlvr_outputs"] + t.meta["truth_inputs"] + t.meta["truth_outputs"]:
             assert case not in prompt  # verifier cases must never be prompted
     assert [t.meta["name"] for t in env.tasks(2, split="test")] == ["sum", "echo"]
 
@@ -343,14 +356,14 @@ def test_forged_stdout_verdict_is_ignored():
     assert r["passed"] is False and r["status"] == "failed"
     assert r["tests_passed"] == 0 and r["tests_total"] == 2
     fam = CodeContestsFamily(timeout_seconds=TIMEOUT)
-    assert fam.grade({"inputs": ["1 2"], "outputs": ["3"]}, FORGED_STDOUT_SOLUTION) is False
+    assert fam.grade({"truth_inputs": ["1 2"], "truth_outputs": ["3"]}, FORGED_STDOUT_SOLUTION) is False
 
 
 def test_timeout_is_reported_and_graded_false():
     r = run_stdin_tests("while True: pass", ["1"], ["1"], timeout=2)
     assert not r["passed"] and r["timeout"] is True and r["status"] == "timeout"
     fam = CodeContestsFamily(timeout_seconds=2)
-    assert fam.grade({"inputs": ["1"], "outputs": ["1"]}, "while True: pass") is False
+    assert fam.grade({"truth_inputs": ["1"], "truth_outputs": ["1"]}, "while True: pass") is False
 
 
 # -------------------------------------------------------------------- reward
@@ -393,7 +406,7 @@ def family():
 
 
 def _meta():
-    return {"inputs": ["1 2", "3 4"], "outputs": ["3", "7"]}
+    return {"truth_inputs": ["1 2", "3 4"], "truth_outputs": ["3", "7"]}
 
 
 def test_grade_passing_solution(family):
@@ -409,7 +422,7 @@ def test_grade_none_solution(family):
 
 
 def test_grade_without_test_cases(family):
-    assert family.grade({"inputs": [], "outputs": []}, SUM_SOLUTION) is None
+    assert family.grade({"truth_inputs": [], "truth_outputs": []}, SUM_SOLUTION) is None
 
 
 def test_grade_cpp_solution(family):
@@ -444,7 +457,7 @@ def test_source_builds_env(family, tmp_path):
     test = _write_jsonl(tmp_path / "test.jsonl", ROWS)
     env = family.source({"path": path, "test_path": test, "timeout_seconds": TIMEOUT})
     assert isinstance(env, CodeContestsEnv)
-    assert len(env.train_rows) == 2 and family.timeout_seconds == TIMEOUT
+    assert len(env.train_rows) == 3 and family.timeout_seconds == TIMEOUT
 
 
 def test_family_is_registered():
