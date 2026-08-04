@@ -51,10 +51,30 @@ def test_enable_thinking_none_sends_no_reasoning_block():
     assert "extra_body" not in requests[0]
 
 
-def test_effort_and_enable_thinking_share_one_reasoning_dict():
+def test_thinking_off_drops_effort_from_the_reasoning_dict():
+    # OpenRouter infers "enabled" from "effort"; sending both here would be a
+    # contradictory payload the provider may resolve either way.
     model, requests = _model(reasoning_effort="low", enable_thinking=False)
     _call(model)
-    assert requests[0]["extra_body"]["reasoning"] == {"effort": "low", "enabled": False}
+    assert requests[0]["extra_body"]["reasoning"] == {"enabled": False}
+
+
+def test_thinking_on_with_effort_sends_effort_alone():
+    model, requests = _model(reasoning_effort="low", enable_thinking=True)
+    _call(model)
+    assert requests[0]["extra_body"]["reasoning"] == {"effort": "low"}
+
+
+def test_thinking_on_without_effort_sends_enabled_alone():
+    model, requests = _model(enable_thinking=True)
+    _call(model)
+    assert requests[0]["extra_body"]["reasoning"] == {"enabled": True}
+
+
+def test_effort_without_a_thinking_toggle_sends_effort_alone():
+    model, requests = _model(reasoning_effort="high")
+    _call(model)
+    assert requests[0]["extra_body"]["reasoning"] == {"effort": "high"}
 
 
 def test_factory_passes_enable_thinking(monkeypatch):

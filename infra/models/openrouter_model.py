@@ -215,14 +215,17 @@ class OpenRouterModel(OpenAIModel):
         # The parent forwards reasoning_effort only on the Responses-API
         # branch. Without the effort override a Harmony model runs at DEFAULT
         # effort and can burn the whole max_tokens budget in the analysis
-        # channel, returning an empty final channel (no verdict). "effort" and
-        # "enabled" (the thinking on/off toggle) share ONE reasoning dict —
-        # built together here so neither setting can clobber the other.
+        # channel, returning an empty final channel (no verdict). OpenRouter
+        # INFERS "enabled" from "effort", so the two keys must never ship
+        # together: {"effort": ..., "enabled": false} is self-contradictory and
+        # the provider is free to honor either half.
         reasoning_opts: dict[str, Any] = {}
-        if self.reasoning_effort:
+        if self.enable_thinking is False:
+            reasoning_opts["enabled"] = False
+        elif self.reasoning_effort:
             reasoning_opts["effort"] = self.reasoning_effort
-        if self.enable_thinking is not None:
-            reasoning_opts["enabled"] = self.enable_thinking
+        elif self.enable_thinking:
+            reasoning_opts["enabled"] = True
         if reasoning_opts:
             request.setdefault("extra_body", {})["reasoning"] = reasoning_opts
         if temperature is not None:

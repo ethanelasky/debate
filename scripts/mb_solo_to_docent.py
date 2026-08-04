@@ -305,8 +305,15 @@ def upload_runs(
     replace: bool = False,
 ) -> None:
     if replace:
+        # Called only after every AgentRun is built, so a build failure never
+        # reaches the delete. A network failure BETWEEN batches still can.
         existing = client.list_agent_run_ids(collection_id)
         if existing:
+            print(
+                "[warn] --replace: deleting the existing runs before uploading. "
+                "If the upload fails part-way the collection is left partial; "
+                "re-run the same command to refill it."
+            )
             client.delete_agent_runs(collection_id, existing)
             print(f"cleared {len(existing)} existing run(s) from the collection")
     for start in range(0, len(runs), batch_size):
@@ -337,6 +344,9 @@ def build_parser() -> argparse.ArgumentParser:
             "match the run. A hash mismatch aborts the upload naming the "
             "offending id; --allow-prompt-drift downgrades that to a warning "
             "and sets prompt_sha_verified=false on those runs.\n\n"
+            "De-duplication is by (id, model) across ALL --results files, "
+            "first occurrence kept, so a partial re-run file can be passed "
+            "alongside the original without uploading a row twice.\n\n"
             "Error rows (transport failure, no response) are uploaded with an "
             "assistant message naming the error type and is_error_row=true, so "
             "failed rows stay visible in the collection.\n\n"
@@ -420,11 +430,31 @@ def main(argv: Optional[Sequence[str]] = None, client: Optional[Any] = None) -> 
 
     data_paths = list(args.data) if args.data else list(DEFAULT_DATA_PATHS)
 
+    # De-duplication spans ALL --results files: a partial re-run file passed
+    # alongside the original otherwise uploads the same (id, model) twice.
     records: list[dict[str, Any]] = []
-    for results_path in args.results:
-        file_records = load_results(results_path)
-        print(f"{results_path}: {len(file_records)} row(s) read")
-        records.extend(file_records)
+    seen: set[tuple[str, Optional[str]]] = set()
+    cross_file_duplicates: list[str] = []
+    try:
+        for results_path in args.results:
+            file_records = load_results(results_path)
+            print(f"{results_path}: {len(file_records)} row(s) read")
+            for record in file_records:
+                key = (record["id"], record.get("model"))
+                if key in seen:
+                    cross_file_duplicates.append(record["id"])
+                    continue
+                seen.add(key)
+                records.append(record)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        parser.exit(2, f"error: {exc}\n")
+        return 2  # pragma: no cover - parser.exit raises SystemExit
+    if cross_file_duplicates:
+        print(
+            f"[warn] skipped {len(cross_file_duplicates)} (id, model) row(s) already "
+            f"seen in an earlier --results file, first occurrence kept: "
+            f"{', '.join(sorted(set(cross_file_duplicates))[:10])}"
+        )
     if args.limit is not None:
         records = records[:args.limit]
     if not records:
@@ -449,7 +479,7 @@ def main(argv: Optional[Sequence[str]] = None, client: Optional[Any] = None) -> 
         runs = build_runs(
             records, prompts, allow_drift=args.allow_prompt_drift, verbose=True
         )
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError, OSError) as exc:
         parser.exit(2, f"error: {exc}\n")
         return 2  # pragma: no cover - parser.exit raises SystemExit
 

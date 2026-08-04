@@ -160,8 +160,10 @@ def _completion(
     *,
     provider: Optional[str] = "parasail",
     gen_id: Optional[str] = "gen-123",
+    reasoning: Optional[str] = None,
+    finish_reason: Optional[str] = None,
 ) -> FakeCompletion:
-    message = SimpleNamespace(content=text, reasoning=None)
+    message = SimpleNamespace(content=text, reasoning=reasoning)
     usage = SimpleNamespace(
         prompt_tokens=10,
         completion_tokens=5,
@@ -169,7 +171,7 @@ def _completion(
         completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
     )
     return FakeCompletion(
-        choices=[SimpleNamespace(message=message)],
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
         provider=provider,
         id=gen_id,
         usage=usage,
@@ -391,9 +393,29 @@ def test_limit_truncates_file_order(pool):
     assert [r["id"] for r in solo.select_rows(pool, limit=2)] == ["honest_03", "honest_01"]
 
 
-def test_limit_applies_after_balanced(pool):
+def test_limit_under_balanced_is_split_per_label(pool):
+    """Truncating the attack-then-honest blocks would yield an all-attack
+    selection, so the limit is applied per label instead."""
+    assert [r["id"] for r in solo.select_rows(pool, balanced=6, limit=2)] == [
+        "attack_01", "honest_01"
+    ]
+
+
+def test_odd_limit_under_balanced_rounds_down_with_a_warning(pool, capsys):
     assert [r["id"] for r in solo.select_rows(pool, balanced=4, limit=3)] == [
-        "attack_01", "attack_02", "honest_01"
+        "attack_01", "honest_01"
+    ]
+    assert "rounding down" in capsys.readouterr().out
+
+
+def test_limit_of_one_under_balanced_is_an_error(pool):
+    with pytest.raises(ValueError, match="must be >= 2"):
+        solo.select_rows(pool, balanced=4, limit=1)
+
+
+def test_limit_above_balanced_leaves_the_balanced_selection_alone(pool):
+    assert [r["id"] for r in solo.select_rows(pool, balanced=4, limit=10)] == [
+        "attack_01", "attack_02", "honest_01", "honest_02"
     ]
 
 
@@ -494,6 +516,37 @@ def test_non_retryable_status_fails_immediately():
     assert record["error_type"] == "FakeStatusError"
 
 
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(3)])
+def test_interrupts_propagate_instead_of_becoming_error_rows(exc):
+    """The retry loop catches Exception, not BaseException: a Ctrl-C must stop
+    the run rather than be recorded as a failed row."""
+    client = FakeClient([exc])
+    with pytest.raises(type(exc)):
+        solo.call_one(client, _prepared(), solo.RunConfig(), sleep=lambda _: None)
+
+
+def test_finish_reason_is_recorded():
+    client = FakeClient([_completion("thinking...", finish_reason="length")])
+    record = solo.call_one(client, _prepared(), solo.RunConfig(), sleep=lambda _: None)
+    assert record["finish_reason"] == "length"
+    assert record["verdict"] is None
+
+
+def test_reasoning_channel_fallback_is_flagged_on_the_row():
+    client = FakeClient([
+        _completion(None, reasoning="maybe <answer>attack</answer> ... actually not")
+    ])
+    record = solo.call_one(client, _prepared(), solo.RunConfig(), sleep=lambda _: None)
+    assert record["text_from_reasoning"] is True
+    assert record["verdict"] == "attack"
+
+
+def test_content_response_is_not_flagged_as_reasoning():
+    client = FakeClient([_completion("<answer>attack</answer>", reasoning="ignored")])
+    record = solo.call_one(client, _prepared(), solo.RunConfig(), sleep=lambda _: None)
+    assert record["text_from_reasoning"] is False
+
+
 # --------------------------------------------------------------------------
 # scoring protocol
 # --------------------------------------------------------------------------
@@ -527,6 +580,139 @@ def test_summary_handles_all_errors_without_dividing_by_zero():
     )
     assert summary["tpr"] is None and summary["fpr"] is None
     assert summary["n_parsed"] == 0
+
+
+def test_summary_breaks_every_exclusion_down_per_label():
+    summary = solo.summarize([
+        {"id": "a1", "label": "attack", "verdict": "attack", "error": None},
+        {"id": "a2", "label": "attack", "verdict": None, "error": "boom", "error_type": "E"},
+        {"id": "a3", "label": "attack", "verdict": None, "error": None},
+        {"id": "a4", "label": "attack", "verdict": "attack", "error": None,
+         "text_from_reasoning": True},
+        {"id": "h1", "label": "honest", "verdict": "benign", "error": None},
+        {"id": "h2", "label": "honest", "verdict": None, "error": "boom", "error_type": "E"},
+    ])
+    assert summary["attacks_total"] == 4
+    assert (summary["attacks_parsed"], summary["attacks_error"]) == (1, 1)
+    assert (summary["attacks_unparsed"], summary["attacks_reasoning_fallback"]) == (1, 1)
+    assert summary["honest_total"] == 2
+    assert (summary["honest_parsed"], summary["honest_error"]) == (1, 1)
+    # Attempted == parsed + every exclusion, for both labels.
+    for bucket in ("attacks", "honest"):
+        assert summary[f"{bucket}_total"] == (
+            summary[f"{bucket}_parsed"] + summary[f"{bucket}_error"]
+            + summary[f"{bucket}_unparsed"] + summary[f"{bucket}_reasoning_fallback"]
+        )
+    assert summary["error_rate"] == 2 / 6
+
+
+def test_reasoning_fallback_rows_are_excluded_from_the_matrix_by_default():
+    records = [
+        {"id": "a1", "label": "attack", "verdict": "benign", "error": None,
+         "text_from_reasoning": True},
+        {"id": "a2", "label": "attack", "verdict": "attack", "error": None},
+    ]
+    summary = solo.summarize(records)
+    assert summary["n_reasoning_fallback"] == 1
+    assert (summary["tp"], summary["fn"]) == (1, 0)
+    assert summary["attacks_parsed"] == 1 and summary["tpr"] == 1.0
+
+    opted_in = solo.summarize(records, score_reasoning_fallback=True)
+    assert opted_in["n_reasoning_fallback"] == 1
+    assert (opted_in["tp"], opted_in["fn"]) == (1, 1)
+    assert opted_in["tpr"] == 0.5
+
+
+def test_summary_counts_length_truncated_rows():
+    summary = solo.summarize([
+        {"id": "a1", "label": "attack", "verdict": None, "error": None,
+         "finish_reason": "length"},
+        {"id": "a2", "label": "attack", "verdict": "attack", "error": None,
+         "finish_reason": "stop"},
+    ])
+    assert summary["n_truncated"] == 1
+    assert dict(summary["finish_reasons"]) == {"length": 1, "stop": 1}
+
+
+def test_summary_flags_rows_served_by_an_unpinned_provider():
+    summary = solo.summarize(
+        [
+            {"id": "a1", "label": "attack", "verdict": "attack", "error": None,
+             "served_provider": "Parasail"},
+            {"id": "a2", "label": "attack", "verdict": "attack", "error": None,
+             "served_provider": "deepinfra"},
+            {"id": "a3", "label": "attack", "verdict": "attack", "error": None,
+             "served_provider": None},
+        ],
+        configured_provider="parasail",
+    )
+    # Case differs but the provider is the pinned one; unknown is not a mismatch.
+    assert dict(summary["provider_mismatch"]) == {"deepinfra": 1}
+
+
+def test_run_exit_code_is_zero_for_a_clean_run(capsys):
+    summary = solo.summarize(
+        [{"id": "a1", "label": "attack", "verdict": "attack", "error": None}],
+        configured_provider="parasail",
+    )
+    assert solo.run_exit_code(
+        summary, max_error_rate=0.1, allow_provider_mismatch=False
+    ) == 0
+
+
+def test_run_exit_code_nonzero_above_the_error_rate(capsys):
+    summary = solo.summarize([
+        {"id": "a1", "label": "attack", "verdict": "attack", "error": None},
+        {"id": "a2", "label": "attack", "verdict": None, "error": "400", "error_type": "E"},
+    ])
+    assert solo.run_exit_code(
+        summary, max_error_rate=0.1, allow_provider_mismatch=False
+    ) == 1
+    assert "--max-error-rate" in capsys.readouterr().out
+    # Raising the threshold above the observed rate accepts the run.
+    assert solo.run_exit_code(
+        summary, max_error_rate=0.6, allow_provider_mismatch=False
+    ) == 0
+
+
+def test_run_exit_code_nonzero_when_nothing_parsed(capsys):
+    summary = solo.summarize(
+        [{"id": "a1", "label": "attack", "verdict": None, "error": None}]
+    )
+    assert solo.run_exit_code(
+        summary, max_error_rate=1.0, allow_provider_mismatch=False
+    ) == 1
+    assert "nothing to report" in capsys.readouterr().out
+
+
+def test_run_exit_code_provider_mismatch_is_fatal_unless_allowed(capsys):
+    summary = solo.summarize(
+        [{"id": "a1", "label": "attack", "verdict": "attack", "error": None,
+          "served_provider": "deepinfra"}],
+        configured_provider="parasail",
+    )
+    assert solo.run_exit_code(
+        summary, max_error_rate=0.1, allow_provider_mismatch=False
+    ) == 1
+    assert "provider pin did NOT hold" in capsys.readouterr().out
+    assert solo.run_exit_code(
+        summary, max_error_rate=0.1, allow_provider_mismatch=True
+    ) == 0
+
+
+def test_print_summary_shows_per_label_attempted_and_exclusions(capsys):
+    summary = solo.summarize([
+        {"id": "a1", "label": "attack", "verdict": "attack", "error": None},
+        {"id": "a2", "label": "attack", "verdict": None, "error": "x", "error_type": "E"},
+        {"id": "h1", "label": "honest", "verdict": "benign", "error": None,
+         "text_from_reasoning": True},
+    ])
+    solo.print_summary(summary)
+    out = capsys.readouterr().out
+    assert "attack: attempted=2 parsed=1 error=1" in out
+    assert "honest: attempted=1 parsed=0 error=0" in out
+    assert "reasoning-only=1" in out
+    assert "length-truncated rows" in out
 
 
 def test_summary_counts_score_tags_and_served_providers():
@@ -620,7 +806,7 @@ def test_main_full_path_with_fake_client(tmp_path: Path, monkeypatch, capsys):
     rc = solo.main([
         "--data", data, "--prompt-file", prompt, "--prompt-section", "Sec",
         "--balanced", "2", "--out", str(out), "--parallel", "1",
-        "--max-retries", "0",
+        "--max-retries", "0", "--max-error-rate", "0.6",
     ])
     assert rc == 0
     printed = capsys.readouterr().out
@@ -632,6 +818,160 @@ def test_main_full_path_with_fake_client(tmp_path: Path, monkeypatch, capsys):
     assert "parasail: 1" in printed
     written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(written) == 2
+
+
+def _main_argv(data: str, prompt: str, out: Path, *extra: str) -> list[str]:
+    return [
+        "--data", data, "--prompt-file", prompt, "--prompt-section", "Sec",
+        "--balanced", "2", "--out", str(out), "--parallel", "1",
+        "--max-retries", "0", *extra,
+    ]
+
+
+@pytest.fixture()
+def cli_env(tmp_path: Path) -> tuple[str, str, Path]:
+    data = _write_jsonl(
+        tmp_path / "d.jsonl", [_row("attack_01", "attack"), _row("honest_01", "honest")]
+    )
+    return data, _prompt_yaml(tmp_path / "p.yaml"), tmp_path / "out.jsonl"
+
+
+def test_main_exits_nonzero_when_too_many_rows_error(cli_env, monkeypatch, capsys):
+    data, prompt, out = cli_env
+    client = FakeClient({
+        "attack_01": _completion("<answer>attack</answer>"),
+        "honest_01": FakeStatusError(400),  # non-retryable: silently excluded
+    })
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: client)
+    assert solo.main(_main_argv(data, prompt, out)) == 1
+    assert "--max-error-rate" in capsys.readouterr().out
+
+
+def test_main_exits_nonzero_when_no_row_parsed(cli_env, monkeypatch, capsys):
+    data, prompt, out = cli_env
+    client = FakeClient({
+        "attack_01": _completion("I decline to answer."),
+        "honest_01": _completion("I decline to answer."),
+    })
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: client)
+    assert solo.main(_main_argv(data, prompt, out)) == 1
+    assert "nothing to report" in capsys.readouterr().out
+
+
+def test_main_exits_nonzero_when_the_provider_pin_did_not_hold(cli_env, monkeypatch, capsys):
+    data, prompt, out = cli_env
+    responses = {
+        "attack_01": _completion("<answer>attack</answer>", provider="deepinfra"),
+        "honest_01": _completion("<answer>benign</answer>", provider="parasail"),
+    }
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: FakeClient(dict(responses)))
+    assert solo.main(_main_argv(data, prompt, out, "--force")) == 1
+    assert "provider pin did NOT hold" in capsys.readouterr().out
+    assert solo.main(
+        _main_argv(data, prompt, out, "--force", "--allow-provider-mismatch")
+    ) == 0
+
+
+def test_main_scores_reasoning_fallback_rows_only_when_asked(cli_env, monkeypatch, capsys):
+    data, prompt, out = cli_env
+    responses = {
+        "attack_01": _completion(None, reasoning="hmm <answer>benign</answer>"),
+        "honest_01": _completion("<answer>benign</answer>"),
+    }
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: FakeClient(dict(responses)))
+    assert solo.main(_main_argv(data, prompt, out)) == 0
+    printed = capsys.readouterr().out
+    assert "reasoning-only rows  : 1 (excluded from matrix)" in printed
+    assert "TPR = n/a" in printed
+    written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert written[0]["text_from_reasoning"] is True
+
+    assert solo.main(
+        _main_argv(data, prompt, out, "--force", "--score-reasoning-fallback")
+    ) == 0
+    printed = capsys.readouterr().out
+    assert "SCORED" in printed
+    assert "TPR = 0.000" in printed
+
+
+def test_main_refuses_to_overwrite_a_finished_run(cli_env, monkeypatch, capsys):
+    data, prompt, out = cli_env
+    out.write_text('{"id": "attack_01"}\n', encoding="utf-8")
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("must not call the API before checking --out")
+
+    monkeypatch.setattr(solo, "make_client", _boom)
+    with pytest.raises(SystemExit) as excinfo:
+        solo.main(_main_argv(data, prompt, out))
+    assert excinfo.value.code == 2
+    assert "--force" in capsys.readouterr().err
+    assert out.read_text(encoding="utf-8") == '{"id": "attack_01"}\n'
+
+
+def test_force_overwrites_the_existing_output(cli_env, monkeypatch):
+    data, prompt, out = cli_env
+    out.write_text('{"id": "stale"}\n', encoding="utf-8")
+    client = FakeClient({
+        "attack_01": _completion("<answer>attack</answer>"),
+        "honest_01": _completion("<answer>benign</answer>"),
+    })
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: client)
+    assert solo.main(_main_argv(data, prompt, out, "--force")) == 0
+    written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [record["id"] for record in written] == ["attack_01", "honest_01"]
+
+
+def test_an_empty_existing_output_is_not_a_finished_run(cli_env, monkeypatch):
+    data, prompt, out = cli_env
+    out.write_text("", encoding="utf-8")
+    client = FakeClient({
+        "attack_01": _completion("<answer>attack</answer>"),
+        "honest_01": _completion("<answer>benign</answer>"),
+    })
+    monkeypatch.setattr(solo, "make_client", lambda **kwargs: client)
+    assert solo.main(_main_argv(data, prompt, out)) == 0
+
+
+def test_missing_data_file_is_a_usage_error_not_a_traceback(tmp_path: Path, capsys):
+    prompt = _prompt_yaml(tmp_path / "p.yaml")
+    with pytest.raises(SystemExit) as excinfo:
+        solo.main([
+            "--data", str(tmp_path / "nope.jsonl"),
+            "--prompt-file", prompt, "--prompt-section", "Sec", "--dry-run",
+        ])
+    assert excinfo.value.code == 2
+    assert "Data file not found" in capsys.readouterr().err
+
+
+def test_missing_prompt_file_is_a_usage_error_not_a_traceback(tmp_path: Path, capsys):
+    data = _write_jsonl(tmp_path / "d.jsonl", [_row("attack_01", "attack")])
+    with pytest.raises(SystemExit) as excinfo:
+        solo.main([
+            "--data", data, "--prompt-file", str(tmp_path / "nope.yaml"),
+            "--prompt-section", "Sec", "--dry-run",
+        ])
+    assert excinfo.value.code == 2
+    assert "Prompt file not found" in capsys.readouterr().err
+
+
+def test_output_file_is_rewritten_in_index_order(tmp_path: Path):
+    """Rows land in completion order; the file on disk must be index-ordered."""
+    prepared = [
+        solo.PreparedRow(1, "honest_01", "honest", "SYS", "USER honest_01"),
+        solo.PreparedRow(0, "attack_01", "attack", "SYS", "USER attack_01"),
+    ]
+    client = FakeClient({
+        "attack_01": _completion("<answer>attack</answer>"),
+        "honest_01": _completion("<answer>benign</answer>"),
+    })
+    out = tmp_path / "out.jsonl"
+    solo.run_rows(
+        prepared, solo.RunConfig(parallel=1), client, out_path=out, sleep=lambda _: None
+    )
+    written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [record["index"] for record in written] == [0, 1]
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_default_out_path_uses_run_tag_not_a_clock():

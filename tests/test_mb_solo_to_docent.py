@@ -518,6 +518,77 @@ def test_duplicate_result_rows_are_deduped_by_id_and_model(env, capsys):
     assert "duplicate" in capsys.readouterr().out
 
 
+def test_duplicate_rows_across_results_files_are_deduped(env, capsys):
+    """A partial re-run file passed alongside the original must not upload the
+    same (id, model) twice; the first occurrence wins."""
+    rows = [json.loads(line) for line in Path(env["results"]).read_text().splitlines()]
+    rerun_path = _write_jsonl(env["tmp"] / "rerun.jsonl", [rows[1], rows[0]])
+    client = FakeDocent()
+    up.main(
+        [
+            "--results", env["results"],
+            "--results", rerun_path,
+            "--data", env["data"],
+            "--prompt-file", env["prompt"],
+            "--prompt-section", "Sec",
+            "--name", "c",
+        ],
+        client=client,
+    )
+    assert [run.metadata["id"] for run in client.uploaded] == ["attack_1_0", "honest_2_0"]
+    out = capsys.readouterr().out
+    assert "skipped 2 (id, model) row(s) already seen" in out
+    # The kept copies are the ones from the first file.
+    assert all(run.metadata["results_file"] == "results.jsonl" for run in client.uploaded)
+
+
+def test_replace_warns_that_a_failed_upload_leaves_a_partial_collection(env, capsys):
+    client = FakeDocent()
+    client.existing_run_ids = ["old-1"]
+    up.main(_argv(env, "--name", "c", "--replace"), client=client)
+    assert "left partial" in capsys.readouterr().out
+
+
+def test_replace_deletes_nothing_when_a_run_cannot_be_built(env):
+    """--replace must not gut the collection when the build step fails."""
+    _write_prompt_yaml(Path(env["prompt"]), marker="-CHANGED")  # every sha mismatches
+    client = FakeDocent()
+    client.existing_run_ids = ["old-1"]
+    with pytest.raises(SystemExit):
+        up.main(_argv(env, "--name", "c", "--replace"), client=client)
+    assert client.deleted == []
+
+
+def test_missing_results_file_exits_2_without_a_traceback(env, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        up.main(
+            [
+                "--results", str(env["tmp"] / "nope.jsonl"),
+                "--data", env["data"],
+                "--prompt-file", env["prompt"],
+                "--prompt-section", "Sec",
+                "--name", "c",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "Results file not found" in capsys.readouterr().err
+
+
+def test_missing_prompt_file_exits_2_without_a_traceback(env, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        up.main(
+            [
+                "--results", env["results"],
+                "--data", env["data"],
+                "--prompt-file", str(env["tmp"] / "nope.yaml"),
+                "--prompt-section", "Sec",
+                "--name", "c",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "Prompt file not found" in capsys.readouterr().err
+
+
 def test_multiple_results_files_are_concatenated(env):
     rows = [json.loads(line) for line in Path(env["results"]).read_text().splitlines()]
     second = rows[0].copy()
