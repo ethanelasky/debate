@@ -29,6 +29,8 @@ and treat its timeout as a failure of the watch, not of the job.
   strength is in question (it was authored alongside the code it gates, or
   drives fakes/synthetic bindings): probe the behavior against the spec with
   independent instruments — real writers, real call paths.
+- Delete ephemeral debugging/probe tests once they have served their purpose,
+  and periodically review test directories for obsolete, redundant, or bloated coverage.
 - Reviewer/verifier subagents verify against the authoritative spec/plan text
   itself (exact file + section, or the governing text pasted verbatim), never
   the orchestrator's paraphrase — paraphrases silently drop or invent clauses.
