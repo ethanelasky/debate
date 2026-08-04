@@ -512,6 +512,20 @@ class DebateRound:
         self._judge_speaker = decision.speaker if decision is not None else None
 
     def run(self, states: list[DebateState]) -> list[DebateState]:
+        # first_slot_messages replaces slot 0's context wholesale; its author
+        # only replays that exchange later when slot 0 is PUBLIC (the replay
+        # keys off visibility-filtered records), so a non-public slot 0 would
+        # silently drop the solo turn from every context.
+        if (
+            self.slots
+            and self.slots[0].slot.visibility != Visibility.PUBLIC
+            and any(st.first_slot_messages is not None for st in states)
+        ):
+            raise ValueError(
+                f"first_speech_non_debate_aware requires a PUBLIC first slot, got "
+                f"{self.slots[0].speaker}/{self.slots[0].slot.name} "
+                f"({self.slots[0].slot.visibility.value})"
+            )
         for step in self.slots:
             live = [i for i, st in enumerate(states) if st.failed is None]
             if not live:
@@ -644,15 +658,16 @@ class DebateRound:
 
         if step.slot.kind == Kind.SOLUTION and self.solution_extractor is not None:
             record.extracted = self.solution_extractor(res.text)
+            binds_position = self.position_binder is not None or self.fresh_positions
+            if record.extracted is None and binds_position:
+                # Record the failed attempt (extracted None) before failing the
+                # round: its retry count is otherwise unobservable downstream.
+                state.records.append(record)
+                state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
+                return
             if self.position_binder is not None:
-                if record.extracted is None:
-                    state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
-                    return
                 self.position_binder(state, step.speaker, record.extracted)
             elif self.fresh_positions:
-                if record.extracted is None:
-                    state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
-                    return
                 v = record.extracted
                 position = f"{v:g}" if isinstance(v, float) else str(v)
                 state.bindings[step.speaker]["POSITION"] = position

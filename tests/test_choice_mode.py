@@ -500,6 +500,9 @@ def test_choice_round_binds_opposite_side_and_scores(prompt_file):
     summary = run_eval.summarize([row])
     assert summary["blind_choice"] == {
         "n": 1,
+        "n_attempted": 1,
+        "n_scored": 1,
+        "n_failed": 0,
         "chose_attack": 0,
         "chose_honest": 1,
         "accuracy": 0.0,  # ground truth of task 0 is "attack"
@@ -570,9 +573,8 @@ def test_choice_retries_exhausted_fails_round(prompt_file):
     (row,) = run_eval.result_rows(env)
     assert row["failed"] == "alice/blind: unparseable solution"
     assert row["chosen_side"] is None
-    # failed slots never append a record (decision-path parity), so the burnt
-    # retries are not observable on the row
-    assert row["choice_retries"] == 0
+    # the exhausted attempt is still recorded, so its burnt retries show up
+    assert row["choice_retries"] == 1
     assert run_eval.summarize([row])["blind_choice"] is None
 
 
@@ -695,6 +697,59 @@ turns:
         run_eval._choice_wiring(
             {"judge_config": {"schema_name": "collaborative"}}, PROTOCOL
         )
+
+
+def test_blind_message_templates_requires_one_solution_slot(prompt_file):
+    # the guard is local: blind_message_templates runs BEFORE _choice_wiring
+    two_solutions = Protocol.parse(
+        yaml.safe_load(
+            """
+turns:
+  - alice: [{name: blind, kind: solution}]
+    bob: [{name: blind, kind: solution}]
+  - judge: [{name: verdict, kind: decision}]
+"""
+        )
+    )
+    exp = {"prompt_config": {"file_path": prompt_file, "entry": "choice_test"}}
+    with pytest.raises(ValueError, match="exactly one solution slot"):
+        run_eval.blind_message_templates(exp, two_solutions)
+
+
+def test_blind_choice_summary_reports_failed_denominator(prompt_file):
+    rows = [
+        {"task_id": "a", "label": "attack", "chosen_side": "attack", "p_attack": 0.9,
+         "verdict_class": "winner", "failed": None},
+        {"task_id": "b", "label": "honest", "chosen_side": None, "p_attack": None,
+         "verdict_class": None, "failed": "alice/blind: unparseable solution"},
+    ]
+    s = run_eval.summarize(rows)
+    # accuracy is over parsed choices only; the attempted count says so
+    assert s["blind_choice"]["accuracy"] == 1.0
+    assert s["blind_choice"]["n_attempted"] == 2
+    assert s["blind_choice"]["n_scored"] == 1
+    assert s["blind_choice"]["n_failed"] == 1
+    assert s["coverage"]["blind_choice"] == {"n_attempted": 2, "n_scored": 1, "n_failed": 1}
+
+
+def test_round_rejects_non_public_first_slot_with_solo_messages(prompt_file):
+    from infra.envs.debate.prompts import RenderedPrompts
+    from infra.envs.debate.round import DebateRound
+
+    ephemeral_first = Protocol.parse(
+        yaml.safe_load(
+            """
+turns:
+  - alice: [{name: blind, kind: solution, visibility: ephemeral}]
+  - judge: [{name: verdict, kind: decision}]
+"""
+        )
+    )
+    lib = load_prompt_library(prompt_file, "sc_choice_test")
+    seats = {s: object() for s in ephemeral_first.speakers}
+    round_ = DebateRound(ephemeral_first, seats, RenderedPrompts(lib))
+    with pytest.raises(ValueError, match="PUBLIC first slot"):
+        round_.run([_solo_state()])
 
 
 def test_real_prompt_entries_hard_fail_until_filled():

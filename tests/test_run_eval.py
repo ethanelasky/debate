@@ -235,6 +235,8 @@ def test_result_rows_failed_round_is_recorded(prompt_file):
     assert summary["fail_reasons"] == {"verdict_unparseable": 1}
     assert summary["failed_task_ids"] == ["attack_0"]
     assert summary["n_scored"] == 0
+    assert summary["n_attempted"] == 1
+    assert summary["failure_rate"] == 1.0
 
 
 # ------------------------------------------------------------------- metrics
@@ -257,6 +259,10 @@ def test_summarize_confusion_auc_and_matched_fpr():
     ]
     s = summarize(rows, matched_fpr=8 / 116)
     assert (s["n"], s["n_scored"], s["n_failed"]) == (8, 7, 1)
+    assert (s["n_attempted"], s["failure_rate"]) == (8, pytest.approx(1 / 8))
+    # every metric group states the pool it was computed over
+    assert s["coverage"]["scores"] == {"n_attempted": 8, "n_scored": 7, "n_failed": 1}
+    assert s["coverage"]["blind_choice"] == {"n_attempted": 8, "n_scored": 0, "n_failed": 8}
     assert s["fail_reasons"] == {"alice/opening": 1}
     assert (s["n_tie"], s["n_neither"]) == (1, 0)
     assert s["confusion_at_0.5"] == {
@@ -402,3 +408,61 @@ def test_main_exits_nonzero_when_nothing_scored(tmp_path, prompt_file, capsys, m
     # results are still written before exiting
     (row,) = [json.loads(line) for line in out.read_text().splitlines()]
     assert row["failed"] == "verdict_unparseable"
+
+
+def test_main_exits_nonzero_above_max_failure_rate(tmp_path, prompt_file, capsys, monkeypatch):
+    # 1 of 4 rounds fails (25%): rows still score, but the pool is selected
+    exp_file = write_configs(tmp_path, prompt_file)
+    env = scripted_env(
+        prompt_file,
+        [
+            '{"winner": "Debater_A", "confidence": 0.8}',
+            '{"winner": "Debater_B", "confidence": 0.9}',
+            '{"winner": "Debater_A", "confidence": 0.7}',
+            "not json",
+            "still not json",
+        ],
+        n_tasks=4,
+        verdict_retries=1,
+    )
+    monkeypatch.setattr(run_eval, "build_eval_env", lambda exp, source: env)
+    out = tmp_path / "res.results.jsonl"
+    argv = ["--experiment-file", exp_file, "--experiment", "mb_test_eval", "--out", str(out)]
+    with pytest.raises(SystemExit) as e:
+        run_eval.main(argv, task_source=MBTaskSource(4))
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "--max-failure-rate" in err
+    summary = json.loads(out.with_suffix(".summary.json").read_text())
+    assert (summary["n_attempted"], summary["n_scored"], summary["n_failed"]) == (4, 3, 1)
+    assert summary["failure_rate"] == pytest.approx(0.25)
+
+    # the same run passes with the threshold raised above the observed rate
+    env2 = scripted_env(
+        prompt_file,
+        [
+            '{"winner": "Debater_A", "confidence": 0.8}',
+            '{"winner": "Debater_B", "confidence": 0.9}',
+            '{"winner": "Debater_A", "confidence": 0.7}',
+            "not json",
+            "still not json",
+        ],
+        n_tasks=4,
+        verdict_retries=1,
+    )
+    monkeypatch.setattr(run_eval, "build_eval_env", lambda exp, source: env2)
+    run_eval.main(argv + ["--max-failure-rate", "0.5"], task_source=MBTaskSource(4))
+    capsys.readouterr()
+
+
+def test_main_docent_collection_requires_upload_ack(tmp_path, prompt_file):
+    exp_file = write_configs(tmp_path, prompt_file)
+    argv = [
+        "--experiment-file", exp_file,
+        "--experiment", "mb_test_eval",
+        "--out", str(tmp_path / "res.results.jsonl"),
+        "--docent-collection", "mb-eval",
+    ]
+    with pytest.raises(SystemExit) as e:
+        run_eval.main(argv, task_source=MBTaskSource(1))
+    assert "--allow-trajectory-upload" in str(e.value.code)
