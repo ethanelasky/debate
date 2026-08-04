@@ -14,7 +14,7 @@
 
 codecontests_rlvr_olmo:
   model: allenai/Olmo-3-7B-Instruct-DPO
-  max_completion_tokens: 8192
+  max_completion_tokens: 2048
   dataset:
     type: codecontests
     path: data/codecontests/train.jsonl
@@ -28,15 +28,25 @@ codecontests_rlvr_olmo:
     # The whole held-out split: 501 problems, 109 contests, disjoint from train
     # by contest so near-duplicates cannot straddle the boundary.
     eval_subset_size: 501
-    # FLAT overshoot penalty: a completion past 4096 tokens loses a constant
+    # FLAT overshoot penalty: a completion past the budget loses a constant
     # 0.1, regardless of how far over. The old repo RAMPED this between a soft
     # 4096 and a hard 8192 (coef 0.10, so a half-way overshoot cost 0.05);
     # flat is the deliberate change, so the gradient says "stay under" rather
-    # than "be marginally shorter".
+    # than "be marginally shorter" — the model learns the budget quickly.
+    #
+    # 1536 is measured, not guessed. Over 12,436 cached model completions on
+    # these problems (the old repo's answer cache), approx tokens:
+    #                 median   p90     p95    fits 1536   fits 2048
+    #   CORRECT   (n=4988)  505   1,272  1,842     92.5%      96.3%
+    #   INCORRECT (n=1590)  676   2,573  3,214     77.4%      85.2%
+    # Correct answers are SHORTER than wrong ones, so a 1536 budget blocks few
+    # correct policy updates while pricing a tail that skews wrong. Those
+    # samples were 122B/35B-class though; if OLMo-7B rambles more, the
+    # over_budget metric will show it in step 1.
     #
     # It only bites if response_length exceeds it — see below. It does NOT
     # move the sampler cap; generation still stops at response_length.
-    soft_token_budget: 4096
+    soft_token_budget: 1536
     overshoot_penalty: 0.1
   training:
     backend: verl
@@ -47,11 +57,11 @@ codecontests_rlvr_olmo:
       # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
       # 1850 max, plus the answer-gen preamble.
       prompt_length: 4096
-      # 8192 mirrors the old repo's soft-4096 / hard-8192 pair: the budget
-      # prices length, this caps it. A response_length at or below the budget
-      # would make the penalty dead config.
-      response_length: 8192
-      max_token_len_per_gpu: 16384   # >= prompt_length + response_length
+      # Headroom over the budget so the penalty has something to price; 2048
+      # still captures 96.3% of correct answers. A response_length at or below
+      # soft_token_budget would make the penalty dead config.
+      response_length: 2048
+      max_token_len_per_gpu: 8192    # >= prompt_length + response_length
       checkpoint_dir: /workspace/checkpoints
     wandb_project: debate-rebuild
     lora_rank: 32
@@ -59,17 +69,17 @@ codecontests_rlvr_olmo:
     ppo_epochs: 1
     adv_length_norm: count
     steps: 100
-    # 16x8 = 128 rollouts/step, 12,800 over the run. Worst case 1.57M tokens
-    # per step, ~96 micro-batches at the 16384 budget — bounded by
-    # max_token_len_per_gpu, so batch size costs time, not memory.
-    batch_size: 16
+    # 8x8 = 64 rollouts/step. verl micro-batches against max_token_len_per_gpu,
+    # so batch size costs wall-clock, not peak memory; the 16x8 arm below is
+    # the same run at double the rollouts. Base arm is the cheaper one.
+    batch_size: 8
     group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
     lr: 1.0e-4
     kl_coef: 0.02
     kl_discount_factor: 0.0
     eval_every: 5
     eval_n: 256        # +-3.1pp binomial noise
-    eval_max_tokens: 8192
+    eval_max_tokens: 2048
     save_every: 25
 
 # 1-step smoke: proves the whole path — dataset load, prompt render, rollout,
@@ -83,3 +93,25 @@ codecontests_rlvr_olmo_smoke:
     group_size: 4
     eval_every: 0
     save_every: 0
+
+# Double the rollouts per step. Same memory profile (verl packs against
+# max_token_len_per_gpu); ~2x the wall-clock.
+codecontests_rlvr_olmo_16x8:
+  _extends: codecontests_rlvr_olmo
+  training:
+    batch_size: 16
+
+# Long-budget control. Only worth running if the smoke run shows OLMo's
+# completions clustering well above 1536 — i.e. if the measured distribution
+# above does not transfer from the 122B/35B-class samples it came from.
+# ~5x the generation of the base arm.
+codecontests_rlvr_olmo_long:
+  _extends: codecontests_rlvr_olmo
+  max_completion_tokens: 8192
+  dataset:
+    soft_token_budget: 4096
+  training:
+    verl:
+      response_length: 8192
+      max_token_len_per_gpu: 16384
+    eval_max_tokens: 8192
