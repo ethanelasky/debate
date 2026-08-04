@@ -26,7 +26,13 @@
 # a one-sided prior toward the proposer, the seat under training, which would
 # inflate its win rate independently of whether it was right. Its symmetric
 # replacement is the "do NOT simply trust either participant's claims" bullet in
-# <verify>, taken verbatim from codecontests.yaml. Asserted by
+# <verify>, taken verbatim from codecontests.yaml.
+#
+# The same rule applies BETWEEN the debaters (Frank, 2026-08-04): a seat is told
+# its own position, never that the other's is locked. `debater_system` is shared
+# by alice and bob, so its <role> no longer says "the Critic argues that answer
+# is wrong" — that reached the proposer, the same leak overall_system had, one
+# level down. Each critic/proposer card still assigns its own seat. Asserted by
 # tests/test_prompts.py::test_judge_never_told_a_position_was_assigned.
 #
 # LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary — overall_system,
@@ -77,8 +83,8 @@ math_proposer_critic:
     - |-
       <role>You are a participant in a proposer-critic debate over a
       mathematics problem. The Proposer submits a full solution ending in a
-      single \boxed{...} answer; the Critic argues that answer is
-      wrong; the Judge decides whether it is actually correct.</role>
+      single \boxed{...} answer; the Judge decides whether it is actually
+      correct.</role>
     - |-
       <answer-vs-reasoning>
       The debate is about whether the FINAL boxed answer is correct, not whether

@@ -24,7 +24,15 @@
 # "Proposer"/"Critic" labels in favour of <NAME>/<OPPONENT_NAME>. The judge's
 # old <critic-bias> block is deleted outright rather than reworded: it installed
 # a one-sided prior toward the proposer, the seat under training, which would
-# inflate its win rate independently of whether it was right. Asserted by
+# inflate its win rate independently of whether it was right.
+#
+# The same rule applies BETWEEN the debaters (Frank, 2026-08-04): a seat is told
+# its own position, never that the other's is locked. `debater_system` is shared
+# by alice and bob, so its <role> no longer says "the Critic argues that program
+# is wrong" — that reached the proposer, the same leak overall_system had, one
+# level down. Each critic/proposer card still assigns its own seat. Alice may
+# learn objections are coming (its <proposer-role> says so); it may not learn
+# they are compulsory. Asserted by
 # tests/test_prompts.py::test_judge_never_told_a_position_was_assigned.
 #
 # NOT fixed by the above, and worth knowing before reading judge win rates: the
@@ -88,9 +96,9 @@ codecontests_proposer_critic:
     - |-
       <role>You are a participant in a proposer-critic debate over a
       programming problem. The Proposer submits a complete Python program
-      reading from stdin and writing to stdout; the Critic argues
-      that program is wrong; the Judge decides whether it is actually
-      correct — whether it would pass the problem's hidden test cases.</role>
+      reading from stdin and writing to stdout; the Judge decides whether it
+      is actually correct — whether it would pass the problem's hidden test
+      cases.</role>
     # old pack's `overall_system` correctness-only rule, verbatim but for
     # "review" -> "debate". Math has no analog: only the code domain has a
     # complexity axis to rule out of scope.
