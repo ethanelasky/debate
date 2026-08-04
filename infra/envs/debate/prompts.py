@@ -1,4 +1,4 @@
-"""Prompt library: YAML entries -> rendered system / preamble / instruction text.
+"""Prompt library: YAML entries -> rendered system / preamble / cue text.
 
 Loading reuses debate/config.py's _includes/_extends resolver unchanged — a
 prompt file is just a config file whose entries happen to be prompt sets. This
@@ -6,92 +6,84 @@ module adds a typed view, `<PLACEHOLDER>` substitution, the compile-time
 prompt/protocol contract, and the adapter implementing round.py's
 PromptLibrary Protocol.
 
-TWO ENTRY SCHEMAS, dispatched per entry by its keys:
-
-STAGE SCHEMA (`slot_stages` present) — the old repo's stage vocabulary
-(prompts/parser.py PromptTag there), not per-speaker blobs. An entry names
-stages; `slot_stages` maps this repo's protocol slot names onto the cue
-stages, so protocols stay declarative and the old-name/new-name correspondence
-is per-pack DATA rather than renderer magic:
+SCHEMA — an entry names the parts of each seat's message sequence directly
+(design 2026-08-04). Roles come from the PROTOCOL, not from the pack: the
+speaker of the first solution slot is the proposer, the decision slot's
+speaker is the judge, and a remaining debater is the critic —
+load_prompt_library therefore requires the protocol.
 
     <entry>:
-      _extends: <parent>                 # optional
-      vars: {KEY: value}                 # static substitutions, merged over parent
-      overall_system:                    # every speaker's system card, first
-      debater_system:                    # both debaters, after overall_system
-      debater_system_proposer:           # proposer only, after debater_system
-      debater_system_critic:             # critic only, after debater_system
-      judge_system:                      # judge only, after overall_system
-      pre_debate:                        # critic's preamble (see below)
-      pre_debate_judge:                  # judge's preamble
-      debater_standard_grading_details:  # tail of the critic's preamble
-      judge_standard_grading_details:    # tail of the judge's preamble
-      <cue stages>: ...                  # pre_opening_speech_proposer, ...
-      slot_stages: {<protocol slot>: <cue stage>}
+      _extends: <parent>            # optional
+      vars: {KEY: value}            # static substitutions, merged over parent
+      overall_system:               # every speaker's system card, first
+      debater_system:               # both debaters, after overall_system
+      debater_system_proposer:      # proposer only, after debater_system
+      debater_system_critic:        # critic only, after debater_system
+      judge_system:                 # judge only, after overall_system
+      pre_debate:                   # SHARED leading user message (see below)
+      pre_debate_proposer:          # proposer's individual leading user message
+      pre_debate_critic:            # critic's individual leading user message
+      pre_debate_judge:             # judge's individual leading user message
+      attribution:                  # optional, see below
+        <reader>: {<author>: <template>}
+      <protocol slot name>: ...     # that slot's per-turn cue
 
-Composition, matching the old repo's speech_format.py + its SYSTEM-collapse:
-  system card = overall_system + debater_system + role card  (ONE system
-                message, blocks joined by a blank line), or
-                overall_system + judge_system for the judge.
-  stage_preamble = pre_debate + debater_standard_grading_details  (critic), or
-                pre_debate_judge + judge_standard_grading_details (judge).
-                Prefixed onto the FIRST user content of that speaker's context.
+Every seat's rendered view is:
 
-The PROPOSER gets NO preamble, deliberately: its opening cue is the task
-family's answer-generation user message spliced in whole, and that rendered
-message must stay byte-identical to the RLVR arm's (tests pin it). Its grading
-framing lives in answer_gen_system instead.
+    [system card]                    overall_system + role card, ONE message
+    [pre_debate]                     shared user message (if defined)
+    [pre_debate_<role>]              individual user message (if defined)
+    ...transcript...                 others' speeches (via attribution) and the
+                                     slot cues buffer into user messages that
+                                     strictly alternate with the seat's own
+                                     assistant turns, exactly as before
 
-Roles come from the PROTOCOL, not from the pack: the speaker of the first
-solution slot is the proposer, the decision slot's speaker is the judge, and a
-remaining debater is the critic. load_prompt_library therefore needs the
-protocol whenever an entry uses the stage schema.
+The system card composes as overall_system + debater_system + role card (one
+system message, blocks joined by a blank line), or overall_system +
+judge_system for the judge — the old repo's consecutive-SYSTEM collapse.
 
-DIRECT SCHEMA (`slots` present, no `slot_stages`) — per-speaker templates
-addressed by protocol slot name (see prompt_configs/monitoringbench.yaml):
+pre_debate / pre_debate_<role> render as SEPARATE user messages, in that
+order, right after the system card. Separate messages are deliberate cache
+design: providers that cache at message boundaries (DashScope) can only reuse
+a prefix of whole messages, so the byte-stable shared content (the problem /
+trajectory) must END a message, with seat-varying content starting a new one.
+Consecutive user messages at the context head are legal (frozen API seats;
+the strict user/assistant alternation applies from the first
+transcript-derived message on).
 
-    <entry>:
-      _extends: <parent>        # optional
-      vars: {KEY: value}        # static substitutions, merged over parent
-      system: {<speaker>: <template>}
-      preamble: [<item>, ...]                           # optional, see below
-      attribution: {<reader>: {<author>: <template>}}   # optional, see below
-      slots:
-        <name>: <template>                # string = any speaker
-        <name>: {<speaker>: <template>}   # map = per-speaker (e.g. closing)
+PER-TURN CUES are keyed by the PROTOCOL SLOT NAME itself — any entry key that
+is not a known stage is a cue, and the loader checks the cue inventory
+against the protocol both ways: a compiled slot without a cue and a cue key
+matching no compiled slot are both errors (dead prompt text is exactly how
+the old repo's pre_debate went dark for months).
 
-Two optional, additive direct-schema keys:
-- `preamble`: ordered list of items; each item renders as its OWN user message
-  at the head of every context of its speaker — after the system message,
-  before any transcript-derived content. An item is a single template string
-  (every speaker gets that message) or a {<speaker>: <template>} map (listed
-  speakers only; others skip that message). Rendered with the reader speaker's
-  bindings. SEPARATE messages are deliberate cache design (2026-08-03):
-  providers that cache at message boundaries (DashScope) can only reuse a
-  prefix of whole messages, so the byte-stable task content (the trajectory)
-  must END a message, with seat-varying content (positions) starting a new
-  one. Consecutive user messages are legal (frozen API seats; the strict
-  user/assistant alternation applies from the first transcript-derived message
-  on). This is DISTINCT from the stage schema's prefix preamble, which joins
-  the first user message precisely so the alternation stays untouched.
-- `attribution`: how a READER speaker sees an AUTHOR speaker's public
-  speeches. The template is rendered with the READER's bindings and the
-  speech text follows after a blank line. Pairs without a template fall back
-  to the hard-coded default "X said:\n<text>".
+The PROPOSER's opening cue is the task family's answer-generation user
+message spliced in whole (<ANSWER_GEN_USER>), and that rendered message must
+stay byte-identical to the RLVR arm's (tests pin it).
 
-Choice mode (mb_debate_choice, 2026-08-03) has no schema of its own here:
-the blind first slot renders the task source's own messages verbatim
-(round.py first_slot_messages / env first_speech_non_debate_aware), and the
-task source builds those messages from the shared trajectory preamble item
-plus the blind slot's SLOT TEMPLATE. The slot-0 author never renders preamble
-messages (its solo exchange replays instead). Only the bindability check
-knows about it — see validate_prompts(choice_positions).
+SOLO FIRST SPEECH (first_speech_non_debate_aware / choice mode): the first
+compiled slot is GENERATED under the task source's own messages verbatim (no
+debate framing). The author's LATER views render normally — debate framing
+(system + preamble messages), then slot 0 like any other own slot: its cue as
+user content, its answer as the first assistant turn — so the answer is
+presented as if it had been produced under the debate framing (deliberate,
+2026-08-04). Packs keep that honest by making the slot-0 cue byte-identical
+to the solo eliciting message (MB's blind instructions; the math packs'
+<ANSWER_GEN_USER>), which single-sourcing gives by construction.
+pre_debate_proposer typically carries just the author's debate identity
+("You are <NAME>, a debater…"): the identity the solo view deliberately
+withheld.
 
-Every stage/template may be a single string OR a LIST of blocks joined with a
-blank line. Blocks compose under _extends: the config resolver merges lists BY
-INDEX, so a child can override one block of a parent's stage (or append blocks
-past the end) without restating the rest — the old repo's adjacent-block
-concatenation, kept.
+`attribution` is how a READER speaker sees an AUTHOR speaker's public
+speeches. The template is rendered with the READER's bindings and the speech
+text follows after a blank line. Pairs without a template fall back to the
+hard-coded default "X said:\n<text>".
+
+Every stage/cue may be a single string OR a LIST of blocks joined with a
+blank line. Blocks compose under _extends: the config resolver merges lists
+BY INDEX, so a child can override one block of a parent's stage (or append
+blocks past the end) without restating the rest — the old repo's
+adjacent-block concatenation, kept.
 
 No Jinja: substitution is a plain replace of `<KEY>`. The placeholder pattern
 is UPPERCASE-only, so literal lowercase tags (`<problem>`) pass through.
@@ -102,6 +94,7 @@ To see where every stage lands in the final message sequences, use
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
@@ -122,38 +115,39 @@ _SYSTEM_STAGES: dict[str, tuple[str, ...]] = {
     CRITIC: ("overall_system", "debater_system", "debater_system_critic"),
     JUDGE: ("overall_system", "judge_system"),
 }
-#: Preamble stages, in order. Prefixed onto the speaker's FIRST user content.
-#: The proposer is absent BY DESIGN — see the module docstring.
-_PREAMBLE_STAGES: dict[str, tuple[str, ...]] = {
-    CRITIC: ("pre_debate", "debater_standard_grading_details"),
-    JUDGE: ("pre_debate_judge", "judge_standard_grading_details"),
+#: Individual leading-user-message stage per role, rendered after the shared
+#: pre_debate message.
+_PRE_DEBATE_STAGES: dict[str, str] = {
+    PROPOSER: "pre_debate_proposer",
+    CRITIC: "pre_debate_critic",
+    JUDGE: "pre_debate_judge",
 }
-_ROLE_STAGES = frozenset(
-    s for stages in (*_SYSTEM_STAGES.values(), *_PREAMBLE_STAGES.values()) for s in stages
-)
-_STAGE_ENTRY_KEYS = frozenset({"vars", "slot_stages"}) | _ROLE_STAGES
-_DIRECT_ENTRY_KEYS = frozenset({"vars", "system", "slots", "preamble", "attribution"})
+_STAGE_KEYS = frozenset(
+    s for stages in _SYSTEM_STAGES.values() for s in stages
+) | frozenset(_PRE_DEBATE_STAGES.values()) | {"pre_debate"}
+_ENTRY_KEYS = frozenset({"vars", "attribution"}) | _STAGE_KEYS
 
 
 @dataclass
 class PromptLibrary:
     system: dict[str, str] = field(default_factory=dict)
-    slots: dict[str, str | dict[str, str]] = field(default_factory=dict)
+    #: speaker -> ordered leading user messages (shared pre_debate first, then
+    #: the role's pre_debate_<role>); [] = none.
+    preamble: dict[str, list[str]] = field(default_factory=dict)
+    #: protocol slot name -> per-turn cue template.
+    slots: dict[str, str] = field(default_factory=dict)
     vars: dict[str, str] = field(default_factory=dict)
-    #: STAGE schema: speaker -> text prefixed onto its first user message
-    #: ("" / absent = none).
-    stage_preamble: dict[str, str] = field(default_factory=dict)
-    #: DIRECT schema: ordered preamble items; each renders as its own leading
-    #: user message. str item = every speaker; map item = listed speakers only.
-    preamble: list[str | dict[str, str]] = field(default_factory=list)
-    #: DIRECT schema: reader -> author -> template replacing "X said:".
+    #: reader -> author -> template replacing the "X said:" default.
     attribution: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: the raw shared pre_debate template (also message 0 of a solo first
+    #: speech built by a task source, e.g. run_eval.blind_message_templates).
+    shared_pre_debate: str = ""
 
 
 def speaker_roles(protocol: Protocol) -> dict[str, str]:
-    """Which seat plays which old-repo role. Derived from the PROTOCOL so a pack
-    never has to name seats: the decision slot's speaker judges, the first
-    solution slot's speaker proposes, any other debater critiques."""
+    """Which seat plays which role. Derived from the PROTOCOL so a pack never
+    has to name seats: the decision slot's speaker judges, the first solution
+    slot's speaker proposes, any other debater critiques."""
     decision = protocol.decision_slot
     judge = decision.speaker if decision is not None else None
     proposer = next(
@@ -169,80 +163,43 @@ def speaker_roles(protocol: Protocol) -> dict[str, str]:
 def load_prompt_library(
     path: str | Path, entry: str, protocol: Optional[Protocol] = None
 ) -> PromptLibrary:
-    """File + entry name -> resolved library (_extends/_includes applied).
+    """File + entry name -> resolved library (_extends/_includes applied), with
+    the role stages composed into per-speaker system cards and preamble
+    messages, and every non-stage key checked against the protocol's slot
+    inventory as that slot's cue.
 
-    An entry with `slot_stages` uses the STAGE schema (role-conditioned, needs
-    `protocol` to decide which seat is proposer/critic/judge); an entry with
-    `slots` uses the DIRECT schema (per-speaker templates, protocol unused)."""
+    `protocol` decides which seat is proposer/critic/judge AND which keys are
+    valid cues, so it is REQUIRED."""
     data = resolve_all_experiments(load_config_with_includes(path))
     cfg = data.get(entry)
     if not isinstance(cfg, dict):
         available = ", ".join(n for n in data if not n.startswith("_")) or "<none>"
         raise KeyError(f"prompt entry {entry!r} not in {path} (available: {available})")
-    if "slot_stages" in cfg:
-        return _load_stage_entry(cfg, entry, protocol)
-    if "slots" in cfg:
-        return _load_direct_entry(cfg, entry)
-    raise ValueError(
-        f"prompt entry {entry!r}: neither `slot_stages` (stage schema) nor `slots` "
-        "(direct schema) present — nothing would render"
-    )
-
-
-def _load_stage_entry(cfg: dict, entry: str, protocol: Optional[Protocol]) -> PromptLibrary:
-    """The old-repo stages composed into the per-speaker system cards, prefix
-    preambles and slot cues this repo renders."""
     if protocol is None:
         raise ValueError(
-            f"prompt entry {entry!r}: load_prompt_library needs the protocol — stages are "
-            "role-conditioned (proposer/critic/judge come from the protocol's solution and "
-            "decision slots)"
-        )
-    slot_stages = {str(k): str(v) for k, v in (cfg.get("slot_stages") or {}).items()}
-    if not slot_stages:
-        raise ValueError(
-            f"prompt entry {entry!r}: no slot_stages — every protocol slot needs the cue "
-            f"stage that serves it, e.g. {{proposal: pre_opening_speech_proposer}}"
-        )
-    unknown = set(cfg) - _STAGE_ENTRY_KEYS - set(slot_stages.values())
-    if unknown:
-        # Also catches a cue stage that slot_stages stopped naming: dead prompt
-        # text is exactly how the old repo's pre_debate went dark for months.
-        raise ValueError(
-            f"prompt entry {entry!r}: stage(s) {sorted(unknown)} are neither a known role stage "
-            f"nor named by slot_stages, so nothing would render them. Known role stages: "
-            f"{sorted(_ROLE_STAGES)}"
-        )
-    stages = {k: _join(v) for k, v in cfg.items() if k not in ("vars", "slot_stages")}
-    missing_cues = sorted({s for s in slot_stages.values() if s not in stages})
-    if missing_cues:
-        raise ValueError(
-            f"prompt entry {entry!r}: slot_stages names stage(s) {missing_cues} that the entry "
-            "does not define"
+            f"prompt entry {entry!r}: load_prompt_library needs the protocol — roles and "
+            "the cue inventory both come from it (proposer/critic/judge from the solution "
+            "and decision slots; cue keys are protocol slot names)"
         )
 
-    roles = speaker_roles(protocol)
-    return PromptLibrary(
-        system={s: _compose(stages, _SYSTEM_STAGES[r]) for s, r in roles.items()},
-        stage_preamble={
-            s: text
-            for s, r in roles.items()
-            if (text := _compose(stages, _PREAMBLE_STAGES.get(r, ())))
-        },
-        slots={slot: stages[stage] for slot, stage in slot_stages.items()},
-        vars={str(k): str(v) for k, v in (cfg.get("vars") or {}).items()},
-    )
-
-
-def _load_direct_entry(cfg: dict, entry: str) -> PromptLibrary:
-    unknown = set(cfg) - _DIRECT_ENTRY_KEYS
-    if unknown:
-        raise ValueError(f"prompt entry {entry!r}: unknown key(s) {sorted(unknown)}")
-    slots: dict[str, str | dict[str, str]] = {}
-    for name, tmpl in (cfg.get("slots") or {}).items():
-        slots[str(name)] = (
-            {str(s): _join(t) for s, t in tmpl.items()} if isinstance(tmpl, dict) else _join(tmpl)
+    slot_names = {cs.slot.name for cs in protocol.compile()}
+    cues = {str(k): _join(v) for k, v in cfg.items() if k not in _ENTRY_KEYS}
+    unused = set(cues) - slot_names
+    if unused:
+        # A pack serves a FAMILY of protocols, so a cue for a slot this
+        # protocol does not compile is legal (e.g. an optional scratchpad
+        # turn) — but it is also exactly what a typo'd stage name looks like,
+        # and silently-dead prompt text is how the old repo's pre_debate went
+        # dark for months. Warn, loudly, every load.
+        warnings.warn(
+            f"prompt entry {entry!r}: cue key(s) {sorted(unused)} match no slot of this "
+            f"protocol (slots: {sorted(slot_names)}) and will not render. Fine if they "
+            "serve another protocol variant; a typo'd stage name looks exactly like "
+            f"this (stages: {sorted(_STAGE_KEYS)}).",
+            stacklevel=2,
         )
+
+    stages = {k: _join(cfg[k]) for k in _STAGE_KEYS if k in cfg}
     attribution: dict[str, dict[str, str]] = {}
     for reader, authors in (cfg.get("attribution") or {}).items():
         if not isinstance(authors, dict):
@@ -251,29 +208,20 @@ def _load_direct_entry(cfg: dict, entry: str) -> PromptLibrary:
                 f"{{author: template}} map, got {type(authors).__name__}"
             )
         attribution[str(reader)] = {str(a): _join(t) for a, t in authors.items()}
-    raw_preamble = cfg.get("preamble") or []
-    if not isinstance(raw_preamble, list):
-        raise ValueError(
-            f"prompt entry {entry!r}: preamble must be a LIST of message items "
-            f"(string = every speaker, map = per-speaker), got {type(raw_preamble).__name__}"
-        )
-    preamble: list[str | dict[str, str]] = []
-    for i, item in enumerate(raw_preamble):
-        if isinstance(item, dict):
-            preamble.append({str(s): _join(t) for s, t in item.items()})
-        elif isinstance(item, (str, int, float)):
-            preamble.append(str(item))
-        else:
-            raise ValueError(
-                f"prompt entry {entry!r}: preamble[{i}] must be a template string or "
-                f"{{speaker: template}} map, got {type(item).__name__}"
-            )
+
+    roles = speaker_roles(protocol)
+    shared = stages.get("pre_debate", "").strip()
+    preamble: dict[str, list[str]] = {}
+    for s, r in roles.items():
+        msgs = [m for m in (shared, stages.get(_PRE_DEBATE_STAGES[r], "").strip()) if m]
+        preamble[s] = msgs
     return PromptLibrary(
-        system={str(k): _join(v) for k, v in (cfg.get("system") or {}).items()},
-        slots=slots,
-        vars={str(k): str(v) for k, v in (cfg.get("vars") or {}).items()},
+        system={s: _compose(stages, _SYSTEM_STAGES[r]) for s, r in roles.items()},
         preamble=preamble,
+        slots=cues,
+        vars={str(k): str(v) for k, v in (cfg.get("vars") or {}).items()},
         attribution=attribution,
+        shared_pre_debate=shared,
     )
 
 
@@ -293,18 +241,12 @@ def _join(template) -> str:
 
 
 def slot_template(lib: PromptLibrary, slot_name: str, speaker: str) -> str:
-    """Template for (slot, speaker). A string entry serves every speaker; a map
-    entry is per-speaker. Missing either level is a KeyError naming both."""
+    """Cue template for a slot. `speaker` is accepted for call-site symmetry;
+    cues are per-slot, and per-seat differences come from distinct protocol
+    slot names."""
     if slot_name not in lib.slots:
-        raise KeyError(f"no template for slot {slot_name!r} (have: {sorted(lib.slots)})")
-    tmpl = lib.slots[slot_name]
-    if isinstance(tmpl, str):
-        return tmpl
-    if speaker not in tmpl:
-        raise KeyError(
-            f"no template for slot {slot_name!r} speaker {speaker!r} (have: {sorted(tmpl)})"
-        )
-    return tmpl[speaker]
+        raise KeyError(f"no cue for slot {slot_name!r} (have: {sorted(lib.slots)})")
+    return lib.slots[slot_name]
 
 
 def render(template: str, bindings: dict[str, str], vars: Optional[dict[str, str]] = None) -> str:
@@ -327,47 +269,28 @@ def _entry_templates(
     lib: PromptLibrary, cs: CompiledSlot, first_slot_verbatim: bool = False
 ) -> Iterator[tuple[str, str]]:
     # Verbatim-first-slot modes (first_speech_non_debate_aware / choice): the
-    # speaker's system never renders in slot 0's context, but the slot TEMPLATE
-    # is still checked — the task source renders it (with task bindings only)
-    # into the solo messages, so a deferred placeholder there is still an error.
-    if cs.speaker in lib.system and not (first_slot_verbatim and cs.index == 0):
+    # speaker's system/preamble never render in slot 0's context, but the slot
+    # CUE is still checked — the task source renders it (with task bindings
+    # only) into the solo messages, so a deferred placeholder there is still an
+    # error.
+    solo_slot0 = first_slot_verbatim and cs.index == 0
+    if cs.speaker in lib.system and not solo_slot0:
         yield f"system[{cs.speaker}]", lib.system[cs.speaker]
-    if lib.stage_preamble.get(cs.speaker) and not (first_slot_verbatim and cs.index == 0):
-        # The stage preamble rides the speaker's FIRST user message in EVERY
-        # context it renders, so it must be bindable at that speaker's
-        # earliest rendered slot.
-        yield f"preamble[{cs.speaker}]", lib.stage_preamble[cs.speaker]
+    if not solo_slot0:
+        for i, tmpl in enumerate(lib.preamble.get(cs.speaker, [])):
+            yield f"preamble[{i}][{cs.speaker}]", tmpl
     try:
-        yield f"slot {cs.slot.name}[{cs.speaker}]", slot_template(lib, cs.slot.name, cs.speaker)
+        yield f"slot {cs.slot.name}", slot_template(lib, cs.slot.name, cs.speaker)
     except KeyError:
         pass  # reported separately
 
 
-def _extra_templates(
-    lib: PromptLibrary, slots: list[CompiledSlot], first_slot_verbatim: bool = False
+def _attribution_templates(
+    lib: PromptLibrary, slots: list[CompiledSlot]
 ) -> Iterator[tuple[CompiledSlot, str, str]]:
-    """(slot, label, template) for preamble / attribution templates at the
-    EARLIEST slot each can render: a preamble item renders in every context of
-    the speakers it serves EXCEPT slot 0 in verbatim-first-slot modes (whose
-    context is the task messages) and never for the slot-0 AUTHOR in those
-    modes (its solo exchange replays instead of preamble messages); an
-    attribution template first renders at the reader's first slot that can see
-    another speaker's earlier public slot. Pairs the protocol never exercises
-    yield nothing."""
-    solo_author = slots[0].speaker if (first_slot_verbatim and slots) else None
-    first_rendering: dict[str, CompiledSlot] = {}
-    for cs in slots:
-        if first_slot_verbatim and cs.index == 0:
-            continue  # slot 0 renders the task messages; no preamble there
-        if cs.speaker != solo_author:
-            first_rendering.setdefault(cs.speaker, cs)
-    for i, item in enumerate(lib.preamble):
-        serves = list(first_rendering) if isinstance(item, str) else [
-            s for s in item if s in first_rendering
-        ]
-        for speaker in serves:
-            tmpl = item if isinstance(item, str) else item[speaker]
-            yield first_rendering[speaker], f"preamble[{i}][{speaker}]", tmpl
+    """(slot, label, template) for attribution templates at the EARLIEST slot
+    each can render: the reader's first slot that can see another speaker's
+    earlier public slot. Pairs the protocol never exercises yield nothing."""
     for reader, authors in lib.attribution.items():
         first_reading = next(
             (
@@ -398,21 +321,23 @@ def _bindability_errors(
     solution slot that binds them. round.py binds a solver's own POSITION and
     every other speaker's OPPONENT_POSITION the moment its solution lands; a
     speaker with no solution slot of its own (the judge) reads POSITION once any
-    solution has landed. Static lib.vars count as bound. Preamble /
-    attribution templates are checked at the earliest slot they can render.
+    solution has landed. Static lib.vars count as bound. Attribution templates
+    are checked at the earliest slot they can render.
 
     Choice mode (position_binder + first_speech_non_debate_aware): the single
     solution slot binds BOTH deferred names for EVERY speaker the moment it
     lands — so both are usable at any strictly-later slot, and neither at the
     solution slot itself. Slot 0 renders the task messages verbatim, so the
-    speaker's system/preamble are exempt there (the slot template is not: the
-    task source renders it into those messages)."""
+    speaker's system/preamble are exempt there (the slot cue is not: the task
+    source renders it into those messages). The solo AUTHOR's system/preamble
+    first render at its next slot after 0, by which point the choice has
+    landed."""
     sols = [cs for cs in slots if cs.slot.kind == Kind.SOLUTION]
     own = {cs.speaker: cs.index for cs in sols}
     first = min((cs.index for cs in sols), default=None)
     errors: list[str] = []
     by_slot: dict[int, list[tuple[str, str]]] = {}
-    for cs, label, tmpl in _extra_templates(lib, slots, first_slot_verbatim=choice_positions):
+    for cs, label, tmpl in _attribution_templates(lib, slots):
         by_slot.setdefault(cs.index, []).append((label, tmpl))
     for cs in slots:
         if choice_positions:
@@ -447,10 +372,10 @@ def validate_prompts(
     choice_positions: bool = False,
 ) -> None:
     """The prompt/protocol contract, checked before any generation: every
-    (slot, speaker) the protocol will ask for resolves, every speaker has a
-    system prompt, and (fresh/choice mode) no template needs a position that
-    has not been generated yet. Raises ValueError listing every problem at
-    once."""
+    compiled slot has a cue, every speaker has a system prompt, attribution
+    names real speakers, and (fresh/choice mode) no template needs a position
+    that has not been generated yet. Raises ValueError listing every problem
+    at once."""
     slots = protocol.compile()
     errors: list[str] = []
     speakers = set(protocol.speakers)
@@ -459,24 +384,17 @@ def validate_prompts(
         if speaker not in lib.system:
             errors.append(f"no system prompt for speaker {speaker!r} (have: {sorted(lib.system)})")
         elif not lib.system[speaker].strip():
-            # A stage entry composes the card, so an empty one means the entry
-            # defines none of the role's stages — silently unprompted otherwise.
+            # Composed from stages, so an empty card means the entry defines
+            # none of them for this role — silently unprompted otherwise.
             errors.append(
-                f"empty system prompt for speaker {speaker!r} (role {roles.get(speaker)!r}): a "
-                f"stage entry must define one of {list(_SYSTEM_STAGES.get(roles.get(speaker, ''), ()))}"
+                f"empty system prompt for speaker {speaker!r} (role {roles.get(speaker)!r}): the "
+                f"entry defines none of {list(_SYSTEM_STAGES.get(roles.get(speaker, ''), ()))}"
             )
     for cs in slots:
         try:
             slot_template(lib, cs.slot.name, cs.speaker)
         except KeyError as e:
             errors.append(str(e.args[0]))
-    for i, item in enumerate(lib.preamble):
-        if isinstance(item, dict):
-            for sp in item:
-                if sp not in speakers:
-                    errors.append(
-                        f"preamble[{i}] speaker {sp!r} not in protocol (have: {sorted(speakers)})"
-                    )
     for reader, authors in lib.attribution.items():
         if reader not in speakers:
             errors.append(f"attribution reader {reader!r} not in protocol (have: {sorted(speakers)})")
@@ -512,27 +430,16 @@ class RenderedPrompts:
             raise KeyError(f"no system prompt for {speaker!r} (have: {sorted(self.lib.system)})")
         return render(self.lib.system[speaker], bindings, self.lib.vars)
 
-    def preamble(self, speaker: str, bindings: dict[str, str]) -> Optional[str]:
-        """STAGE schema: old-repo pre_debate[_judge] + grading details,
-        prefixed onto this speaker's first user content. None for a speaker
-        with no preamble (the proposer, whose opening cue must stay
-        byte-identical to the RLVR arm; every direct-schema speaker)."""
-        tmpl = self.lib.stage_preamble.get(speaker)
-        return render(tmpl, bindings, self.lib.vars) if tmpl else None
-
     def instruction(self, slot_name: str, speaker: str, bindings: dict[str, str]) -> str:
         return render(slot_template(self.lib, slot_name, speaker), bindings, self.lib.vars)
 
     def preamble_messages(self, speaker: str, bindings: dict[str, str]) -> list[str]:
-        """DIRECT schema: one rendered string per leading user message for this
-        speaker, in item order; items whose map lacks the speaker are skipped."""
-        out: list[str] = []
-        for item in self.lib.preamble:
-            tmpl = item if isinstance(item, str) else item.get(speaker)
-            if tmpl is None:
-                continue
-            out.append(render(tmpl, bindings, self.lib.vars))
-        return out
+        """The speaker's leading user messages (shared pre_debate, then its
+        role's pre_debate_<role>), each rendered as its own message."""
+        return [
+            render(tmpl, bindings, self.lib.vars)
+            for tmpl in self.lib.preamble.get(speaker, [])
+        ]
 
     def attributed(
         self,
@@ -578,9 +485,8 @@ def preview(lib: PromptLibrary, protocol: Protocol, speakers: Optional[list[str]
     placeholder_names = {
         m.group(1)
         for tmpl in list(lib.system.values())
-        + list(lib.stage_preamble.values())
-        + [t for v in lib.slots.values() for t in (v.values() if isinstance(v, dict) else [v])]
-        + [t for item in lib.preamble for t in (item.values() if isinstance(item, dict) else [item])]
+        + [t for msgs in lib.preamble.values() for t in msgs]
+        + list(lib.slots.values())
         + [t for authors in lib.attribution.values() for t in authors.values()]
         for m in PLACEHOLDER.finditer(tmpl)
     }

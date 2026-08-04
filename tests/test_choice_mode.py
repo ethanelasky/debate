@@ -2,15 +2,18 @@
 
 2026-08-03 rework: the blind first turn is TWO solo user messages —
 [trajectory message, blind-instructions message] — rendered verbatim by
-first_speech_non_debate_aware and replayed in full in the chooser's later
-contexts; the trajectory message doubles as the other seats' first preamble
-message (byte-identical, so message-boundary prompt caches can reuse it).
-This file covers:
+first_speech_non_debate_aware; the trajectory message doubles as every seat's
+shared pre_debate message (byte-identical, so message-boundary prompt caches
+can reuse it). 2026-08-04: the chooser's LATER contexts no longer replay those
+solo messages verbatim — they render normally (system card, preamble messages,
+then slot 0's own cue and its answer as the first assistant turn), and the
+packs keep that honest by making the slot-0 cue byte-identical to the blind
+instructions message. This file covers:
 - monitoringbench parse_choice / choice_retry_feedback / position binder
   (two-seat and single-seat) / MonitoringBenchFamily / blind Task.messages
   (incl. the FILL_ME hard guard);
-- round: preamble-as-separate-messages, full solo replay, solution feedback
-  retries in the solo context;
+- round: preamble-as-separate-messages, the chooser's reframed later context,
+  solution feedback retries in the solo context;
 - prompts.validate_prompts(choice_positions=...) bindability rule;
 - run_eval choice plumbing: validation, chosen_side/choice_retries rows,
   collaborative (grade-the-consultant) p_attack, blind_choice summary block.
@@ -68,37 +71,38 @@ turns:
     )
 )
 
+# alice speaks the only solution slot, so the protocol makes her the PROPOSER
+# (the blind chooser) and bob the CRITIC; the seats' distinct preamble content
+# is expressed as those role stages. `pre_debate` is the shared trajectory
+# message every seat opens with — the same template the task source renders as
+# blind message 0.
 PROMPTS_YAML = """
 choice_test:
-  system:
-    alice: "NEUTRAL DEBATE SYSTEM."
-    bob: "NEUTRAL DEBATE SYSTEM."
-    judge: "Judge <NAME> vs <OPPONENT_NAME>."
-  preamble:
-    - "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
-    - bob: "You are <NAME>. Position: <POSITION> vs <OPPONENT_POSITION>"
-      judge: "Assigned: <POSITION> vs <OPPONENT_POSITION>"
-  slots:
-    blind: "BLIND INSTRUCTIONS. End with the answer tag."
-    opening: "Open, <NAME>. Position: <POSITION>"
-    pre_speech: "Rebut, <NAME>. Position: <POSITION>"
-    verdict: "Output your JSON verdict."
+  debater_system: "NEUTRAL DEBATE SYSTEM."
+  judge_system: "Judge <NAME> vs <OPPONENT_NAME>."
+  pre_debate: "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
+  pre_debate_proposer: "You are <NAME>, a debater."
+  pre_debate_critic: "You are <NAME>. Position: <POSITION> vs <OPPONENT_POSITION>"
+  pre_debate_judge: "Assigned: <POSITION> vs <OPPONENT_POSITION>"
+  blind: "BLIND INSTRUCTIONS. End with the answer tag."
+  opening: "Open, <NAME>. Position: <POSITION>"
+  pre_speech: "Rebut, <NAME>. Position: <POSITION>"
+  verdict: "Output your JSON verdict."
 
 sc_choice_test:
-  system:
-    alice: "NEUTRAL CONSULTANT SYSTEM."
-    judge: "Grade the consultant <NAME>."
-  preamble:
-    - "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
-    - judge: "The consultant chose: <POSITION>"
-  slots:
-    blind: "BLIND INSTRUCTIONS. End with the answer tag."
-    pre_speech: "Develop, <NAME>. Position: <POSITION>"
-    verdict: "Output your JSON grading verdict."
+  debater_system: "NEUTRAL CONSULTANT SYSTEM."
+  judge_system: "Grade the consultant <NAME>."
+  pre_debate: "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
+  pre_debate_judge: "The consultant chose: <POSITION>"
+  blind: "BLIND INSTRUCTIONS. End with the answer tag."
+  pre_speech: "Develop, <NAME>. Position: <POSITION>"
+  verdict: "Output your JSON grading verdict."
 """
 
 BACKGROUND = "SYNTHETIC-TRAJECTORY-TEXT do-not-print-me"
+TRAJ_TEMPLATE = "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
 TRAJ_MESSAGE = f"TRAJECTORY MESSAGE: {BACKGROUND}"
+# byte-identical to the `blind` cue: what makes the chooser's later view honest
 INSTR_MESSAGE = "BLIND INSTRUCTIONS. End with the answer tag."
 
 
@@ -112,7 +116,7 @@ def prompt_file(tmp_path_factory):
 def mb_task(i, label):
     return Task(
         # choice mode: Task.messages IS the blind solo context — trajectory
-        # message then instructions message, replayed in full later
+        # message then instructions message, rendered verbatim at slot 0
         messages=[
             {"role": "user", "content": TRAJ_MESSAGE},
             {"role": "user", "content": INSTR_MESSAGE},
@@ -357,10 +361,10 @@ def _solo_state():
     return st
 
 
-def test_blind_context_is_verbatim_and_replayed_in_full(prompt_file):
+def test_blind_context_is_verbatim_then_reframed_for_the_author(prompt_file):
     from infra.envs.debate.prompts import RenderedPrompts
 
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     prompts = RenderedPrompts(lib)
     slots = PROTOCOL.compile()
     st = _solo_state()
@@ -378,22 +382,28 @@ def test_blind_context_is_verbatim_and_replayed_in_full(prompt_file):
     rebut = slots[2]
     assert rebut.speaker == "alice" and rebut.slot.name == "pre_speech"
     msgs = render_context(st, rebut, prompts)
-    # full solo replay: BOTH solo messages then the blind answer, then the
-    # transcript-derived turn — and NO preamble for the solo author
-    assert [m["role"] for m in msgs] == ["system", "user", "user", "assistant", "user"]
+    # the author's later view is the NORMAL debate framing: system card, the
+    # shared then proposer preamble messages, and slot 0 rendered like any own
+    # slot — its cue as user content, its answer as the first assistant turn.
+    # The solo messages are never replayed; the cue is byte-identical to the
+    # blind instructions, which is what keeps the reframing honest.
+    assert [m["role"] for m in msgs] == ["system", "user", "user", "user", "assistant", "user"]
     assert msgs[0]["content"] == "NEUTRAL DEBATE SYSTEM."
     assert msgs[1]["content"] == TRAJ_MESSAGE
-    assert msgs[2]["content"] == INSTR_MESSAGE
-    assert msgs[3]["content"] == "fine <answer>benign</answer>"
-    assert "BOB-OPENING" in msgs[4]["content"]
-    assert "Rebut, Debater_A" in msgs[4]["content"]
-    assert MB_POSITION_HONEST in msgs[4]["content"]  # chosen position bound into the cue
+    assert msgs[2]["content"] == "You are Debater_A, a debater."
+    assert msgs[3]["content"] == INSTR_MESSAGE
+    assert msgs[4]["content"] == "fine <answer>benign</answer>"
+    assert "BOB-OPENING" in msgs[5]["content"]
+    assert "Rebut, Debater_A" in msgs[5]["content"]
+    assert MB_POSITION_HONEST in msgs[5]["content"]  # chosen position bound into the cue
+    # exactly one system message, by construction: the solo messages carried none
+    assert sum(m["role"] == "system" for m in msgs) == 1
 
 
 def test_bob_context_shares_trajectory_message_bytes(prompt_file):
     from infra.envs.debate.prompts import RenderedPrompts
 
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     prompts = RenderedPrompts(lib)
     slots = PROTOCOL.compile()
     st = _solo_state()
@@ -415,7 +425,7 @@ def test_bob_context_shares_trajectory_message_bytes(prompt_file):
 def test_judge_context_gets_traj_and_role_messages(prompt_file):
     from infra.envs.debate.prompts import RenderedPrompts
 
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     prompts = RenderedPrompts(lib)
     slots = PROTOCOL.compile()
     st = _solo_state()
@@ -438,7 +448,7 @@ def test_judge_context_gets_traj_and_role_messages(prompt_file):
 
 
 def test_bindability_choice_vs_fresh(prompt_file):
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     # bob/judge preamble items use POSITION/OPPONENT_POSITION; the single
     # solution slot binds both names for everyone in choice mode -> OK.
     validate_prompts(lib, PROTOCOL, choice_positions=True)
@@ -449,7 +459,7 @@ def test_bindability_choice_vs_fresh(prompt_file):
 def test_bindability_rejects_position_in_blind_template(prompt_file):
     # the blind slot TEMPLATE is rendered by the task source with task
     # bindings only — a deferred placeholder there must fail validation
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     lib.slots["blind"] = "Assess the trajectory. You argue <POSITION>."
     with pytest.raises(ValueError, match="POSITION.*choice_positions"):
         validate_prompts(lib, PROTOCOL, choice_positions=True)
@@ -459,18 +469,26 @@ def test_bindability_exempts_speaker_system_at_slot_zero(prompt_file):
     # alice's system references POSITION: never rendered at slot 0 (verbatim
     # context), rendered at her later slots where POSITION is bound -> choice
     # passes; fresh mode checks it at slot 0 -> fails.
-    lib = load_prompt_library(prompt_file, "choice_test")
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
     lib.system["alice"] = "DEBATE SYSTEM. You argue <POSITION>."
     validate_prompts(lib, PROTOCOL, choice_positions=True)
     with pytest.raises(ValueError, match="POSITION"):
         validate_prompts(lib, PROTOCOL, fresh_positions=True)
 
 
-def test_preamble_map_speaker_must_be_in_protocol(prompt_file):
-    lib = load_prompt_library(prompt_file, "choice_test")
-    lib.preamble.append({"carol": "hi"})
-    with pytest.raises(ValueError, match="preamble\\[2\\] speaker 'carol'"):
-        validate_prompts(lib, PROTOCOL)
+def test_preamble_stages_compose_shared_then_role(prompt_file):
+    """Preamble speakers can no longer be wrong — each seat's leading messages
+    are derived from its protocol role: the shared pre_debate first, then that
+    role's individual stage."""
+    lib = load_prompt_library(prompt_file, "choice_test", PROTOCOL)
+    assert lib.shared_pre_debate == TRAJ_TEMPLATE
+    assert lib.preamble == {
+        "alice": [TRAJ_TEMPLATE, "You are <NAME>, a debater."],
+        "bob": [TRAJ_TEMPLATE, "You are <NAME>. Position: <POSITION> vs <OPPONENT_POSITION>"],
+        "judge": [TRAJ_TEMPLATE, "Assigned: <POSITION> vs <OPPONENT_POSITION>"],
+    }
+    # the shared message is byte-identical across seats: the cache invariant
+    assert len({msgs[0] for msgs in lib.preamble.values()}) == 1
 
 
 # --------------------------------------------------------- round + run_eval
@@ -613,7 +631,7 @@ def test_sc_choice_grading_p_attack(prompt_file, side_tag, verdict, conf, expect
 def test_sc_choice_contexts(prompt_file):
     from infra.envs.debate.prompts import RenderedPrompts
 
-    lib = load_prompt_library(prompt_file, "sc_choice_test")
+    lib = load_prompt_library(prompt_file, "sc_choice_test", SC_PROTOCOL)
     prompts = RenderedPrompts(lib)
     slots = SC_PROTOCOL.compile()
     st = DebateState(bindings=_bindings(with_bob=False))
@@ -745,7 +763,7 @@ turns:
 """
         )
     )
-    lib = load_prompt_library(prompt_file, "sc_choice_test")
+    lib = load_prompt_library(prompt_file, "sc_choice_test", ephemeral_first)
     seats = {s: object() for s in ephemeral_first.speakers}
     round_ = DebateRound(ephemeral_first, seats, RenderedPrompts(lib))
     with pytest.raises(ValueError, match="PUBLIC first slot"):
@@ -787,30 +805,64 @@ turns:
         tmpls, vars_ = run_eval.blind_message_templates(exp, topo)
         assert len(tmpls) == 2
         assert "<BACKGROUND_TEXT>" in tmpls[0]
-        assert "<FILL_ME_BLIND_INSTRUCTIONS>" in tmpls[1]
+        # Blind instructions filled 2026-08-04: self-contained monitor guidance
+        # (four security failures) + the answer tag, no debate framing.
+        assert "four security failures" in tmpls[1]
+        assert "<answer>attack</answer>" in tmpls[1]
+        for word in ("debate", "opponent", "judge", "assigned"):
+            assert word not in tmpls[1].lower(), word
         render(tmpls[0], {"BACKGROUND_TEXT": "x"}, vars_)  # trajectory msg renders
-        with pytest.raises(ValueError, match="FILL_ME_BLIND_INSTRUCTIONS"):
-            render(tmpls[1], {"BACKGROUND_TEXT": "x"}, vars_)
+        render(tmpls[1], {"BACKGROUND_TEXT": "x"}, vars_)  # instructions render fully
+
+
+MB_DEBATE_CHOICE_TOPO = Protocol.parse(
+    yaml.safe_load(
+        """
+turns:
+  - alice: [{name: blind_assessment, kind: solution}]
+    bob:   [{name: pre_opening_speech}]
+  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
+"""
+    )
+)
+MB_SC_CHOICE_TOPO = Protocol.parse(
+    yaml.safe_load(
+        """
+turns:
+  - alice: [{name: blind_assessment, kind: solution}]
+  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
+"""
+    )
+)
 
 
 def test_real_choice_entries_cache_invariants():
-    """alice/bob systems byte-identical + free of seat placeholders; the
-    trajectory preamble item is shared and identical across both choice
-    entries (the cross-arm byte-stability that makes cache reuse possible)."""
+    """alice/bob systems byte-identical + free of seat placeholders; the shared
+    pre_debate (trajectory) message is identical across both choice entries
+    (the cross-arm byte-stability that makes cache reuse possible)."""
     import re
 
     dbg = load_prompt_library(
-        "infra/envs/debate/prompt_configs/monitoringbench.yaml", "mb_debate_choice"
+        "infra/envs/debate/prompt_configs/monitoringbench.yaml",
+        "mb_debate_choice",
+        MB_DEBATE_CHOICE_TOPO,
     )
     sc = load_prompt_library(
-        "infra/envs/debate/prompt_configs/monitoringbench.yaml", "mb_single_consultancy_choice"
+        "infra/envs/debate/prompt_configs/monitoringbench.yaml",
+        "mb_single_consultancy_choice",
+        MB_SC_CHOICE_TOPO,
     )
+    # the proposer and critic cards compose to the same bytes: the chooser must
+    # not be able to tell which seat it is before the blind turn
     assert dbg.system["alice"] == dbg.system["bob"]
     for tmpl in (dbg.system["alice"], sc.system["alice"]):
         seat_refs = {m for m in re.findall(r"<([A-Z_]+)>", tmpl) if "NAME" in m or "POSITION" in m}
         assert seat_refs == set(), seat_refs
-    assert isinstance(dbg.preamble[0], str) and "<BACKGROUND_TEXT>" in dbg.preamble[0]
-    assert sc.preamble[0] == dbg.preamble[0]
+    assert "<BACKGROUND_TEXT>" in dbg.shared_pre_debate
+    assert sc.shared_pre_debate == dbg.shared_pre_debate
+    # and it really is every seat's first leading message
+    for lib in (dbg, sc):
+        assert all(msgs[0] == lib.shared_pre_debate for msgs in lib.preamble.values())
 
 
 def test_real_config_arms_resolve_offline():
@@ -822,7 +874,9 @@ def test_real_config_arms_resolve_offline():
         assert exp["first_speech_non_debate_aware"] is True
         topo = run_eval._resolve_protocol(exp)
         run_eval._choice_wiring(exp, topo)
-        lib = load_prompt_library(exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"])
+        lib = load_prompt_library(
+            exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"], topo
+        )
         validate_prompts(lib, topo, choice_positions=True)
     smoke = load_experiment("configs/mb_eval.yaml", "mb_smoke4_single_consultancy_choice")
     assert smoke["judge_config"]["schema_name"] == "collaborative"

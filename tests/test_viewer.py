@@ -33,23 +33,22 @@ def create_app(**kwargs):
     kwargs.setdefault("allowed_hosts", ["testserver"])
     return _create_app(**kwargs)
 
+# Single prompt schema (infra/envs/debate/prompts.py): fixed stage keys plus
+# per-turn cues keyed DIRECTLY by protocol slot name (`opening` / `closing`).
 PROMPTS_A = """\
 base_entry:
   vars:
     GREETING: hello
-  system:
-    alice:
-      - block zero
-      - block one
-      - block two
-    judge: judge system prompt
-  preamble:
-    - alice: preamble text
-  slots:
-    opening: opening instruction
-    closing:
-      alice: alice closing
-      judge: judge closing
+  overall_system:
+    - block zero
+    - block one
+    - block two
+  debater_system: debater system prompt
+  judge_system: judge system prompt
+  pre_debate: shared preamble text
+  pre_debate_proposer: proposer preamble text
+  opening: opening instruction
+  closing: closing instruction
   attribution:
     judge:
       alice: alice said this
@@ -58,11 +57,9 @@ base_entry:
 PROMPTS_B = """\
 child_entry:
   _extends: base_entry
-  system:
-    alice:
-      - OVERRIDDEN block zero
-  slots:
-    opening: child opening instruction
+  overall_system:
+    - OVERRIDDEN block zero
+  opening: child opening instruction
 """
 
 EXPERIMENTS = """\
@@ -151,16 +148,17 @@ def test_prompts_raw_vs_resolved_extends_chain(client: TestClient) -> None:
     # raw child holds ONLY its overrides
     assert raw["child_entry"]["_extends"] == "base_entry"
     assert "vars" not in raw["child_entry"]
-    assert raw["child_entry"]["system"]["alice"] == ["OVERRIDDEN block zero"]
+    assert raw["child_entry"]["overall_system"] == ["OVERRIDDEN block zero"]
 
     # resolved child: _extends applied, lists merged BY INDEX, _extends stripped
     child = resolved["child_entry"]
     assert "_extends" not in child
-    assert child["system"]["alice"] == ["OVERRIDDEN block zero", "block one", "block two"]
-    assert child["system"]["judge"] == "judge system prompt"  # inherited
+    assert child["overall_system"] == ["OVERRIDDEN block zero", "block one", "block two"]
+    assert child["judge_system"] == "judge system prompt"  # inherited
+    assert child["pre_debate"] == "shared preamble text"  # inherited
     assert child["vars"] == {"GREETING": "hello"}  # inherited
-    assert child["slots"]["opening"] == "child opening instruction"  # overridden
-    assert child["slots"]["closing"]["judge"] == "judge closing"  # inherited
+    assert child["opening"] == "child opening instruction"  # overridden cue
+    assert child["closing"] == "closing instruction"  # inherited cue
 
 
 def test_prompts_save_roundtrip_multifile(client: TestClient, dirs: tuple[Path, Path]) -> None:
@@ -170,7 +168,7 @@ def test_prompts_save_roundtrip_multifile(client: TestClient, dirs: tuple[Path, 
     original_a = (prompts / "a.yaml").read_text()
     original_b = (prompts / "b.yaml").read_text()
 
-    raw["child_entry"]["slots"]["opening"] = "EDITED child opening\nsecond line"
+    raw["child_entry"]["opening"] = "EDITED child opening\nsecond line"
     r = client.post(
         "/api/prompts",
         json={"raw": raw, "source_file_overrides": {}, "mtimes": payload["mtimes"]},
@@ -190,7 +188,7 @@ def test_prompts_save_roundtrip_multifile(client: TestClient, dirs: tuple[Path, 
     new_b = yaml.safe_load((prompts / "b.yaml").read_text())
     old_b = yaml.safe_load(original_b)
     assert new_b["_includes"] == old_b["_includes"]  # preserved
-    old_b["child_entry"]["slots"]["opening"] = "EDITED child opening\nsecond line"
+    old_b["child_entry"]["opening"] = "EDITED child opening\nsecond line"
     assert new_b == old_b
 
 
@@ -232,7 +230,7 @@ def test_prompts_new_entry_targets_parent_file(client: TestClient, dirs: tuple[P
 
 def test_prompts_new_entry_without_target_rejected(client: TestClient) -> None:
     raw = client.get("/api/prompts").json()["raw"]
-    raw["orphan"] = {"system": {"alice": "hi"}}
+    raw["orphan"] = {"overall_system": "hi"}
     r = client.post("/api/prompts", json={"raw": raw})
     assert r.status_code == 400
 
@@ -260,18 +258,34 @@ def test_prompts_post_duplicate_entry_is_409(client: TestClient, dirs: tuple[Pat
     assert "base_entry" in r.json()["detail"]
 
 
-def test_prompts_invalid_entry_keys_flagged(dirs: tuple[Path, Path]) -> None:
-    """R8: entry keys outside infra's _ENTRY_KEYS are reported per entry —
-    the viewer must not present an entry load_prompt_library would refuse
-    as healthy."""
+def test_prompts_unknown_keys_are_presumed_cues_not_invalid(
+    dirs: tuple[Path, Path],
+) -> None:
+    """R8 under the single schema: a non-stage key is a per-turn cue keyed by
+    a PROTOCOL SLOT NAME, and the viewer has no protocol — so it must not
+    flag one as invalid. It surfaces the presumed cues informationally."""
     configs, prompts = dirs
     (prompts / "c.yaml").write_text(
-        "weird_entry:\n  vars: {A: b}\n  bogus_key: 1\n", encoding="utf-8"
+        "weird_entry:\n  vars: {A: b}\n  some_slot: cue text\n", encoding="utf-8"
     )
     app = create_app(configs_dir=configs, prompts_dir=prompts)
     payload = TestClient(app).get("/api/prompts").json()
-    assert payload["invalid"] == {"weird_entry": ["bogus_key"]}
-    assert "weird_entry" in payload["raw"]  # still shown, just flagged
+    assert payload["invalid"] == {}
+    assert payload["cues"]["weird_entry"] == ["some_slot"]
+    assert payload["cues"]["base_entry"] == ["closing", "opening"]
+    assert payload["cues"]["child_entry"] == ["closing", "opening"]
+    assert "weird_entry" in payload["raw"]
+
+
+def test_prompts_non_mapping_entry_flagged_invalid(dirs: tuple[Path, Path]) -> None:
+    """The one structural problem the viewer CAN detect without a protocol."""
+    configs, prompts = dirs
+    (prompts / "c.yaml").write_text("scalar_entry: 5\n", encoding="utf-8")
+    app = create_app(configs_dir=configs, prompts_dir=prompts)
+    payload = TestClient(app).get("/api/prompts").json()
+    assert payload["invalid"] == {"scalar_entry": ["<entry is not a mapping>"]}
+    assert "scalar_entry" not in payload["cues"]
+    assert "scalar_entry" in payload["raw"]  # still shown, just flagged
 
 
 def test_prompts_per_file_error_isolation(dirs: tuple[Path, Path]) -> None:
@@ -298,7 +312,7 @@ def test_prompts_stale_mtime_409_only_for_touched_files(
     _, prompts = dirs
     payload = client.get("/api/prompts").json()
     raw = payload["raw"]
-    raw["child_entry"]["slots"]["opening"] = "post-race edit"
+    raw["child_entry"]["opening"] = "post-race edit"
 
     # a.yaml goes stale, but the edit only touches b.yaml -> still saves
     _bump_mtime(prompts / "a.yaml")
@@ -307,7 +321,7 @@ def test_prompts_stale_mtime_409_only_for_touched_files(
     assert r.json()["written"] == ["b.yaml"]
 
     # now b.yaml goes stale under a second edit based on old tokens -> 409
-    raw["child_entry"]["slots"]["opening"] = "second racing edit"
+    raw["child_entry"]["opening"] = "second racing edit"
     _bump_mtime(prompts / "b.yaml")
     r = client.post("/api/prompts", json={"raw": raw, "mtimes": payload["mtimes"]})
     assert r.status_code == 409
@@ -749,17 +763,20 @@ def test_atomic_write_failure_leaves_original(
     assert not list(configs.glob("*.tmp"))  # temp file cleaned up
 
 
-def test_prompts_js_groups_match_direct_schema() -> None:
-    """The prompts page's component groups must be exactly infra's direct
-    entry keys. They drifted once already — GROUPS said "user_preamble" while
-    the schema key is "preamble", so the largest component rendered as a
-    single unusable JSON blob instead of per-speaker rows."""
-    from infra.envs.debate.prompts import _DIRECT_ENTRY_KEYS
+def test_prompts_js_groups_match_entry_schema() -> None:
+    """The prompts page's component groups must be exactly infra's fixed entry
+    keys plus the catch-all "cues" bucket. They drifted once already — GROUPS
+    said "user_preamble" while the schema key was "preamble", so the largest
+    component rendered as a single unusable JSON blob instead of rows."""
+    from infra.envs.debate.prompts import _ENTRY_KEYS, _STAGE_KEYS
 
     source = (VIEWER_PKG / "static" / "js" / "prompts.js").read_text()
     groups = re.search(r"const GROUPS = \[(.*?)\];", source, re.S)
     assert groups, "GROUPS list not found in prompts.js"
-    assert set(re.findall(r'"([^"]+)"', groups.group(1))) == set(_DIRECT_ENTRY_KEYS)
+    found = set(re.findall(r'"([^"]+)"', groups.group(1)))
+    assert found == set(_ENTRY_KEYS) | {"cues"}
+    # every stage key gets its own group (no stage silently lands in "cues")
+    assert set(_STAGE_KEYS) <= found
 
 
 def test_foreign_host_header_rejected(dirs: tuple[Path, Path]) -> None:

@@ -40,8 +40,6 @@ class PromptLibrary(TypingProtocol):
 
     def system(self, speaker: str, bindings: dict[str, str]) -> str: ...
 
-    def preamble(self, speaker: str, bindings: dict[str, str]) -> Optional[str]: ...
-
     def instruction(self, slot_name: str, speaker: str, bindings: dict[str, str]) -> str: ...
 
     def preamble_messages(self, speaker: str, bindings: dict[str, str]) -> list[str]: ...
@@ -309,60 +307,34 @@ def render_context(
     alternates user/assistant. Configured preamble messages render as SEPARATE
     user messages right after the system message, before any transcript
     content — consecutive user messages at the context head are deliberate
-    (message-boundary prompt caches can then reuse the byte-stable task
+    (message-boundary prompt caches can then reuse the byte-stable shared
     message across seats; frozen API seats accept repeated roles).
 
     Exception: with first_slot_messages set, the FIRST compiled slot is
-    generated under the task source's own messages verbatim — no debate system
-    card, no preamble, no instruction cue — and the author's later contexts
-    replay that WHOLE solo exchange verbatim (all solo messages, then the
-    slot-0 answer as an assistant turn) in place of preamble + cue, so what
-    the author sees as the thing it answered is what it actually answered.
-    The solo author never renders preamble messages. This is the ONE
-    deliberate exception; if a second context exception is ever needed,
-    convert to per-slot context sources instead of adding another branch
-    here."""
+    GENERATED under the task source's own messages verbatim — no debate
+    system card, no preamble, no cue. The author's LATER contexts render
+    normally: debate framing (system + preamble messages), then slot 0 like
+    any other own slot — its cue as user content, its answer as the first
+    assistant turn. The answer is thereby presented as if it had been
+    produced under the debate framing (deliberate, 2026-08-04); packs keep
+    that honest by making the slot-0 cue byte-identical to the solo
+    eliciting message (both MB's blind instructions and the math packs'
+    <ANSWER_GEN_USER> are single-sourced, so this holds by construction).
+    The generation view is the ONE deliberate exception; if a second context
+    exception is ever needed, convert to per-slot context sources instead of
+    adding another branch here."""
     S = current.speaker
     solo = state.first_slot_messages
     if solo is not None and current.index == 0:
         return [dict(m) for m in solo]
     visible = visible_records(state, current)
-    is_solo_author = solo is not None and any(
-        r.slot.index == 0 and r.slot.speaker == S for r in visible
-    )
 
     msgs: list[Message] = [{"role": "system", "content": prompts.system(S, state.bindings[S])}]
-    if not is_solo_author:
-        for pm in prompts.preamble_messages(S, state.bindings[S]):
-            msgs.append({"role": "user", "content": pm})
-    # The stage-schema preamble (old repo's pre_debate[_judge] + grading
-    # details): a prefix riding the FIRST user content this speaker sees,
-    # whatever that turns out to be. It joins `pending` rather than becoming
-    # its own message, so the alternation invariant is untouched. The proposer
-    # has no preamble, which is what keeps its opening cue byte-identical to
-    # the RLVR arm's user message.
-    prefix = prompts.preamble(S, state.bindings[S])
-    pending: list[str] = [prefix] if prefix else []
+    for pm in prompts.preamble_messages(S, state.bindings[S]):
+        msgs.append({"role": "user", "content": pm})
+    pending: list[str] = []
     for rec in visible:
         if rec.slot.speaker == S:
-            if solo is not None and rec.slot.index == 0:
-                # replay the solo exchange verbatim; nothing may precede it
-                # (the solo author renders no preamble messages, and slot 0 is
-                # the earliest possible record). A prefix preamble for the
-                # solo author would land here and be silently lost, so it is
-                # an error, not an assert (which vanishes under python -O).
-                if pending:
-                    raise ValueError(
-                        f"solo replay must open {S}'s context, but preamble text is "
-                        "already pending — the solo author may not have a prefix "
-                        "preamble"
-                    )
-                # The solo system card (if any) served slot-0 generation; a
-                # second system message mid-context is invalid for strict chat
-                # templates, so the replay starts at the first non-system turn.
-                msgs.extend(dict(m) for m in solo if m["role"] != "system")
-                msgs.append({"role": "assistant", "content": rec.text})
-                continue
             pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
             msgs.append({"role": "user", "content": "\n\n".join(pending)})
             pending = []

@@ -1,8 +1,9 @@
 """Implementer-E Rev-2 infra knobs (MB_MIGRATION_SPEC.md, REV 2 items 2/3/7):
 
-- `preamble`: ordered list of items, each rendered as its OWN leading user
-  message for the speakers it serves (2026-08-03 message-boundary cache
-  rework; supersedes the REV-2 `user_preamble` single joined block);
+- preamble stages (`pre_debate` shared + `pre_debate_<role>` individual), each
+  rendered as its OWN leading user message for the speakers it serves
+  (2026-08-03 message-boundary cache rework; supersedes the REV-2
+  `user_preamble` single joined block);
 - `attribution`: per-(reader, author) template replacing the hard-coded
   "X said:" default, rendered with the READER's bindings, speech text after a
   blank line; missing pairs fall back;
@@ -30,32 +31,48 @@ from infra.envs.debate.prompts import (
 from infra.envs.debate.round import DebateState, SlotRecord, create_retry_feedback, render_context
 from infra.envs.debate.protocol import Protocol
 from test_debate_env import ScriptedModel
-from test_env_extensions import BACKGROUND, GOOD_VERDICT, PROTOCOL, MBTaskSource
+from test_env_extensions import BACKGROUND, GOOD_VERDICT, MBTaskSource
+
+# Same topology as test_env_extensions.PROTOCOL, except alice's opening is a
+# SOLUTION slot: roles now come from the protocol, and a per-seat preamble is
+# only expressible as a per-ROLE stage, so alice has to be the proposer and bob
+# the critic for this file's alice-only-preamble cases to exist at all.
+PROTOCOL = Protocol.parse(
+    {
+        "turns": [
+            {"alice": [{"name": "opening", "kind": "solution"}]},
+            {"bob": [{"name": "opening"}]},
+            {"alice": [{"name": "rebuttal"}]},
+            {"bob": [{"name": "rebuttal"}]},
+            {"judge": [{"name": "deliberation", "visibility": "private"},
+                       {"name": "verdict", "kind": "decision"}]},
+        ]
+    }
+)
 
 PROMPTS_YAML = """
 mb_plain:
-  system:
-    alice: "You are <NAME>. Argue: <POSITION>."
-    bob: "You are <NAME>. Argue: <POSITION>."
-    judge: "Judge <NAME> vs <OPPONENT_NAME>."
-  slots:
-    opening: "Open, <NAME>."
-    rebuttal: "Rebut, <NAME>."
-    deliberation: "Deliberate."
-    verdict: "Output your JSON verdict."
+  debater_system: "You are <NAME>. Argue: <POSITION>."
+  judge_system: "Judge <NAME> vs <OPPONENT_NAME>."
+  opening: "Open, <NAME>."
+  rebuttal: "Rebut, <NAME>."
+  deliberation: "Deliberate."
+  verdict: "Output your JSON verdict."
 
 mb_empty_keys:
   _extends: mb_plain
-  preamble: []
+  pre_debate: ""
+  pre_debate_proposer: ""
+  pre_debate_critic: ""
+  pre_debate_judge: ""
   attribution: {}
 
 mb_knobs:
   _extends: mb_plain
-  preamble:
-    - alice: "PREAMBLE for <NAME>: <BACKGROUND_TEXT>"
-      judge:
-      - "Judge preamble block one."
-      - "Trajectory: <BACKGROUND_TEXT>"
+  pre_debate_proposer: "PREAMBLE for <NAME>: <BACKGROUND_TEXT>"
+  pre_debate_judge:
+    - "Judge preamble block one."
+    - "Trajectory: <BACKGROUND_TEXT>"
   attribution:
     judge:
       alice: "The first debater (<NAME>) argued:"
@@ -102,51 +119,78 @@ def _ctx(lib, index):
 
 
 def test_new_keys_load_including_block_lists(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
-    assert lib.preamble[0]["alice"] == "PREAMBLE for <NAME>: <BACKGROUND_TEXT>"
-    assert lib.preamble[0]["judge"] == "Judge preamble block one.\n\nTrajectory: <BACKGROUND_TEXT>"
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
+    # preamble is per SPEAKER now, an ordered list of leading user messages,
+    # resolved from the speaker's role (alice proposes, bob critiques)
+    assert lib.preamble["alice"] == ["PREAMBLE for <NAME>: <BACKGROUND_TEXT>"]
+    assert lib.preamble["judge"] == ["Judge preamble block one.\n\nTrajectory: <BACKGROUND_TEXT>"]
+    assert lib.preamble["bob"] == []
     assert lib.attribution["judge"]["alice"] == "The first debater (<NAME>) argued:"
     assert lib.attribution["alice"]["bob"] == "Your opponent <OPPONENT_NAME> said:"
     # absent keys stay empty
-    plain = load_prompt_library(prompt_file, "mb_plain")
-    assert plain.preamble == [] and plain.attribution == {}
+    plain = load_prompt_library(prompt_file, "mb_plain", PROTOCOL)
+    assert plain.preamble == {s: [] for s in PROTOCOL.speakers}
+    assert plain.attribution == {} and plain.shared_pre_debate == ""
 
 
-def test_unknown_entry_key_still_rejected(tmp_path):
+def test_typo_stage_key_becomes_a_dead_cue_and_warns(tmp_path):
+    """There is no `preamble` key to misspell any more: a near-miss stage name
+    is indistinguishable from a per-turn cue, so it lands in the cue inventory,
+    matches no slot, and warns instead of silently becoming prompt text."""
     p = tmp_path / "p.yaml"
-    p.write_text("e:\n  system: {alice: s}\n  slots: {s: t}\n  preambles: {alice: oops}\n")
-    with pytest.raises(ValueError, match="preambles"):
-        load_prompt_library(p, "e")
+    p.write_text(
+        "e:\n  debater_system: s\n  judge_system: j\n  opening: o\n"
+        "  rebuttal: r\n  deliberation: d\n  verdict: v\n"
+        "  pre_debate_propose: 'oops'\n"
+    )
+    with pytest.warns(UserWarning, match="pre_debate_propose"):
+        lib = load_prompt_library(p, "e", PROTOCOL)
+    assert all("oops" not in m for msgs in lib.preamble.values() for m in msgs)
+    validate_prompts(lib, PROTOCOL)
+
+
+def test_load_without_protocol_refuses(prompt_file):
+    """Roles and the cue inventory both come from the protocol, so there is
+    nothing to compose without it."""
+    with pytest.raises(ValueError, match="needs the protocol"):
+        load_prompt_library(prompt_file, "mb_knobs")
 
 
 def test_attribution_must_be_nested_map(tmp_path):
     p = tmp_path / "p.yaml"
-    p.write_text("e:\n  system: {alice: s}\n  slots: {s: t}\n  attribution: {judge: 'flat template'}\n")
+    p.write_text(
+        "e:\n  debater_system: s\n  judge_system: j\n  opening: o\n"
+        "  rebuttal: r\n  deliberation: d\n  verdict: v\n"
+        "  attribution: {judge: 'flat template'}\n"
+    )
     with pytest.raises(ValueError, match="attribution"):
-        load_prompt_library(p, "e")
+        load_prompt_library(p, "e", PROTOCOL)
 
 
 # --------------------------------------------------------------- validation
 
 
 def test_validate_checks_speaker_names_against_protocol():
+    """Preamble speakers can no longer be wrong — they are derived from the
+    protocol's roles — but a seat with no system card and bogus attribution
+    names are still reported, all at once."""
     lib = PromptLibrary(
-        system={s: "sys" for s in ("alice", "bob", "judge")},
+        system={s: "sys" for s in ("alice", "bob")},  # judge card missing
+        preamble={s: [] for s in PROTOCOL.speakers},
         slots={"opening": "o", "rebuttal": "r", "deliberation": "d", "verdict": "v"},
-        preamble=[{"carol": "hi"}],
         attribution={"dave": {"alice": "t"}, "judge": {"eve": "t", "judge": "self"}},
     )
     with pytest.raises(ValueError) as e:
         validate_prompts(lib, PROTOCOL)
     msg = str(e.value)
-    assert "preamble[0] speaker 'carol'" in msg
+    assert "no system prompt for speaker 'judge'" in msg
     assert "attribution reader 'dave'" in msg
     assert "'eve' not in protocol" in msg
     assert "never reads its own" in msg
 
 
 def test_validate_passes_with_well_formed_knobs(prompt_file):
-    validate_prompts(load_prompt_library(prompt_file, "mb_knobs"), PROTOCOL)
+    validate_prompts(load_prompt_library(prompt_file, "mb_knobs", PROTOCOL), PROTOCOL)
 
 
 def test_fresh_mode_preamble_cannot_use_deferred_positions():
@@ -157,7 +201,7 @@ def test_fresh_mode_preamble_cannot_use_deferred_positions():
     lib = PromptLibrary(
         system={"alice": "s", "judge": "s"},
         slots={"proposal": "p", "verdict": "v"},
-        preamble=[{"alice": "You argue <POSITION>"}],
+        preamble={"alice": ["You argue <POSITION>"], "judge": []},
     )
     with pytest.raises(ValueError, match="preamble\\[0\\]\\[alice\\].*POSITION"):
         validate_prompts(lib, topo, fresh_positions=True)
@@ -168,7 +212,7 @@ def test_fresh_mode_preamble_cannot_use_deferred_positions():
 
 
 def test_preamble_is_its_own_leading_user_message(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     rendered = f"PREAMBLE for Debater_A: {BACKGROUND}"
     # alice's contexts: opening (slot 0) and rebuttal (slot 2)
     for index in (0, 2):
@@ -192,7 +236,7 @@ def test_preamble_is_its_own_leading_user_message(prompt_file):
 
 
 def test_speaker_without_preamble_is_untouched(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     for index in (1, 3):  # bob's slots
         assert all("PREAMBLE" not in m["content"] for m in _ctx(lib, index))
 
@@ -201,7 +245,7 @@ def test_speaker_without_preamble_is_untouched(prompt_file):
 
 
 def test_attribution_templates_use_reader_bindings(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     # judge reads alice and bob through its own bindings (NAME/OPPONENT_NAME
     # are the judge's, i.e. Debater_A/Debater_B)
     judge_ctx = "\n\n".join(m["content"] for m in _ctx(lib, 5))
@@ -215,7 +259,7 @@ def test_attribution_templates_use_reader_bindings(prompt_file):
 
 
 def test_attribution_missing_pair_falls_back_to_default(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     # bob has no attribution entries: hard-coded "X said:" (no blank line)
     bob_ctx = "\n\n".join(m["content"] for m in _ctx(lib, 3))
     assert "Debater_A said:\nalice opening text" in bob_ctx
@@ -241,15 +285,15 @@ def test_attributed_direct_fallback_and_template():
 
 
 def test_absent_and_empty_keys_render_byte_identically(prompt_file):
-    plain = load_prompt_library(prompt_file, "mb_plain")
-    empty = load_prompt_library(prompt_file, "mb_empty_keys")
+    plain = load_prompt_library(prompt_file, "mb_plain", PROTOCOL)
+    empty = load_prompt_library(prompt_file, "mb_empty_keys", PROTOCOL)
     for index in range(6):
         assert _ctx(plain, index) == _ctx(empty, index)
 
 
 def test_backward_compat_golden_context(prompt_file):
     """Byte-exact current-behavior lock for a no-knobs library."""
-    plain = load_prompt_library(prompt_file, "mb_plain")
+    plain = load_prompt_library(prompt_file, "mb_plain", PROTOCOL)
     assert _ctx(plain, 5) == [
         {"role": "system", "content": "Judge Debater_A vs Debater_B."},
         {
@@ -266,7 +310,7 @@ def test_backward_compat_golden_context(prompt_file):
 
 
 def test_preview_renders_new_keys(prompt_file):
-    lib = load_prompt_library(prompt_file, "mb_knobs")
+    lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     out = preview(lib, PROTOCOL)
     assert "PREAMBLE for <alice:NAME>: <BACKGROUND_TEXT>" in out
     assert "The first debater (<judge:NAME>) argued:" in out

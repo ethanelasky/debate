@@ -6,8 +6,20 @@
 "use strict";
 
 (() => {
-    // Keys of the DIRECT entry schema (infra/envs/debate/prompts.py).
-    const GROUPS = ["vars", "system", "preamble", "slots", "attribution"];
+    // The entry schema (infra/envs/debate/prompts.py): the fixed keys, plus
+    // "cues" — every OTHER key is a per-turn cue keyed by protocol slot name,
+    // and the page has no protocol, so it groups them all together.
+    const GROUPS = [
+        "vars",
+        "overall_system", "debater_system", "debater_system_proposer",
+        "debater_system_critic", "judge_system",
+        "pre_debate", "pre_debate_proposer", "pre_debate_critic", "pre_debate_judge",
+        "attribution",
+        "cues",
+    ];
+    const CUES = "cues";
+    // Stage keys: one row each, value a string or a block list.
+    const STAGES = new Set(GROUPS.filter(g => g !== "vars" && g !== "attribution" && g !== CUES));
     const KEY_ENTRIES = "cv.prompts.entries";
     const KEY_COMPONENTS = "cv.prompts.components";
 
@@ -25,6 +37,7 @@
         files: [],
         mtimes: {},
         invalid: {},
+        cues: {},
         entries: new Set(V.loadStored(KEY_ENTRIES, [])),
         components: new Set(V.loadStored(KEY_COMPONENTS, [])),
     };
@@ -57,32 +70,29 @@
         const rows = [];
         for (const [key, value] of Object.entries(entry)) {
             if (key === "_extends") continue;
-            if (key === "preamble" && Array.isArray(value)) {
-                // preamble is a LIST of message items: a string item renders
-                // for every speaker, a map item is per-speaker. Flatten to one
-                // row per (item index, speaker) — as a single row this, the
-                // largest component, would render as one unusable JSON blob.
-                value.forEach((item, i) => {
-                    if (V.isDict(item)) {
-                        for (const speaker of Object.keys(item)) {
-                            rows.push({ path: [key, String(i), speaker], group: key });
+            if (key === "vars" && V.isDict(value)) {
+                for (const varName of Object.keys(value)) {
+                    rows.push({ path: [key, varName], group: key });
+                }
+            } else if (key === "attribution" && V.isDict(value)) {
+                // reader -> author -> template: one row per (reader, author)
+                // pair, since as a single row this renders as a JSON blob.
+                for (const [reader, authors] of Object.entries(value)) {
+                    if (V.isDict(authors)) {
+                        for (const author of Object.keys(authors)) {
+                            rows.push({ path: [key, reader, author], group: key });
                         }
                     } else {
-                        rows.push({ path: [key, String(i)], group: key });
+                        rows.push({ path: [key, reader], group: key });
                     }
-                });
-                continue;
-            }
-            if (!GROUPS.includes(key) || !V.isDict(value)) {
-                rows.push({ path: [key], group: GROUPS.includes(key) ? key : "other" });
-                continue;
-            }
-            for (const [sub, subValue] of Object.entries(value)) {
-                if ((key === "slots" || key === "attribution") && V.isDict(subValue)) {
-                    for (const leaf of Object.keys(subValue)) rows.push({ path: [key, sub, leaf], group: key });
-                } else {
-                    rows.push({ path: [key, sub], group: key });
                 }
+            } else if (STAGES.has(key) || key === "vars" || key === "attribution") {
+                // a stage (or a malformed vars/attribution) is one row; block
+                // lists become one textarea per block inside that row.
+                rows.push({ path: [key], group: key });
+            } else {
+                // any other key is a per-turn cue keyed by protocol slot name.
+                rows.push({ path: [key], group: CUES });
             }
         }
         return rows.map(r => ({ ...r, id: r.path.join(".") }));
@@ -96,7 +106,10 @@
                 if (!seen.has(row.id)) { seen.add(row.id); rows.push(row); }
             }
         }
-        const rank = (r) => (r.group === "other" ? GROUPS.length : GROUPS.indexOf(r.group));
+        const rank = (r) => {
+            const i = GROUPS.indexOf(r.group);
+            return i === -1 ? GROUPS.length : i;
+        };
         return rows
             .map((row, i) => ({ row, i }))
             .sort((x, y) => rank(x.row) - rank(y.row) || x.i - y.i)
@@ -141,32 +154,11 @@
     // one block of a list template. Editing an inherited component first
     // copies the resolved value into the child's raw entry (verbatim), then
     // replaces only the edited piece — matching by-index _extends merging.
-    // A row path can pass THROUGH a list index (preamble items). _extends
-    // merges lists by index, so writing raw.preamble[2] into a raw entry with
-    // no preamble would leave holes dumping as nulls over the parent's items
-    // 0 and 1 — copy the resolved siblings in first, as the block-list branch
-    // of applyEdit already does for its own list.
-    function seedListsAlongPath(name, path) {
-        for (let i = 1; i < path.length; i++) {
-            if (!/^\d+$/.test(String(path[i]))) continue;
-            const listPath = path.slice(0, i);
-            const resolvedList = V.getPath(state.resolved[name], listPath);
-            let rawList = V.getPath(state.raw[name], listPath);
-            if (!Array.isArray(rawList)) {
-                rawList = [];
-                V.setPath(state.raw[name], listPath, rawList);
-            }
-            while (rawList.length <= Number(path[i])) {
-                const sibling = Array.isArray(resolvedList) ? resolvedList[rawList.length] : undefined;
-                rawList.push(sibling === undefined ? "" : V.clone(sibling));
-            }
-        }
-    }
-
+    // Row paths address dict keys only (stage / vars name / reader+author /
+    // cue slot name), so no path passes through a list index.
     function applyEdit(name, row, blockIdx, value) {
         if (!V.isDict(state.raw[name])) state.raw[name] = {};
         if (blockIdx === null) {
-            seedListsAlongPath(name, row.path);
             V.setPath(state.raw[name], row.path, value);
         } else {
             let leaf = V.getPath(state.raw[name], row.path);
@@ -202,6 +194,7 @@
             state.files = payload.files || [];
             state.mtimes = payload.mtimes || {};
             state.invalid = payload.invalid || {};
+            state.cues = payload.cues || {};
             renderFileErrors(payload.errors || {});
             initFilters();
             render();
@@ -397,6 +390,15 @@
                         class: "chip error",
                         title: "load_prompt_library would refuse this entry",
                     }, `invalid: ${state.invalid[name].join(", ")}`));
+                }
+                const cues = state.cues[name] || [];
+                if (cues.length) {
+                    // Informational: without the protocol the page cannot say
+                    // whether these are real slot names or typo'd stages.
+                    sub.append(V.el("span", {
+                        class: "chip",
+                        title: "read as per-turn cues, keyed by protocol slot name",
+                    }, `cues: ${cues.join(", ")}`));
                 }
                 return V.el("th", {}, V.el("div", { class: "col-title" }, name), sub);
             }),

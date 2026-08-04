@@ -211,13 +211,13 @@ def _choice_wiring(exp: dict, protocol: Protocol):
 def blind_message_templates(exp: dict, protocol: Protocol) -> tuple[list[str], dict[str, str]]:
     """Choice mode: the blind first-turn USER-message templates + prompt vars.
     Message 0 is the shared trajectory message — BY CONSTRUCTION the entry's
-    preamble[0] (a string item containing <BACKGROUND_TEXT>), the same
-    template the other seats render as their first preamble message, so the
-    trajectory message is byte-identical across the blind call, the chooser's
-    replayed history, and the other seats' contexts (message-boundary cache
-    reuse). Message 1 is the blind-instructions SLOT TEMPLATE. The task source
-    substitutes <BACKGROUND_TEXT> per row into Task.messages (rendered
-    verbatim by first_speech_non_debate_aware).
+    pre_debate stage (containing <BACKGROUND_TEXT>), the same template every
+    seat renders as its first preamble message, so the trajectory message is
+    byte-identical across the blind call, the chooser's later framed
+    contexts, and the other seats' contexts (message-boundary cache reuse).
+    Message 1 is the blind-instructions SLOT CUE. The task source substitutes
+    <BACKGROUND_TEXT> per row into Task.messages (rendered verbatim by
+    first_speech_non_debate_aware).
 
     Runs before build_eval_env's _choice_wiring, so the one-solution-slot rule
     is re-checked here rather than relied on from a distance."""
@@ -229,15 +229,17 @@ def blind_message_templates(exp: dict, protocol: Protocol) -> tuple[list[str], d
             f"choice_positions: expected exactly one solution slot (the blind choice "
             f"slot), got {sorted(sols)}"
         )
-    lib = load_prompt_library(exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"])
-    if not lib.preamble or not isinstance(lib.preamble[0], str) or "<BACKGROUND_TEXT>" not in lib.preamble[0]:
+    lib = load_prompt_library(
+        exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"], protocol
+    )
+    if "<BACKGROUND_TEXT>" not in lib.shared_pre_debate:
         raise ValueError(
-            "choice_positions: the prompt entry's preamble[0] must be a shared (string) "
+            "choice_positions: the prompt entry's pre_debate stage must be the shared "
             "trajectory template containing <BACKGROUND_TEXT> — it doubles as the blind "
             "first-turn's trajectory message"
         )
     (sol,) = sols.values()
-    return [lib.preamble[0], slot_template(lib, sol.slot.name, sol.speaker)], dict(lib.vars)
+    return [lib.shared_pre_debate, slot_template(lib, sol.slot.name, sol.speaker)], dict(lib.vars)
 
 
 def build_eval_env(exp: dict, task_source) -> DebateEnv:
@@ -626,7 +628,9 @@ def _dry_run(args: argparse.Namespace, exp: dict, task_source) -> None:
     choice = bool(exp.get("choice_positions"))
     if choice:
         _choice_wiring(exp, protocol)  # eager protocol checks; wiring discarded
-    lib = load_prompt_library(exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"])
+    lib = load_prompt_library(
+        exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"], protocol
+    )
     validate_prompts(lib, protocol, fresh_positions=False, choice_positions=choice)
     tasks = task_source.tasks(args.limit if args.limit is not None else 10**9, split="test")
     labels: dict[str, int] = {}

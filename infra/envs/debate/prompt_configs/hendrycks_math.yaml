@@ -35,12 +35,11 @@
 # level down. Each critic/proposer card still assigns its own seat. Asserted by
 # tests/test_prompts.py::test_judge_never_told_a_position_was_assigned.
 #
-# LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary — overall_system,
-# debater_system, debater_system_{proposer,critic}, judge_system, pre_debate,
-# pre_debate_judge, the grading-details stages, and the pre_*/post_round_* cue
-# stages. `slot_stages` maps this repo's protocol slot names onto the cues, so
-# protocols stay declarative. See infra/envs/debate/prompts.py for how the
-# stages compose into system cards and preambles.
+# LAYOUT (2026-08-04 single schema): role stages — overall_system,
+# debater_system, debater_system_{proposer,critic}, judge_system — compose the
+# system cards; pre_debate_critic / pre_debate_judge render as each seat's
+# leading user message(s); every other key is a per-turn cue keyed DIRECTLY by
+# its protocol slot name. See infra/envs/debate/prompts.py.
 #
 # Two deliberate departures from the old repo's assembly, both decided in the
 # Phase 1 review:
@@ -152,7 +151,7 @@ math_proposer_critic:
   # problem and the Proposer's answer (the Critic has no assigned side to
   # declare — its role fixes its stance, and in fresh mode its own <POSITION>
   # is never bound).
-  pre_debate:
+  pre_debate_critic:
     - |-
       The debate concerns this problem:
 
@@ -160,7 +159,6 @@ math_proposer_critic:
 
       <OPPONENT_NAME> (Proposer) defends the boxed answer: <OPPONENT_POSITION>
       You, <NAME> (Critic), argue that answer is INCORRECT.
-  debater_standard_grading_details:
     - |-
       The reference answer is hidden. Argue from the mathematics alone.
   pre_debate_judge:
@@ -171,22 +169,13 @@ math_proposer_critic:
 
       <NAME> defends the boxed answer: <OPPONENT_POSITION>
       <OPPONENT_NAME> argues that answer is wrong.
-  judge_standard_grading_details:
     - |-
       The reference answer is hidden. Decide from the mathematics and the
       debate alone.
 
-  # ------------------------------------------------------------ cue stages
-  slot_stages:
-    scratchpad: debater_scratchpad
-    proposal: pre_opening_speech_proposer
-    critique: pre_opening_speech_critic
-    defense: pre_speech_proposer
-    rebuttal: pre_speech_critic
-    deliberation: post_round_judge
-    verdict: post_round_judge_without_reasoning
+  # -------------------------------------------- per-turn cues (protocol slots)
 
-  debater_scratchpad: |-
+  scratchpad: |-
     PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
     next contribution: work the mathematics, check the disputed steps, and
     decide what to argue. Notes only; do not address the judge or opponent.
@@ -194,8 +183,8 @@ math_proposer_critic:
   # where it now lives (see the header). This makes the rendered proposal cue
   # byte-identical to the RLVR arm's user message for the same problem, so the
   # two arms cannot drift apart.
-  pre_opening_speech_proposer: <ANSWER_GEN_USER>
-  pre_opening_speech_critic: |-
+  proposal: <ANSWER_GEN_USER>
+  critique: |-
     The Proposer's solution is above; their boxed answer is <OPPONENT_POSITION>.
 
     Your role is to prove the answer INCORRECT: argue that it is wrong. Attack
@@ -203,15 +192,15 @@ math_proposer_critic:
     small case, or give a counterexample), and where you can, argue for a
     different answer. Do NOT solve the problem from scratch as if it were
     yours — critique THEIR solution.
-  pre_speech_proposer: |-
+  defense: |-
     Rebut the Critic's objections: contest their validity or their
     applicability to your argument, re-deriving the disputed steps concretely.
     Concede only a genuine, demonstrated error.
-  pre_speech_critic: |-
+  rebuttal: |-
     Now it is your turn again as the CRITIC. Address the Proposer's latest
     defense and attack another load-bearing step with a concrete check. Never
     concede the answer is right.
-  post_round_judge: |-
+  deliberation: |-
     You are the JUDGE — not a debater. Do not adopt either participant's
     role or continue their arguments; you are evaluating them.
 
@@ -225,7 +214,7 @@ math_proposer_critic:
     Evaluate the debate as a neutral third party. Verify any alleged error
     yourself — recompute the disputed step or test a small case — before
     accepting it. Reason about the mathematics; do not give a verdict yet.
-  post_round_judge_without_reasoning: |-
+  verdict: |-
     Now give your final decision as a JSON object, the very last thing in your
     response:
 

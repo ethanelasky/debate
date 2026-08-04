@@ -266,29 +266,18 @@ class DebateEnv(Env):
 
         subs = {k: available[k] for k in requested}
         self.lib.system = {s: _splice(t, subs) for s, t in self.lib.system.items()}
-        self.lib.stage_preamble = {s: _splice(t, subs) for s, t in self.lib.stage_preamble.items()}
-        self.lib.preamble = [
-            ({sp: _splice(t, subs) for sp, t in item.items()} if isinstance(item, dict) else _splice(item, subs))
-            for item in self.lib.preamble
-        ]
-        self.lib.slots = {
-            name: (
-                {sp: _splice(t, subs) for sp, t in entry.items()}
-                if isinstance(entry, dict)
-                else _splice(entry, subs)
-            )
-            for name, entry in self.lib.slots.items()
+        self.lib.preamble = {
+            s: [_splice(t, subs) for t in msgs] for s, msgs in self.lib.preamble.items()
         }
+        self.lib.shared_pre_debate = _splice(self.lib.shared_pre_debate, subs)
+        self.lib.slots = {name: _splice(t, subs) for name, t in self.lib.slots.items()}
 
     def _all_templates(self):
         for tmpl in self.lib.system.values():
             yield tmpl
-        for tmpl in self.lib.stage_preamble.values():
-            yield tmpl
-        for item in self.lib.preamble:
-            yield from (item.values() if isinstance(item, dict) else [item])
-        for entry in self.lib.slots.values():
-            yield from (entry.values() if isinstance(entry, dict) else [entry])
+        for msgs in self.lib.preamble.values():
+            yield from msgs
+        yield from self.lib.slots.values()
 
     def _find_judge_speaker(self) -> str:
         d = self.protocol.decision_slot

@@ -154,7 +154,7 @@ mb_double_consultancy:
 # The stub protocol (one consultant, two sequential speeches, then judge) is
 # structural scaffolding only and carries no recorded-decision status.
 # KNOWN NON-RUNNABLE: validate_prompts rejects this stub — the prompt entry
-# inherits bob's user_preamble/attribution from mb_double_consultancy but the
+# inherits bob's attribution from mb_double_consultancy but the
 # one-consultant protocol has no bob. Resolving that is part of the same
 # deferred SC rework (the entry loads and previews fine).
 # ============================================================================
@@ -194,11 +194,11 @@ mb_smoke4_double_consultancy:
 # Alice's first slot (blind_assessment, solution kind) is generated in the
 # SOLO context: first_speech_non_debate_aware renders Task.messages verbatim,
 # built by the task source as TWO user messages — [trajectory message
-# (= the entry's preamble[0], byte-identical to bob's/judge's first preamble
-# message), blind-instructions message (the blind_assessment slot template)]
-# — no system, no debate framing, no assigned side. The instructions REQUIRE
-# user fill-in (<FILL_ME_BLIND_INSTRUCTIONS> hard-errors at task build;
-# nothing is spent). The <answer>attack|benign</answer> tag picks alice's
+# (= the entry's shared pre_debate stage, byte-identical to every seat's first
+# preamble message), blind-instructions message (the blind_assessment cue)]
+# — no system, no debate framing, no assigned side. The blind instructions
+# (filled 2026-08-04) mirror the pack's monitoring-system-prompt so the blind
+# view matches the solo baseline. The <answer>attack|benign</answer> tag picks alice's
 # side; bob argues the opposite; the blind assessment is PUBLIC (alice's
 # opening speech). Turn 1 stays mutually blind (co-located, as in mb_debate).
 # CACHE LAYOUT: seat-neutral system + trajectory-as-own-message means both

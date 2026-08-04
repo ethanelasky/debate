@@ -21,8 +21,10 @@ Save semantics (multi-file, ported from the old _save_to_source_files):
 
 GET isolation (R10): a malformed/unresolvable file is reported per-file in
 `errors` instead of failing the whole page. `_includes` containment (R1) is
-NOT isolated — an escaping include is a hard 400. Entry keys outside infra's
-accepted set are reported per-entry in `invalid` (R8).
+NOT isolated — an escaping include is a hard 400. Structurally broken entries
+(not a mapping) are reported per-entry in `invalid` (R8); an entry's non-stage
+keys are reported in `cues` as informational, since without the protocol the
+viewer cannot tell a per-slot cue from a typo'd stage name.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import yaml
 from fastapi import APIRouter, HTTPException, Request
 
 from infra.config import load_config_with_includes, resolve_all_experiments
-from infra.envs.debate.prompts import _DIRECT_ENTRY_KEYS, _STAGE_ENTRY_KEYS
+from infra.envs.debate.prompts import _ENTRY_KEYS
 from tools.viewer.yamlio import (
     check_includes_containment,
     check_includes_list,
@@ -50,34 +52,42 @@ router = APIRouter(tags=["prompts"])
 
 
 def _entry_key_problems(resolved: dict[str, Any]) -> dict[str, list[str]]:
-    """R8: per-entry keys that load_prompt_library would refuse. Stage-schema
-    entries (`slot_stages` present) may additionally name arbitrary cue stages
-    referenced by slot_stages, so only keys that are neither known stage keys
-    nor named cue stages count as bad there."""
-    invalid: dict[str, list[str]] = {}
-    for name, cfg in resolved.items():
-        if not isinstance(cfg, dict):
-            invalid[name] = ["<entry is not a mapping>"]
-            continue
-        if "slot_stages" in cfg:
-            cues = set((cfg.get("slot_stages") or {}).values()) if isinstance(
-                cfg.get("slot_stages"), dict
-            ) else set()
-            bad = sorted(k for k in cfg if k not in _STAGE_ENTRY_KEYS and k not in cues)
-        else:
-            bad = sorted(k for k in cfg if k not in _DIRECT_ENTRY_KEYS)
-        if bad:
-            invalid[name] = bad
-    return invalid
+    """R8, single-schema form: the only structural problem the viewer can
+    detect is an entry that is not a mapping.
+
+    Under the current schema (infra/envs/debate/prompts.py) an entry key is
+    either one of the fixed `_ENTRY_KEYS` or the name of a PROTOCOL SLOT whose
+    per-turn cue it holds. The viewer never sees the protocol — it edits prompt
+    files standalone — so it cannot tell a legitimate cue key from a typo'd
+    stage name, and flagging every non-stage key would flag every real pack.
+    Cue-vs-slot reconciliation stays where the protocol is known
+    (load_prompt_library's warning + validate_prompts)."""
+    return {
+        name: ["<entry is not a mapping>"]
+        for name, cfg in resolved.items()
+        if not isinstance(cfg, dict)
+    }
+
+
+def _presumed_cue_keys(resolved: dict[str, Any]) -> dict[str, list[str]]:
+    """Informational, NOT invalid: each entry's non-stage keys, i.e. what the
+    loader would read as per-turn cues keyed by protocol slot name. Shown so a
+    typo'd stage name is at least visible as "this became a cue"."""
+    return {
+        name: sorted(k for k in cfg if k != "_extends" and k not in _ENTRY_KEYS)
+        for name, cfg in resolved.items()
+        if isinstance(cfg, dict)
+    }
 
 
 def _load_prompts_state(prompts_dir: Path) -> dict[str, Any]:
     """Merge every prompt file into one namespace.
 
-    Returns {raw, resolved, source_files, files, mtimes, errors, invalid}:
-    raw/resolved keyed by entry name, source_files mapping entry -> filename,
-    files the pickable list, mtimes the R9 staleness tokens, errors per-file
-    load failures (R10), invalid per-entry key problems (R8). Duplicate entry
+    Returns {raw, resolved, source_files, files, mtimes, errors, invalid,
+    cues}: raw/resolved keyed by entry name, source_files mapping entry ->
+    filename, files the pickable list, mtimes the R9 staleness tokens, errors
+    per-file load failures (R10), invalid per-entry structural problems (R8),
+    cues the per-entry keys read as protocol-slot cues. Duplicate entry
     names across files are a 409 — the save path could only keep one copy, so
     we refuse to present a mergeable view.
     """
@@ -128,6 +138,7 @@ def _load_prompts_state(prompts_dir: Path) -> dict[str, Any]:
         "mtimes": mtimes,
         "errors": errors,
         "invalid": _entry_key_problems(resolved),
+        "cues": _presumed_cue_keys(resolved),
     }
 
 

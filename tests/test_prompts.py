@@ -58,10 +58,7 @@ def splice_task_prompts(lib, name):
         k: v.replace("<PROBLEM>", "<TOPIC>")
         for k, v in task_prompts(name).supplied_templates().items()
     }
-    lib.slots = {
-        n: ({s: _splice(t, subs) for s, t in e.items()} if isinstance(e, dict) else _splice(e, subs))
-        for n, e in lib.slots.items()
-    }
+    lib.slots = {n: _splice(t, subs) for n, t in lib.slots.items()}
     return lib
 
 
@@ -84,13 +81,14 @@ MINIMAL_ENTRY = (
     "_base:\n"
     "  vars: {A: '1', B: '2'}\n"
     "  overall_system: 'shared <A>'\n"
-    "  slot_stages: {proposal: pre_opening_speech_proposer}\n"
-    "  pre_opening_speech_proposer: 'x'\n"
+    "  proposal: 'x'\n"          # per-turn cue, keyed by the protocol slot name
     "child:\n"
     "  _extends: _base\n"
     "  vars: {B: 'two'}\n"
     "  debater_system_proposer: 'proposer card'\n"
 )
+
+SOLO_PROPOSAL = {"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]}
 
 
 def test_extends_merges_vars_over_parent(lib, tmp_path):
@@ -99,7 +97,7 @@ def test_extends_merges_vars_over_parent(lib, tmp_path):
 
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY)
-    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    proto = Protocol.parse(SOLO_PROPOSAL)
     child = load_prompt_library(path, "child", proto)
     assert child.vars == {"A": "1", "B": "two"}
     assert child.system == {"alice": "shared <A>\n\nproposer card"}
@@ -120,26 +118,30 @@ def test_load_without_protocol_refuses(tmp_path):
         load_prompt_library(path, "child")
 
 
-def test_unrendered_stage_key_rejected(tmp_path):
-    """A typo'd role stage, or a cue stage slot_stages stopped naming, is dead
-    prompt text — which is exactly how the old repo's pre_debate went dark."""
+def test_cue_matching_no_slot_warns(tmp_path):
+    """A typo'd stage name is indistinguishable from a cue, so it lands in the
+    cue inventory and matches no slot — dead prompt text, which is exactly how
+    the old repo's pre_debate went dark. A pack may legitimately carry cues for
+    sibling protocols, so this is a loud warning, not an error."""
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY + "  pre_debate_typo: 'oops'\n")
-    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
-    with pytest.raises(ValueError, match="pre_debate_typo"):
-        load_prompt_library(path, "child", proto)
+    proto = Protocol.parse(SOLO_PROPOSAL)
+    with pytest.warns(UserWarning, match="pre_debate_typo"):
+        lib = load_prompt_library(path, "child", proto)
+    # warned, but still loaded — and the typo'd key never reaches a message
+    assert lib.preamble == {"alice": []}
+    validate_prompts(lib, proto)
 
 
-def test_slot_stages_naming_undefined_stage_rejected(tmp_path):
+def test_slot_without_a_cue_is_rejected(tmp_path):
+    """Every compiled slot needs a cue; an entry that names none for a slot is
+    caught by validate_prompts before any generation."""
     path = tmp_path / "p.yaml"
-    path.write_text(
-        "solo:\n"
-        "  overall_system: 'sys'\n"
-        "  slot_stages: {proposal: nope}\n"
-    )
-    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
-    with pytest.raises(ValueError, match="nope"):
-        load_prompt_library(path, "solo", proto)
+    path.write_text("solo:\n  overall_system: 'sys'\n")
+    proto = Protocol.parse(SOLO_PROPOSAL)
+    lib = load_prompt_library(path, "solo", proto)
+    with pytest.raises(ValueError, match="no cue for slot 'proposal'"):
+        validate_prompts(lib, proto)
 
 
 # ---------------------------------------------------------- slot_template
@@ -149,13 +151,17 @@ def test_string_template_serves_any_speaker(lib):
     assert slot_template(lib, "proposal", "alice") is slot_template(lib, "proposal", "zebra")
 
 
-def test_map_template_is_per_speaker():
-    lib = PromptLibrary(slots={"closing": {"alice": "case FOR", "bob": "case AGAINST"}})
-    assert slot_template(lib, "closing", "alice") == "case FOR"
-    assert slot_template(lib, "closing", "bob") == "case AGAINST"
+def test_per_seat_cues_come_from_distinct_slot_names():
+    """Cues are per-SLOT: `speaker` is accepted for call-site symmetry only, so
+    two seats differ by speaking differently-named slots rather than by a
+    per-speaker map."""
+    lib = PromptLibrary(slots={"closing_for": "case FOR", "closing_against": "case AGAINST"})
+    assert slot_template(lib, "closing_for", "alice") == "case FOR"
+    assert slot_template(lib, "closing_for", "bob") == "case FOR"
+    assert slot_template(lib, "closing_against", "bob") == "case AGAINST"
     with pytest.raises(KeyError) as e:
         slot_template(lib, "closing", "judge")
-    assert "closing" in str(e.value) and "judge" in str(e.value)
+    assert "closing" in str(e.value)
 
 
 def test_missing_slot_named_in_message(lib):
@@ -308,7 +314,8 @@ def test_judge_never_told_a_position_was_assigned(protocol):
         ]
         seen_by_judge = flat(
             "\n".join(
-                [pack.system["judge"], pack.stage_preamble.get("judge", "")]
+                [pack.system["judge"]]
+                + pack.preamble.get("judge", [])
                 + [slot_template(pack, name, "judge") for name in judge_slots]
             )
         )
@@ -422,8 +429,7 @@ def test_block_lists_join_and_extend_by_index(tmp_path):
             {
                 "_base": {
                     "overall_system": ["identity block", "rules block", "format block"],
-                    "slot_stages": {"speech": "pre_speech_proposer"},
-                    "pre_speech_proposer": ["do the thing"],
+                    "speech": ["do the thing"],
                 },
                 "child": {
                     "_extends": "_base",

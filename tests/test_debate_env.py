@@ -330,9 +330,14 @@ def test_docent_export(tmp_path):
     # judge view: rendered context ends with its own verdict as assistant
     judge_view = run.transcripts[3]
     assert judge_view.messages[0].role == "system"
-    assert "Debater_A said:" in "".join(
-        m.text if hasattr(m, "text") else str(getattr(m, "content", "")) for m in judge_view.messages[1:2]
-    )
+
+    def _text(m):
+        return m.text if hasattr(m, "text") else str(getattr(m, "content", ""))
+
+    # message 1 is the judge's pre_debate_judge preamble, its own user message;
+    # the attributed transcript starts in the message after it
+    assert "The debate concerns this problem:" in _text(judge_view.messages[1])
+    assert "Debater_A said:" in _text(judge_view.messages[2])
     path = export_jsonl(runs, str(tmp_path / "debates.jsonl"))
     import json as _json
 
