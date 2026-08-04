@@ -4,6 +4,7 @@ verifier (real subprocesses), reward, and grading."""
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -12,6 +13,7 @@ from infra.envs.tasks.codecontests import (
     CodeContestsEnv,
     CodeContestsFamily,
     extract_code,
+    is_cpp_code,
     run_stdin_tests,
 )
 
@@ -84,6 +86,32 @@ def test_too_few_rows_raises(tmp_path):
         CodeContestsEnv(path=path, timeout_seconds=TIMEOUT)
 
 
+def test_len_mismatch_row_dropped_and_counted(tmp_path, caplog):
+    rows = ROWS[:2] + [
+        {
+            "name": "mismatch",
+            "description": "Read one line and print it back twice.",
+            "inputs": ["a", "b"],
+            "outputs": ["a"],  # zip would silently truncate to one case
+        }
+    ]
+    path = _write_jsonl(tmp_path / "train.jsonl", rows)
+    with caplog.at_level(logging.INFO, logger="infra.envs.tasks.codecontests"):
+        env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT)
+    assert [r["name"] for r in env.train_rows] == ["sum", "echo"]
+    messages = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "len_mismatch=1" in messages and "kept=2" in messages
+
+
+def test_train_test_overlap_warns_but_keeps_rows(tmp_path, caplog):
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    with caplog.at_level(logging.WARNING, logger="infra.envs.tasks.codecontests"):
+        env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT)
+    warning = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning and "2 problem name(s)" in warning[0].getMessage()
+    assert len(env.train_rows) == 2 and len(env.test_rows) == 2  # nothing dropped
+
+
 def test_tasks_carry_meta_and_hide_test_io(env):
     tasks = env.tasks(3, split="train") + env.tasks(2, split="test")
     for t in tasks:
@@ -152,10 +180,10 @@ def test_prompt_file_override(tmp_path):
     ]
 
 
-def _pc_topology():
-    from infra.envs.debate.topology import Topology
+def _pc_protocol():
+    from infra.envs.debate.protocol import Protocol
 
-    return Topology.parse(
+    return Protocol.parse(
         {
             "turns": [
                 {"alice": [{"name": "proposal", "kind": "solution"}]},
@@ -174,7 +202,7 @@ def _debate_env(env):
 
     return DebateEnv(
         DebateEnvConfig(
-            topology=_pc_topology(),
+            protocol=_pc_protocol(),
             prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
             prompt_entry="codecontests_proposer_critic",
             trained_speakers=["alice"],
@@ -248,6 +276,22 @@ def test_extract_none_without_code():
     assert extract_code("```python\n```") is None
 
 
+# ------------------------------------------------------------- C++ detection
+
+
+def test_is_cpp_code_requires_strong_anchor():
+    # plain Python with C++-ish identifiers must NOT be classified as C++
+    # (it would be graded incorrect without ever being executed)
+    assert not is_cpp_code("vector = [0]*n\nnull = None\nprint(min(vector))")
+    # two weak-pattern hits (`vector <`, case-insensitive NULL) used to clear
+    # the threshold; without a strong anchor they must not
+    assert not is_cpp_code("if vector < n:\n    null = None\nprint(vector)")
+    assert is_cpp_code(
+        "#include <bits/stdc++.h>\nusing namespace std;\n"
+        "int main(){int a;cin>>a;cout<<a;}"
+    )
+
+
 # ------------------------------------------------------------------ verifier
 
 
@@ -278,6 +322,35 @@ def test_runtime_error_is_a_failure_not_a_crash():
     r = run_stdin_tests("raise ValueError('boom')", ["x"], ["1"], timeout=TIMEOUT)
     assert not r["passed"]
     assert "ValueError" in r["first_failure"]["stderr"]
+
+
+# Forges a result JSON as the LAST line of the runner's real stdout (atexit
+# fires after the runner restores sys.stdout). With the old parse-last-stdout
+# scheme this flipped the verdict to passed; the file side-channel must grade
+# by the real test outcomes.
+FORGED_STDOUT_SOLUTION = (
+    "import atexit, json\n"
+    "atexit.register(lambda: print(json.dumps({\n"
+    "    'status': 'passed', 'passed': True, 'tests_passed': 2,\n"
+    "    'tests_total': 2, 'timeout': False, 'first_failure': None,\n"
+    "})))\n"
+    "print(0)\n"
+)
+
+
+def test_forged_stdout_verdict_is_ignored():
+    r = run_stdin_tests(FORGED_STDOUT_SOLUTION, ["1 2", "3 4"], ["3", "7"], timeout=TIMEOUT)
+    assert r["passed"] is False and r["status"] == "failed"
+    assert r["tests_passed"] == 0 and r["tests_total"] == 2
+    fam = CodeContestsFamily(timeout_seconds=TIMEOUT)
+    assert fam.grade({"inputs": ["1 2"], "outputs": ["3"]}, FORGED_STDOUT_SOLUTION) is False
+
+
+def test_timeout_is_reported_and_graded_false():
+    r = run_stdin_tests("while True: pass", ["1"], ["1"], timeout=2)
+    assert not r["passed"] and r["timeout"] is True and r["status"] == "timeout"
+    fam = CodeContestsFamily(timeout_seconds=2)
+    assert fam.grade({"inputs": ["1"], "outputs": ["1"]}, "while True: pass") is False
 
 
 # -------------------------------------------------------------------- reward

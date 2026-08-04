@@ -2,13 +2,13 @@
 # Thinking OFF; private scratchpad slots replace <think>: proposal turn gets
 # 1000 plan + 1000 argument, later speeches 500 + 500, judge 1000 + verdict.
 # Judge = frozen Qwen3.5-4B served by a local vLLM on the pod (see
-# scripts/pod_run.sh). Standalone entry on purpose: topology turn lists
-# merge BY INDEX under _extends, which poisons mixed-shape topologies.
+# scripts/pod_run.sh). Standalone entry on purpose: protocol turn lists
+# merge BY INDEX under _extends, which poisons mixed-shape protocols.
 #
 # Run (on the pod): debate-rl --experiment-file configs/math_pc_olmo.yaml --experiment math_pc_olmo_l5
 
 math_pc_olmo_l5:
-  topology:
+  protocol:
     turns:
       - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
                 {name: proposal, kind: solution, max_total_tokens: 1000}]

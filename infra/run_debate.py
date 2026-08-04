@@ -5,7 +5,7 @@ model_settings drive the training backend AND its sampling; `training:` holds
 optimization/loop knobs only):
 
     math_pc:
-      topology: {turns: [...]}                # per-slot token budgets live HERE
+      protocol: {turns: [...]}                # per-slot token budgets live HERE
       prompt_config: {file_path: ..., entry: ...}
       agents:
         alice:
@@ -35,7 +35,7 @@ from infra.config import load_experiment, parse_model_settings, reject_unknown_k
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
-from infra.envs.debate.topology import Topology
+from infra.envs.debate.protocol import Protocol
 from infra.envs.tasks import get_family
 from infra.models.base import ModelSettings, resolved_sampling_profile
 from infra.models.factory import instantiate_model
@@ -113,7 +113,7 @@ VERL_KEYS = {
 }
 
 EXPERIMENT_KEYS = {
-    "topology",
+    "protocol",
     "prompt_config",
     "agents",
     "judge_config",
@@ -160,10 +160,10 @@ def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSe
 
 
 def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, ModelSettings]) -> DebateEnv:
-    topo_spec = exp["topology"]
-    if isinstance(topo_spec, str):
-        topo_spec = exp["_topologies"][topo_spec]
-    topology = Topology.parse(topo_spec)
+    proto_spec = exp["protocol"]
+    if isinstance(proto_spec, str):
+        proto_spec = exp["_protocols"][proto_spec]
+    protocol = Protocol.parse(proto_spec)
 
     frozen_models = {
         speaker: instantiate_model(settings, is_debater=speaker != "judge", binding="train")
@@ -173,10 +173,10 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     # Per-trained-seat sampling + template kwargs; trained seats must sample
     # UNBIASED (temp/top_p 1.0) — anything else corrupts the ratio anchor
     # (the old repo's §6 gate, kept hard).
-    # Token budgets are the TOPOLOGY's job (per-slot caps); the seat's base
+    # Token budgets are the PROTOCOL's job (per-slot caps); the seat's base
     # max_tokens is just a ceiling derived from its largest slot cap.
     caps_by_speaker: dict[str, list] = {}
-    for cs in topology.compile():
+    for cs in protocol.compile():
         caps_by_speaker.setdefault(cs.speaker, []).append(cs.slot.max_total_tokens)
     trained_sampling: dict[str, SamplingParams] = {}
     trained_chat_kwargs: dict[str, dict] = {}
@@ -193,8 +193,8 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         caps = caps_by_speaker.get(speaker, [])
         if any(c is None for c in caps):
             raise ValueError(
-                f"trained seat {speaker!r} has topology slot(s) without max_total_tokens; "
-                "set per-slot budgets in the topology (speech budgets are format-specific)"
+                f"trained seat {speaker!r} has protocol slot(s) without max_total_tokens; "
+                "set per-slot budgets in the protocol (speech budgets are format-specific)"
             )
         trained_sampling[speaker] = SamplingParams(max_tokens=max(caps), temperature=temp, top_p=top_p)
         if settings.enable_thinking is not None:
@@ -203,7 +203,7 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     ds = dict(exp.get("dataset") or {})
     family = get_family(ds.pop("type", None))
     config = DebateEnvConfig(
-        topology=topology,
+        protocol=protocol,
         prompt_file=exp["prompt_config"]["file_path"],
         prompt_entry=exp["prompt_config"]["entry"],
         trained_speakers=list(trained),
@@ -402,7 +402,7 @@ def main() -> None:
     cfg = Config(
         base_model=lead.model_file_path,
         sampling=SamplingParams(
-            # no ceiling here: budgets are the topology's per-slot caps, and
+            # no ceiling here: budgets are the protocol's per-slot caps, and
             # Policy hard-errors on any generation left unbounded
             max_tokens=None,
             temperature=profile.temperature if profile.temperature is not None else 1.0,

@@ -56,6 +56,20 @@ and treat its timeout as a failure of the watch, not of the job.
 
 ## Decisionmaking
 
+**System design choices are never finalized without the user understanding
+them first.** Before a new abstraction, seam, or object contract is landed —
+or an existing one is reshaped — explain it to the user in plain terms (what
+the pieces are, what each owns, what crosses each boundary, what it makes
+easy vs. hard) and get explicit confirmation. Explanation is part of the
+work, not a follow-up. A design the user cannot hold in their head cannot be
+verified by them, and every later review, debugging session, and experimental
+result then has to be taken on faith — verification cost and complexity blow
+up exactly where correctness matters most. When in doubt about whether
+something counts as system design, assume it does and check. Prefer
+explaining in the user's terms (a walkthrough, a diagram, a worked example of
+one object's life) over restating the code. Implementation details inside an
+already-understood and approved design continue autonomously.
+
 Reviewers and subagents surface evidence, risks, alternatives, and proposed
 decisions; their recommendations are not accepted decisions. Label findings as
 confirmed bugs, implementation constraints, optional simplifications, or user
@@ -75,7 +89,7 @@ reads (grep for them); a misspelled knob fails silently.
 
 ## Evaluation protocol
 
-Token budgets derive from the training config (here: the topology's per-slot
+Token budgets derive from the training config (here: the protocol's per-slot
 caps), never hardcoded. Eval at temperature 0 on a fixed held-out slice.
 Zero transport errors — retry, then invalidate the run; never score a
 transport error as wrong. Compare runs with paired per-problem tests

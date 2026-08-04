@@ -17,7 +17,7 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 def _debate_exp() -> dict:
     return {
-        "topology": {"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]},
+        "protocol": {"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]},
         "prompt_config": {"file_path": "x.yaml", "entry": "e"},
         "agents": {"alice": {"trained": True, "model_settings": {"model_type": "tinker"}}},
         "dataset": {"type": "math"},
@@ -74,7 +74,7 @@ def test_unknown_agent_key_raises():
 
 def test_private_keys_pass():
     exp = _debate_exp()
-    exp["_topologies"] = {"pc": {"turns": []}}
+    exp["_protocols"] = {"pc": {"turns": []}}
     exp["_extends"] = "_base"
     validate_debate(exp)
     rlvr = _rlvr_exp()

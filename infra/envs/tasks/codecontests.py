@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import logging
 import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,8 @@ from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 
 PROMPT_FILE = "codecontests.yaml"
+
+logger = logging.getLogger(__name__)
 
 # Each verifier subprocess may use up to 4GB (RLIMIT_AS in the runner script),
 # so cap concurrency to keep total memory bounded.
@@ -78,6 +82,17 @@ CPP_PATTERNS = [
     r"\bauto\s+\w+\s*=",  # C++ auto type inference
 ]
 
+# Strong anchors: at least one must match (case-sensitively) before the weak
+# CPP_PATTERNS can classify text as C++. Without this, plain Python such as
+# `vector = [0]*n` plus a variable named `null` (NULL under IGNORECASE) scored
+# >= 2 weak hits and was graded incorrect WITHOUT execution.
+CPP_STRONG_ANCHORS = [
+    r"#include\b",
+    r"\busing\s+namespace\b",
+    r"\bstd::",
+    r"\bint\s+main\s*\(",
+]
+
 PYTHON_CODE_BLOCK_PATTERN = re.compile(r"```python\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 GENERIC_BLOCK_PATTERN = re.compile(r"```\s*(.*?)```", re.DOTALL)
 _OPEN_FENCE_PATTERN = re.compile(r"```[ \t]*(?:python)?[ \t]*\r?\n", re.IGNORECASE)
@@ -86,7 +101,9 @@ _OPEN_FENCE_PATTERN = re.compile(r"```[ \t]*(?:python)?[ \t]*\r?\n", re.IGNORECA
 def is_cpp_code(code: str, threshold: int = 2) -> bool:
     if not code:
         return False
-    return sum(1 for p in CPP_PATTERNS if re.search(p, code, re.IGNORECASE)) >= threshold
+    if not any(re.search(p, code) for p in CPP_STRONG_ANCHORS):
+        return False
+    return sum(1 for p in CPP_PATTERNS if re.search(p, code)) >= threshold
 
 
 def row_eligible(entry: dict[str, Any]) -> bool:
@@ -150,27 +167,49 @@ def run_stdin_tests(
         with open(runner_path, "w") as f:
             f.write(_TEST_RUNNER_SCRIPT)
 
+        # The runner writes its verdict to this file, never to stdout: the
+        # untrusted solution shares the runner's stdout (e.g. via atexit after
+        # the StringIO swap is undone) and could forge a result JSON line
+        # there. stdout/stderr are captured for diagnostics only.
+        result_path = os.path.join(tmpdir, "result.json")
+
         try:
-            proc = subprocess.run(
-                [sys.executable, runner_path, solution_path, test_cases_path],
+            proc = subprocess.Popen(
+                [sys.executable, runner_path, solution_path, test_cases_path, result_path],
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
+                start_new_session=True,  # own process group, so timeout kills grandchildren too
             )
+        except Exception as exc:  # noqa: BLE001
+            return _failure_result("error", len(inputs), repr(exc), t0)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()  # reap
             return _failure_result("timeout", len(inputs), "Total execution timed out.", t0, timeout=True)
         except Exception as exc:  # noqa: BLE001
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            proc.communicate()
             return _failure_result("error", len(inputs), repr(exc), t0)
 
         elapsed = time.perf_counter() - t0
-        try:  # runner prints its result JSON on the last line of stdout
-            result = json.loads(proc.stdout.strip().split("\n")[-1])
+        try:  # verdict comes ONLY from the runner-written result file
+            with open(result_path) as f:
+                result = json.load(f)
             result["execution_time_seconds"] = elapsed
             return result
-        except (json.JSONDecodeError, IndexError):
+        except (OSError, json.JSONDecodeError, ValueError):
             return _failure_result(
-                "error", len(inputs), (proc.stderr or proc.stdout or "")[:1000], t0
+                "error", len(inputs), (stderr or stdout or "")[:1000], t0
             )
     except Exception as exc:  # noqa: BLE001
         return _failure_result("error", len(inputs), repr(exc), t0)
@@ -194,9 +233,12 @@ def _failure_result(
 
 
 # Runner script: execs the solution against each case with stdin/stdout
-# swapped to StringIO, then prints one JSON line.
+# swapped to StringIO, then writes one JSON result to the file given as
+# argv[3] (atomically, via os.replace) — never to stdout, which the solution
+# code shares and could forge.
 _TEST_RUNNER_SCRIPT = r'''
 import json
+import os
 import sys
 import io
 import re
@@ -209,6 +251,15 @@ try:
     resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
 except (ValueError, resource.error):
     pass  # Not available on all platforms
+try:
+    resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+except (ValueError, resource.error):
+    pass  # best-effort (macOS)
+try:
+    fsize_limit = 64 * 1024**2
+    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
+except (ValueError, resource.error):
+    pass  # best-effort (macOS)
 
 def normalize_output(s):
     lines = s.split("\n")
@@ -229,6 +280,18 @@ def normalize_output(s):
 def main():
     solution_path = sys.argv[1]
     test_cases_path = sys.argv[2]
+    result_path = sys.argv[3]
+
+    def write_result(obj):
+        # temp name + os.replace: the parent never sees a half-written file
+        tmp_path = result_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp_path, result_path)
+
+    # Hide the result path from the solution (it runs in-process and could
+    # read sys.argv, then forge the verdict file from an atexit hook).
+    sys.argv = [solution_path]
 
     with open(solution_path) as f:
         solution_code = f.read()
@@ -237,12 +300,12 @@ def main():
     try:
         compiled = compile(solution_code, solution_path, "exec")
     except SyntaxError as e:
-        print(json.dumps({
+        write_result({
             "status": "error", "passed": False,
             "tests_passed": 0, "tests_total": 0, "timeout": False,
             "first_failure": {"test_idx": 0, "expected": "", "actual": "",
                               "stderr": f"SyntaxError: {e}"},
-        }))
+        })
         return
 
     with open(test_cases_path) as f:
@@ -292,14 +355,14 @@ def main():
                 }
 
     passed = tests_passed == tests_total
-    print(json.dumps({
+    write_result({
         "status": "passed" if passed else "failed",
         "passed": passed,
         "tests_passed": tests_passed,
         "tests_total": tests_total,
         "timeout": False,
         "first_failure": first_failure,
-    }))
+    })
 
 if __name__ == "__main__":
     main()
@@ -311,22 +374,49 @@ if __name__ == "__main__":
 
 def _load_rows(path: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    n_total = 0
+    n_no_tests = 0
+    n_multi_answer = 0
+    n_len_mismatch = 0
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            n_total += 1
             entry = json.loads(line)
-            if not row_eligible(entry):
+            inputs, outputs = entry.get("inputs"), entry.get("outputs")
+            if not inputs or not outputs:
+                n_no_tests += 1
+                continue
+            desc_lower = (entry.get("description", "") or "").lower()
+            if any(phrase in desc_lower for phrase in _MULTI_ANSWER_PHRASES):
+                n_multi_answer += 1
+                continue
+            if len(inputs) != len(outputs):
+                # the runner zips inputs with outputs, which would silently
+                # truncate to the shorter list and grade on partial cases
+                n_len_mismatch += 1
                 continue
             rows.append(
                 {
                     "problem": str(entry.get("description", "")).strip(),
                     "name": str(entry.get("name", "")).strip(),
-                    "inputs": list(entry["inputs"]),
-                    "outputs": list(entry["outputs"]),
+                    "inputs": list(inputs),
+                    "outputs": list(outputs),
                 }
             )
+    logger.info(
+        "codecontests rows from %s: total=%d kept=%d dropped=%d "
+        "(no_tests=%d multi_answer=%d len_mismatch=%d)",
+        path,
+        n_total,
+        len(rows),
+        n_no_tests + n_multi_answer + n_len_mismatch,
+        n_no_tests,
+        n_multi_answer,
+        n_len_mismatch,
+    )
     return rows
 
 
@@ -351,6 +441,17 @@ class CodeContestsEnv(Env):
         self.train_rows = _load_rows(path)
         if test_path is not None:
             self.test_rows = _load_rows(test_path)
+            overlap = {r["name"] for r in self.train_rows if r["name"]} & {
+                r["name"] for r in self.test_rows if r["name"]
+            }
+            if overlap:
+                logger.warning(
+                    "codecontests: %d problem name(s) present in BOTH train (%s) "
+                    "and test (%s); eval on the overlap measures memorization",
+                    len(overlap),
+                    path,
+                    test_path,
+                )
         else:
             rng = random.Random(seed + 22222)
             rows = list(self.train_rows)
@@ -386,10 +487,15 @@ class CodeContestsEnv(Env):
 
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         code = extract_code(text, relaxed=True)
+        # every key present in EVERY branch, so eval-time averages are means
+        # over all samples rather than over the branch that happened to set it
         info: dict[str, Any] = {
             "correct": 0.0,
             "has_code": float(code is not None),
             "tests_passed_frac": 0.0,
+            "cpp_code": 0.0,
+            "exec_timeout": 0.0,
+            "exec_error": 0.0,
         }
         if code is None:
             return 0.0, info
@@ -403,6 +509,9 @@ class CodeContestsEnv(Env):
         total = result.get("tests_total") or len(task.meta["inputs"])
         info["correct"] = float(bool(result.get("passed")))
         info["tests_passed_frac"] = result.get("tests_passed", 0) / total if total else 0.0
+        # verifier breakage must be distinguishable from wrong answers
+        info["exec_timeout"] = float(bool(result.get("timeout")))
+        info["exec_error"] = float(result.get("status") == "error")
         return self.format_reward + self.correct_reward * info["correct"], info
 
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
@@ -484,7 +593,7 @@ class CodeContestsFamily(TaskFamily):
             return None
         if is_cpp_code(solution):
             return False
-        return bool(run_stdin_tests(solution, inputs, outputs, timeout=self.timeout_seconds)["passed"])
+        return bool(run_stdin_tests(solution, inputs, outputs, timeout=self.timeout_seconds).get("passed"))
 
     def format_flags(self, text: str) -> dict[str, float]:
         # strict flag: a properly CLOSED fence, independent of the (possibly

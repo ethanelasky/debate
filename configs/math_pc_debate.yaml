@@ -4,7 +4,7 @@
 # Run: debate-rl --experiment-file configs/math_pc_debate.yaml --experiment <name>
 
 _base_math_pc:
-  topology:
+  protocol:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 1024, max_total_tokens: 3072}]
       - bob:   [{name: critique, max_total_tokens: 768}]
@@ -126,7 +126,7 @@ math_pc_gspo:
 # Expect low proposal accuracy on a 4B; intended for the 9B or curriculum end.
 math_pc_l5:
   _extends: _base_math_pc
-  topology:
+  protocol:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 2048, max_total_tokens: 6144}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}

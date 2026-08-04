@@ -161,7 +161,7 @@ def reject_unknown_keys(
     The repo-wide guard against typo'd config keys silently reading a default
     (a misspelled `first_speech_non_debate_aware` trains the wrong arm and says
     nothing). `ignore_private` skips '_'-prefixed keys, which are this module's
-    template plumbing (_extends, _preset, _topologies, ...) rather than values
+    template plumbing (_extends, _preset, _protocols, ...) rather than values
     any consumer reads.
     """
     keys = set(d) if not ignore_private else {k for k in d if not str(k).startswith("_")}

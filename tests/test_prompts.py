@@ -8,7 +8,7 @@ from infra.envs.debate.prompts import (
     slot_template,
     validate_prompts,
 )
-from infra.envs.debate.topology import Topology
+from infra.envs.debate.protocol import Protocol
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 
 
@@ -42,9 +42,9 @@ BINDINGS = {
 }
 
 
-def load_pack(path: str, entry: str, topo=None):
-    """Packs are role-conditioned, so loading one needs a topology."""
-    return load_prompt_library(path, entry, topo or Topology.parse(PC_TOPOLOGY))
+def load_pack(path: str, entry: str, proto=None):
+    """Packs are role-conditioned, so loading one needs a protocol."""
+    return load_prompt_library(path, entry, proto or Protocol.parse(PC_TOPOLOGY))
 
 
 def splice_task_prompts(lib, name):
@@ -73,8 +73,8 @@ def lib():
 
 
 @pytest.fixture
-def topology():
-    return Topology.parse(PC_TOPOLOGY)
+def protocol():
+    return Protocol.parse(PC_TOPOLOGY)
 
 
 # ------------------------------------------------------------------ loading
@@ -99,8 +99,8 @@ def test_extends_merges_vars_over_parent(lib, tmp_path):
 
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY)
-    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
-    child = load_prompt_library(path, "child", topo)
+    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    child = load_prompt_library(path, "child", proto)
     assert child.vars == {"A": "1", "B": "two"}
     assert child.system == {"alice": "shared <A>\n\nproposer card"}
     assert child.slots == {"proposal": "x"}
@@ -111,12 +111,12 @@ def test_unknown_entry_raises(lib):
         load_pack(MATH_YAML, "nope")
 
 
-def test_load_without_topology_refuses(tmp_path):
+def test_load_without_protocol_refuses(tmp_path):
     """Stages are role-conditioned; there is nothing to compose without the
-    topology that says which seat proposes, critiques and judges."""
+    protocol that says which seat proposes, critiques and judges."""
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY)
-    with pytest.raises(ValueError, match="needs the topology"):
+    with pytest.raises(ValueError, match="needs the protocol"):
         load_prompt_library(path, "child")
 
 
@@ -125,9 +125,9 @@ def test_unrendered_stage_key_rejected(tmp_path):
     prompt text — which is exactly how the old repo's pre_debate went dark."""
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY + "  pre_debate_typo: 'oops'\n")
-    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
     with pytest.raises(ValueError, match="pre_debate_typo"):
-        load_prompt_library(path, "child", topo)
+        load_prompt_library(path, "child", proto)
 
 
 def test_slot_stages_naming_undefined_stage_rejected(tmp_path):
@@ -137,9 +137,9 @@ def test_slot_stages_naming_undefined_stage_rejected(tmp_path):
         "  overall_system: 'sys'\n"
         "  slot_stages: {proposal: nope}\n"
     )
-    topo = Topology.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
+    proto = Protocol.parse({"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}]})
     with pytest.raises(ValueError, match="nope"):
-        load_prompt_library(path, "solo", topo)
+        load_prompt_library(path, "solo", proto)
 
 
 # ---------------------------------------------------------- slot_template
@@ -192,12 +192,12 @@ def test_substituted_text_is_not_rescanned():
 # --------------------------------------------------------- validate_prompts
 
 
-def test_validate_passes_for_math_pc(lib, topology):
-    validate_prompts(lib, topology, fresh_positions=True)
-    validate_prompts(lib, topology, fresh_positions=False)
+def test_validate_passes_for_math_pc(lib, protocol):
+    validate_prompts(lib, protocol, fresh_positions=True)
+    validate_prompts(lib, protocol, fresh_positions=False)
 
 
-def test_validate_passes_for_codecontests_pc(topology):
+def test_validate_passes_for_codecontests_pc(protocol):
     cc = load_pack(CODECONTESTS_YAML, "codecontests_proposer_critic")
     assert set(cc.system) == {"alice", "bob", "judge"}
     assert set(cc.slots) == set(load_pack(MATH_YAML, "math_proposer_critic").slots)
@@ -206,8 +206,8 @@ def test_validate_passes_for_codecontests_pc(topology):
     # spliced in by DebateEnv, so the debate yaml must NOT restate the wording.
     assert slot_template(cc, "proposal", "alice").strip() == "<ANSWER_GEN_USER>"
     assert "```python" in task_prompts("codecontests.yaml").answer_gen_user
-    validate_prompts(cc, topology, fresh_positions=True)
-    validate_prompts(cc, topology, fresh_positions=False)
+    validate_prompts(cc, protocol, fresh_positions=True)
+    validate_prompts(cc, protocol, fresh_positions=False)
 
 
 def test_codecontests_pc_is_forced_disagree_with_old_pack_methodology():
@@ -271,43 +271,43 @@ def test_codecontests_verdict_slot_matches_competitive_parser():
     assert parse_verdict(filled, "collaborative", seats) is None
 
 
-def test_validate_fails_on_missing_slot_template(lib, topology):
+def test_validate_fails_on_missing_slot_template(lib, protocol):
     lib.slots.pop("rebuttal")
     with pytest.raises(ValueError, match="rebuttal"):
-        validate_prompts(lib, topology)
+        validate_prompts(lib, protocol)
 
 
-def test_validate_fails_on_missing_system_prompt(lib, topology):
+def test_validate_fails_on_missing_system_prompt(lib, protocol):
     lib.system.pop("judge")
     with pytest.raises(ValueError, match="judge"):
-        validate_prompts(lib, topology)
+        validate_prompts(lib, protocol)
 
 
-def test_validate_fails_on_empty_composed_system_card(lib, topology):
+def test_validate_fails_on_empty_composed_system_card(lib, protocol):
     """Cards are COMPOSED from stages, so 'defines no stage for this role'
     surfaces as an empty string rather than a missing key."""
     lib.system["bob"] = ""
     with pytest.raises(ValueError, match="empty system prompt for speaker 'bob'"):
-        validate_prompts(lib, topology)
+        validate_prompts(lib, protocol)
 
 
-def test_validate_fails_bindability_when_position_in_solution_slot(lib, topology):
+def test_validate_fails_bindability_when_position_in_solution_slot(lib, protocol):
     lib.slots["proposal"] = lib.slots["proposal"] + "\nYour answer is <POSITION>."
     with pytest.raises(ValueError, match="POSITION"):
-        validate_prompts(lib, topology, fresh_positions=True)
-    validate_prompts(lib, topology, fresh_positions=False)  # assigned mode: fine
+        validate_prompts(lib, protocol, fresh_positions=True)
+    validate_prompts(lib, protocol, fresh_positions=False)  # assigned mode: fine
 
 
 def test_validate_fails_when_critic_needs_position_before_any_solution(lib):
-    topo = Topology.parse({"turns": [{"bob": [{"name": "critique"}]}]})
+    proto = Protocol.parse({"turns": [{"bob": [{"name": "critique"}]}]})
     lib.system = {"bob": lib.system["bob"]}
     with pytest.raises(ValueError, match="OPPONENT_POSITION"):
-        validate_prompts(lib, topo, fresh_positions=True)
+        validate_prompts(lib, proto, fresh_positions=True)
 
 
-def test_bindability_ignores_placeholders_covered_by_vars(topology):
+def test_bindability_ignores_placeholders_covered_by_vars(protocol):
     lib = PromptLibrary(
-        system={s: "sys" for s in topology.speakers},
+        system={s: "sys" for s in protocol.speakers},
         slots={
             "proposal": "<POSITION>",
             "critique": "c",
@@ -318,7 +318,7 @@ def test_bindability_ignores_placeholders_covered_by_vars(topology):
         },
         vars={"POSITION": "static"},
     )
-    validate_prompts(lib, topology, fresh_positions=True)
+    validate_prompts(lib, protocol, fresh_positions=True)
 
 
 # ------------------------------------------------------------ RenderedPrompts
@@ -369,10 +369,10 @@ def test_block_lists_join_and_extend_by_index(tmp_path):
             }
         )
     )
-    topo = Topology.parse({"turns": [{"alice": [{"name": "speech"}]}]})
-    base = load_prompt_library(p, "_base", topo)
+    proto = Protocol.parse({"turns": [{"alice": [{"name": "speech"}]}]})
+    base = load_prompt_library(p, "_base", proto)
     assert base.system["alice"] == "identity block\n\nrules block\n\nformat block"
-    child = load_prompt_library(p, "child", topo)
+    child = load_prompt_library(p, "child", proto)
     assert child.system["alice"] == "identity block\n\nCHILD RULES\n\nformat block\n\nextra"
     assert child.slots["speech"] == "do the thing"  # inherited untouched
 
@@ -381,9 +381,9 @@ def test_preview_shows_block_placement():
     import yaml as _yaml
 
     from infra.envs.debate.prompts import load_prompt_library, preview
-    from infra.envs.debate.topology import Topology
+    from infra.envs.debate.protocol import Protocol
 
-    topo = Topology.parse(
+    proto = Protocol.parse(
         _yaml.safe_load(
             "turns: [{alice: [{name: proposal, kind: solution}]}, {bob: [{name: critique}]},"
             " {alice: [{name: defense}]}, {judge: [{name: verdict, kind: decision}]}]"
@@ -391,11 +391,11 @@ def test_preview_shows_block_placement():
     )
     lib = splice_task_prompts(
         load_prompt_library(
-            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic", topo
+            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic", proto
         ),
         "math.yaml",
     )
-    out = preview(lib, topo)
+    out = preview(lib, proto)
     assert "<alice/proposal output>" in out          # stubbed prior slots
     assert "<TOPIC>" in out                          # runtime placeholders kept visible
     assert "EXACTLY one \\boxed{...}" in out         # spliced task wording renders for real

@@ -1,4 +1,4 @@
-"""DebateEnv: topology-driven debate rollouts as an Env.
+"""DebateEnv: protocol-driven debate rollouts as an Env.
 
 One rollout path (train + eval). Reward is judge-only (DESIGN-debate-env.md
 §5); gt correctness from solution slots lands in info as metrics.
@@ -13,6 +13,8 @@ per-datum advantage offsets in grpo_pack.
 
 from __future__ import annotations
 
+import concurrent.futures
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -41,7 +43,7 @@ from infra.envs.debate.round import (
     SeatRunner,
     SlotRecord,
 )
-from infra.envs.debate.topology import Kind, Topology, Visibility
+from infra.envs.debate.protocol import Kind, Protocol, Visibility
 from infra.envs.task_prompts import PROBLEM_PLACEHOLDER, TASK_SUPPLIED_TEMPLATES
 from infra.models.base import Model
 
@@ -59,7 +61,7 @@ def _splice(template: str, subs: dict[str, str]) -> str:
 
 @dataclass
 class DebateEnvConfig:
-    topology: Topology
+    protocol: Protocol
     prompt_file: str
     prompt_entry: str
     trained_speakers: list[str]                 # subset of debater speakers; [] = pure eval
@@ -93,15 +95,15 @@ class DebateEnv(Env):
         self.family = family
         self.solution_extractor = family.extractor(relaxed_extraction)
 
-        self.topology = config.topology
-        speakers = self.topology.speakers
+        self.protocol = config.protocol
+        speakers = self.protocol.speakers
         self.judge_speaker = self._find_judge_speaker()
         self.debaters = [s for s in speakers if s != self.judge_speaker]
         if len(self.debaters) > 2:
             raise ValueError("at most two debater speakers supported")
         unknown = set(config.trained_speakers) - set(self.debaters)
         if unknown:
-            raise ValueError(f"trained_speakers not in topology: {sorted(unknown)}")
+            raise ValueError(f"trained_speakers not in protocol: {sorted(unknown)}")
         missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
         if missing:
             raise ValueError(f"speakers without models: {sorted(missing)}")
@@ -113,10 +115,10 @@ class DebateEnv(Env):
                     "first_speech_non_debate_aware requires fresh_positions: an assigned "
                     "position to defend is inherently debate-aware"
                 )
-            first = self.topology.compile()[0]
+            first = self.protocol.compile()[0]
             if first.slot.kind != Kind.SOLUTION or first.speaker == self.judge_speaker:
                 raise ValueError(
-                    "first_speech_non_debate_aware requires the first topology slot to be a "
+                    "first_speech_non_debate_aware requires the first protocol slot to be a "
                     f"debater solution slot (got {first.speaker}/{first.slot.name} "
                     f"kind={first.slot.kind.value})"
                 )
@@ -127,12 +129,43 @@ class DebateEnv(Env):
                     "the transcript as a public record (DESIGN-pc-format.md row 10)"
                 )
 
+        if not config.fresh_positions:
+            # Probe the contract up front: assigned mode reads meta["gold"] /
+            # meta["distractor"] per debate, and a missing key would otherwise
+            # die as a bare KeyError mid-rollout after backends are up.
+            probe = task_source.tasks(1)
+            if probe and not {"gold", "distractor"} <= set(probe[0].meta):
+                raise ValueError(
+                    "assigned-position debate (fresh_positions=False) requires "
+                    'Task.meta["gold"] and Task.meta["distractor"], but task source '
+                    f"{type(task_source).__name__} does not provide them"
+                )
+
+        # Grammar forcing (decision_json_schema) is only consumed by LocalModel
+        # judges; API/tinker judges silently drop json_schema, so verdict
+        # quality then rests entirely on parse retries.
+        if config.judge.schema_name == "competitive":
+            judge_model = config.frozen_models.get(self.judge_speaker)
+            if judge_model is not None:
+                try:
+                    from infra.models.local_model import LocalModel
+                except Exception:  # noqa: BLE001 - optional dep; treat as non-local
+                    LocalModel = None
+                if LocalModel is None or not isinstance(judge_model, LocalModel):
+                    warnings.warn(
+                        f"judge model {type(judge_model).__name__} does not consume "
+                        "json_schema: grammar-forced verdicts are unavailable for this "
+                        "judge type and verdict quality depends on judge.retries",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
         self.lib: PromptLibrary = load_prompt_library(
-            config.prompt_file, config.prompt_entry, self.topology
+            config.prompt_file, config.prompt_entry, self.protocol
         )
         self._inject_task_prompt_templates()
         self.prompts = RenderedPrompts(self.lib)
-        validate_prompts(self.lib, self.topology, fresh_positions=config.fresh_positions)
+        validate_prompts(self.lib, self.protocol, fresh_positions=config.fresh_positions)
         self.shaping = build_shaping(config.scoring.shaping)
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
@@ -194,9 +227,9 @@ class DebateEnv(Env):
             yield from (entry.values() if isinstance(entry, dict) else [entry])
 
     def _find_judge_speaker(self) -> str:
-        d = self.topology.decision_slot
+        d = self.protocol.decision_slot
         if d is None:
-            raise ValueError("debate topology needs a decision slot (judge-only rewards)")
+            raise ValueError("debate protocol needs a decision slot (judge-only rewards)")
         return d.speaker
 
     # ------------------------------------------------------------------ env
@@ -209,7 +242,7 @@ class DebateEnv(Env):
 
         cfg = self.config
         seats: dict[str, SeatRunner] = {}
-        for speaker in self.topology.speakers:
+        for speaker in self.protocol.speakers:
             if speaker in cfg.trained_speakers:
                 seat_policy = policy
                 if speaker in cfg.trained_sampling or speaker in cfg.trained_chat_kwargs:
@@ -264,7 +297,7 @@ class DebateEnv(Env):
                 "additionalProperties": False,
             }
         round_ = DebateRound(
-            self.topology,
+            self.protocol,
             seats,
             self.prompts,
             verdict_parser=lambda text: parse_verdict(
@@ -277,6 +310,12 @@ class DebateEnv(Env):
         )
         round_.run(states)
 
+        # Grade all solutions up front, deduped and in parallel: codecontests
+        # grading is a subprocess with up to a 90s timeout per call, so serial
+        # per-state grading of a 32-debate batch can burn tens of minutes for
+        # a metrics-only scalar. _trajectories only looks the results up.
+        grades, grade_errors = self._grade_solutions(states)
+
         # one GRPO group per (task, arm, trained seat)
         by_seat_group: dict[tuple[int, str], list[Trajectory]] = {}
         fail_reasons: dict[str, int] = {}
@@ -287,7 +326,7 @@ class DebateEnv(Env):
                 n_failed += 1
                 fail_reasons[st.failed.split(":")[0]] = fail_reasons.get(st.failed.split(":")[0], 0) + 1
                 continue
-            trajs = self._trajectories(st)
+            trajs = self._trajectories(st, grades)
             if trajs is None:
                 n_unscoreable += 1
                 continue
@@ -300,6 +339,7 @@ class DebateEnv(Env):
             "debates_failed": n_failed,
             "debates_unscoreable": n_unscoreable,
             "fail_reasons": fail_reasons,
+            "grade_errors": grade_errors,
         }
         self.last_states = states  # retained for transcript export (docent)
         for g in groups:
@@ -313,7 +353,14 @@ class DebateEnv(Env):
 
     def _build_state(self, task: Task, flipped: bool) -> DebateState:
         cfg = self.config
-        question = task.meta.get("question") or (task.messages[-1]["content"] if task.messages else "")
+        question = task.meta.get("question")
+        if not question:
+            raise ValueError(
+                f"task source {type(self.task_source).__name__} produced a task "
+                'without a non-empty meta["question"]; the TaskFamily contract '
+                "(infra/envs/tasks/base.py) requires every Task.meta to carry "
+                '{"question": str} — it is what DebateEnv binds as the debate TOPIC'
+            )
         bindings: dict[str, dict[str, str]] = {}
         a, b = (self.debaters + [None, None])[:2]
         names = {s: self.display[s] for s in self.debaters}
@@ -417,7 +464,56 @@ class DebateEnv(Env):
             )
         return RoundTokenReport(counts=counts)
 
-    def _trajectories(self, st: DebateState) -> Optional[list[Trajectory]]:
+    def _grade_key(self, st: DebateState, solution: Any) -> tuple[Any, str]:
+        """Dedup key for grading: same task + same solution text = one grade.
+        The task component prefers a stable name/question; id() of the shared
+        meta dict is the last resort (states in a group share the Task.meta)."""
+        task_meta = st.meta.get("task") or {}
+        tkey = task_meta.get("name") or task_meta.get("question") or id(task_meta)
+        return (tkey, str(solution))
+
+    def _grade_solutions(
+        self, states: list[DebateState]
+    ) -> tuple[dict[tuple[Any, str], Optional[bool]], int]:
+        """family.grade for every (task, solution) pair _trajectories will
+        need, deduped and run in a thread pool (grading may shell out to slow
+        subprocesses; math grading is trivially fast and unharmed by the pool).
+        A grade call that raises records None — it must never kill a rollout."""
+        pending: dict[tuple[Any, str], tuple[dict[str, Any], Any]] = {}
+        for st in states:
+            if st.failed is not None:
+                continue
+            solutions = {
+                r.slot.speaker: r.extracted
+                for r in st.records
+                if r.slot.slot.kind == Kind.SOLUTION
+            }
+            for speaker in self.config.trained_speakers:
+                solution = solutions.get(speaker)
+                if solution is None:
+                    continue
+                key = self._grade_key(st, solution)
+                if key not in pending:
+                    pending[key] = (st.meta.get("task") or {}, solution)
+        grades: dict[tuple[Any, str], Optional[bool]] = {}
+        errors = 0
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {
+                    key: pool.submit(self.family.grade, meta, solution)
+                    for key, (meta, solution) in pending.items()
+                }
+                for key, fut in futures.items():
+                    try:
+                        grades[key] = fut.result()
+                    except Exception:  # noqa: BLE001
+                        grades[key] = None
+                        errors += 1
+        return grades, errors
+
+    def _trajectories(
+        self, st: DebateState, grades: dict[tuple[Any, str], Optional[bool]]
+    ) -> Optional[list[Trajectory]]:
         cfg = self.config
         verdict = self._verdict(st)
         if verdict is None:
@@ -475,7 +571,7 @@ class DebateEnv(Env):
                     if v is not None:
                         info[f"judge_conf_{src}"] = float(v)
             if solutions.get(speaker) is not None:
-                correct = self.family.grade(st.meta.get("task", {}), solutions[speaker])
+                correct = grades.get(self._grade_key(st, solutions[speaker]))
                 if correct is not None:
                     info["solution_correct"] = float(correct)
             trajs.append(

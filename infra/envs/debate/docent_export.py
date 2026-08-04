@@ -33,7 +33,7 @@ from docent.data_models.chat import (
 )
 
 from infra.envs.debate.round import DebateState, render_context
-from infra.envs.debate.topology import Visibility
+from infra.envs.debate.protocol import Visibility
 
 
 def _assistant(text: str, thinking: Optional[str] = None, **meta) -> AssistantMessage:
@@ -124,7 +124,7 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
     runs = []
     for i, st in enumerate(states):
         transcripts = [_omniscient_transcript(st)]
-        for speaker in env.topology.speakers:
+        for speaker in env.protocol.speakers:
             view = _speaker_view(st, speaker, env)
             if view is not None:
                 transcripts.append(view)

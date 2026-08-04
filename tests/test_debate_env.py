@@ -5,6 +5,9 @@ critiques; a scripted judge emits valid competitive JSON. Checks trajectories,
 rewards, datums, groups, and blindness-sensitive context rendering.
 """
 
+import threading
+import time
+
 import pytest
 
 from infra.backend.base import Backend, Sample, SamplingParams
@@ -12,14 +15,14 @@ from infra.envs.base import Policy, Task
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
-from infra.envs.debate.topology import Topology
+from infra.envs.debate.protocol import Protocol
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.math import MathFamily
 from infra.models.base import Model, ModelResponse
 
 import yaml
 
-TOPOLOGY = Topology.parse(
+PROTOCOL = Protocol.parse(
     yaml.safe_load(
         """
 turns:
@@ -116,10 +119,10 @@ class TaskSource:
         ]
 
 
-def make_env(trained, judge_script, scoring=None):
+def make_env(trained, judge_script, scoring=None, task_source=None, family=None):
     return DebateEnv(
         DebateEnvConfig(
-            topology=TOPOLOGY,
+            protocol=PROTOCOL,
             prompt_file=PROMPT_FILE,
             prompt_entry="math_proposer_critic",
             trained_speakers=trained,
@@ -131,8 +134,8 @@ def make_env(trained, judge_script, scoring=None):
             scoring=scoring or ScoringConfig(),
             fresh_positions=True,
         ),
-        TaskSource(),
-        MathFamily(),
+        task_source if task_source is not None else TaskSource(),
+        family if family is not None else MathFamily(),
     )
 
 
@@ -221,6 +224,71 @@ def test_fresh_position_binds_into_critique_and_verdict():
     assert "7" in seen[0]  # alice's extracted answer bound into bob's prompt
 
 
+class NoQuestionTaskSource(TaskSource):
+    """Violates the TaskFamily contract: meta lacks 'question'. Inherits
+    TaskSource.prompts so construction gets past the template splice and the
+    rollout reaches the meta check this test is actually about."""
+
+    def tasks(self, n, split="train"):
+        return [
+            Task(messages=[{"role": "user", "content": "What is 2+2?"}], meta={"gt": 4.0})
+            for _ in range(n)
+        ]
+
+
+def test_missing_question_meta_raises_contract_error():
+    backend = ScriptedBackend(["\\boxed{2}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    src = NoQuestionTaskSource()
+    env = make_env(["alice"], [GOOD_VERDICT], task_source=src)
+    with pytest.raises(ValueError, match=r"NoQuestionTaskSource.*question.*TaskFamily"):
+        env.rollout(src.tasks(1), policy, group_size=1)
+
+
+class CountingFamily(MathFamily):
+    """grade() counts calls (and sleeps, so accidental serial re-grading would
+    at least be visible in runtime); always correct."""
+
+    def __init__(self):
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def grade(self, meta, solution):
+        with self._lock:
+            self.calls += 1
+        time.sleep(0.05)
+        return True
+
+
+def test_grading_deduped_within_group():
+    # group_size=2, identical scripted proposals -> same (task, solution) key
+    # twice; family.grade must run exactly once, both trajs get the metric.
+    backend = ScriptedBackend(["\\boxed{2}", "\\boxed{2}", "Defense.", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    family = CountingFamily()
+    env = make_env(["alice"], [GOOD_VERDICT, GOOD_VERDICT], family=family)
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=2)
+    assert family.calls == 1
+    trajs = [t for g in groups for t in g]
+    assert len(trajs) == 2
+    assert all(t.info["solution_correct"] == 1.0 for t in trajs)
+    assert env.last_rollout_info["grade_errors"] == 0
+
+
+def test_grade_exception_recorded_not_propagated():
+    class ExplodingFamily(MathFamily):
+        def grade(self, meta, solution):
+            raise RuntimeError("verifier fell over")
+
+    backend = ScriptedBackend(["\\boxed{2}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [GOOD_VERDICT], family=ExplodingFamily())
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+    (t,) = groups[0]
+    assert "solution_correct" not in t.info  # graded as None, not a crash
+    assert env.last_rollout_info["grade_errors"] == 1
+
+
 def test_unscoreable_verdict_drops_debate():
     backend = ScriptedBackend(["\\boxed{2}", "Defense."])
     policy = Policy(backend, SamplingParams(max_tokens=128))
@@ -279,7 +347,7 @@ def test_self_play_both_seats_harvested():
     policy = Policy(backend, SamplingParams(max_tokens=128))
     env = DebateEnv(
         DebateEnvConfig(
-            topology=TOPOLOGY,
+            protocol=PROTOCOL,
             prompt_file=PROMPT_FILE,
             prompt_entry="math_proposer_critic",
             trained_speakers=["alice", "bob"],
@@ -343,10 +411,10 @@ def test_format_reward_targets_solution_datum():
     assert t.reward == pytest.approx(1.125)  # mean, for logging
 
 
-def make_solo_env(topology=TOPOLOGY, fresh_positions=True):
+def make_solo_env(protocol=PROTOCOL, fresh_positions=True):
     return DebateEnv(
         DebateEnvConfig(
-            topology=topology,
+            protocol=protocol,
             prompt_file=PROMPT_FILE,
             prompt_entry="math_proposer_critic",
             trained_speakers=["alice"],
@@ -383,7 +451,7 @@ def test_non_debate_aware_first_speech():
     from infra.envs.debate.round import render_context
 
     state = env.last_states[0]
-    slots = TOPOLOGY.compile()
+    slots = PROTOCOL.compile()
     render = lambda cs: "\n".join(m["content"] for m in render_context(state, cs, env.prompts))
     proposal_ctx, defense_ctx = render(slots[0]), render(slots[2])
     assert proposal_ctx == "What is 1+1?"          # the task's own messages, verbatim
@@ -410,7 +478,7 @@ def test_non_debate_aware_requires_fresh_positions():
 
 
 def test_non_debate_aware_requires_leading_solution_slot():
-    topo = Topology.parse(
+    proto = Protocol.parse(
         yaml.safe_load(
             """
 turns:
@@ -421,13 +489,13 @@ turns:
         )
     )
     with pytest.raises(ValueError, match="debater solution slot"):
-        make_solo_env(topology=topo)
+        make_solo_env(protocol=proto)
 
 
 def test_non_debate_aware_requires_public_proposal():
     # a private/ephemeral opening would silently hide the speech from the
     # critic and judge (row 10: the solo speech is a PUBLIC record)
-    topo = Topology.parse(
+    proto = Protocol.parse(
         yaml.safe_load(
             """
 turns:
@@ -438,7 +506,7 @@ turns:
         )
     )
     with pytest.raises(ValueError, match="public"):
-        make_solo_env(topology=topo)
+        make_solo_env(protocol=proto)
 
 
 def test_non_debate_aware_requires_user_message():

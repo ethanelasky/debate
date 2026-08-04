@@ -1,7 +1,7 @@
-"""Turn topology: the declarative debate structure (DESIGN-debate-env.md §1).
+"""Turn protocol: the declarative debate structure (DESIGN-debate-env.md §1).
 
 Five rules, restated as code:
-  1. A topology is ordered turns; each turn maps speakers to ordered slots.
+  1. A protocol is ordered turns; each turn maps speakers to ordered slots.
   2. Visibility classes: public (released to others at the next turn
      boundary), private (author-only, forever), ephemeral (author-only, and
      only for the rest of the same turn).
@@ -9,7 +9,7 @@ Five rules, restated as code:
      the author's own public/private slots from any earlier position +
      the author's own ephemeral slots from earlier in the SAME turn.
   4. Rendering is per-speaker (round.py's job, not this module's).
-  5. Nothing else — blindness is readable off the topology.
+  5. Nothing else — blindness is readable off the protocol.
 """
 
 from __future__ import annotations
@@ -81,14 +81,14 @@ class CompiledSlot:
 
 
 @dataclass
-class Topology:
+class Protocol:
     turns: list[dict[str, list[Slot]]] = field(default_factory=list)
 
     @classmethod
-    def parse(cls, raw: dict[str, Any]) -> "Topology":
+    def parse(cls, raw: dict[str, Any]) -> "Protocol":
         turns_raw = raw.get("turns")
         if turns_raw is None:
-            raise ValueError("topology missing 'turns'")
+            raise ValueError("protocol missing 'turns'")
         turns: list[dict[str, list[Slot]]] = []
         for t, turn_raw in enumerate(turns_raw or []):
             if not isinstance(turn_raw, dict) or not turn_raw:
@@ -100,9 +100,9 @@ class Topology:
                 # bare-string shorthand: `- speech` == `{name: speech}`
                 turn[str(speaker)] = [Slot.parse({"name": s} if isinstance(s, str) else s) for s in slots_raw]
             turns.append(turn)
-        topo = cls(turns=turns)
-        topo.validate()
-        return topo
+        proto = cls(turns=turns)
+        proto.validate()
+        return proto
 
     def validate(self) -> None:
         slots = self.compile()
@@ -112,7 +112,7 @@ class Topology:
 
         decisions = [cs for cs in slots if cs.slot.kind == Kind.DECISION]
         if len(decisions) > 1:
-            raise ValueError("at most one decision slot per topology")
+            raise ValueError("at most one decision slot per protocol")
         if decisions:
             d = decisions[0]
             if d.slot.visibility != Visibility.PUBLIC:

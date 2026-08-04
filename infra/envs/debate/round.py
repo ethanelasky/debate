@@ -21,11 +21,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol as TypingProtocol
 
 from infra.backend.base import Datum, Sample, SamplingParams
 from infra.envs.base import Policy, SlotLimits, datum_from_sample
-from infra.envs.debate.topology import CompiledSlot, Kind, Topology, Visibility
+from infra.envs.debate.protocol import CompiledSlot, Kind, Protocol, Visibility
 from infra.models.base import Model, ModelInput, ModelResponse
 
 Message = dict[str, str]  # {"role": "system"|"user"|"assistant", "content": str}
@@ -35,7 +35,7 @@ def slot_limits(cs: CompiledSlot) -> SlotLimits:
     return SlotLimits(cs.slot.max_think_tokens, cs.slot.max_visible_tokens, cs.slot.max_total_tokens)
 
 
-class PromptLibrary(Protocol):
+class PromptLibrary(TypingProtocol):
     """Per-slot templates; the only place speaker identity/instructions live."""
 
     def system(self, speaker: str, bindings: dict[str, str]) -> str: ...
@@ -203,7 +203,7 @@ class FrozenSeat(SeatRunner):
             inputs = [
                 [ModelInput(role=m["role"], content=m["content"]) for m in requests[i].messages] for i in idxs
             ]
-            # requests come from one topology step, so json_schema is uniform
+            # requests come from one protocol step, so json_schema is uniform
             schemas = {id(requests[i].json_schema) for i in idxs}
             if len(schemas) > 1:
                 raise ValueError(f"{self.model.alias}: mixed json_schema within one generate batch")
@@ -311,7 +311,7 @@ VerdictParser = Callable[[str], Optional[dict]]
 class DebateRound:
     def __init__(
         self,
-        topology: Topology,
+        protocol: Protocol,
         seats: dict[str, SeatRunner],
         prompts: PromptLibrary,
         *,
@@ -321,11 +321,11 @@ class DebateRound:
         fresh_positions: bool = False,
         decision_json_schema: Optional[dict] = None,
     ):
-        missing = set(topology.speakers) - set(seats)
+        missing = set(protocol.speakers) - set(seats)
         if missing:
-            raise ValueError(f"topology speakers without seats: {sorted(missing)}")
-        self.topology = topology
-        self.slots = topology.compile()
+            raise ValueError(f"protocol speakers without seats: {sorted(missing)}")
+        self.protocol = protocol
+        self.slots = protocol.compile()
         self.seats = seats
         self.prompts = prompts
         self.verdict_parser = verdict_parser

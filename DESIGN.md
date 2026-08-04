@@ -231,13 +231,15 @@ Single-turn: one Datum per trajectory.
 ### DebateEnv — SALVAGED from `~/ai-debate/ai_debate/debate/`, slimmed
 
 Not a rewrite. The protocol machinery encodes accumulated knowledge worth
-keeping: protocol-as-data slot topology, per-round sequential/blind control
+keeping: protocol-as-data slot structure, per-round sequential/blind control
 with final-round-always-blind, the judge logit scan with its BPE
 surface-normalization gotcha, the reward ladder edge cases, and the prompt
 YAML library. Port these, strip the apparatus.
 
-**Port ~as-is:** `protocol.py` (Protocol enum) + `turn_plan.py` (compiled slot
-topology); `judge.py`'s verdict parsing + `scan_judge_logit`/
+**Port ~as-is:** the old repo's `protocol.py` (Protocol enum) + `turn_plan.py`
+(compiled slot structure) — collapsed here into one `Protocol` dataclass, since
+this repo has no separate format enum: the slot list IS the format;
+`judge.py`'s verdict parsing + `scan_judge_logit`/
 `score_decision_token`; `reward_ladder.py` — but unified into ONE module,
 collapsing the two diverged copies (`experiments/verdict_verifier.py` vs
 `debate/outcome.py`); the prompt YAMLs (`quality.yaml`,

@@ -1,6 +1,6 @@
 # Debate environment — design (post-feedback)
 
-Topology is YAML data, not code. Rewards are judge-only. Hard token limits are
+Protocol is YAML data, not code. Rewards are judge-only. Hard token limits are
 controls. Each remaining item: **core** (build now) / **defer**.
 
 ## Rollout flow
@@ -8,7 +8,7 @@ controls. Each remaining item: **core** (build now) / **defer**.
 ```mermaid
 flowchart TD
     T[Task from dataset] --> B[Round build: positions bound<br/>into prompt variables<br/>fresh: from solution slot at runtime<br/>assigned: from dataset]
-    B --> TU[Turn loop over YAML topology]
+    B --> TU[Turn loop over YAML protocol]
     TU -->|per speaker: system prompt once,<br/>own slots assistant, others' public<br/>slots attributed user content| TU
     TU --> JV[Judge turn: reads labeled transcript,<br/>emits JSON verdict]
     JV --> C[confidence dict: json + logit,<br/>both captured, no overwrite]
@@ -18,11 +18,11 @@ flowchart TD
     D --> G[GRPO groups question,side → backend]
 ```
 
-## 1. Turn topology (YAML)
+## 1. Turn protocol (YAML)
 
 **Semantics (the whole model, five rules):**
 
-1. A topology is an ordered list of **turns**. Each turn maps speakers to an
+1. A protocol is an ordered list of **turns**. Each turn maps speakers to an
    ordered list of **slots** they generate that turn.
 2. Three visibility classes:
    * `public` — released to every other speaker at the next turn boundary.
@@ -62,12 +62,12 @@ flowchart TD
 - `decision` — extracted (JSON verdict) and compared to the solution(s); the
   judge's verdict slot.
 
-Standard topologies ship as `_topologies` YAML resolved by the existing
+Standard protocols ship as `_protocols` YAML resolved by the existing
 `_extends`/includes machinery — experiments inherit and override turn
 structure like everything else.
 
 ```yaml
-_topologies:
+_protocols:
   simultaneous_2round:
     turns:
       - alice: [{name: proposal, kind: solution}, {name: opening_defense}]
@@ -100,8 +100,8 @@ _topologies:
 
 | aspect | rec |
 |---|---|
-| topology schema + compiler to flat slots (speaker, turn, name, kind, visibility, limits) | **core** |
-| standard topologies as YAML data | **core** |
+| protocol schema + compiler to flat slots (speaker, turn, name, kind, visibility, limits) | **core** |
+| standard protocols as YAML data | **core** |
 
 ## 2. Positions: fresh vs assigned
 
@@ -191,11 +191,11 @@ soft token limits, verdict-dialect plurality (JSON only), judge-logit
 overwrite (both confidences kept instead), gt-reward-inside-debate-env,
 `override_prompt`, Protocol enum / TurnPlan / `sequential_turns` /
 scratchpad + judge-question toggles / per-reader view projection (all
-superseded by the topology).
+superseded by the protocol).
 
 ## Build order
 
-1. `envs/debate/topology.py` — schema, validation, flat-slot compiler
+1. `envs/debate/protocol.py` — schema, validation, flat-slot compiler
 2. `envs/debate/prompts.py` — template library load + per-slot rendering (rule 4)
 3. budget-forced sampling in `envs/base.Policy` (+ `Model.predict` passthrough)
    for the three hard limits

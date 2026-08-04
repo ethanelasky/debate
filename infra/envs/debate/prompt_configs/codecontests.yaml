@@ -22,7 +22,7 @@
 #    reasonability-principle / frivolous-issues blocks.
 #
 # LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary, with `slot_stages`
-# mapping this repo's topology slot names onto the cue stages. Same two
+# mapping this repo's protocol slot names onto the cue stages. Same two
 # departures as the math pack: the PROPOSER gets no pre_debate preamble (its
 # opening cue is <ANSWER_GEN_USER> and must stay byte-identical to the RLVR
 # arm), and there are no past-tense own-speech labels. See the math pack's

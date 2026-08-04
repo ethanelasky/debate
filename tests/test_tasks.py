@@ -4,11 +4,13 @@ Everything here is offline: MathFamily.source() is only ever called with an
 invalid config, where reject_unknown_keys fires before any dataset loading.
 """
 
+import json
+
 import pytest
 import yaml
 
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
-from infra.envs.tasks import get_family
+from infra.envs.tasks import TASK_FAMILIES, get_family
 from infra.envs.tasks.base import reject_unknown_keys
 from infra.envs.tasks.math import MathFamily, _parse_levels
 
@@ -112,12 +114,12 @@ def test_math_debate_pack_splices_the_rlvr_prompt():
     shared composition). The byte-identity of the two arms is enforced in
     test_math_debate_proposal_slot_equals_rlvr_user_message below."""
     from infra.envs.debate.prompts import load_prompt_library, slot_template
-    from infra.envs.debate.topology import Topology
+    from infra.envs.debate.protocol import Protocol
 
     lib = load_prompt_library(
         "infra/envs/debate/prompt_configs/hendrycks_math.yaml",
         "math_proposer_critic",
-        Topology.parse(
+        Protocol.parse(
             {
                 "turns": [
                     {"alice": [{"name": "proposal", "kind": "solution"}]},
@@ -140,7 +142,7 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
     from infra.envs.base import Task
     from infra.envs.debate.env import DebateEnv, DebateEnvConfig
     from infra.envs.debate.judge import JudgeConfig
-    from infra.envs.debate.topology import Topology
+    from infra.envs.debate.protocol import Protocol
 
     problem = "What is $1 + 1$?"
 
@@ -154,7 +156,7 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
 
     debate = DebateEnv(
         DebateEnvConfig(
-            topology=Topology.parse(
+            protocol=Protocol.parse(
                 {
                     "turns": [
                         {"alice": [{"name": "proposal", "kind": "solution"}]},
@@ -238,3 +240,45 @@ def test_missing_prompt_file_raises(tmp_path):
     with pytest.raises(ValueError) as exc:
         load_generation_prompts(tmp_path / "nope.yaml")
     assert "not found" in str(exc.value)
+
+
+# --------------------------------------------------- family task conformance
+# Every family's tasks must carry a non-empty meta["question"] (the TaskFamily
+# contract in infra/envs/tasks/base.py): DebateEnv binds it as the debate
+# TOPIC and now raises if it is missing.
+
+
+@pytest.mark.parametrize("name", sorted(TASK_FAMILIES))
+def test_family_tasks_carry_question(name, tmp_path):
+    if name == "codecontests":
+        rows = [
+            {
+                "name": f"p{i}",
+                "description": f"Read one line and print {i}.",
+                "inputs": ["x"],
+                "outputs": [str(i)],
+            }
+            for i in range(4)
+        ]
+        path = tmp_path / "cc.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        env = get_family(name).source(
+            {"path": str(path), "test_path": str(path), "timeout_seconds": 5}
+        )
+        tasks = env.tasks(2, split="train") + env.tasks(2, split="test")
+    elif name == "math":
+        # MathEnv.__init__ downloads the dataset, which these offline tests
+        # never do (module docstring); exercise task construction directly.
+        from infra.envs.tasks.math import PROMPT_FILE, MathEnv
+
+        env = object.__new__(MathEnv)  # skip __init__ (dataset download)
+        env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
+        row = {"problem": "What is 1+1?", "gt": 2.0, "level": 5}
+        tasks = [MathEnv._task(env, row, "train")]
+    else:
+        pytest.fail(f"no offline conformance recipe for task family {name!r}; add one here")
+    for task in tasks:
+        question = task.meta.get("question")
+        assert isinstance(question, str) and question.strip(), (
+            f"{name}: Task.meta['question'] missing or empty (TaskFamily contract)"
+        )

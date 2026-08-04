@@ -3,12 +3,12 @@
 Loading reuses debate/config.py's _includes/_extends resolver unchanged — a
 prompt file is just a config file whose entries happen to be prompt sets. This
 module adds a typed view, `<PLACEHOLDER>` substitution, the compile-time
-prompt/topology contract, and the adapter implementing round.py's
+prompt/protocol contract, and the adapter implementing round.py's
 PromptLibrary Protocol.
 
 SCHEMA — the old repo's stage vocabulary (prompts/parser.py PromptTag there),
 not per-speaker blobs. An entry names stages; `slot_stages` maps this repo's
-topology slot names onto the cue stages, so topologies stay declarative and the
+protocol slot names onto the cue stages, so protocols stay declarative and the
 old-name/new-name correspondence is per-pack DATA rather than renderer magic:
 
     <entry>:
@@ -24,7 +24,7 @@ old-name/new-name correspondence is per-pack DATA rather than renderer magic:
       debater_standard_grading_details:  # tail of the critic's preamble
       judge_standard_grading_details:    # tail of the judge's preamble
       <cue stages>: ...                  # pre_opening_speech_proposer, ...
-      slot_stages: {<topology slot>: <cue stage>}
+      slot_stages: {<protocol slot>: <cue stage>}
 
 Composition, matching the old repo's speech_format.py + its SYSTEM-collapse:
   system card = overall_system + debater_system + role card  (ONE system
@@ -39,10 +39,10 @@ family's answer-generation user message spliced in whole, and that rendered
 message must stay byte-identical to the RLVR arm's (tests pin it). Its grading
 framing lives in answer_gen_system instead.
 
-Roles come from the TOPOLOGY, not from the pack: the speaker of the first
+Roles come from the PROTOCOL, not from the pack: the speaker of the first
 solution slot is the proposer, the decision slot's speaker is the judge, and a
 remaining debater is the critic. load_prompt_library therefore needs the
-topology whenever an entry uses role-conditioned stages.
+protocol whenever an entry uses role-conditioned stages.
 
 Every stage may be a single string OR a LIST of blocks joined with a blank
 line. Blocks compose under _extends: the config resolver merges lists BY INDEX,
@@ -54,7 +54,7 @@ No Jinja: substitution is a plain replace of `<KEY>`. The placeholder pattern
 is UPPERCASE-only, so literal lowercase tags (`<problem>`) pass through.
 Attribution of others' speeches is NOT in the schema; it lives in
 RenderedPrompts.attributed. To see where every stage lands in the final message
-sequences, use `preview(lib, topology)`.
+sequences, use `preview(lib, protocol)`.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from infra.config import load_config_with_includes, resolve_all_experiments
-from infra.envs.debate.topology import CompiledSlot, Kind, Topology
+from infra.envs.debate.protocol import CompiledSlot, Kind, Protocol
 
 PLACEHOLDER = re.compile(r"<([A-Z_][A-Z0-9_]*)>")
 
@@ -101,30 +101,30 @@ class PromptLibrary:
     preamble: dict[str, str] = field(default_factory=dict)
 
 
-def speaker_roles(topology: Topology) -> dict[str, str]:
-    """Which seat plays which old-repo role. Derived from the TOPOLOGY so a pack
+def speaker_roles(protocol: Protocol) -> dict[str, str]:
+    """Which seat plays which old-repo role. Derived from the PROTOCOL so a pack
     never has to name seats: the decision slot's speaker judges, the first
     solution slot's speaker proposes, any other debater critiques."""
-    decision = topology.decision_slot
+    decision = protocol.decision_slot
     judge = decision.speaker if decision is not None else None
     proposer = next(
-        (cs.speaker for cs in topology.compile() if cs.slot.kind == Kind.SOLUTION and cs.speaker != judge),
+        (cs.speaker for cs in protocol.compile() if cs.slot.kind == Kind.SOLUTION and cs.speaker != judge),
         None,
     )
     roles: dict[str, str] = {}
-    for s in topology.speakers:
+    for s in protocol.speakers:
         roles[s] = JUDGE if s == judge else (PROPOSER if s == proposer else CRITIC)
     return roles
 
 
 def load_prompt_library(
-    path: str | Path, entry: str, topology: Optional[Topology] = None
+    path: str | Path, entry: str, protocol: Optional[Protocol] = None
 ) -> PromptLibrary:
     """File + entry name -> resolved library (_extends/_includes applied), with
     the old-repo stages composed into the per-speaker system cards, preambles
     and slot cues this repo renders.
 
-    `topology` decides which seat is proposer/critic/judge and is REQUIRED: the
+    `protocol` decides which seat is proposer/critic/judge and is REQUIRED: the
     stage vocabulary is role-conditioned, so there is nothing to compose
     without it."""
     data = resolve_all_experiments(load_config_with_includes(path))
@@ -132,17 +132,17 @@ def load_prompt_library(
     if not isinstance(cfg, dict):
         available = ", ".join(n for n in data if not n.startswith("_")) or "<none>"
         raise KeyError(f"prompt entry {entry!r} not in {path} (available: {available})")
-    if topology is None:
+    if protocol is None:
         raise ValueError(
-            f"prompt entry {entry!r}: load_prompt_library needs the topology — stages are "
-            "role-conditioned (proposer/critic/judge come from the topology's solution and "
+            f"prompt entry {entry!r}: load_prompt_library needs the protocol — stages are "
+            "role-conditioned (proposer/critic/judge come from the protocol's solution and "
             "decision slots)"
         )
 
     slot_stages = {str(k): str(v) for k, v in (cfg.get("slot_stages") or {}).items()}
     if not slot_stages:
         raise ValueError(
-            f"prompt entry {entry!r}: no slot_stages — every topology slot needs the cue "
+            f"prompt entry {entry!r}: no slot_stages — every protocol slot needs the cue "
             f"stage that serves it, e.g. {{proposal: pre_opening_speech_proposer}}"
         )
     unknown = set(cfg) - _ENTRY_KEYS - set(slot_stages.values())
@@ -162,7 +162,7 @@ def load_prompt_library(
             "does not define"
         )
 
-    roles = speaker_roles(topology)
+    roles = speaker_roles(protocol)
     return PromptLibrary(
         system={s: _compose(stages, _SYSTEM_STAGES[r]) for s, r in roles.items()},
         preamble={
@@ -263,15 +263,15 @@ def _bindability_errors(lib: PromptLibrary, slots: list[CompiledSlot]) -> list[s
     return list(dict.fromkeys(errors))
 
 
-def validate_prompts(lib: PromptLibrary, topology: Topology, fresh_positions: bool = False) -> None:
-    """The prompt/topology contract, checked before any generation: every
-    (slot, speaker) the topology will ask for resolves, every speaker has a
+def validate_prompts(lib: PromptLibrary, protocol: Protocol, fresh_positions: bool = False) -> None:
+    """The prompt/protocol contract, checked before any generation: every
+    (slot, speaker) the protocol will ask for resolves, every speaker has a
     system prompt, and (fresh mode) no template needs a position that has not
     been generated yet. Raises ValueError listing every problem at once."""
-    slots = topology.compile()
+    slots = protocol.compile()
     errors: list[str] = []
-    roles = speaker_roles(topology)
-    for speaker in topology.speakers:
+    roles = speaker_roles(protocol)
+    for speaker in protocol.speakers:
         if speaker not in lib.system:
             errors.append(f"no system prompt for speaker {speaker!r} (have: {sorted(lib.system)})")
         elif not lib.system[speaker].strip():
@@ -289,7 +289,7 @@ def validate_prompts(lib: PromptLibrary, topology: Topology, fresh_positions: bo
     if fresh_positions:
         errors += _bindability_errors(lib, slots)
     if errors:
-        raise ValueError("prompt/topology mismatch:\n  " + "\n  ".join(dict.fromkeys(errors)))
+        raise ValueError("prompt/protocol mismatch:\n  " + "\n  ".join(dict.fromkeys(errors)))
 
 
 # ------------------------------------------------------------- round adapter
@@ -320,22 +320,22 @@ class RenderedPrompts:
         return f"{author_name} said:\n{text}"
 
 
-def load_rendered_prompts(path: str | Path, entry: str, topology: Topology) -> RenderedPrompts:
-    return RenderedPrompts(load_prompt_library(path, entry, topology))
+def load_rendered_prompts(path: str | Path, entry: str, protocol: Protocol) -> RenderedPrompts:
+    return RenderedPrompts(load_prompt_library(path, entry, protocol))
 
 
 # ------------------------------------------------------------------ preview
 
 
-def preview(lib: PromptLibrary, topology: Topology, speakers: Optional[list[str]] = None) -> str:
+def preview(lib: PromptLibrary, protocol: Protocol, speakers: Optional[list[str]] = None) -> str:
     """Render each speaker's final-slot message sequence with placeholders kept
     visible (<TOPIC> stays <TOPIC>) and other speakers' outputs stubbed as
     <alice/proposal output>. Answers "where does my prompt text land" without
-    running anything: python -m debate.envs.debate.prompts <file> <entry> <topo.yaml>
+    running anything: python -m debate.envs.debate.prompts <file> <entry> <proto.yaml>
     """
     from infra.envs.debate.round import DebateState, SlotRecord, render_context
 
-    slots = topology.compile()
+    slots = protocol.compile()
     placeholder_names = {
         m.group(1)
         for tmpl in list(lib.system.values())
@@ -345,10 +345,10 @@ def preview(lib: PromptLibrary, topology: Topology, speakers: Optional[list[str]
     }
     placeholder_names -= set(lib.vars)  # var-bound placeholders render for real
     identity = {name: f"<{name}>" for name in placeholder_names}  # single-pass sub: safe
-    bindings = {s: {**identity, "NAME": f"<{s}:NAME>"} for s in topology.speakers}
+    bindings = {s: {**identity, "NAME": f"<{s}:NAME>"} for s in protocol.speakers}
 
     out: list[str] = []
-    for speaker in speakers or topology.speakers:
+    for speaker in speakers or protocol.speakers:
         own = [cs for cs in slots if cs.speaker == speaker]
         if not own:
             continue
@@ -371,8 +371,8 @@ if __name__ == "__main__":
 
     import yaml as _yaml
 
-    from infra.envs.debate.topology import Topology as _T
+    from infra.envs.debate.protocol import Protocol as _T
 
-    topo_ = _T.parse(_yaml.safe_load(open(sys.argv[3])))
-    lib_ = load_prompt_library(sys.argv[1], sys.argv[2], topo_)
-    print(preview(lib_, topo_))
+    proto_ = _T.parse(_yaml.safe_load(open(sys.argv[3])))
+    lib_ = load_prompt_library(sys.argv[1], sys.argv[2], proto_)
+    print(preview(lib_, proto_))

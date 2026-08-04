@@ -10,8 +10,8 @@
 # LAYOUT (Ethan, 2026-08-03): the old repo's STAGE vocabulary — overall_system,
 # debater_system, debater_system_{proposer,critic}, judge_system, pre_debate,
 # pre_debate_judge, the grading-details stages, and the pre_*/post_round_* cue
-# stages. `slot_stages` maps this repo's topology slot names onto the cues, so
-# topologies stay declarative. See infra/envs/debate/prompts.py for how the
+# stages. `slot_stages` maps this repo's protocol slot names onto the cues, so
+# protocols stay declarative. See infra/envs/debate/prompts.py for how the
 # stages compose into system cards and preambles.
 #
 # Two deliberate departures from the old repo's assembly, both decided in the
