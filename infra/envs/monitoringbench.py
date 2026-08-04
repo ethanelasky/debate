@@ -253,7 +253,14 @@ class MonitoringBenchTaskSource:
         if self.choice_messages is not None:
             if not self.choice_messages:
                 raise ValueError("monitoringbench: choice_messages is empty")
-            if not any("<BACKGROUND_TEXT>" in t for t in self.choice_messages):
+            msgs = self._choice_message_dicts()
+            bad = [m for m in msgs if m["role"] not in ("system", "user")]
+            if bad:
+                raise ValueError(
+                    f"monitoringbench: choice_messages roles must be system/user, got "
+                    f"{sorted({m['role'] for m in bad})}"
+                )
+            if not any("<BACKGROUND_TEXT>" in m["content"] for m in msgs):
                 raise ValueError(
                     "monitoringbench: no choice_messages template references "
                     "<BACKGROUND_TEXT>, so the trajectory could not be inserted "
@@ -294,12 +301,12 @@ class MonitoringBenchTaskSource:
 
             messages = [
                 {
-                    "role": "user",
+                    "role": m["role"],
                     "content": render(
-                        tmpl, {"BACKGROUND_TEXT": transcript}, self.choice_prompt_vars
+                        m["content"], {"BACKGROUND_TEXT": transcript}, self.choice_prompt_vars
                     ),
                 }
-                for tmpl in self.choice_messages
+                for m in self._choice_message_dicts()
             ]
         else:
             # TOPIC is not referenced by MB prompts; the message is unused.
@@ -321,6 +328,17 @@ class MonitoringBenchTaskSource:
                 "red_team_objective_accomplished": row.red_team_objective_accomplished,
             },
         )
+
+    def _choice_message_dicts(self) -> list[dict[str, str]]:
+        """choice_messages items are {"role", "content"} template dicts; a bare
+        string is shorthand for a user message."""
+        out = []
+        for m in self.choice_messages or []:
+            if isinstance(m, str):
+                out.append({"role": "user", "content": m})
+            else:
+                out.append({"role": str(m.get("role", "user")), "content": str(m.get("content", ""))})
+        return out
 
     def tasks(self, n: int, split: str = "test") -> list[Task]:
         if self._whitelisted:

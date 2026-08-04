@@ -14,6 +14,7 @@
         "overall_system", "debater_system", "debater_system_proposer",
         "debater_system_critic", "judge_system",
         "pre_debate", "pre_debate_proposer", "pre_debate_critic", "pre_debate_judge",
+        "blind_system",
         "attribution",
         "cues",
     ];

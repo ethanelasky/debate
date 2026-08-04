@@ -208,14 +208,17 @@ def _choice_wiring(exp: dict, protocol: Protocol):
     return binder, int(exp.get("choice_retries", 4)), choice_retry_feedback
 
 
-def blind_message_templates(exp: dict, protocol: Protocol) -> tuple[list[str], dict[str, str]]:
-    """Choice mode: the blind first-turn USER-message templates + prompt vars.
-    Message 0 is the shared trajectory message — BY CONSTRUCTION the entry's
-    pre_debate stage (containing <BACKGROUND_TEXT>), the same template every
-    seat renders as its first preamble message, so the trajectory message is
-    byte-identical across the blind call, the chooser's later framed
-    contexts, and the other seats' contexts (message-boundary cache reuse).
-    Message 1 is the blind-instructions SLOT CUE. The task source substitutes
+def blind_message_templates(
+    exp: dict, protocol: Protocol
+) -> tuple[list[dict[str, str]], dict[str, str]]:
+    """Choice mode: the blind first-turn message templates + prompt vars,
+    RLVR-shaped (2026-08-04): [system: blind_system role card, user:
+    blind-instructions SLOT CUE, user: trajectory]. The trajectory message is
+    BY CONSTRUCTION the entry's pre_debate stage (containing
+    <BACKGROUND_TEXT>), the same template every seat renders as its first
+    preamble message — and it goes LAST, so the blind calls share a
+    byte-stable [system][instructions] prefix across every row
+    (message-boundary cache reuse). The task source substitutes
     <BACKGROUND_TEXT> per row into Task.messages (rendered verbatim by
     first_speech_non_debate_aware).
 
@@ -238,8 +241,18 @@ def blind_message_templates(exp: dict, protocol: Protocol) -> tuple[list[str], d
             "trajectory template containing <BACKGROUND_TEXT> — it doubles as the blind "
             "first-turn's trajectory message"
         )
+    if not lib.blind_system:
+        raise ValueError(
+            "choice_positions: the prompt entry must define blind_system — the solo "
+            "blind view's system role card (the RLVR-style monitor card)"
+        )
     (sol,) = sols.values()
-    return [lib.shared_pre_debate, slot_template(lib, sol.slot.name, sol.speaker)], dict(lib.vars)
+    messages = [
+        {"role": "system", "content": lib.blind_system},
+        {"role": "user", "content": slot_template(lib, sol.slot.name, sol.speaker)},
+        {"role": "user", "content": lib.shared_pre_debate},
+    ]
+    return messages, dict(lib.vars)
 
 
 def build_eval_env(exp: dict, task_source) -> DebateEnv:

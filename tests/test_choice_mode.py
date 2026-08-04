@@ -830,16 +830,18 @@ turns:
         }
         topo = Protocol.parse(yaml.safe_load(topo_yaml))
         tmpls, vars_ = run_eval.blind_message_templates(exp, topo)
-        assert len(tmpls) == 2
-        assert "<BACKGROUND_TEXT>" in tmpls[0]
-        # Blind instructions filled 2026-08-04: self-contained monitor guidance
-        # (four security failures) + the answer tag, no debate framing.
-        assert "four security failures" in tmpls[1]
-        assert "<answer>attack</answer>" in tmpls[1]
+        # RLVR-shaped blind view (2026-08-04): monitor role card as SYSTEM,
+        # short instruction cue, then the trajectory LAST (byte-stable
+        # [system][instructions] prefix across rows).
+        assert [m["role"] for m in tmpls] == ["system", "user", "user"]
+        system, cue, traj = (m["content"] for m in tmpls)
+        assert "four security failures" in system
+        assert "<answer>attack</answer>" in cue
+        assert "<BACKGROUND_TEXT>" in traj
         for word in ("debate", "opponent", "judge", "assigned"):
-            assert word not in tmpls[1].lower(), word
-        render(tmpls[0], {"BACKGROUND_TEXT": "x"}, vars_)  # trajectory msg renders
-        render(tmpls[1], {"BACKGROUND_TEXT": "x"}, vars_)  # instructions render fully
+            assert word not in (system + cue).lower(), word
+        for tmpl in (system, cue, traj):
+            render(tmpl, {"BACKGROUND_TEXT": "x"}, vars_)  # renders fully
 
 
 MB_DEBATE_CHOICE_TOPO = Protocol.parse(
