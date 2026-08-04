@@ -139,6 +139,19 @@ class SingleTurnEnv(Env):
 
     grade_workers: int = 1
 
+    #: Flat overshoot penalty. A sample longer than `soft_token_budget` loses
+    #: `overshoot_penalty` from its reward — a constant, NOT scaled by how far
+    #: over it went. The old repo ramped the penalty between a soft budget and
+    #: a hard limit (coef 0.10 at 4096/8192 cost a half-way overshoot 0.05);
+    #: flat is the deliberate change, so the gradient says "stay under the
+    #: budget" rather than "be marginally shorter".
+    #:
+    #: This does NOT change the sampler cap: generation still stops at the
+    #: backend's response_length. It only prices length in the reward, so a
+    #: budget above that cap can never fire. Off by default.
+    soft_token_budget: Optional[int] = None
+    overshoot_penalty: float = 0.0
+
     @abstractmethod
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         """Completion text -> (reward, metric info), one call per kept sample.
@@ -166,6 +179,12 @@ class SingleTurnEnv(Env):
             scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
 
         for (gi, s), (reward, info) in zip(kept, scored):
+            # Length is priced here rather than in reward(), which only sees
+            # text; token counts live on the Sample.
+            over = bool(self.soft_token_budget and len(s.tokens) > self.soft_token_budget)
+            info = {**info, "tokens": float(len(s.tokens)), "over_budget": float(over)}
+            if over:
+                reward -= self.overshoot_penalty
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
         if n_dropped and groups and groups[0]:
             groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)

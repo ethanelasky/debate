@@ -462,3 +462,38 @@ def test_source_builds_env(family, tmp_path):
 
 def test_family_is_registered():
     assert isinstance(get_family("codecontests"), CodeContestsFamily)
+
+
+# --------------------------------------------------------- soft token budget
+
+
+def test_flat_overshoot_penalty_is_constant_not_ramped(tmp_path):
+    """A sample past the budget loses a CONSTANT amount, however far over it
+    went. The old repo ramped this between a soft budget and a hard limit;
+    flat is the deliberate change (Frank, 2026-08-04)."""
+    from infra.backend.base import Sample
+
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT,
+                          soft_token_budget=10, overshoot_penalty=0.25)
+
+    class FakePolicy:
+        """Two samples: one just over the budget, one far over."""
+        def predict(self, messages, n):
+            def mk(k):
+                return Sample(
+                    tokens=[0] * k, logprobs=[0.0] * k,
+                    text="```python\n" + SUM_SOLUTION + "\n```",
+                    stop_reason="stop", prompt_tokens=[0],
+                )
+            return [[mk(11), mk(500)] for _ in messages]
+
+    groups = env.rollout(env.tasks(1, split="train"), FakePolicy(), group_size=2)
+    rewards = sorted(t.reward for t in groups[0])
+    assert len(set(rewards)) == 1, f"penalty scaled with length: {rewards}"
+    assert all(t.info["over_budget"] == 1.0 for t in groups[0])
+
+    env.soft_token_budget = None
+    unpenalised = sorted(t.reward for t in env.rollout(
+        env.tasks(1, split="train"), FakePolicy(), group_size=2)[0])
+    assert unpenalised[0] - rewards[0] == pytest.approx(0.25)

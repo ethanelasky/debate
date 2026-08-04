@@ -14,7 +14,7 @@
 
 codecontests_rlvr_olmo:
   model: allenai/Olmo-3-7B-Instruct-DPO
-  max_completion_tokens: 1536
+  max_completion_tokens: 8192
   dataset:
     type: codecontests
     path: data/codecontests/train.jsonl
@@ -28,6 +28,16 @@ codecontests_rlvr_olmo:
     # The whole held-out split: 501 problems, 109 contests, disjoint from train
     # by contest so near-duplicates cannot straddle the boundary.
     eval_subset_size: 501
+    # FLAT overshoot penalty: a completion past 4096 tokens loses a constant
+    # 0.1, regardless of how far over. The old repo RAMPED this between a soft
+    # 4096 and a hard 8192 (coef 0.10, so a half-way overshoot cost 0.05);
+    # flat is the deliberate change, so the gradient says "stay under" rather
+    # than "be marginally shorter".
+    #
+    # It only bites if response_length exceeds it — see below. It does NOT
+    # move the sampler cap; generation still stops at response_length.
+    soft_token_budget: 4096
+    overshoot_penalty: 0.1
   training:
     backend: verl
     verl:
@@ -37,8 +47,11 @@ codecontests_rlvr_olmo:
       # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
       # 1850 max, plus the answer-gen preamble.
       prompt_length: 4096
-      response_length: 1536
-      max_token_len_per_gpu: 8192
+      # 8192 mirrors the old repo's soft-4096 / hard-8192 pair: the budget
+      # prices length, this caps it. A response_length at or below the budget
+      # would make the penalty dead config.
+      response_length: 8192
+      max_token_len_per_gpu: 16384   # >= prompt_length + response_length
       checkpoint_dir: /workspace/checkpoints
     wandb_project: debate-rebuild
     lora_rank: 32
@@ -46,14 +59,17 @@ codecontests_rlvr_olmo:
     ppo_epochs: 1
     adv_length_norm: count
     steps: 100
-    batch_size: 8
+    # 16x8 = 128 rollouts/step, 12,800 over the run. Worst case 1.57M tokens
+    # per step, ~96 micro-batches at the 16384 budget — bounded by
+    # max_token_len_per_gpu, so batch size costs time, not memory.
+    batch_size: 16
     group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
     lr: 1.0e-4
     kl_coef: 0.02
     kl_discount_factor: 0.0
     eval_every: 5
     eval_n: 256        # +-3.1pp binomial noise
-    eval_max_tokens: 1536
+    eval_max_tokens: 8192
     save_every: 25
 
 # 1-step smoke: proves the whole path — dataset load, prompt render, rollout,

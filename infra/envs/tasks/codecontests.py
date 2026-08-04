@@ -564,8 +564,14 @@ class CodeContestsEnv(SingleTurnEnv):
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
         prompt_file: Optional[str] = None,
+        soft_token_budget: Optional[int] = None,
+        overshoot_penalty: float = 0.0,
     ):
         self.rng = random.Random(seed)
+        # Flat penalty past the budget (see SingleTurnEnv). Inert unless the
+        # backend's response_length is set above the budget.
+        self.soft_token_budget = soft_token_budget
+        self.overshoot_penalty = overshoot_penalty
         self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
         self.timeout_seconds = timeout_seconds
         self.correct_reward = correct_reward
@@ -682,6 +688,8 @@ class CodeContestsFamily(TaskFamily):
                 "correct_reward",
                 "format_reward",
                 "prompt_file",
+                "soft_token_budget",
+                "overshoot_penalty",
             },
             "codecontests",
         )
@@ -702,6 +710,8 @@ class CodeContestsFamily(TaskFamily):
             correct_reward=float(ds.get("correct_reward", 1.0)),
             format_reward=float(ds.get("format_reward", 0.1)),
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
+            soft_token_budget=(int(ds["soft_token_budget"]) if ds.get("soft_token_budget") else None),
+            overshoot_penalty=float(ds.get("overshoot_penalty", 0.0)),
         )
 
     def extractor(self, relaxed: bool) -> Callable[[str], Any]:
