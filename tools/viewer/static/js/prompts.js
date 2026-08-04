@@ -6,9 +6,16 @@
 "use strict";
 
 (() => {
-    const GROUPS = ["vars", "system", "user_preamble", "slots", "attribution"];
+    // Keys of the DIRECT entry schema (infra/envs/debate/prompts.py).
+    const GROUPS = ["vars", "system", "preamble", "slots", "attribution"];
     const KEY_ENTRIES = "cv.prompts.entries";
     const KEY_COMPONENTS = "cv.prompts.components";
+
+    // Metadata editors whose text does not currently parse as JSON, keyed by
+    // entry+row. State keeps the last VALID value; saving is blocked until
+    // these clear (the single rolling .backup.yaml cannot undo a bad save).
+    const invalidJson = new Map();
+    const editorKey = (name, row) => `${name} ${row.id}`;
 
     const state = {
         raw: null,
@@ -50,6 +57,22 @@
         const rows = [];
         for (const [key, value] of Object.entries(entry)) {
             if (key === "_extends") continue;
+            if (key === "preamble" && Array.isArray(value)) {
+                // preamble is a LIST of message items: a string item renders
+                // for every speaker, a map item is per-speaker. Flatten to one
+                // row per (item index, speaker) — as a single row this, the
+                // largest component, would render as one unusable JSON blob.
+                value.forEach((item, i) => {
+                    if (V.isDict(item)) {
+                        for (const speaker of Object.keys(item)) {
+                            rows.push({ path: [key, String(i), speaker], group: key });
+                        }
+                    } else {
+                        rows.push({ path: [key, String(i)], group: key });
+                    }
+                });
+                continue;
+            }
             if (!GROUPS.includes(key) || !V.isDict(value)) {
                 rows.push({ path: [key], group: GROUPS.includes(key) ? key : "other" });
                 continue;
@@ -118,9 +141,32 @@
     // one block of a list template. Editing an inherited component first
     // copies the resolved value into the child's raw entry (verbatim), then
     // replaces only the edited piece — matching by-index _extends merging.
+    // A row path can pass THROUGH a list index (preamble items). _extends
+    // merges lists by index, so writing raw.preamble[2] into a raw entry with
+    // no preamble would leave holes dumping as nulls over the parent's items
+    // 0 and 1 — copy the resolved siblings in first, as the block-list branch
+    // of applyEdit already does for its own list.
+    function seedListsAlongPath(name, path) {
+        for (let i = 1; i < path.length; i++) {
+            if (!/^\d+$/.test(String(path[i]))) continue;
+            const listPath = path.slice(0, i);
+            const resolvedList = V.getPath(state.resolved[name], listPath);
+            let rawList = V.getPath(state.raw[name], listPath);
+            if (!Array.isArray(rawList)) {
+                rawList = [];
+                V.setPath(state.raw[name], listPath, rawList);
+            }
+            while (rawList.length <= Number(path[i])) {
+                const sibling = Array.isArray(resolvedList) ? resolvedList[rawList.length] : undefined;
+                rawList.push(sibling === undefined ? "" : V.clone(sibling));
+            }
+        }
+    }
+
     function applyEdit(name, row, blockIdx, value) {
         if (!V.isDict(state.raw[name])) state.raw[name] = {};
         if (blockIdx === null) {
+            seedListsAlongPath(name, row.path);
             V.setPath(state.raw[name], row.path, value);
         } else {
             let leaf = V.getPath(state.raw[name], row.path);
@@ -167,6 +213,13 @@
     }
 
     async function save() {
+        if (invalidJson.size) {
+            // Those editors' values were never applied; saving now would write
+            // the last valid value while the screen shows something else.
+            V.status(
+                `Fix the invalid JSON first: ${[...invalidJson.values()].join(", ")}`, "err");
+            return;
+        }
         if (!V.isDirty()) { V.status("No changes to save"); return; }
         if (!confirm(V.SAVE_WARNING)) return;
         const saveBtn = document.getElementById("saveBtn");
@@ -245,9 +298,32 @@
         const area = (text, blockIdx, meta) => {
             const node = V.el("textarea", { spellcheck: "false" });
             node.value = text;
+            let errorNote = null;
             node.addEventListener("input", () => {
                 let value = node.value;
-                if (meta) { try { value = JSON.parse(node.value); } catch { /* raw string until valid */ } }
+                if (meta) {
+                    try {
+                        value = JSON.parse(node.value);
+                    } catch (err) {
+                        // Mid-edit text lives in the DOM only: writing it into
+                        // state would replace a structured YAML value with one
+                        // string, and saving that is not recoverable from the
+                        // single rolling backup. Block the save instead.
+                        invalidJson.set(editorKey(name, row), `${name} / ${row.id}`);
+                        node.classList.add("json-invalid");
+                        if (!errorNote) {
+                            errorNote = V.el("div", { class: "json-error" });
+                            node.after(errorNote);
+                        }
+                        errorNote.textContent = `Invalid JSON — not applied: ${err.message}`;
+                        V.autogrow(node);
+                        V.status(`Invalid JSON in ${name} / ${row.id} — saving is blocked`, "err");
+                        return;
+                    }
+                    invalidJson.delete(editorKey(name, row));
+                    node.classList.remove("json-invalid");
+                    if (errorNote) { errorNote.remove(); errorNote = null; }
+                }
                 applyEdit(name, row, blockIdx, value);
                 V.autogrow(node);
                 const td = node.closest("td");
@@ -329,6 +405,9 @@
     }
 
     function render() {
+        // every textarea is rebuilt from state (i.e. from last-valid values),
+        // so no unparsed mid-edit text survives this
+        invalidJson.clear();
         const mount = document.getElementById("tableMount");
         const names = Object.keys(state.resolved || {}).filter(
             n => state.entries.size === 0 || state.entries.has(n));

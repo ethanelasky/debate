@@ -51,16 +51,22 @@ const V = (() => {
         cur[path[path.length - 1]] = value;
     }
 
+    // Returns true when the delete changed an ARRAY's shape: splicing shifts
+    // every later element down one, so any row path holding an index past the
+    // removed one now points at a different value. Callers must re-render
+    // their row list on true — and note infra.config.deep_merge merges lists
+    // by index, so a stale index would silently re-target a child's override.
     function deletePath(obj, path) {
         const parents = [];
         let cur = obj;
         for (let i = 0; i < path.length - 1; i++) {
-            if (!isDict(cur) && !Array.isArray(cur)) return;
+            if (!isDict(cur) && !Array.isArray(cur)) return false;
             parents.push(cur);
             cur = cur[path[i]];
         }
-        if (cur === null || typeof cur !== "object") return;
-        if (Array.isArray(cur)) cur.splice(Number(path[path.length - 1]), 1);
+        if (cur === null || typeof cur !== "object") return false;
+        const spliced = Array.isArray(cur);
+        if (spliced) cur.splice(Number(path[path.length - 1]), 1);
         else delete cur[path[path.length - 1]];
         // prune now-empty dicts so removed overrides don't leave `key: {}` husks
         for (let i = path.length - 2; i >= 0; i--) {
@@ -69,6 +75,7 @@ const V = (() => {
             if (isDict(child) && Object.keys(child).length === 0) delete holder[path[i]];
             else break;
         }
+        return spliced;
     }
 
     // ---------- persistence ----------

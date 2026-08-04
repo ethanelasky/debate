@@ -21,12 +21,21 @@ def main(argv: list[str] | None = None) -> None:
 
     import uvicorn
 
-    from tools.viewer.server import create_app
+    from tools.viewer.server import create_app, is_loopback_host
+
+    if not is_loopback_host(args.host):
+        print(
+            f"\n*** WARNING: binding to {args.host} exposes an UNAUTHENTICATED "
+            "read+write config editor to the network.\n"
+            "*** Anyone who can reach this port can rewrite your prompt and "
+            "experiment YAML. Use 127.0.0.1 unless you mean it.\n"
+        )
 
     if not args.no_browser:
         url = f"http://{args.host}:{args.port}/prompts"
         threading.Timer(0.8, webbrowser.open, args=(url,)).start()
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    # the bound host is same-origin by construction; every other Host is a 400
+    uvicorn.run(create_app(allowed_hosts=[args.host]), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

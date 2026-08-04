@@ -207,7 +207,20 @@ def merge_preserving_types(incoming: Any, existing: Any) -> Any:
     if isinstance(incoming, dict) and isinstance(existing, dict):
         existing_by_json_key: dict[str, Any] = {}
         for k in existing:
-            existing_by_json_key.setdefault(_json_key(k), k)
+            json_key = _json_key(k)
+            if json_key in existing_by_json_key:
+                # Two YAML keys collapsing to one JSON key (1 vs "1") means the
+                # GET already lost one of them; keeping the first silently would
+                # write the wrong value under the survivor's type. Refuse.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"YAML keys {existing_by_json_key[json_key]!r} and {k!r} both "
+                        f"map to JSON key {json_key!r} — the viewer cannot edit this "
+                        "file safely; rename one key"
+                    ),
+                )
+            existing_by_json_key[json_key] = k
         out: dict[Any, Any] = {}
         for in_key, in_value in incoming.items():
             if isinstance(in_key, str) and in_key in existing_by_json_key:

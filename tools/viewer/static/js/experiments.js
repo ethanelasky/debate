@@ -82,8 +82,12 @@
         return String(v);
     }
 
+    // An emptied text field is the EMPTY STRING, never a key deletion: the
+    // only way to remove a key is the cell's ✕ button (clearCell) or a
+    // select's blank option, so a value can be cleared without the row
+    // disappearing under the cursor.
     function parseValue(text, reference) {
-        if (text === "") return undefined;
+        if (text === "") return "";
         // A string-typed field stays a string: typing "true"/"1" into it must
         // not coerce (the reference is the field's current resolved value).
         if (typeof reference === "string") return text;
@@ -173,18 +177,22 @@
 
     function onEdit(target, name, row) {
         const reference = V.getPath(state.resolved[name], row.path);
-        const value = parseValue(target.value, reference);
+        // A select's blank option ("—" / "— no preset —") IS its clear
+        // affordance; text fields clear via the cell's ✕ button instead.
+        const cleared = target.tagName === "SELECT" && target.value === "";
+        const value = cleared ? undefined : parseValue(target.value, reference);
         const parent = parentOf(name);
         const inheritedValue = parent !== undefined ? V.getPath(state.resolved[parent], row.path) : undefined;
         const preset = isPresetRow(row);
+        let structural = false;
 
         if (!V.isDict(state.raw[name])) state.raw[name] = {};
         if (value === undefined || (!preset && value === inheritedValue)) {
-            V.deletePath(state.raw[name], row.path);
+            structural = V.deletePath(state.raw[name], row.path);
             if (inheritedValue !== undefined) V.setPath(state.resolved[name], row.path, inheritedValue);
             // no parent value: the resolved leaf must go too — a stale value
             // styled as "inherited" would misreport the config.
-            else V.deletePath(state.resolved[name], row.path);
+            else structural = V.deletePath(state.resolved[name], row.path) || structural;
         } else {
             V.setPath(state.raw[name], row.path, value);
             if (!preset) V.setPath(state.resolved[name], row.path, value);
@@ -196,12 +204,34 @@
                 `"${name}" is extended by ${kids.join(", ")} — their resolved views refresh after save + reload`);
         }
 
+        V.setDirty(true);
+        if (structural) {
+            // An array element was spliced out: every later index shifted, so
+            // the row paths are stale — rebuild them before the next edit
+            // writes to the wrong element (deep_merge merges lists by index).
+            render();
+            return;
+        }
+
         const nowInherited = V.getPath(state.raw[name], row.path) === undefined
             && V.getPath(state.resolved[name], row.path) !== undefined;
         target.classList.toggle("inh", nowInherited);
         const td = target.closest("td");
         if (td) td.classList.toggle("cell-inh", nowInherited);
+    }
+
+    // Explicit key removal (the ✕ in a cell). Always re-renders: removing an
+    // array element renumbers its siblings, and removing a dict key can prune
+    // empty parents, so the row list must be rebuilt either way.
+    function clearCell(name, row) {
+        const parent = parentOf(name);
+        const inheritedValue = parent !== undefined
+            ? V.getPath(state.resolved[parent], row.path) : undefined;
+        V.deletePath(state.raw[name], row.path);
+        if (inheritedValue !== undefined) V.setPath(state.resolved[name], row.path, inheritedValue);
+        else V.deletePath(state.resolved[name], row.path);
         V.setDirty(true);
+        render();
     }
 
     // Mixed-shape row (R5): a column whose value at this path is a container
@@ -318,9 +348,21 @@
                 V.el("td", { class: "rowhead" },
                     V.el("span", { class: depth ? `indent-${depth}` : "" }, label)));
             for (const name of names) {
-                const inherited = !isNestedInCell(name, row)
-                    && V.getPath(state.raw[name], row.path) === undefined;
-                tr.append(V.el("td", { class: `cell${inherited ? " cell-inh" : ""}` }, buildInput(name, row)));
+                const nested = isNestedInCell(name, row);
+                const inherited = !nested && V.getPath(state.raw[name], row.path) === undefined;
+                const td = V.el("td", { class: `cell${inherited ? " cell-inh" : ""}` },
+                    buildInput(name, row));
+                // Only an explicit ✕ deletes a key — emptying the text field
+                // enters "". Shown when this file actually holds the key.
+                if (!nested && V.getPath(state.raw[name], row.path) !== undefined) {
+                    td.append(V.el("button", {
+                        class: "clear-btn",
+                        type: "button",
+                        title: "Remove this key from the file",
+                        onclick: () => clearCell(name, row),
+                    }, "✕"));
+                }
+                tr.append(td);
             }
             tbody.append(tr);
         }

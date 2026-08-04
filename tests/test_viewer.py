@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -17,9 +18,20 @@ import yaml
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tools.viewer.server import create_app  # noqa: E402
+from tools.viewer.server import create_app as _create_app  # noqa: E402
 
 VIEWER_PKG = Path(__file__).resolve().parents[1] / "tools" / "viewer"
+
+
+def create_app(**kwargs):
+    """create_app with TestClient's default Host on the allowlist.
+
+    The real app rejects any Host outside the loopback names (DNS-rebinding
+    defense); TestClient talks to `http://testserver`, so every test that is
+    not itself about host validation opts that name in.
+    """
+    kwargs.setdefault("allowed_hosts", ["testserver"])
+    return _create_app(**kwargs)
 
 PROMPTS_A = """\
 base_entry:
@@ -735,6 +747,108 @@ def test_atomic_write_failure_leaves_original(
     assert r.status_code == 500
     assert (configs / "exp.yaml").read_text() == original  # bytes untouched
     assert not list(configs.glob("*.tmp"))  # temp file cleaned up
+
+
+def test_prompts_js_groups_match_direct_schema() -> None:
+    """The prompts page's component groups must be exactly infra's direct
+    entry keys. They drifted once already — GROUPS said "user_preamble" while
+    the schema key is "preamble", so the largest component rendered as a
+    single unusable JSON blob instead of per-speaker rows."""
+    from infra.envs.debate.prompts import _DIRECT_ENTRY_KEYS
+
+    source = (VIEWER_PKG / "static" / "js" / "prompts.js").read_text()
+    groups = re.search(r"const GROUPS = \[(.*?)\];", source, re.S)
+    assert groups, "GROUPS list not found in prompts.js"
+    assert set(re.findall(r'"([^"]+)"', groups.group(1))) == set(_DIRECT_ENTRY_KEYS)
+
+
+def test_foreign_host_header_rejected(dirs: tuple[Path, Path]) -> None:
+    """DNS-rebinding defense: a page on an attacker-controlled hostname that
+    resolves to 127.0.0.1 must not reach this read+write API."""
+    configs, prompts = dirs
+    app = _create_app(configs_dir=configs, prompts_dir=prompts)
+    c = TestClient(app, base_url="http://evil.example.com")
+    for url in ("/prompts", "/api/prompts", "/api/experiments/files"):
+        r = c.get(url)
+        assert r.status_code == 400, url
+        assert "Host" in r.json()["detail"]
+    # writes are blocked too, before any route runs
+    assert c.post("/api/prompts", json={"raw": {}}).status_code == 400
+
+
+def test_loopback_and_bound_hosts_accepted(dirs: tuple[Path, Path]) -> None:
+    """localhost / 127.0.0.1 / [::1] (any port) always pass; a non-loopback
+    --host is accepted only because it was explicitly bound."""
+    configs, prompts = dirs
+    app = _create_app(configs_dir=configs, prompts_dir=prompts, allowed_hosts=["192.168.1.5"])
+    c = TestClient(app, base_url="http://127.0.0.1")
+    for host in ("localhost:8080", "127.0.0.1", "[::1]:9999", "::1", "192.168.1.5:8080"):
+        r = c.get("/api/experiments/files", headers={"host": host})
+        assert r.status_code == 200, host
+    assert c.get("/api/experiments/files", headers={"host": "other.host"}).status_code == 400
+
+
+def test_missing_host_header_rejected(dirs: tuple[Path, Path]) -> None:
+    configs, prompts = dirs
+    app = _create_app(configs_dir=configs, prompts_dir=prompts)
+    c = TestClient(app, base_url="http://127.0.0.1")
+    assert c.get("/api/experiments/files", headers={"host": ""}).status_code == 400
+
+
+def test_host_check_helpers() -> None:
+    from tools.viewer.server import host_name, is_loopback_host
+
+    assert host_name("[::1]:8080") == "::1"
+    assert host_name("LOCALHOST:8080") == "localhost"
+    assert host_name("127.0.0.1") == "127.0.0.1"
+    assert is_loopback_host("localhost")
+    assert is_loopback_host("::1")
+    assert not is_loopback_host("0.0.0.0")
+
+
+def test_colliding_json_keys_rejected_on_save(tmp_path: Path) -> None:
+    """Two YAML keys that collapse to the same JSON key (1 vs "1") cannot be
+    edited safely — the GET already lost one — so the save is a 400 naming
+    both keys instead of a silent drop."""
+    configs = tmp_path / "configs"
+    prompts = tmp_path / "prompts"
+    configs.mkdir()
+    prompts.mkdir()
+    (configs / "collide.yaml").write_text(
+        "exp:\n  ports:\n    1: int_key\n    '1': str_key\n  batch: 4\n", encoding="utf-8"
+    )
+    c = TestClient(create_app(configs_dir=configs, prompts_dir=prompts))
+
+    payload = c.get("/api/experiments/file/collide.yaml").json()
+    before = (configs / "collide.yaml").read_text()
+    raw = payload["raw"]
+    raw["exp"]["batch"] = 8
+    r = c.post(
+        "/api/experiments/file/collide.yaml", json={"raw": raw, "mtime": payload["mtime"]}
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "'1'" in detail and "1" in detail
+    assert (configs / "collide.yaml").read_text() == before  # nothing written
+    assert not (configs / "collide.backup.yaml").exists()
+
+
+def test_colliding_json_keys_rejected_on_prompts_save(tmp_path: Path) -> None:
+    configs = tmp_path / "configs"
+    prompts = tmp_path / "prompts"
+    configs.mkdir()
+    prompts.mkdir()
+    (prompts / "a.yaml").write_text(
+        "entry:\n  vars:\n    1: int_key\n    '1': str_key\n", encoding="utf-8"
+    )
+    c = TestClient(create_app(configs_dir=configs, prompts_dir=prompts))
+    payload = c.get("/api/prompts").json()
+    raw = payload["raw"]
+    raw["entry"]["vars"]["NEW"] = "x"
+    r = c.post("/api/prompts", json={"raw": raw, "mtimes": payload["mtimes"]})
+    assert r.status_code == 400
+    assert "JSON key" in r.json()["detail"]
+    assert not (prompts / "a.backup.yaml").exists()
 
 
 def test_viewer_never_references_trajectory_dir() -> None:
