@@ -315,6 +315,7 @@ class DebateEnv(Env):
         # per-state grading of a 32-debate batch can burn tens of minutes for
         # a metrics-only scalar. _trajectories only looks the results up.
         grades, grade_errors = self._grade_solutions(states)
+        self._attach_labels(states, grades)
 
         # one GRPO group per (task, arm, trained seat)
         by_seat_group: dict[tuple[int, str], list[Trajectory]] = {}
@@ -510,6 +511,38 @@ class DebateEnv(Env):
                         grades[key] = None
                         errors += 1
         return grades, errors
+
+    def _attach_labels(
+        self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]
+    ) -> None:
+        """Park each solution slot's ground-truth label on the debate it came
+        from, so transcript exports carry it.
+
+        Judge accuracy is derived from transcripts (winner x side x label),
+        never from aggregated metrics (AGENTS.md), and the label cannot be
+        recovered downstream: math's `gt` survives the export by being a
+        scalar, but codecontests' test cases are deliberately withheld from
+        every export, so re-grading offline would mean rejoining to the source
+        dataset and re-running the same 90s-timeout verifier that already ran
+        here.
+
+        st.meta["grades"][speaker] semantics, distinct on purpose:
+          absent -> never graded (no solution slot, or an untrained seat:
+                    _grade_solutions only grades trained_speakers)
+          None   -> graded and ungradeable (no ground truth, or grade raised)
+          bool   -> the label
+        """
+        for st in states:
+            if st.failed is not None:
+                continue
+            labels: dict[str, Optional[bool]] = {}
+            for r in st.records:
+                if r.slot.slot.kind != Kind.SOLUTION or r.extracted is None:
+                    continue
+                key = self._grade_key(st, r.extracted)
+                if key in grades:
+                    labels[r.slot.speaker] = grades[key]
+            st.meta["grades"] = labels
 
     def _trajectories(
         self, st: DebateState, grades: dict[tuple[Any, str], Optional[bool]]
