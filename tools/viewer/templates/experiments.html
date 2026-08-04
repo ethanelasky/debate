@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Experiments · Config Viewer{% endblock %}
+
+{% block content %}
+<main class="page">
+    <div class="toolbar">
+        <div class="field">
+            <label for="filePicker">Config file</label>
+            <select id="filePicker" class="select"></select>
+        </div>
+        <div class="field">
+            <label for="search">Search</label>
+            <input type="search" id="search" class="input" placeholder="Filter experiments…" autocomplete="off">
+        </div>
+        <div class="field">
+            <label>Experiments</label>
+            <div id="experimentSelect"></div>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn" id="reloadBtn" type="button">Reload</button>
+        <button class="btn primary" id="saveBtn" type="button">Save</button>
+    </div>
+
+    <details class="models">
+        <summary>Model presets (_models)</summary>
+        <div class="models-body" id="modelsBody"></div>
+    </details>
+
+    <div class="table-scroll" id="tableMount">
+        <div class="empty">Loading…</div>
+    </div>
+</main>
+{% endblock %}
+
+{% block page_js %}
+<script src="/static/js/experiments.js"></script>
+{% endblock %}

@@ -308,7 +308,7 @@ def test_judge_never_told_a_position_was_assigned(protocol):
         ]
         seen_by_judge = flat(
             "\n".join(
-                [pack.system["judge"], pack.preamble.get("judge", "")]
+                [pack.system["judge"], pack.stage_preamble.get("judge", "")]
                 + [slot_template(pack, name, "judge") for name in judge_slots]
             )
         )

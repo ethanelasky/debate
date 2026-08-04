@@ -7,3 +7,6 @@ __pycache__/
 wandb/
 wheels/
 checkpoints/
+# MonitoringBench data + results: local for now by user decision (2026-08-01), not yet committed
+data/monitoringbench/
+outputs/

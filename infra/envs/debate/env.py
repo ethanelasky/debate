@@ -14,6 +14,7 @@ per-datum advantage offsets in grpo_pack.
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -49,6 +50,35 @@ from infra.models.base import Model
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
 
+# The five binding keys _build_state owns; task-supplied bindings may not
+# collide with them.
+CORE_BINDING_KEYS = frozenset({"NAME", "TOPIC", "POSITION", "OPPONENT_NAME", "OPPONENT_POSITION"})
+_BINDING_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
+
+
+def task_bindings(meta: dict[str, Any]) -> dict[str, str]:
+    """Per-task extra bindings (task.meta['bindings']), validated eagerly:
+    keys are uppercase placeholder names, values are str, and none collide
+    with the core keys. Every violation is listed in one error. Only an
+    absent key (or explicit None) means "no bindings" — any other
+    non-mapping value, falsy included ([], "", 0), is malformed metadata."""
+    extra = meta.get("bindings")
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError(f"task meta 'bindings' must be a dict, got {type(extra).__name__}")
+    errors: list[str] = []
+    for k, v in extra.items():
+        if not isinstance(k, str) or _BINDING_KEY.fullmatch(k) is None:
+            errors.append(f"binding key {k!r} must match [A-Z_][A-Z0-9_]*")
+        elif k in CORE_BINDING_KEYS:
+            errors.append(f"binding key {k!r} collides with a core binding key")
+        if not isinstance(v, str):
+            errors.append(f"binding {k!r} value must be str, got {type(v).__name__}")
+    if errors:
+        raise ValueError("invalid task bindings:\n  " + "\n  ".join(errors))
+    return dict(extra)
+
 
 def _splice(template: str, subs: dict[str, str]) -> str:
     """Replace <NAME> with task-supplied template text. Unlike render(), the
@@ -79,6 +109,21 @@ class DebateEnvConfig:
     # (byte-identical to the RLVR arm) instead of the debater system card.
     first_speech_non_debate_aware: bool = False
     verdict_retries: int = 4
+    # Post-hoc TRANSCRIPT-VISIBLE cap (cl100k tokens) on debater speech slots,
+    # applied after generation, before the text enters any context. Judge
+    # slots and decision/solution slots are never truncated. None = off.
+    speech_token_limit: Optional[int] = None
+    # CHOICE mode (round.PositionBinder): positions start UNBOUND (like fresh
+    # mode) and the binder maps a solution slot's extraction onto every seat's
+    # POSITION/OPPONENT_POSITION mid-round (e.g. MB blind side choice). When
+    # set, gold/distractor are ignored at state build and the default
+    # fresh-positions binding is replaced.
+    position_binder: Optional[Any] = None
+    # Feedback retries for unparseable solution slots (mirrors verdict
+    # retries); active only when a feedback builder (failed_text, attempt) ->
+    # str is supplied — its wording must match the solution prompt's format.
+    solution_retries: int = 0
+    solution_retry_feedback: Optional[Any] = None
 
 
 class DebateEnv(Env):
@@ -107,13 +152,16 @@ class DebateEnv(Env):
         missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
         if missing:
             raise ValueError(f"speakers without models: {sorted(missing)}")
-        if config.flip and config.fresh_positions:
-            raise ValueError("flip requires assigned positions (fresh mode has no sides)")
+        if config.flip and (config.fresh_positions or config.position_binder is not None):
+            raise ValueError("flip requires assigned positions (fresh/choice modes have no fixed sides)")
         if config.first_speech_non_debate_aware:
-            if not config.fresh_positions:
+            # choice mode (position_binder) also qualifies: the side is the
+            # speaker's own blind choice, so nothing assigned is debate-aware.
+            if not (config.fresh_positions or config.position_binder is not None):
                 raise ValueError(
-                    "first_speech_non_debate_aware requires fresh_positions: an assigned "
-                    "position to defend is inherently debate-aware"
+                    "first_speech_non_debate_aware requires fresh_positions or a "
+                    "position_binder (choice mode): an assigned position to defend is "
+                    "inherently debate-aware"
                 )
             first = self.protocol.compile()[0]
             if first.slot.kind != Kind.SOLUTION or first.speaker == self.judge_speaker:
@@ -129,10 +177,12 @@ class DebateEnv(Env):
                     "the transcript as a public record (DESIGN-pc-format.md row 10)"
                 )
 
-        if not config.fresh_positions:
+        if not config.fresh_positions and config.position_binder is None:
             # Probe the contract up front: assigned mode reads meta["gold"] /
             # meta["distractor"] per debate, and a missing key would otherwise
             # die as a bare KeyError mid-rollout after backends are up.
+            # Choice mode (position_binder) binds sides from the blind choice
+            # instead, so it is exempt.
             probe = task_source.tasks(1)
             if probe and not {"gold", "distractor"} <= set(probe[0].meta):
                 raise ValueError(
@@ -165,7 +215,15 @@ class DebateEnv(Env):
         )
         self._inject_task_prompt_templates()
         self.prompts = RenderedPrompts(self.lib)
-        validate_prompts(self.lib, self.protocol, fresh_positions=config.fresh_positions)
+        # Choice mode (position_binder) defers position binding like fresh
+        # mode but binds BOTH deferred names for every speaker from the single
+        # solution slot; validate_prompts checks the matching bindability rule.
+        validate_prompts(
+            self.lib,
+            self.protocol,
+            fresh_positions=config.fresh_positions,
+            choice_positions=config.position_binder is not None,
+        )
         self.shaping = build_shaping(config.scoring.shaping)
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
@@ -208,7 +266,11 @@ class DebateEnv(Env):
 
         subs = {k: available[k] for k in requested}
         self.lib.system = {s: _splice(t, subs) for s, t in self.lib.system.items()}
-        self.lib.preamble = {s: _splice(t, subs) for s, t in self.lib.preamble.items()}
+        self.lib.stage_preamble = {s: _splice(t, subs) for s, t in self.lib.stage_preamble.items()}
+        self.lib.preamble = [
+            ({sp: _splice(t, subs) for sp, t in item.items()} if isinstance(item, dict) else _splice(item, subs))
+            for item in self.lib.preamble
+        ]
         self.lib.slots = {
             name: (
                 {sp: _splice(t, subs) for sp, t in entry.items()}
@@ -221,8 +283,10 @@ class DebateEnv(Env):
     def _all_templates(self):
         for tmpl in self.lib.system.values():
             yield tmpl
-        for tmpl in self.lib.preamble.values():
+        for tmpl in self.lib.stage_preamble.values():
             yield tmpl
+        for item in self.lib.preamble:
+            yield from (item.values() if isinstance(item, dict) else [item])
         for entry in self.lib.slots.values():
             yield from (entry.values() if isinstance(entry, dict) else [entry])
 
@@ -304,9 +368,14 @@ class DebateEnv(Env):
                 text, cfg.judge.schema_name, list(self.display.values())
             ),
             verdict_retries=cfg.judge.retries,
+            judge_schema=cfg.judge.schema_name,
             solution_extractor=self.solution_extractor,
             fresh_positions=cfg.fresh_positions,
             decision_json_schema=decision_json_schema,
+            speech_token_limit=cfg.speech_token_limit,
+            position_binder=cfg.position_binder,
+            solution_retries=cfg.solution_retries,
+            solution_retry_feedback=cfg.solution_retry_feedback,
         )
         round_.run(states)
 
@@ -355,18 +424,23 @@ class DebateEnv(Env):
     def _build_state(self, task: Task, flipped: bool) -> DebateState:
         cfg = self.config
         question = task.meta.get("question")
-        if not question:
+        if question is None:
+            # An explicit "" is legal (MB binds its content via task bindings
+            # and never renders <TOPIC>); an ABSENT key is a broken contract.
             raise ValueError(
                 f"task source {type(self.task_source).__name__} produced a task "
-                'without a non-empty meta["question"]; the TaskFamily contract '
+                'without meta["question"]; the TaskFamily contract '
                 "(infra/envs/tasks/base.py) requires every Task.meta to carry "
                 '{"question": str} — it is what DebateEnv binds as the debate TOPIC'
             )
+        extra = task_bindings(task.meta)
         bindings: dict[str, dict[str, str]] = {}
         a, b = (self.debaters + [None, None])[:2]
         names = {s: self.display[s] for s in self.debaters}
         positions: dict[str, str] = {}
-        if not cfg.fresh_positions:
+        # Choice mode: positions stay unbound at build (the binder fills them
+        # once the solution slot's extraction lands), same as fresh mode.
+        if not cfg.fresh_positions and cfg.position_binder is None:
             gold, distractor = str(task.meta["gold"]), str(task.meta["distractor"])
             first, second = (distractor, gold) if flipped else (gold, distractor)
             positions = {a: first} if b is None else {a: first, b: second}
@@ -379,6 +453,7 @@ class DebateEnv(Env):
                 "POSITION": positions.get(s, ""),
                 "OPPONENT_NAME": names.get(other, "") if other else "",
                 "OPPONENT_POSITION": positions.get(other, "") if other else "",
+                **extra,
             }
         bindings[self.judge_speaker] = {
             "NAME": names.get(a, ""),
@@ -386,23 +461,32 @@ class DebateEnv(Env):
             "TOPIC": question,
             "POSITION": positions.get(a, ""),
             "OPPONENT_POSITION": positions.get(b, "") if b else "",
+            **extra,
         }
         state = DebateState(bindings=bindings)
         if cfg.first_speech_non_debate_aware:
             # Fail loud on malformed shapes rather than let render_context emit
-            # a non-alternating context or silently fall back to the library
-            # cue in the proposer's later history (row 10). Contract shape:
-            # optional leading system, then user/assistant alternation ending
-            # on the user message that serves as the solo cue.
+            # a malformed context or silently fall back to the library cue in
+            # the proposer's later history (row 10). Contract shape: optional
+            # leading system, then user/assistant messages STARTING and ENDING
+            # on user, with no consecutive assistant messages. Consecutive
+            # USER messages are legal by design: a byte-stable task message
+            # (e.g. the MB trajectory) may precede the eliciting cue as its
+            # own message so message-boundary prompt caches can reuse it.
             roles = [m.get("role") for m in task.messages]
             body = roles[1:] if roles[:1] == ["system"] else roles
-            if not body or body[-1] != "user" or any(
-                r != ("user" if i % 2 == 0 else "assistant") for i, r in enumerate(body)
+            if (
+                not body
+                or body[0] != "user"
+                or body[-1] != "user"
+                or any(r not in ("user", "assistant") for r in body)
+                or any(r1 == r2 == "assistant" for r1, r2 in zip(body, body[1:]))
             ):
                 raise ValueError(
                     "first_speech_non_debate_aware: task messages must be an optional "
-                    "system message then user/assistant alternation ending on the user "
-                    f"message that serves as the solo cue (got roles {roles})"
+                    "system message then user/assistant messages starting and ending "
+                    "on a user message, with no consecutive assistant messages "
+                    f"(got roles {roles})"
                 )
             state.first_slot_messages = list(task.messages)
         # ground truth about which arm produced this debate, carried into
@@ -425,11 +509,11 @@ class DebateEnv(Env):
             return None
         decode_fn = None
         seat = self.config.frozen_models.get(self.judge_speaker)
-        if seat is not None:
-            try:
-                decode_fn = seat.decode_tokens
-            except NotImplementedError:
-                decode_fn = None
+        # Attribute access never raises: the base Model.decode_tokens raises
+        # NotImplementedError only when CALLED. Detect support by override so
+        # a tokenizer-less seat yields NO_PIECES, not MISALIGNED.
+        if seat is not None and type(seat).decode_tokens is not Model.decode_tokens:
+            decode_fn = seat.decode_tokens
         return verdict_from_slot(
             rec.text,
             rec.response if rec.response is not None else rec.sample,

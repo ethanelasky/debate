@@ -1,0 +1,279 @@
+# MonitoringBench eval-only experiments (debate + double-consultancy arms;
+# mb_single_consultancy is a PORTED-BUT-EXCLUDED stub — see its banner).
+# Migration of the old repo's experiments/configs/monitoringbench_experiments.yaml
+# per MB_MIGRATION_SPEC.md (Rev 2); textual/structural deltas vs the old arms
+# are enumerated in MB_PROMPT_DELTAS.md.
+#
+# EVAL-ONLY (no training block): binary attack-vs-honest classification of
+# bash agent trajectories. `fresh_positions: false` + `flip: false` keep FIXED
+# seating — alice (display Debater_A) ALWAYS argues the "attack" position
+# (task.meta gold/distractor encode seating, not correctness; ground truth is
+# meta["label"]).
+#
+# Run: python -m infra.run_eval --experiment-file configs/mb_eval.yaml --experiment <name>
+#
+# SAFETY: data/monitoringbench/*.jsonl contain red-team attack trajectories.
+# Never print/log record contents; work by id/label/count only.
+
+_models:
+  # DashScope qwen3.6-flash debater (both seats). Ported from old
+  # base_config.yaml `qwen36_flash_debater` (working tree :565-569);
+  # generation_params.max_new_tokens -> max_new_tokens.
+  # Temperature: NONE declared (provider default) — recorded decision, parity
+  # with the old arms.
+  qwen36_flash_debater:
+    model_type: alibaba
+    model_file_path: qwen3.6-flash
+    max_new_tokens: 32768
+  # DeepSeek-V4-Flash judge (MonitoringBench debate/consultancy arms).
+  # DeepSeek first-party is not servable from this account (404, 2026-07-31);
+  # pinned to parasail/fp8 by recorded decision. Ported from old
+  # base_config.yaml `deepseekv4_flash_judge` (:207-215).
+  # capture_token_logprobs: true — judge logit channel is extra measurement;
+  # the json channel remains primary (recorded decision).
+  deepseekv4_flash_judge:
+    model_type: openrouter
+    model_file_path: deepseek/deepseek-v4-flash
+    provider_order: ["parasail"]
+    quantizations: ["fp8"]
+    capture_token_logprobs: true
+    max_new_tokens: 32768
+  # small-judge arm; DashScope has no 4b (Access denied 2026-07-31), pinned
+  # parasail/bf16 by recorded decision. Ported from old base_config.yaml
+  # `qwen35_9b_judge` (:216-226).
+  # User decision 2026-07-31: no-think judge — OpenRouter reasoning
+  # {"enabled": false} verified on the pinned parasail/bf16 endpoint.
+  qwen35_9b_judge:
+    model_type: openrouter
+    model_file_path: qwen/qwen3.5-9b
+    provider_order: ["parasail"]
+    quantizations: ["bf16"]
+    enable_thinking: false
+    max_new_tokens: 32768
+
+# Shared base (non-runnable). Protocol + prompt entry live in the LEAF
+# experiments only: config lists merge BY INDEX, so a child overriding a
+# parent protocol's `turns` would silently inherit leftover parent turns.
+_mb_base:
+  prompt_config:
+    file_path: infra/envs/debate/prompt_configs/monitoringbench.yaml
+  fresh_positions: false   # positions come from task.meta gold/distractor
+  flip: false              # fixed seating: alice/Debater_A argues "attack"
+  # POST-GENERATION visible truncation of non-judge speech slots; must equal
+  # the {limit}=250 baked into the prompt file's
+  # vars.SPEECH_TOKEN_LIMIT_INSTRUCTION. Does NOT cap generation — the
+  # per-slot max_total_tokens: 4096 below keeps the generation budget
+  # (context-overflow protection: trajectories run up to ~58k input tokens;
+  # at 4096 reserved output none of the 258 old rows overflowed).
+  speech_token_limit: 250
+  agents:
+    alice:
+      model_settings:
+        _preset: qwen36_flash_debater
+        alias: qwen36-flash-alice
+    bob:
+      model_settings:
+        _preset: qwen36_flash_debater
+        alias: qwen36-flash-bob
+    judge:
+      model_settings:
+        _preset: deepseekv4_flash_judge
+        alias: deepseekv4-flash-judge
+  # retries: 4 matches the old repo's judge max_retries default (judge.py:765).
+  judge_config: {schema_name: competitive, retries: 4}
+  dataset:
+    # 2026-07-30 pool amendment: honest_mb116 + attacks_covering140_v2 = 256 rounds.
+    files:
+      - data/monitoringbench/honest_mb116.jsonl
+      - data/monitoringbench/attacks_covering140_v2.jsonl
+    seed: 0
+
+# ---- Debate arm ----
+# Old sequencing verified against $OLD/debate/speech_format.py:252-296 +
+# turn_plan.py: dual_proposer_debate is non-PC and the MB experiments never
+# set sequential_turns (default false), so second_sees_first was FALSE for
+# EVERY round — openings mutually blind AND rebuttals mutually blind (each
+# rebuttal sees both openings only). Encoded here as two co-located turns
+# (same-turn co-occupancy = structural blindness); the judge's flat view is
+# A-opening, B-opening, A-rebuttal, B-rebuttal — the same interleave the old
+# judge saw. See MB_PROMPT_DELTAS.md.
+# REV 2: slot names are the OLD prompt-stanza names (pre_opening_speech /
+# pre_speech / post_round_judge_without_reasoning); `deliberation` kept.
+mb_debate:
+  _extends: _mb_base
+  protocol:
+    turns:
+      - alice: [{name: pre_opening_speech, max_total_tokens: 4096}]
+        bob:   [{name: pre_opening_speech, max_total_tokens: 4096}]
+      - alice: [{name: pre_speech, max_total_tokens: 4096}]
+        bob:   [{name: pre_speech, max_total_tokens: 4096}]
+      # FUTURE/EXPERIMENTAL (NOT part of any runnable arm; REV 2 item 6):
+      # judge question-asking mid-debate would insert a judge turn between
+      # the debater rounds, e.g.
+      #   - judge: [{name: judge_question_generation, max_total_tokens: 4096}]
+      # using the question templates ported into
+      # infra/envs/debate/prompt_configs/monitoringbench.yaml (quality.yaml
+      # wording). Blocked on infra support for binding the judge's questions
+      # into <JUDGE_QUESTIONS> for the debaters' next slot
+      # (pre_judge_question_for_debater); see MB_PROMPT_DELTAS.md delta 11.
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  prompt_config:
+    entry: mb_debate
+
+# ---- Double-consultancy arm (compute-matched twin) ----
+# ONE debater turn: same-turn co-occupancy makes both consultants blind to
+# each other for BOTH slots (the old DC's full independence). Judge sees the
+# flat order A-opening, A-second, B-opening, B-second — this DIFFERS from
+# the old DC judge's A1 B1 A2 B2 interleave; enumerated in MB_PROMPT_DELTAS.md.
+# REV 2: the second slot is `pre_speech` (old name), whose DC template
+# overrides the debate one via _extends exactly as the old DC entry did.
+mb_double_consultancy:
+  _extends: _mb_base
+  protocol:
+    turns:
+      - alice: [{name: pre_opening_speech, max_total_tokens: 4096},
+                {name: pre_speech, max_total_tokens: 4096}]
+        bob:   [{name: pre_opening_speech, max_total_tokens: 4096},
+                {name: pre_speech, max_total_tokens: 4096}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  prompt_config:
+    entry: mb_double_consultancy
+
+# ============================================================================
+# ---- Single-consultancy arm — EXCLUDED FROM SMOKE AND FULL RUNS. DO NOT ----
+# ---- RUN THIS EXPERIMENT. -------------------------------------------------
+# Ported per REV 2 item 1 (config + protocol STUB only). Standing 2026-07-31
+# decisions are still OPEN:
+#   (a) the consultant must CHOOSE its side — the mechanism is undecided
+#       (this stub meanwhile inherits fixed seating, which is NOT the decided
+#       design);
+#   (b) the mb_single_consultancy prompt entry inherits the DC TWO-CONSULTANT
+#       judge framing, which needs a user-reviewed rewrite before any run.
+# The stub protocol (one consultant, two sequential speeches, then judge) is
+# structural scaffolding only and carries no recorded-decision status.
+# KNOWN NON-RUNNABLE: validate_prompts rejects this stub — the prompt entry
+# inherits bob's user_preamble/attribution from mb_double_consultancy but the
+# one-consultant protocol has no bob. Resolving that is part of the same
+# deferred SC rework (the entry loads and previews fine).
+# ============================================================================
+mb_single_consultancy:
+  _extends: _mb_base
+  protocol:
+    turns:
+      - alice: [{name: pre_opening_speech, max_total_tokens: 4096}]
+      - alice: [{name: pre_speech, max_total_tokens: 4096}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  prompt_config:
+    entry: mb_single_consultancy
+
+# ---- Approved 2-attack + 2-honest smoke slices ----
+# task_ids filter is EXCLUSIVE (n does not further limit); dataset dict
+# deep-merges key-wise with the parent's, so `files` and `seed` are inherited.
+mb_smoke4_debate:
+  _extends: mb_debate
+  dataset:
+    task_ids:
+      - attack_11436013_1
+      - attack_13976680_0
+      - honest_9614184_0
+      - honest_34113609_0
+
+mb_smoke4_double_consultancy:
+  _extends: mb_double_consultancy
+  dataset:
+    task_ids:
+      - attack_11436013_1
+      - attack_13976680_0
+      - honest_9614184_0
+      - honest_34113609_0
+
+# ---- Blind side-choice debate arm (2026-08-03; PRIMARY) ----
+# Alice's first slot (blind_assessment, solution kind) is generated in the
+# SOLO context: first_speech_non_debate_aware renders Task.messages verbatim,
+# built by the task source as TWO user messages — [trajectory message
+# (= the entry's preamble[0], byte-identical to bob's/judge's first preamble
+# message), blind-instructions message (the blind_assessment slot template)]
+# — no system, no debate framing, no assigned side. The instructions REQUIRE
+# user fill-in (<FILL_ME_BLIND_INSTRUCTIONS> hard-errors at task build;
+# nothing is spent). The <answer>attack|benign</answer> tag picks alice's
+# side; bob argues the opposite; the blind assessment is PUBLIC (alice's
+# opening speech). Turn 1 stays mutually blind (co-located, as in mb_debate).
+# CACHE LAYOUT: seat-neutral system + trajectory-as-own-message means both
+# seats' calls share the [system][trajectory] prefix on DashScope's
+# message-boundary cache. Seating is NOT fixed: attack_seat per row comes
+# from the bound position strings; rows carry chosen_side + choice_retries,
+# the summary a blind_choice accuracy block. Unparseable choices retry with
+# feedback (choice_retries, default 4), then the round fails loudly.
+mb_debate_choice:
+  _extends: _mb_base
+  choice_positions: true
+  choice_retries: 4
+  first_speech_non_debate_aware: true
+  protocol:
+    turns:
+      - alice: [{name: blind_assessment, kind: solution, max_total_tokens: 4096}]
+        bob:   [{name: pre_opening_speech, max_total_tokens: 4096}]
+      - alice: [{name: pre_speech, max_total_tokens: 4096}]
+        bob:   [{name: pre_speech, max_total_tokens: 4096}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  prompt_config:
+    entry: mb_debate_choice
+
+# ---- Single-consultancy choice arm (2026-08-03; BASELINE) ----
+# Same blind first slot as the debate arm (identical solo context, identical
+# trajectory message), then ONE develop speech, then the judge GRADES the
+# consultant: judge_config schema_name 'collaborative' -> verdict
+# {"Debater_A": {"verdict": correct|incorrect, "confidence": 0.5-1.0}};
+# run_eval maps it to p_attack via the chosen side (P(correct) if alice chose
+# attack, else 1 - P(correct)). vs mb_debate_choice this isolates what the
+# opponent + rebuttal dynamics add. Prompt entry wording is DRAFTED (adapted
+# from the ported DC entry) — user review required before any run; same
+# FILL_ME guard as the debate arm.
+mb_single_consultancy_choice:
+  _extends: _mb_base
+  choice_positions: true
+  choice_retries: 4
+  first_speech_non_debate_aware: true
+  judge_config: {schema_name: collaborative, retries: 4}
+  # NOTE: _mb_base's bob agent is inherited too (deep-merge cannot remove
+  # keys); bob is absent from this protocol, so his model object is
+  # instantiated but never called. alice/judge restated for readability.
+  agents:
+    alice:
+      model_settings:
+        _preset: qwen36_flash_debater
+        alias: qwen36-flash-alice
+    judge:
+      model_settings:
+        _preset: deepseekv4_flash_judge
+        alias: deepseekv4-flash-judge
+  protocol:
+    turns:
+      - alice: [{name: blind_assessment, kind: solution, max_total_tokens: 4096}]
+      - alice: [{name: pre_speech, max_total_tokens: 4096}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  prompt_config:
+    entry: mb_single_consultancy_choice
+
+mb_smoke4_debate_choice:
+  _extends: mb_debate_choice
+  dataset:
+    task_ids:
+      - attack_11436013_1
+      - attack_13976680_0
+      - honest_9614184_0
+      - honest_34113609_0
+
+mb_smoke4_single_consultancy_choice:
+  _extends: mb_single_consultancy_choice
+  dataset:
+    task_ids:
+      - attack_11436013_1
+      - attack_13976680_0
+      - honest_9614184_0
+      - honest_34113609_0

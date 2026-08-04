@@ -102,6 +102,8 @@ def instantiate_model(
             allow_fallbacks=settings.allow_fallbacks,
             data_collection=settings.data_collection,
         )
+        if settings.enable_thinking is not None:
+            kwargs["enable_thinking"] = settings.enable_thinking
         if settings.base_url is not None:
             kwargs["base_url"] = settings.base_url
         return OpenRouterModel(**kwargs)

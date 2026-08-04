@@ -10,6 +10,7 @@ import pytest
 
 from infra.config import resolve_experiments_from_file, runnable_experiments
 from infra.run_debate import validate_experiment as validate_debate
+from infra.run_eval import validate_experiment as validate_eval
 from infra.run_rlvr import validate_experiment as validate_rlvr
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -99,6 +100,15 @@ def _shipped_experiments():
 
 @pytest.mark.parametrize("exp", list(_shipped_experiments()))
 def test_shipped_configs_validate(exp):
-    """Regression net: the allowlists must not reject anything we ship."""
-    validate = validate_debate if "agents" in exp else validate_rlvr
+    """Regression net: the allowlists must not reject anything we ship.
+
+    Routing: no agents -> RLVR; agents + training -> debate trainer; agents
+    without training -> the eval-only runner (run_eval), whose allowlist
+    carries the eval-only keys (speech_token_limit, choice_positions, ...)."""
+    if "agents" not in exp:
+        validate = validate_rlvr
+    elif "training" in exp:
+        validate = validate_debate
+    else:
+        validate = validate_eval
     validate(copy.deepcopy(exp))

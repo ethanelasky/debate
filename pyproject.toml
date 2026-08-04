@@ -11,6 +11,7 @@ dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.0",
     "openai>=1.0",
+    "tiktoken>=0.5",
     "backoff>=2.0",
     "wandb>=0.18",
     "docent-python>=0.1.74",
@@ -19,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 providers = ["anthropic>=0.30", "google-genai>=1.0"]
 logging = ["wandb"]
+viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 debate-train = "infra.train:main"
@@ -29,4 +31,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["infra*"]
+include = ["infra*", "tools*"]
+
+[tool.setuptools.package-data]
+"tools.viewer" = ["templates/*.html", "static/css/*.css", "static/js/*.js"]

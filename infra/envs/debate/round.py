@@ -44,7 +44,18 @@ class PromptLibrary(TypingProtocol):
 
     def instruction(self, slot_name: str, speaker: str, bindings: dict[str, str]) -> str: ...
 
-    def attributed(self, author_name: str, slot_name: str, text: str) -> str: ...
+    def preamble_messages(self, speaker: str, bindings: dict[str, str]) -> list[str]: ...
+
+    def attributed(
+        self,
+        author_name: str,
+        slot_name: str,
+        text: str,
+        *,
+        reader: Optional[str] = None,
+        author: Optional[str] = None,
+        reader_bindings: Optional[dict[str, str]] = None,
+    ) -> str: ...
 
 
 @dataclass
@@ -57,6 +68,7 @@ class SlotRecord:
     datum: Optional[Datum] = None        # trained seats (advantages zeroed; mask from budget forcing)
     response: Optional[ModelResponse] = None  # frozen seats
     retries: int = 0
+    truncated: bool = False              # speech_token_limit fired on this slot's visible text
 
 
 @dataclass
@@ -82,6 +94,7 @@ class DebateState:
                 "thinking": r.thinking,
                 "extracted": r.extracted,
                 "retries": r.retries,
+                "truncated": r.truncated,
             }
             for r in self.records
         ]
@@ -227,6 +240,44 @@ class FrozenSeat(SeatRunner):
         return [r if r is not None else SlotResult(text="", failed=True, fail_reason="missing") for r in results]
 
 
+# -------------------------------------------------- post-hoc speech truncation
+
+
+_SPEECH_ENCODER = None
+
+
+def _speech_encoder():
+    """cl100k_base, lazily — only speech_token_limit users pay the tiktoken
+    import (matches the old repo's lazy-encoder pattern)."""
+    global _SPEECH_ENCODER
+    if _SPEECH_ENCODER is None:
+        import tiktoken
+
+        _SPEECH_ENCODER = tiktoken.get_encoding("cl100k_base")
+    return _SPEECH_ENCODER
+
+
+def truncate_speech_to_token_limit(speech: str, token_limit: int) -> tuple[str, bool]:
+    """Post-hoc TRANSCRIPT-VISIBLE truncation, ported from the old repo's
+    utils/string_utils.truncate_speech_to_token_limit (working tree): count
+    cl100k_base tokens, cut at token_limit, decode the kept prefix. Text up to
+    a trailing '</think>' is preserved uncounted (the old Qwen handling —
+    applied unconditionally here since model aliases are not plumbed in; in
+    this repo thinking is stripped before recording, so the branch is normally
+    inert). Returns (text, fired)."""
+    if not speech or token_limit <= 0:
+        return speech, False
+    prefix, countable = "", speech
+    if "</think>" in speech:
+        end = speech.rfind("</think>") + len("</think>")
+        prefix, countable = speech[:end], speech[end:]
+    enc = _speech_encoder()
+    tokens = enc.encode(countable)
+    if len(tokens) <= token_limit:
+        return speech, False
+    return prefix + enc.decode(tokens[:token_limit]), True
+
+
 # ------------------------------------------------- context assembly + render
 
 
@@ -250,62 +301,170 @@ def visible_records(state: DebateState, current: CompiledSlot) -> list[SlotRecor
     return out
 
 
-def _solo_cue(messages: list[Message]) -> Optional[str]:
-    """The solo (non-debate) user turn that actually elicited the first speech."""
-    for m in reversed(messages):
-        if m["role"] == "user":
-            return m["content"]
-    return None
-
-
 def render_context(
     state: DebateState, current: CompiledSlot, prompts: PromptLibrary
 ) -> list[Message]:
-    """Rule 4. Invariants: one system message first; strict user/assistant
-    alternation; ends on a user message (the current slot's instruction cue).
+    """Rule 4. Invariants: one system message first; ends on a user message
+    (the current slot's instruction cue); transcript-derived content strictly
+    alternates user/assistant. Configured preamble messages render as SEPARATE
+    user messages right after the system message, before any transcript
+    content — consecutive user messages at the context head are deliberate
+    (message-boundary prompt caches can then reuse the byte-stable task
+    message across seats; frozen API seats accept repeated roles).
 
     Exception: with first_slot_messages set, the FIRST compiled slot is
     generated under the task source's own messages verbatim — no debate system
-    card, no instruction cue — and the author's own history later renders that
-    solo user turn in place of the slot's cue, so what the author sees as the
-    thing it answered is what it actually answered. This is the ONE deliberate
-    exception; if a second context exception is ever needed, convert to
-    per-slot context sources instead of adding another branch here."""
+    card, no preamble, no instruction cue — and the author's later contexts
+    replay that WHOLE solo exchange verbatim (all solo messages, then the
+    slot-0 answer as an assistant turn) in place of preamble + cue, so what
+    the author sees as the thing it answered is what it actually answered.
+    The solo author never renders preamble messages. This is the ONE
+    deliberate exception; if a second context exception is ever needed,
+    convert to per-slot context sources instead of adding another branch
+    here."""
     S = current.speaker
     solo = state.first_slot_messages
     if solo is not None and current.index == 0:
         return [dict(m) for m in solo]
-    solo_cue = _solo_cue(solo) if solo is not None else None
+    visible = visible_records(state, current)
+    is_solo_author = solo is not None and any(
+        r.slot.index == 0 and r.slot.speaker == S for r in visible
+    )
 
     msgs: list[Message] = [{"role": "system", "content": prompts.system(S, state.bindings[S])}]
-    # The old repo's pre_debate[_judge] + grading details: a preamble riding the
-    # FIRST user content this speaker sees, whatever that turns out to be. It
-    # joins `pending` rather than becoming its own message, so the alternation
-    # invariant is untouched. The proposer has no preamble, which is what keeps
-    # its opening cue byte-identical to the RLVR arm's user message.
-    preamble = prompts.preamble(S, state.bindings[S])
-    pending: list[str] = [preamble] if preamble else []
-    for rec in visible_records(state, current):
+    if not is_solo_author:
+        for pm in prompts.preamble_messages(S, state.bindings[S]):
+            msgs.append({"role": "user", "content": pm})
+    # The stage-schema preamble (old repo's pre_debate[_judge] + grading
+    # details): a prefix riding the FIRST user content this speaker sees,
+    # whatever that turns out to be. It joins `pending` rather than becoming
+    # its own message, so the alternation invariant is untouched. The proposer
+    # has no preamble, which is what keeps its opening cue byte-identical to
+    # the RLVR arm's user message.
+    prefix = prompts.preamble(S, state.bindings[S])
+    pending: list[str] = [prefix] if prefix else []
+    for rec in visible:
         if rec.slot.speaker == S:
-            if solo_cue is not None and rec.slot.index == 0:
-                pending.append(solo_cue)
-            else:
-                pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
+            if solo is not None and rec.slot.index == 0:
+                # replay the solo exchange verbatim; nothing may precede it
+                # (the solo author renders no preamble messages, and slot 0 is
+                # the earliest possible record). A prefix preamble for the
+                # solo author would land here and be silently lost, so it is
+                # an error, not an assert (which vanishes under python -O).
+                if pending:
+                    raise ValueError(
+                        f"solo replay must open {S}'s context, but preamble text is "
+                        "already pending — the solo author may not have a prefix "
+                        "preamble"
+                    )
+                # The solo system card (if any) served slot-0 generation; a
+                # second system message mid-context is invalid for strict chat
+                # templates, so the replay starts at the first non-system turn.
+                msgs.extend(dict(m) for m in solo if m["role"] != "system")
+                msgs.append({"role": "assistant", "content": rec.text})
+                continue
+            pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
             msgs.append({"role": "user", "content": "\n\n".join(pending)})
             pending = []
             msgs.append({"role": "assistant", "content": rec.text})
         else:
-            author_name = state.bindings[rec.slot.speaker]["NAME"]
-            pending.append(prompts.attributed(author_name, rec.slot.slot.name, rec.text))
+            author = rec.slot.speaker
+            pending.append(
+                prompts.attributed(
+                    state.bindings[author]["NAME"],
+                    rec.slot.slot.name,
+                    rec.text,
+                    reader=S,
+                    author=author,
+                    reader_bindings=state.bindings[S],
+                )
+            )
     pending.append(prompts.instruction(current.slot.name, S, state.bindings[S]))
     msgs.append({"role": "user", "content": "\n\n".join(pending)})
     return msgs
+
+
+# ------------------------------------------------------- verdict retry feedback
+
+
+def create_retry_feedback(
+    failed_text: str, retry_attempt: int, schema: str, seat_names: list[str]
+) -> str:
+    """Error-feedback user message for an unparseable-verdict retry, ported
+    from the old repo's Judge._create_retry_prompt (ai_debate/debate/judge.py,
+    working tree). The scaffolding (PARSING ERROR header, previous-response
+    snippet capped at 500 chars, format-block framing, closing "Ensure" list)
+    and the collaborative branch keep the old wording verbatim. The
+    competitive example lines substitute THIS round's seat display names — the
+    old winner-shape constants were byte-copies of the old math arm's decision
+    instruction ('"Debater A" ... the Proposer's boxed answer'), whose seat
+    naming and win semantics do not exist here; the confidence / Tie /
+    no-other-keys bullets and the closing sentence are kept verbatim."""
+    error_msg = (
+        f"PARSING ERROR: Your previous verdict could not be parsed. "
+        f"This is retry attempt {retry_attempt}.\n\n"
+    )
+    if failed_text:
+        snippet = failed_text[:500]
+        if len(failed_text) > 500:
+            snippet += "..."
+        error_msg += f"Your previous response:\n{snippet}\n\n"
+    error_msg += "Please provide your verdict in the following JSON format:\n```json\n{\n"
+
+    if schema == "competitive":
+        names = " | ".join(f'"{n}"' for n in seat_names)
+        error_msg += f'  "winner": {names} | "Tie",\n'
+        error_msg += '  "confidence": 0.50-1.00\n'
+        error_msg += "}\n```\n\n"
+        error_msg += "Ensure:\n"
+        error_msg += (
+            f'- "winner" is exactly one of {names}, written exactly as shown\n'
+        )
+        error_msg += "- Confidence must be between 0.50 and 1.00 inclusive.\n"
+        error_msg += (
+            '- "Tie" is reserved for a debate that is UNRESOLVABLE for a structural '
+            "reason — for example, the question is cut off or malformed. An objection "
+            "you could not fully confirm or refute is NOT a tie: choose the more "
+            "likely winner and express the uncertainty in your confidence. If you do "
+            'declare "Tie", set confidence to 0.50.\n'
+        )
+        error_msg += "- Do not add any other keys to the JSON object.\n"
+        error_msg += "- The JSON is valid and complete\n"
+        error_msg += (
+            "\nThe JSON object must be the very last thing you output, with nothing "
+            "after it.\n"
+        )
+        return error_msg
+
+    for i, alias in enumerate(seat_names):
+        error_msg += f'  "{alias}": {{\n'
+        error_msg += '    "verdict": "correct" or "incorrect",\n'
+        error_msg += '    "confidence": <number between 0 and 1>\n'
+        error_msg += "  }"
+        if i < len(seat_names) - 1:
+            error_msg += ","
+        error_msg += "\n"
+
+    error_msg += "}\n```\n\n"
+    error_msg += "Ensure:\n"
+    error_msg += "- The verdict field contains exactly 'correct' or 'incorrect' (lowercase)\n"
+    error_msg += "- The confidence field is a number between 0.0 and 1.0\n"
+    error_msg += "- The JSON is valid and complete\n"
+
+    return error_msg
 
 
 # ---------------------------------------------------------------- turn loop
 
 
 VerdictParser = Callable[[str], Optional[dict]]
+
+# Custom mid-round position binding: called with (state, chooser_speaker,
+# extracted) when a solution slot's extraction lands; replaces the default
+# fresh-positions binding (which only sets the chooser's own POSITION and
+# others' OPPONENT_POSITION — a binder can set every seat's, e.g. MB's
+# chosen-side stance mapping for chooser, opponent, and judge).
+PositionBinder = Callable[["DebateState", str, Any], None]
 
 
 class DebateRound:
@@ -317,9 +476,14 @@ class DebateRound:
         *,
         verdict_parser: Optional[VerdictParser] = None,
         verdict_retries: int = 4,
+        judge_schema: str = "competitive",
         solution_extractor: Optional[Callable[[str], Any]] = None,
         fresh_positions: bool = False,
         decision_json_schema: Optional[dict] = None,
+        speech_token_limit: Optional[int] = None,
+        position_binder: Optional[PositionBinder] = None,
+        solution_retries: int = 0,
+        solution_retry_feedback: Optional[Callable[[str, int], str]] = None,
     ):
         missing = set(protocol.speakers) - set(seats)
         if missing:
@@ -331,8 +495,21 @@ class DebateRound:
         self.verdict_parser = verdict_parser
         self.verdict_retries = verdict_retries
         self.decision_json_schema = decision_json_schema
+        self.judge_schema = judge_schema  # shapes the retry feedback's example
         self.solution_extractor = solution_extractor
         self.fresh_positions = fresh_positions
+        self.position_binder = position_binder
+        # Solution-slot retry mirrors the verdict retry, but only when a
+        # feedback builder is supplied (its wording is format-specific and
+        # must match what the solution prompt asked for).
+        self.solution_retries = solution_retries
+        self.solution_retry_feedback = solution_retry_feedback
+        # Truncation targets SPEECH slots of non-judge speakers only; the
+        # judge is the decision slot's speaker (its deliberation/verdict text
+        # is never cut).
+        self.speech_token_limit = speech_token_limit
+        decision = protocol.decision_slot
+        self._judge_speaker = decision.speaker if decision is not None else None
 
     def run(self, states: list[DebateState]) -> list[DebateState]:
         for step in self.slots:
@@ -350,6 +527,21 @@ class DebateRound:
                 raise RuntimeError(f"seat {step.speaker}: {len(results)} results for {len(requests)} requests")
             if step.slot.kind == Kind.DECISION and self.verdict_parser is not None:
                 results = self._retry_unparseable(step, states, live, results, runner)
+            if (
+                step.slot.kind == Kind.SOLUTION
+                and self.solution_extractor is not None
+                and self.solution_retry_feedback is not None
+            ):
+                results = self._retry_with_feedback(
+                    step,
+                    states,
+                    live,
+                    results,
+                    runner,
+                    parser=self.solution_extractor,
+                    feedback=lambda st, text, attempt: self.solution_retry_feedback(text, attempt),
+                    max_retries=self.solution_retries,
+                )
             for i, res in zip(live, results):
                 self._ingest(states[i], step, res)
         return states
@@ -362,23 +554,63 @@ class DebateRound:
         results: list[SlotResult],
         runner: SeatRunner,
     ) -> list[SlotResult]:
+        """Verdict feedback retry, ported from the old repo's
+        Judge.render_decision. Counting/exhaustion semantics are unchanged."""
+
+        def feedback(st: DebateState, failed_text: str, attempt: int) -> str:
+            bindings = st.bindings[step.speaker]
+            seat_names = [
+                n for n in (bindings.get("NAME", ""), bindings.get("OPPONENT_NAME", "")) if n
+            ]
+            return create_retry_feedback(failed_text, attempt, self.judge_schema, seat_names)
+
+        return self._retry_with_feedback(
+            step,
+            states,
+            live,
+            results,
+            runner,
+            parser=self.verdict_parser,
+            feedback=feedback,
+            max_retries=self.verdict_retries,
+            json_schema=self.decision_json_schema,
+        )
+
+    def _retry_with_feedback(
+        self,
+        step: CompiledSlot,
+        states: list[DebateState],
+        live: list[int],
+        results: list[SlotResult],
+        runner: SeatRunner,
+        *,
+        parser: Callable[[str], Any],
+        feedback: Callable[[DebateState, str, int], str],
+        max_retries: int,
+        json_schema: Optional[dict] = None,
+    ) -> list[SlotResult]:
+        """Shared feedback-retry loop (old repo's Judge.render_decision shape):
+        each retry re-renders the base context and appends the latest FAILED
+        attempt as an assistant turn plus an error-feedback user message, so
+        the seat sees what it wrote and why it was rejected. Attempts do not
+        accumulate: retry N carries only the attempt-N-1 failure."""
         retries = [0] * len(results)
-        for attempt in range(self.verdict_retries):
+        for attempt in range(max_retries):
             bad = [
                 j
                 for j, res in enumerate(results)
-                if not res.failed and self.verdict_parser(res.text) is None
+                if not res.failed and parser(res.text) is None
             ]
             if not bad:
                 break
-            requests = [
-                GenRequest(
-                    render_context(states[live[j]], step, self.prompts),
-                    slot_limits(step),
-                    json_schema=self.decision_json_schema,
-                )
-                for j in bad
-            ]
+            requests = []
+            for j in bad:
+                st = states[live[j]]
+                messages = render_context(st, step, self.prompts) + [
+                    {"role": "assistant", "content": results[j].text},
+                    {"role": "user", "content": feedback(st, results[j].text, retries[j] + 1)},
+                ]
+                requests.append(GenRequest(messages, slot_limits(step), json_schema=json_schema))
             fresh = runner.generate(requests)
             for j, res in zip(bad, fresh):
                 retries[j] += 1
@@ -390,21 +622,34 @@ class DebateRound:
         if res.failed:
             state.failed = f"{step.speaker}/{step.slot.name}: {res.fail_reason}"
             return
+        text, truncated = res.text, False
+        if (
+            self.speech_token_limit is not None
+            and step.slot.kind == Kind.SPEECH
+            and step.speaker != self._judge_speaker
+        ):
+            text, truncated = truncate_speech_to_token_limit(text, self.speech_token_limit)
         record = SlotRecord(
             slot=step,
-            text=res.text,
+            text=text,
             thinking=res.thinking,
             sample=res.sample,
             datum=res.datum,
             response=res.response,
             retries=res.retries,
+            truncated=truncated,
         )
         if not res.text.strip():
             state.meta.setdefault("empty_slots", []).append(f"{step.speaker}/{step.slot.name}@{step.turn}")
 
         if step.slot.kind == Kind.SOLUTION and self.solution_extractor is not None:
             record.extracted = self.solution_extractor(res.text)
-            if self.fresh_positions:
+            if self.position_binder is not None:
+                if record.extracted is None:
+                    state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
+                    return
+                self.position_binder(state, step.speaker, record.extracted)
+            elif self.fresh_positions:
                 if record.extracted is None:
                     state.failed = f"{step.speaker}/{step.slot.name}: unparseable solution"
                     return
