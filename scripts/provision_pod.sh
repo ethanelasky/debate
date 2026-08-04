@@ -31,17 +31,28 @@ ENV_DIR="$VOL/envs/verl-main"
 export HF_HOME="${HF_HOME:-$VOL/hf}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$VOL/uv/cache}"
 export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$VOL/uv/python}"
-mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+# Every long step below is bounded by timeout(1) — an unbounded stall is the
+# exact failure this script must not have. Checked before the first $VOL touch
+# because that mkdir is itself an NFS operation that can hang.
+command -v timeout >/dev/null 2>&1 || {
+  echo "FATAL: no timeout(1) (coreutils) on this image; provisioning not started" >&2; exit 1; }
+
+# $VOL is a network volume on most pods: mkdir hangs if it is unreachable.
+timeout -k 30s 120 mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" || {
+  echo "FATAL: mkdir under \$VOL=$VOL failed or hung >120s (network volume unreachable?)" >&2; exit 1; }
 
 log() { echo -e "\n=== [provision] $* ==="; }
 
 log "GPU / driver"
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || {
-  echo "FATAL: no nvidia-smi"; exit 1; }
+# nvidia-smi blocks forever on a wedged driver / ECC-recovering GPU.
+timeout -k 30s 60 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || {
+  echo "FATAL: no nvidia-smi (or it hung >60s: driver wedged, recreate the pod)" >&2; exit 1; }
 
 # Single-arch flash-attn build: ~5x less compile work and memory than the
 # default multi-arch fan-out.
-ARCH="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
+ARCH="$(timeout -k 30s 60 nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" || {
+  echo "FATAL: could not read compute_cap from nvidia-smi (hung >60s or driver wedged)" >&2; exit 1; }
+[ -n "$ARCH" ] || { echo "FATAL: empty compute_cap from nvidia-smi; cannot pick a flash-attn arch" >&2; exit 1; }
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$ARCH}"
 log "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST MAX_JOBS=$MAX_JOBS"
 
@@ -52,7 +63,9 @@ log "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST MAX_JOBS=$MAX_JOBS"
 # ptxas) and are a LAST resort only.
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="$CUDA_HOME/bin:$PATH"
-if ! nvcc --version 2>/dev/null | grep -q "release 13"; then
+# "release 13" also matches a future "release 130"; anchor on the dot. nvcc can
+# hang on a half-mounted toolkit dir, hence the bound.
+if ! timeout -k 5s 30 nvcc --version 2>/dev/null | grep -q "release 13\."; then
   VENV_CU="$ENV_DIR/lib/python3.12/site-packages/nvidia/cu13"
   if [ -x "$VENV_CU/bin/nvcc" ]; then
     log "WARNING: system nvcc missing/not 13.x; falling back to pip toolchain fragments (skew-prone)"
@@ -62,21 +75,33 @@ if ! nvcc --version 2>/dev/null | grep -q "release 13"; then
   fi
 fi
 
-command -v uv >/dev/null 2>&1 || {
+if ! command -v uv >/dev/null 2>&1; then
   log "installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  # The installer script itself unpacks and writes to ~/.local; bound the sh
+  # side too, not just the download.
+  if ! curl -LsSf -m 120 https://astral.sh/uv/install.sh | timeout -k 30s 300 sh; then
+    echo "FATAL: uv install failed or exceeded its deadline (astral.sh unreachable, or the installer stalled writing to \$HOME)" >&2; exit 1
+  fi
   export PATH="$HOME/.local/bin:$PATH"
-}
+  command -v uv >/dev/null 2>&1 || {
+    echo "FATAL: uv still not on PATH after install; expected \$HOME/.local/bin/uv" >&2; exit 1; }
+fi
 
-[ -x "$ENV_DIR/bin/python" ] || { log "creating venv (python 3.12)"; uv venv "$ENV_DIR" --python 3.12 --seed; }
+# The interpreter download can stall on a bad mirror; $VOL may also be NFS.
+if [ ! -x "$ENV_DIR/bin/python" ]; then
+  log "creating venv (python 3.12)"
+  timeout -k 30s 900 uv venv "$ENV_DIR" --python 3.12 --seed || {
+    echo "FATAL: uv venv at $ENV_DIR failed or exceeded 900s (python 3.12 download stalled, or \$VOL not writable)" >&2; exit 1; }
+fi
 P="$ENV_DIR/bin/python"
 
 log "vllm ($VLLM_PIN) + verl @ ${VERL_PIN:0:7} (joint resolve)"
-uv pip install -p "$P" "$VLLM_PIN" \
+timeout -k 30s 3600 uv pip install -p "$P" "$VLLM_PIN" \
   "verl @ git+https://github.com/volcengine/verl@${VERL_PIN}" \
   "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb>=0.18" jinja2 codetiming \
   backoff "docent-python>=0.1.74" "pydantic>=2.0" "openai>=1.0" pyyaml \
-  "transformers>=5.13,<6"
+  "transformers>=5.13,<6" || {
+  echo "FATAL: joint vllm+verl resolve failed or exceeded 3600s (git clone of verl hanging, or NFS-stalled \$UV_CACHE_DIR=$UV_CACHE_DIR)" >&2; exit 1; }
 # transformers >=5.13 is a HARD floor: 5.10-5.12 misapply OLMo-3's YaRN factor
 # to sliding-attention layers (HF regression #39847, fixed in #46911), which
 # skews trainer logprobs ~1 nat/token vs vLLM past 4096 ctx and silently
@@ -86,7 +111,7 @@ uv pip install -p "$P" "$VLLM_PIN" \
 # KeyErrors on the new per-layer-type dict; shim it to accept both (same
 # semantics: yarn on full-attention layers, default rope on sliding).
 log "patching vllm olmo2.py for transformers>=5.13 rope schema"
-"$P" - <<'PYEOF'
+timeout -k 30s 600 "$P" - <<'PYEOF' || { echo "FATAL: vllm olmo2.py patch failed or exceeded 600s (importing vllm can stall on a first-touch NFS site-packages)" >&2; exit 1; }
 import vllm.model_executor.models.olmo2 as m
 path = m.__file__
 src = open(path).read()
@@ -95,7 +120,8 @@ old = '''        if sliding_window is None:
         else:
             rope_theta = self.config.rope_parameters["rope_theta"]
             rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}'''
-new = '''        _rp = self.config.rope_parameters
+new = '''        # debate-rope-shim
+        _rp = self.config.rope_parameters
         if "rope_theta" not in _rp and ("full_attention" in _rp or "sliding_attention" in _rp):
             rope_parameters = _rp["full_attention" if sliding_window is None else "sliding_attention"]
         elif sliding_window is None:
@@ -106,7 +132,7 @@ new = '''        _rp = self.config.rope_parameters
 if old in src:
     open(path, "w").write(src.replace(old, new))
     print("patched", path)
-elif "_rp" in src:
+elif "debate-rope-shim" in src:
     print("already patched")
 else:
     raise SystemExit(f"FATAL: rope block not found in {path} — vllm version changed, re-check")
@@ -118,7 +144,7 @@ PYEOF
 # bf16, recomputed fp32). Cast the bounded outputs to x.dtype at return —
 # computation stays fp32, same numerics the FSDP2 cast produced pre-patch.
 log "patching transformers modeling_olmo3.py rope output dtype"
-"$P" - <<'PYEOF'
+timeout -k 30s 600 "$P" - <<'PYEOF' || { echo "FATAL: transformers modeling_olmo3.py patch failed or exceeded 600s" >&2; exit 1; }
 import transformers.models.olmo3.modeling_olmo3 as m
 path = m.__file__
 src = open(path).read()
@@ -139,20 +165,65 @@ else:
     raise SystemExit(f"FATAL: rope return not found in {path} — transformers changed, re-check")
 PYEOF
 
-log "flash-attn (source build; wheel cached in \$UV_CACHE_DIR for later pods; nvcc: $(nvcc --version | grep -o 'release [0-9.]*')"
-uv pip install -p "$P" ninja packaging
+# peft disable_adapter() (the ref-logprob pass) temporarily flips adapter
+# requires_grad off. If that pass runs before any training forward, FSDP2
+# lazy-init caches "no trainable params" per group and later reduce-scatters
+# bf16 grads into fp32 params — fatal under torch>=2.11 grad_dtype
+# enforcement (diagnosed 2026-08-03; debate runs dodged it only because their
+# first pass was a training forward). Force lazy-init right after the wrap,
+# while adapters are trainable.
+log "patching verl transformer_impl.py fsdp2 lazy-init"
+timeout -k 30s 600 "$P" - <<'PYEOF' || { echo "FATAL: verl transformer_impl.py lazy-init patch failed or exceeded 600s" >&2; exit 1; }
+import verl.workers.engine.fsdp.transformer_impl as m
+path = m.__file__.replace(".pyc", ".py")
+SENTINEL = "# debate-fsdp2-lazyinit"
+ANCHOR = "            fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)"
+PATCH = f"""{ANCHOR}
+            {SENTINEL}: peft disable_adapter() (ref-logprob pass) flips adapter
+            # requires_grad off; if that pass runs first, FSDP2 lazy-init caches
+            # "no trainable params" per group and later reduces bf16 grads into
+            # fp32 params (fatal under torch>=2.11 grad_dtype enforcement).
+            # Initialize dtype attrs NOW, while adapters are trainable.
+            module._get_fsdp_state()._lazy_init()"""
+src = open(path).read()
+if SENTINEL in src:
+    print("already patched")
+elif ANCHOR in src:
+    open(path, "w").write(src.replace(ANCHOR, PATCH, 1))
+    print("patched", path)
+else:
+    raise SystemExit(f"FATAL: fsdp2 load anchor not found in {path} — verl changed, re-check")
+PYEOF
+
+# Captured in its own statement: inside $(...) a hung/failed nvcc is invisible
+# because `log` itself succeeds.
+NVCC_VER="$(timeout -k 5s 30 nvcc --version | grep -o 'release [0-9.]*')" || {
+  echo "FATAL: nvcc --version failed or hung >30s just before the flash-attn build (CUDA_HOME=$CUDA_HOME)" >&2; exit 1; }
+log "flash-attn (source build; wheel cached in \$UV_CACHE_DIR for later pods; nvcc: $NVCC_VER"
+timeout -k 30s 600 uv pip install -p "$P" ninja packaging || {
+  echo "FATAL: installing ninja/packaging failed or exceeded 600s; without ninja the flash-attn build serializes and will not finish" >&2; exit 1; }
 # flash-attn's setup ignores TORCH_CUDA_ARCH_LIST; it wants FLASH_ATTN_CUDA_ARCHS
 # ("80;90" style, no dots) — without it the build fans out to every arch incl.
 # sm_100/sm_120 and dies.
 FLASH_ATTN_CUDA_ARCHS="$(echo "$TORCH_CUDA_ARCH_LIST" | tr -d '.' | tr ';' ';')" \
-MAX_JOBS="$MAX_JOBS" uv pip install -p "$P" --no-build-isolation "flash-attn==2.8.3.post1"
+MAX_JOBS="$MAX_JOBS" timeout -k 30s 7200 uv pip install -p "$P" --no-build-isolation "flash-attn==2.8.3.post1" || {
+  echo "FATAL: flash-attn source build failed or exceeded 7200s with MAX_JOBS=$MAX_JOBS / archs $TORCH_CUDA_ARCH_LIST." >&2
+  echo "  A build that merely OOM-Killed exits fast; a 2h wall means nvcc is thrashing (arch fan-out) or a cutlass unit is stuck — check dmesg and free -g." >&2
+  exit 1; }
 
 log "exporting built wheel to $VOL/wheels"
-mkdir -p "$VOL/wheels"
-find "${UV_CACHE_DIR:-/root/.cache/uv}" /root/.cache/uv -name "flash_attn*.whl" -newer "$ENV_DIR/bin/python" -exec cp -v {} "$VOL/wheels/" \; 2>/dev/null || true
+# Non-fatal (the env is already built) but NOT silent: an empty wheel cache
+# makes the next pod repeat the 2h build, so a total failure has to be visible.
+timeout -k 30s 60 mkdir -p "$VOL/wheels" || {
+  echo "WARNING: mkdir $VOL/wheels failed or hung >60s; flash-attn wheel NOT exported — the next pod will rebuild it" >&2; }
+# One of the two cache paths is normally absent; find's rc is therefore not a
+# usable signal — the ls below is what decides whether the export worked.
+timeout -k 30s 300 find "${UV_CACHE_DIR:-/root/.cache/uv}" /root/.cache/uv -name "flash_attn*.whl" -newer "$ENV_DIR/bin/python" -exec cp -v {} "$VOL/wheels/" \; 2>/dev/null || true
+ls "$VOL/wheels"/flash_attn*.whl >/dev/null 2>&1 || {
+  echo "WARNING: no flash_attn*.whl in $VOL/wheels after export; the next pod repeats the source build" >&2; }
 
 log "sanity"
-"$P" - <<'PY'
+timeout -k 30s 900 "$P" - <<'PY' || { echo "FATAL: sanity import failed or exceeded 900s — a hang here is usually torch/vllm probing a wedged GPU, not a slow import" >&2; exit 1; }
 import torch, vllm, verl, flash_attn, ray
 from verl.workers.engine_workers_tinker import TinkerActorRolloutRefWorker
 print("torch", torch.__version__, "| vllm", vllm.__version__, "| verl", verl.__version__,
