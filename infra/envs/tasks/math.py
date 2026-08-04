@@ -17,7 +17,7 @@ from infra.envs.answer_parsing import (
     extract_number_from_boxed_answer,
     parse_number,
 )
-from infra.envs.base import Env, Policy, Task, Trajectory, datum_from_sample
+from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 
@@ -57,7 +57,7 @@ def _rows(split, levels: set[int]) -> list[dict[str, Any]]:
     return rows
 
 
-class MathEnv(Env):
+class MathEnv(SingleTurnEnv):
     def __init__(
         self,
         levels: tuple[int, ...] = (5,),
@@ -128,23 +128,6 @@ class MathEnv(Env):
             "has_boxed": float(has_boxed and extract_last_boxed_content(text) is not None),
         }
         return reward, info
-
-    def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
-        results = policy.predict([t.messages for t in tasks], n=group_size)
-        groups: list[list[Trajectory]] = []
-        n_dropped = 0
-        for task, samples in zip(tasks, results):
-            trajs = []
-            for s in samples:
-                if not s.fidelity_ok():
-                    n_dropped += 1
-                    continue
-                reward, info = self.reward(task, s.text)
-                trajs.append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
-            groups.append(trajs)
-        if n_dropped and groups and groups[0]:
-            groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
-        return groups
 
 
 def strict_extract(text: str) -> Optional[float]:
