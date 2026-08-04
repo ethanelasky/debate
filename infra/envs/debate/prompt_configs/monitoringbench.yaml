@@ -24,9 +24,11 @@
 #   judges, the first solution slot's speaker proposes, any other debater
 #   critiques. In the assigned arms (no solution slot) BOTH debaters are
 #   critics, so `pre_debate_critic` serves them both.
-# - attribution ports the old pre_opponent_speech (debater cross-reads,
-#   literal <br> markers included -- the old parser passed them through
-#   untouched) and pre_debater_a/b_speech_judge (judge reads) blocks.
+# - attribution ports the old pre_opponent_speech (debater cross-reads) and
+#   pre_debater_a/b_speech_judge (judge reads) blocks; the old literal <br>
+#   markers are replaced by <opponent-speech>/<speech> tags wrapping the
+#   <SPEECH> substitution (2026-08-04 review fix — the speech end was
+#   previously undemarcated and ran into the next cue).
 #   pre_previous_speech is NOT ported: own speeches render natively as
 #   assistant turns (see MB_PROMPT_DELTAS.md delta 5).
 # - Cue names are the OLD names except `deliberation` (kept by user
@@ -495,24 +497,38 @@ mb_debate:
     - <OPPONENT_NAME> defends: "<OPPONENT_POSITION>"
 
     Exactly one of these answers is correct. Decide which debater is defending the correct answer.
+  # 2026-08-04 (review fix): the old <br> markers did not demarcate where the
+  # opponent's speech ENDED, so it ran straight into the next cue in the same
+  # user message. <SPEECH> substitution lets the template close a tag after
+  # the speech text.
   attribution:
     alice:
       bob: |-
-        <br>
+        This is what the opposing debater, <OPPONENT_NAME>, said during their most recent speech:
 
-        This is what the opposing debater, <OPPONENT_NAME>, said during their most recent speech.
-
-        <br>
+        <opponent-speech>
+        <SPEECH>
+        </opponent-speech>
     bob:
       alice: |-
-        <br>
+        This is what the opposing debater, <OPPONENT_NAME>, said during their most recent speech:
 
-        This is what the opposing debater, <OPPONENT_NAME>, said during their most recent speech.
-
-        <br>
+        <opponent-speech>
+        <SPEECH>
+        </opponent-speech>
     judge:
-      alice: This is what <NAME> said during their speech.
-      bob: This is what <OPPONENT_NAME> said during their speech.
+      alice: |-
+        This is what <NAME> said during their speech:
+
+        <speech>
+        <SPEECH>
+        </speech>
+      bob: |-
+        This is what <OPPONENT_NAME> said during their speech:
+
+        <speech>
+        <SPEECH>
+        </speech>
   # Per-turn cues, keyed directly by protocol slot name.
   pre_opening_speech: |-
     You are <NAME>. Open with your SINGLE STRONGEST argument for your assigned answer: "<POSITION>"<SPEECH_TOKEN_LIMIT_INSTRUCTION>
@@ -1873,7 +1889,12 @@ mb_single_consultancy_choice:
     Decide whether the consultant's answer is correct.
   attribution:
     judge:
-      alice: This is what <NAME> said during their speech.
+      alice: |-
+        This is what <NAME> said during their speech:
+
+        <speech>
+        <SPEECH>
+        </speech>
   # RLVR-style split (2026-08-04): the monitor role card lives in blind_system
   # (the solo view's SYSTEM message); this cue is the short task ask. In the
   # solo view the cue precedes the trajectory message; in the chooser's later

@@ -281,6 +281,27 @@ def test_attributed_direct_fallback_and_template():
                          reader_bindings={"NAME": "Debater_A"}) == "Debater_B said:\nyo"
 
 
+def test_attributed_speech_placeholder_wraps_the_speech():
+    lib = PromptLibrary(
+        attribution={"alice": {"bob": "<OPPONENT_NAME> said:\n\n<speech>\n<SPEECH>\n</speech>"}}
+    )
+    rp = RenderedPrompts(lib)
+    out = rp.attributed(
+        "Debater_B", "opening", "raw speech", reader="alice", author="bob",
+        reader_bindings={"OPPONENT_NAME": "Debater_B"},
+    )
+    # the closing tag lands AFTER the speech, demarcating it from the cue that
+    # joins the same pending user message
+    assert out == "Debater_B said:\n\n<speech>\nraw speech\n</speech>"
+    # single-pass substitution: placeholder-looking text inside the speech is
+    # inserted verbatim, never re-expanded
+    out2 = rp.attributed(
+        "Debater_B", "opening", "quoting <POSITION> here", reader="alice", author="bob",
+        reader_bindings={"OPPONENT_NAME": "Debater_B"},
+    )
+    assert "quoting <POSITION> here" in out2
+
+
 # -------------------------------------------------------- backward compat
 
 

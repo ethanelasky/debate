@@ -458,15 +458,21 @@ class RenderedPrompts:
         reader_bindings: Optional[dict[str, str]] = None,
     ) -> str:
         """How `reader` sees `author`'s speech. A configured (reader, author)
-        attribution template is rendered with the READER's bindings and the
-        speech text follows after a blank line; without one (or without
-        reader/author identity, e.g. legacy positional calls) the hard-coded
-        default applies."""
+        attribution template is rendered with the READER's bindings; a
+        <SPEECH> placeholder in it is replaced by the speech text (single-pass
+        substitution, so placeholder-looking text inside the speech is never
+        re-expanded) — this is what lets a template CLOSE a tag after the
+        speech, demarcating it from whatever follows in the same user message.
+        A template without <SPEECH> gets the speech appended after a blank
+        line; without any template (or without reader/author identity, e.g.
+        legacy positional calls) the hard-coded default applies."""
         tmpl = None
         if reader is not None and author is not None:
             tmpl = self.lib.attribution.get(reader, {}).get(author)
         if tmpl is None:
             return f"{author_name} said:\n{text}"
+        if "<SPEECH>" in tmpl:
+            return render(tmpl, {**(reader_bindings or {}), "SPEECH": text}, self.lib.vars)
         return render(tmpl, reader_bindings or {}, self.lib.vars) + "\n\n" + text
 
 
