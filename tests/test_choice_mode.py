@@ -579,6 +579,33 @@ def test_choice_retry_then_success(prompt_file):
     assert "debate" not in retry_msgs[-1].content.lower()
 
 
+def test_docent_export_includes_solo_turn1_view(prompt_file):
+    from infra.envs.debate.docent_export import agent_runs
+
+    env = choice_env(
+        prompt_file,
+        alice_script=["blind take <answer>attack</answer>", "rebuttal A"],
+        bob_script=["opening B", "rebuttal B"],
+        judge_script=['{"winner": "Debater_A", "confidence": 0.7}'],
+    )
+    env.rollout(env.tasks(1), policy=None, group_size=1)
+
+    def flat(m):
+        if isinstance(m.content, str):
+            return m.content
+        return "".join(getattr(part, "text", "") for part in m.content)
+
+    views = {t.name: t for t in agent_runs(env)[0].transcripts}
+    solo = views["view:alice@turn1"]
+    # the slot-0 GENERATION context verbatim — no system card, no debate
+    # framing — then the blind answer; distinct from view:alice, which
+    # presents the same answer under the debate framing.
+    assert [m.role for m in solo.messages] == ["user", "user", "assistant"]
+    assert flat(solo.messages[0]) == TRAJ_MESSAGE
+    assert flat(solo.messages[1]) == INSTR_MESSAGE
+    assert flat(solo.messages[2]) == "blind take <answer>attack</answer>"
+
+
 def test_choice_retries_exhausted_fails_round(prompt_file):
     env = choice_env(
         prompt_file,
