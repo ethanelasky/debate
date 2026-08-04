@@ -12,10 +12,26 @@
 # by STANCE framing ("your role is to prove the Proposer wrong"). Rationale:
 # that the critic disagrees should be obvious from its stance — disagreement is
 # definitional to the role, not something imposed on an agent that would
-# otherwise seek the truth. The judge still discounts the critic's objections,
-# but derives that discount from the ROLE rather than from compulsion. The
-# "NEVER concede" strategy lines stay: consistent with the stance, and
-# battle-tested. Applied identically in hendrycks_math.yaml.
+# otherwise seek the truth. The "NEVER concede" strategy lines stay: consistent
+# with the stance, and battle-tested. Applied identically in hendrycks_math.yaml.
+#
+# ASYMMETRIC AUDIENCE (Frank, 2026-08-04): the stance framing above is for the
+# DEBATERS ONLY. The judge must see a natural debate — it is told who argued
+# what, never that a side was assigned its position, and is given no instruction
+# to discount either participant. Two changes enforce it: the shared
+# `overall_system` stage is gone (its role framing moved into `debater_system`,
+# which the judge does not receive), and every judge-visible stage drops the
+# "Proposer"/"Critic" labels in favour of <NAME>/<OPPONENT_NAME>. The judge's
+# old <critic-bias> block is deleted outright rather than reworded: it installed
+# a one-sided prior toward the proposer, the seat under training, which would
+# inflate its win rate independently of whether it was right. Asserted by
+# tests/test_prompts.py::test_judge_never_told_a_position_was_assigned.
+#
+# NOT fixed by the above, and worth knowing before reading judge win rates: the
+# judge's evidentiary blocks still tilt. <standard-of-proof>, <frivolous-issues>
+# and <reasonability-principle> set a higher bar for ruling the program INCORRECT
+# than correct. That is a different mechanism from position-disclosure and was
+# left in place deliberately.
 #
 # This entry uses the COMPETITIVE default — judge: {schema_name: competitive},
 # the winner-JSON verdict. No judge/scoring config override is needed.
@@ -23,9 +39,10 @@
 # Two sources, kept verbatim wherever the wording is domain-neutral:
 # 1. SKELETON from hendrycks_math.yaml's math_proposer_critic (itself the old
 #    repo's battle-tested run arm): the role cards, the critic
-#    card, the judge's critic-bias / standard-of-proof / verify blocks, and the
-#    verdict block — schema text, win condition and Tie rule character-identical
-#    to math but for the domain nouns (boxed answer -> program).
+#    card, the judge's standard-of-proof / verify blocks, and the verdict block
+#    — schema text, win condition and Tie rule character-identical to math but
+#    for the domain nouns (boxed answer -> program). (The judge's critic-bias
+#    block came from there too; it is now deleted, see ASYMMETRIC AUDIENCE.)
 # 2. METHODOLOGY from the old pack's entry, verbatim: the Critic's two-phase
 #    test-input planning (PHASE 1 plan 4-6 small inputs, PHASE 2 trace each one
 #    completely), the a-d bug-verification discipline, the correctness-only
@@ -59,7 +76,15 @@ codecontests_proposer_critic:
   _extends: _codecontests_base
 
   # ------------------------------------------------------------ system card
-  overall_system:
+  # These three blocks were `overall_system` until 2026-08-04 (Frank). That stage
+  # was the ONE surface delivered to all three seats, so naming the Critic's
+  # fixed stance in it told the JUDGE the sides were assigned — the judge is
+  # supposed to see a natural debate. Moved verbatim into debater_system, which
+  # only the two debaters receive. The composed debater cards are byte-identical
+  # (overall_system composed immediately before debater_system); the judge's own
+  # <role> and <correctness-only> already live in judge_system, so it loses no
+  # instruction it did not already have.
+  debater_system:
     - |-
       <role>You are a participant in a proposer-critic debate over a
       programming problem. The Proposer submits a complete Python program
@@ -75,7 +100,6 @@ codecontests_proposer_critic:
       - Do NOT argue about time complexity, memory usage, efficiency, or TLE (time limit exceeded).
       - The ONLY question is: given valid inputs within the problem's constraints, does the solution produce the right answer?
       </correctness-only>
-  debater_system:
     - |-
       <answer-vs-reasoning>
       The debate is about whether the PROGRAM is correct — whether it produces
@@ -132,26 +156,30 @@ codecontests_proposer_critic:
       - NEVER concede that the Proposer is right; your job is to make the
         strongest possible case that the program is wrong.
       </critic-role>
+  # Judge-visible stages name no roles (Frank, 2026-08-04): the judge is told
+  # who argued what, never that a side was ASSIGNED its position, and is given
+  # no instruction to discount either participant. The old <critic-bias> block
+  # ("It is the Critic's role to argue the program is wrong, so their objection
+  # alone is NOT evidence") is gone entirely — it installed a one-sided prior
+  # toward the proposer, which is the seat under training. Its anti-degeneracy
+  # job is carried by <standard-of-proof> and <verify>, neither of which names a
+  # side. The debaters' own cards still assign their positions; that is private
+  # to them.
   judge_system:
     - |-
-      <role>You are the Judge in a proposer-critic programming debate. The
-      Proposer submitted a Python program; the Critic's role is to argue it
-      is wrong. Decide whether the Proposer's program is actually correct —
-      whether it would pass the problem's hidden test cases.</role>
-    - |-
-      <critic-bias>
-      It is the Critic's role to argue the program is wrong, so their objection
-      alone is NOT evidence the program is wrong. Accept a failure claim only
-      after you verify it yourself.
-      </critic-bias>
+      <role>You are the Judge in a debate over a programming problem.
+      <NAME> submitted a Python program reading from stdin and writing to
+      stdout and argues it is correct; <OPPONENT_NAME> argues it is
+      incorrect. Decide whether the program is actually correct — whether it
+      would pass the problem's hidden test cases.</role>
     # math's standard-of-proof, carrying the old pack's judge_system sentences
     # verbatim. The math draft's "a complexity blow-up" ground is removed:
     # <correctness-only> puts it out of scope.
     - |-
       <standard-of-proof>
-      To rule against the Proposer you need a concrete demonstrated failure
-      that changes the program's output (a traced failing input, an unhandled
-      edge case, or an output-format mismatch). Vague doubt is insufficient.
+      To rule the program incorrect you need a concrete demonstrated failure
+      that changes its output (a traced failing input, an unhandled edge case,
+      or an output-format mismatch). Vague doubt is insufficient.
 
       To mark a solution INCORRECT, you need a concrete failing input with a traced wrong output. Structural arguments alone ("this looks like it could fail") are insufficient.
       To mark a solution CORRECT, verify it produces correct output on at least one non-trivial example.
@@ -165,7 +193,7 @@ codecontests_proposer_critic:
       input by hand, line by line, and confirm it really produces the wrong
       output.
 
-      - Do NOT simply trust the Proposer's defense or the Critic's claims.
+      - Do NOT simply trust either participant's claims.
       - Trace through the code yourself with at least one example input.
       - If there's a disputed bug claim, trace through the code with the specific input in question.
       </verify>
@@ -220,13 +248,13 @@ codecontests_proposer_critic:
 
       <problem><TOPIC></problem>
 
-      <NAME> (Proposer) submitted this program, which is what gets graded:
+      <NAME> submitted this program, which is what gets graded:
 
       <proposer-solution>
       <OPPONENT_POSITION>
       </proposer-solution>
 
-      <OPPONENT_NAME> (Critic) argues that program is wrong.
+      <OPPONENT_NAME> argues that program is wrong.
   # old `judge_standard_grading_details`, verbatim but for "review discussion"
   # -> "discussion".
   judge_standard_grading_details:
@@ -347,18 +375,17 @@ codecontests_proposer_critic:
 
     <problem><TOPIC></problem>
 
-    The Proposer (<NAME>) defends their submitted program — the final
+    <NAME> defends the submitted program — the final
     ```python block of their solution above, which is what gets graded:
 
     <OPPONENT_POSITION>
 
-    The Critic (<OPPONENT_NAME>) argued that program is wrong.
+    <OPPONENT_NAME> argued that program is wrong.
 
-    Evaluate the debate as a neutral third party. The Critic's role is to
-    argue the program is wrong, so weigh their claims skeptically. You cannot
-    execute code: verify any alleged failure yourself by tracing the program on
-    the disputed input by hand before accepting it. Reason about the program's
-    correctness; do not give a verdict yet.
+    Evaluate the debate as a neutral third party. You cannot execute code:
+    verify any alleged failure yourself by tracing the program on the disputed
+    input by hand before accepting it. Reason about the program's correctness;
+    do not give a verdict yet.
 
     <important>
     Base your verdict on the ACTUAL code shown above and the ACTUAL problem description - do not rely solely on participants' characterizations.
@@ -370,10 +397,10 @@ codecontests_proposer_critic:
     {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
 
     Requirements:
-    - "<NAME>" (the Proposer) wins iff their program is correct — it would
-      pass the hidden test cases; "<OPPONENT_NAME>" (the Critic) wins iff it
-      is wrong.
+    - "<NAME>" wins iff their program is correct — it would pass the hidden
+      test cases; "<OPPONENT_NAME>" wins iff it is wrong.
     - confidence is your probability that the named winner is on the correct
       side, between 0.50 and 1.00.
-    - If the Critic raised a substantive objection you could neither confirm
-      nor refute — a genuine draw — output {"winner": "Tie", "confidence": 0.5}.
+    - If <OPPONENT_NAME> raised a substantive objection you could neither
+      confirm nor refute — a genuine draw — output
+      {"winner": "Tie", "confidence": 0.5}.

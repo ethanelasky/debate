@@ -285,10 +285,17 @@ def test_validate_fails_on_missing_system_prompt(lib, protocol):
         validate_prompts(lib, protocol)
 
 
-def test_no_compulsion_framing_in_either_pack():
-    """Ethan, 2026-08-04: the critic's disagreement is definitional to its role,
-    so neither pack may tell it to disagree against its own belief. The judge
-    keeps its discount but derives it from the ROLE."""
+def test_judge_never_told_a_position_was_assigned(protocol):
+    """Frank, 2026-08-04: the judge must see a natural debate. Nothing it
+    receives may say a side ARGUES BECAUSE IT WAS TOLD TO, and nothing may tell
+    it to discount a participant. The debaters' own cards still assign their
+    positions — that is private to them, and asserted here so the split does not
+    silently collapse in the other direction.
+
+    Scoped to the judge's ACTUAL surface, not the whole pack: system card,
+    preamble, and every slot cue the judge speaks. A shared stage would land
+    here too, which is the regression this exists to catch (the role framing
+    lived in `overall_system`, delivered to all three seats, until this rule)."""
     for path, entry, subject in (
         (MATH_YAML, "math_proposer_critic", "answer"),
         (CODECONTESTS_YAML, "codecontests_proposer_critic", "program"),
@@ -296,21 +303,35 @@ def test_no_compulsion_framing_in_either_pack():
         pack = load_pack(path, entry)
         # prompts are hard-wrapped prose, so compare on normalized whitespace
         flat = lambda s: " ".join(s.split())  # noqa: E731
-        text = flat(
+        judge_slots = [
+            cs.slot.name for cs in protocol.compile() if cs.speaker == "judge"
+        ]
+        seen_by_judge = flat(
             "\n".join(
-                list(pack.system.values())
-                + list(pack.preamble.values())
-                + [t for v in pack.slots.values() for t in ([v] if isinstance(v, str) else v.values())]
+                [pack.system["judge"], pack.preamble.get("judge", "")]
+                + [slot_template(pack, name, "judge") for name in judge_slots]
             )
         )
-        for banned in ("FORCED", "forced to disagree", "regardless of what you privately believe"):
-            assert banned not in text, f"{entry}: {banned!r}"
+        for banned in (
+            "FORCED",
+            "forced to disagree",
+            "regardless of what you privately believe",
+            "role is to argue",
+            "is required to argue",
+            "weigh their claims skeptically",
+            "(Critic)",
+            "(Proposer)",
+            "the Critic",
+            "the Proposer",
+        ):
+            assert banned not in seen_by_judge, f"{entry}: judge sees {banned!r}"
+        # ...while the debaters' cards keep their assigned positions
         assert "Your role is to prove the Proposer wrong" in flat(pack.system["bob"])
-        # the judge still discounts the critic, now on role grounds
-        assert f"It is the Critic's role to argue the {subject} is wrong" in flat(pack.system["judge"])
-        assert f"The Critic's role is to argue the {subject} is wrong" in flat(
-            slot_template(pack, "deliberation", "judge")
-        )
+        assert "NEVER concede that the Proposer is right" in flat(pack.system["bob"])
+        assert "<proposer-role>" in pack.system["alice"]
+        # the symmetric skepticism that replaced the one-sided <critic-bias>
+        assert "Do NOT simply trust either participant's claims" in flat(pack.system["judge"])
+        assert subject in flat(pack.system["judge"])
 
 
 def test_validate_fails_on_empty_composed_system_card(lib, protocol):
