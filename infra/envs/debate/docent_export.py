@@ -135,6 +135,11 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
             "empty_slots": st.meta.get("empty_slots", []),
             "task": {k: v for k, v in st.meta.get("task", {}).items() if isinstance(v, (str, int, float, bool))},
             "bindings": {s: b.get("NAME") for s, b in st.bindings.items()},
+            # Ground-truth label per solution slot. The `task` filter above
+            # drops codecontests' inputs/outputs (test cases must never leave
+            # the verifier), so this is the ONLY record of correctness that
+            # survives export — see DebateEnv._attach_labels.
+            "grades": st.meta.get("grades", {}),
         }
         if st.failed is None:
             meta.update(_verdict_metadata(env, st))
