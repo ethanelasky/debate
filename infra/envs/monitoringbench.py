@@ -236,8 +236,8 @@ class MonitoringBenchTaskSource:
     other seats' preamble), later messages carry the blind instructions, so
     message-boundary prompt caches can reuse the trajectory across calls.
     Substitution uses the prompt library's render(), so an unfilled
-    placeholder (e.g. <FILL_ME_BLIND_INSTRUCTIONS>) hard-errors at task build
-    — before any generation is paid for.
+    placeholder (a typo'd or deliberately-unbound <UPPERCASE> tag)
+    hard-errors at task build — before any generation is paid for.
     """
 
     def __init__(
