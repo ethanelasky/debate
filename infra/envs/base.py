@@ -7,6 +7,7 @@ eval machinery.
 
 from __future__ import annotations
 
+import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
@@ -124,6 +125,55 @@ class Env(ABC):
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
         """One group of rewarded trajectories per task. Samples failing
         fidelity checks are dropped (and counted in info), not trained on."""
+
+
+class SingleTurnEnv(Env):
+    """One generation per task, scored by reward(): the RLVR rollout shape,
+    shared by every task-source env (math, codecontests, ...).
+
+    Subclasses implement tasks() and reward(). The only axis they differ on is
+    `grade_workers`: > 1 runs reward() in a thread pool, for verifiers that
+    shell out to a subprocess (code execution). Pure-python graders leave it at
+    1 and score inline rather than pay for a pool they cannot use.
+    """
+
+    grade_workers: int = 1
+
+    @abstractmethod
+    def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
+        """Completion text -> (reward, metric info), one call per kept sample.
+        Every info key should be present on EVERY branch, so eval-time averages
+        are means over all samples rather than over whichever branch set it."""
+
+    def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        results = policy.predict([t.messages for t in tasks], n=group_size)
+        groups: list[list[Trajectory]] = [[] for _ in tasks]
+        kept: list[tuple[int, Sample]] = []
+        n_dropped = 0
+        for gi, samples in enumerate(results):
+            for s in samples:
+                if not s.fidelity_ok():
+                    n_dropped += 1
+                    continue
+                kept.append((gi, s))
+
+        workers = max(1, self.grade_workers)
+        if workers > 1 and kept:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self.reward, tasks[gi], s.text) for gi, s in kept]
+                scored = [f.result() for f in futures]
+        else:
+            scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
+
+        for (gi, s), (reward, info) in zip(kept, scored):
+            groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
+        # Deliberately violates the every-branch rule in reward()'s docstring:
+        # a batch-level counter stamped on one sample (and lost when the first
+        # group is empty). Pinned by tests; fixing it means a new channel for
+        # batch info, not spreading the key across trajectories.
+        if n_dropped and groups and groups[0]:
+            groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
+        return groups
 
 
 def datum_from_sample(s: Sample) -> Datum:

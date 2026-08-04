@@ -9,7 +9,6 @@ runner is a plain subprocess.
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
 import os
@@ -24,7 +23,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from infra.envs.base import Env, Policy, Task, Trajectory, datum_from_sample
+from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 
@@ -420,7 +419,10 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
     return rows
 
 
-class CodeContestsEnv(Env):
+class CodeContestsEnv(SingleTurnEnv):
+    # Grading shells out to a subprocess per sample, so threads overlap.
+    grade_workers = _MAX_CONCURRENT_VERIFIERS
+
     def __init__(
         self,
         path: str,
@@ -513,30 +515,6 @@ class CodeContestsEnv(Env):
         info["exec_timeout"] = float(bool(result.get("timeout")))
         info["exec_error"] = float(result.get("status") == "error")
         return self.format_reward + self.correct_reward * info["correct"], info
-
-    def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
-        results = policy.predict([t.messages for t in tasks], n=group_size)
-        n_dropped = 0
-        pending: list[tuple[int, Any, Any]] = []  # (group idx, sample, future)
-        n_groups = len(tasks)
-        # Grading shells out to a subprocess per sample, so threads overlap.
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, _MAX_CONCURRENT_VERIFIERS)
-        ) as pool:
-            for gi, (task, samples) in enumerate(zip(tasks, results)):
-                for s in samples:
-                    if not s.fidelity_ok():
-                        n_dropped += 1
-                        continue
-                    pending.append((gi, s, pool.submit(self.reward, task, s.text)))
-
-            groups: list[list[Trajectory]] = [[] for _ in range(n_groups)]
-            for gi, s, fut in pending:
-                reward, info = fut.result()
-                groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
-        if n_dropped and groups and groups[0]:
-            groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
-        return groups
 
 
 # -------------------------------------------------------------------- family
