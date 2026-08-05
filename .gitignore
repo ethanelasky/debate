@@ -11,3 +11,6 @@ checkpoints/
 # Built datasets: reproducible from scripts/build_codecontests_rlvr.py
 # (the manifest pins revision, seed and sha256), too large to track.
 data/
+
+# Agent worktrees (created by isolation: worktree)
+.claude/worktrees/

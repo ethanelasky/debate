@@ -35,6 +35,10 @@ class Config:
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
+    # wandb entity (team). None falls back to the API key's DEFAULT entity,
+    # which is a personal namespace — runs then land somewhere the rest of the
+    # team cannot see. Set it explicitly in the experiment config.
+    wandb_entity: str | None = None
     run_name: str | None = None
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
@@ -156,7 +160,12 @@ def _make_logger(cfg: Config):
     if cfg.wandb_project:
         import wandb
 
-        run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
+        run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,   # None -> wandb's default entity
+            name=cfg.run_name,
+            config=vars(cfg),
+        )
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:
@@ -181,6 +190,7 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=Config.eval_every)
     parser.add_argument("--eval-n", type=int, default=Config.eval_n)
     parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--load", default=None, help="checkpoint path to resume from")
     args = parser.parse_args()
 
@@ -196,6 +206,7 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_n=args.eval_n,
         wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
     )
 
     from infra.backend.tinker import TinkerBackend

@@ -89,6 +89,22 @@ backup, not the working copy. Watch for orphaned `VLLM::EngineCore` processes
 — `pkill -f vllm` does not match them. Trust only env vars the code actually
 reads (grep for them); a misspelled knob fails silently.
 
+## Hardware cost
+
+Any change to model size, batch, sequence length, parallelism or concurrency:
+do the arithmetic before proposing it, and say which quantity binds. Memory is
+`weights + gradients + optimizer + activations` for training, `weights + KV
+cache` for serving; the first three scale with the model, the last two with
+batch and sequence. Wall-clock is bounded below by the slowest single item in
+any fan-out, and GPU-idle time counts even when the work is on CPU.
+
+Measure the distribution, not the mean, and confirm which limit actually
+binds — when raising a knob changes nothing, there is usually a second limit
+underneath. Read limits in their own currency (address space is not resident
+memory; `free`/`nproc` are the host, not the cgroup).
+
+Working notes and worked numbers: `docs/hardware-model.md`.
+
 ## Evaluation protocol
 
 Token budgets derive from the training config (here: the protocol's per-slot

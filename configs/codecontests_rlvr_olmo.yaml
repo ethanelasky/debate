@@ -24,7 +24,7 @@ codecontests_rlvr_olmo:
     # Bounds a runaway program, not honest work: the reward suite is <=10 small
     # cases (2 MB total budget, enforced at build time), so a correct solution
     # finishes in well under a second.
-    timeout_seconds: 30
+    timeout_seconds: 10
     # The whole held-out split: 501 problems, 109 contests, disjoint from train
     # by contest so near-duplicates cannot straddle the boundary.
     eval_subset_size: 501
@@ -63,6 +63,10 @@ codecontests_rlvr_olmo:
       response_length: 2048
       max_token_len_per_gpu: 8192    # >= prompt_length + response_length
       checkpoint_dir: /workspace/checkpoints
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
     wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
@@ -115,3 +119,90 @@ codecontests_rlvr_olmo_long:
       response_length: 8192
       max_token_len_per_gpu: 16384
     eval_max_tokens: 8192
+
+# ---------------------------------------------------------------- 32B arm
+# The real baseline. Matches the OLD repo's CodeContests canary
+# (codecontests_olmo31_32b_canary_experiments.yaml): Olmo-3.1-32B-Instruct-DPO
+# on 8 GPUs, lora_rank 32, gpu_mem_util 0.45, max_new_tokens 8192.
+#
+# NOTE the model family: 3.1, not the 3-7B the MATH baselines in this repo use.
+# The arms above are 7B and exist to prove the code path cheaply; this is the
+# one whose numbers mean anything.
+#
+# Why 8 GPUs: 32B in bf16 is ~64 GB of weights, so vLLM's rollout copy plus
+# FSDP training state cannot share a single 80 GB card.
+#
+# The token budget goes back to the canary's 4096/8192 pair rather than the
+# 1536/2048 measured for the 7B arms — a 32B is the size class those cached
+# completions came from, so the short budget's evidence does not apply here.
+codecontests_rlvr_olmo31_32b:
+  _extends: codecontests_rlvr_olmo
+  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  max_completion_tokens: 8192
+  dataset:
+    soft_token_budget: 4096
+    overshoot_penalty: 0.1
+  training:
+    verl:
+      n_gpus: 8
+      # Shard the ROLLOUT across all 8 GPUs. Without this rollout_tp defaults
+      # to 1 and vLLM tries to put the whole 32B (~64 GB bf16) on ONE card;
+      # at gpu_memory_utilization 0.45 of a 143 GB H200 that is a 64 GB budget
+      # for 64 GB of weights, so it dies with "No available memory for the
+      # cache blocks" before a single token is generated. With tp=8 each card
+      # holds ~8 GB of weights and the rest of its 45% budget is KV cache.
+      rollout_tp: 8
+      response_length: 8192
+      max_token_len_per_gpu: 16384
+    eval_max_tokens: 8192
+
+# 2 steps with eval on every step: enough to draw a LINE in wandb rather than a
+# single point, and enough to see the policy actually move (grad_norm, kl,
+# entropy, reward between step 0 and 1). eval_n is small so the greedy pass
+# plus verifier stays under a minute.
+codecontests_rlvr_olmo_smoke2:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 1
+    eval_n: 8
+    save_every: 0
+
+# 10 steps at the REAL arm's rollout shape (8x8), so the curves reflect what a
+# full run would look like rather than 2x4 noise. eval every 2 steps on 32
+# held-out problems: enough points to see a trend, cheap enough to stay ~30min.
+codecontests_rlvr_olmo_smoke10:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 10
+    batch_size: 8
+    group_size: 8
+    eval_every: 2
+    eval_n: 32
+    save_every: 0
+
+# 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
+# worth reading: the 7B smoke showed the plumbing works but the model is too
+# weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
+codecontests_rlvr_olmo31_32b_smoke10:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 10
+    batch_size: 8
+    group_size: 8
+    eval_every: 2
+    eval_n: 32
+    save_every: 0
+
+# 1-step plumbing check for the 32B path: proves the weights load, shard across
+# 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
+codecontests_rlvr_olmo31_32b_smoke:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 1
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0

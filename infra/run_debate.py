@@ -63,6 +63,7 @@ TRAINING_KEYS = {
     "eval_n",
     "save_every",
     "wandb_project",
+    "wandb_entity",
 }
 
 # training-block keys that map 1:1 onto Config fields, with their YAML casts.
@@ -364,6 +365,7 @@ def main() -> None:
     parser.add_argument("--experiment-file", required=True)
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
+    parser.add_argument("--wandb-entity", default=None, help="override training.wandb_entity")
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     parser.add_argument("--steps", type=int, default=None, help="override training.steps")
     parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
@@ -408,6 +410,7 @@ def main() -> None:
             temperature=profile.temperature if profile.temperature is not None else 1.0,
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),
+        wandb_entity=(None if args.no_wandb else args.wandb_entity or tr.get("wandb_entity")),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),

@@ -226,11 +226,18 @@ if [ -n "$TRAINER_PIDS" ]; then
   exit 5
 fi
 
+# CONFIG is overridable so a mode is not welded to one task family — the
+# defaults are the MATH arms, but CodeContests (and anything added later) lives
+# in its own file:
+#   CONFIG=configs/codecontests_rlvr_olmo.yaml bash scripts/pod_run.sh rlvr <exp>
+# The experiment name is still validated against whichever file is selected, so
+# a mismatched pair fails at load with the available names listed.
 case "$MODE" in
-  debate) RUNNER=infra.run_debate; CONFIG=configs/math_pc_olmo.yaml ;;
-  rlvr)   RUNNER=infra.run_rlvr;   CONFIG=configs/math_rlvr_olmo.yaml ;;
+  debate) RUNNER=infra.run_debate; CONFIG="${CONFIG:-configs/math_pc_olmo.yaml}" ;;
+  rlvr)   RUNNER=infra.run_rlvr;   CONFIG="${CONFIG:-configs/math_rlvr_olmo.yaml}" ;;
   *) echo "unknown mode $MODE (debate|rlvr)" >&2; exit 2 ;;
 esac
+[ -f "$CONFIG" ] || { echo "FATAL: config $CONFIG not found (cwd $(pwd))" >&2; exit 2; }
 
 # Idle watchdog: once the pod has been idle for IDLE_MINUTES (default 30) — no
 # trainer/eval processes, no active SSH, GPU idle — it kills leftover vLLM

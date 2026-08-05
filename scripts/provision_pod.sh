@@ -95,8 +95,22 @@ if [ ! -x "$ENV_DIR/bin/python" ]; then
 fi
 P="$ENV_DIR/bin/python"
 
-log "vllm ($VLLM_PIN) + verl @ ${VERL_PIN:0:7} (joint resolve)"
-timeout -k 30s 3600 uv pip install -p "$P" "$VLLM_PIN" \
+# verl caps transformers at <5.11 (setup.py + requirements.txt, still true at
+# main ddfbf4e). Our floor is >=5.13 and non-negotiable — see the note below.
+# The two are unsatisfiable together, so the resolve HAS to be told which one
+# wins; without this the install dies with "your requirements are
+# unsatisfiable" and nothing provisions.
+#
+# Overriding is safe as far as verl's own reason goes: its bound exists for a
+# sink-less-model bug fixed in transformers 5.6.1 (huggingface/transformers
+# #45588), and `<5.11` is an untested-ceiling, not a known break. It is still
+# an override of an upstream pin — if verl starts using a transformers API
+# that moved after 5.11, this is the first place to look.
+OVERRIDE="$VOL/verl-transformers-override.txt"
+printf 'transformers>=5.13,<6\n' > "$OVERRIDE"
+
+log "vllm ($VLLM_PIN) + verl @ ${VERL_PIN:0:7} (joint resolve, transformers override)"
+timeout -k 30s 3600 uv pip install -p "$P" --override "$OVERRIDE" "$VLLM_PIN" \
   "verl @ git+https://github.com/volcengine/verl@${VERL_PIN}" \
   "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb>=0.18" jinja2 codetiming \
   backoff "docent-python>=0.1.74" "pydantic>=2.0" "openai>=1.0" pyyaml \

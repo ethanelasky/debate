@@ -162,9 +162,20 @@ PROMPT_FILE = "codecontests.yaml"
 
 logger = logging.getLogger(__name__)
 
-# Each verifier subprocess may use up to 4GB (RLIMIT_AS in the runner script),
-# so cap concurrency to keep total memory bounded.
-_MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "8"))
+# Concurrent verifier subprocesses. This is the limit that BINDS: the thread
+# pool in SingleTurnEnv.rollout also gates on this semaphore, so raising pool
+# workers alone changes nothing (measured three times before we noticed).
+#
+# Was 8, derived from "RLIMIT_AS is 4GB, so 8 x 4GB = 32GB". That arithmetic
+# mixed currencies: RLIMIT_AS bounds VIRTUAL address space, while the thing
+# worth budgeting is resident memory — measured at ~21MB per verifier process,
+# three orders of magnitude less. 4GB is still the right backstop against a
+# runaway allocation; it was never a sane basis for a concurrency budget.
+#
+# 32 measured 2.87x faster wallclock on 632 real completions with 632/632
+# identical verdicts. The floor is the timeout itself, not concurrency: a
+# fan-out cannot finish before its slowest item.
+_MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "32"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
 
 # Descriptions containing these admit multiple valid outputs, which exact

@@ -178,6 +178,11 @@ class SingleTurnEnv(Env):
         else:
             scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
 
+        # Retained for export: the generated text is the ONLY record of what the
+        # policy produced, and re-grading it offline against a stronger test
+        # suite is how proposer accuracy gets measured after the run. Without
+        # this the completions are gone the moment the step ends.
+        self.last_rollout: list[dict[str, Any]] = []
         for (gi, s), (reward, info) in zip(kept, scored):
             # Length is priced here rather than in reward(), which only sees
             # text; token counts live on the Sample.
@@ -185,6 +190,19 @@ class SingleTurnEnv(Env):
             info = {**info, "tokens": float(len(s.tokens)), "over_budget": float(over)}
             if over:
                 reward -= self.overshoot_penalty
+            meta = tasks[gi].meta
+            self.last_rollout.append({
+                # scalar identity only — never the test suites, which must not
+                # leave the process any more than they may enter a prompt
+                "name": meta.get("name"),
+                "question": (meta.get("question") or "")[:4000],
+                "split": meta.get("split"),
+                "cf_rating": meta.get("cf_rating"),
+                "text": s.text,
+                "reward": float(reward),
+                "stop_reason": s.stop_reason,
+                "info": {k: v for k, v in info.items() if isinstance(v, (int, float))},
+            })
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
         if n_dropped and groups and groups[0]:
             groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)

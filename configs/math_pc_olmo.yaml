@@ -71,6 +71,10 @@ math_pc_olmo_l5:
       prompt_length: 8192
       response_length: 1024          # largest slot cap
       max_token_len_per_gpu: 16384
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
     wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
