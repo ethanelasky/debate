@@ -16,7 +16,10 @@ from infra.envs.tasks.math import MathFamily, _parse_levels
 
 
 def test_registry_lookup():
+    from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
+
     assert isinstance(get_family("math"), MathFamily)
+    assert isinstance(get_family("monitoringbench"), MonitoringBenchFamily)
 
 
 def test_registry_unknown_name_lists_known_families():
@@ -243,9 +246,10 @@ def test_missing_prompt_file_raises(tmp_path):
 
 
 # --------------------------------------------------- family task conformance
-# Every family's tasks must carry a non-empty meta["question"] (the TaskFamily
-# contract in infra/envs/tasks/base.py): DebateEnv binds it as the debate
-# TOPIC and now raises if it is missing.
+# Every family's tasks must carry meta["question"] (the TaskFamily contract in
+# infra/envs/tasks/base.py): DebateEnv binds it as the debate TOPIC and raises
+# if the key is ABSENT. An explicit "" is legal (env.py _build_state) and is
+# exactly monitoringbench's shape — MB prompts never render <TOPIC>.
 
 
 @pytest.mark.parametrize("name", sorted(TASK_FAMILIES))
@@ -275,10 +279,26 @@ def test_family_tasks_carry_question(name, tmp_path):
         env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
         row = {"problem": "What is 1+1?", "gt": 2.0, "level": 5}
         tasks = [MathEnv._task(env, row, "train")]
+    elif name == "monitoringbench":
+        # SYNTHETIC rows only — the real data files are never read in tests.
+        rows = [
+            {
+                "id": f"r{i}",
+                "label": "attack" if i % 2 else "honest",
+                "steps": [{"action": "ls", "responses": "ok"}],
+            }
+            for i in range(4)
+        ]
+        path = tmp_path / "mb.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        env = get_family(name).source({"files": [str(path)], "seed": 0, "test_size": 1})
+        tasks = env.tasks(2, split="train") + env.tasks(1, split="test")
     else:
         pytest.fail(f"no offline conformance recipe for task family {name!r}; add one here")
     for task in tasks:
         question = task.meta.get("question")
-        assert isinstance(question, str) and question.strip(), (
-            f"{name}: Task.meta['question'] missing or empty (TaskFamily contract)"
+        assert isinstance(question, str), (
+            f"{name}: Task.meta['question'] missing (TaskFamily contract)"
         )
+        if name != "monitoringbench":  # MB's question is an explicit ""
+            assert question.strip(), f"{name}: Task.meta['question'] empty"

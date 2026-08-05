@@ -17,7 +17,7 @@ import yaml
 from infra.envs.base import Task
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig, task_bindings
 from infra.envs.debate.judge import JudgeConfig
-from infra.envs.monitoringbench import MonitoringBenchFamily
+from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.envs.debate.round import truncate_speech_to_token_limit
 from infra.envs.debate.protocol import Protocol
 from test_debate_env import ScriptedModel

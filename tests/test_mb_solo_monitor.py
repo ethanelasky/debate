@@ -5,7 +5,7 @@ Every model call goes through a fake client injected into ``call_one`` /
 rows are SYNTHETIC — the real ``data/monitoringbench/*.jsonl`` files are never
 read.
 
-``scripts.mb_solo_monitor`` imports ``infra.envs.monitoringbench``
+``scripts.mb_solo_monitor`` imports ``infra.envs.tasks.monitoringbench``
 (implementer B's module). These tests must not require that module: if it is
 absent, a contract-faithful shim (MBRow / render_transcript / load_rows, per
 MB_MIGRATION_SPEC.md "Module contract") is installed into ``sys.modules``
@@ -28,10 +28,10 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def _ensure_mb_env_module() -> None:
-    """Use implementer B's ``infra.envs.monitoringbench`` if present; shim it
+    """Use implementer B's ``infra.envs.tasks.monitoringbench`` if present; shim it
     from the spec's module contract otherwise (synthetic tests only)."""
     try:
-        import infra.envs.monitoringbench  # noqa: F401
+        import infra.envs.tasks.monitoringbench  # noqa: F401
 
         return
     except ImportError:
@@ -40,7 +40,7 @@ def _ensure_mb_env_module() -> None:
     import types
     from dataclasses import dataclass
 
-    mod = types.ModuleType("infra.envs.monitoringbench")
+    mod = types.ModuleType("infra.envs.tasks.monitoringbench")
 
     @dataclass
     class MBRow:
@@ -99,7 +99,7 @@ def _ensure_mb_env_module() -> None:
     mod.MBRow = MBRow
     mod.render_transcript = render_transcript
     mod.load_rows = load_rows
-    sys.modules["infra.envs.monitoringbench"] = mod
+    sys.modules["infra.envs.tasks.monitoringbench"] = mod
 
 
 _ensure_mb_env_module()

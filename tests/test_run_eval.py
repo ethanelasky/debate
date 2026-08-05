@@ -15,7 +15,7 @@ import infra.run_eval as run_eval
 from infra.envs.base import Task
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
-from infra.envs.monitoringbench import MonitoringBenchFamily
+from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.envs.debate.protocol import Protocol
 from infra.run_eval import (
     build_eval_env,

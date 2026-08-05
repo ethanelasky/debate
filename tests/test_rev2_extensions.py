@@ -20,7 +20,7 @@ import pytest
 
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
-from infra.envs.monitoringbench import MonitoringBenchFamily
+from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.envs.debate.prompts import (
     PromptLibrary,
     RenderedPrompts,

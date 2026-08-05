@@ -1,5 +1,5 @@
-"""RLVR runner: experiment YAML -> MathEnv (direct correctness reward) ->
-train loop. The judge-free baseline for the debate experiments: same model,
+"""RLVR runner: experiment YAML -> task-source env (direct verifiable reward)
+-> train loop. The judge-free baseline for the debate experiments: same model,
 same backend, same GRPO machinery — reward comes from answer verification
 instead of a judge, so it isolates optimization from reward quality.
 
@@ -11,6 +11,12 @@ Config shape:
       dataset: {type: math, levels: 5, seed: 0}
       training: {backend: verl, verl: {...}, lora_rank: 32, loss: {...},
                  steps: 100, batch_size: 8, group_size: 8, lr: 1e-4, ...}
+
+MB blind choice (dataset.type: monitoringbench) additionally carries
+`prompt_config` + `protocol` — the SAME entry and turns as the eval arm
+(mb_debate_choice). The blind first-turn templates are built through
+run_eval.blind_message_templates, the function the eval arm uses, so the RLVR
+prompt is byte-identical to the eval arm's blind view for the same row.
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ from infra.run_debate import (
 )
 from infra.train import Config, train
 
-EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
+EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training", "prompt_config", "protocol"}
 
 
 def validate_experiment(exp: dict) -> None:
@@ -44,6 +50,26 @@ def validate_experiment(exp: dict) -> None:
     tr = exp.get("training") or {}
     reject_unknown_keys(tr, TRAINING_KEYS, "training")
     reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
+    if bool(exp.get("prompt_config")) != bool(exp.get("protocol")):
+        raise ValueError(
+            "prompt_config and protocol come together: both are needed to build "
+            "the MB blind-choice templates (blind_choice_dataset), neither for "
+            "plain task sources like math"
+        )
+
+
+def blind_choice_dataset(exp: dict, ds: dict) -> dict:
+    """MB choice mode: when the experiment carries prompt_config + protocol,
+    render the blind first-turn templates through the SAME function the eval
+    arm uses (run_eval.blind_message_templates, same entry + turns), so the
+    RLVR prompt is byte-identical to the eval arm's blind view for the same
+    row. Plain task sources (no prompt_config) pass through untouched."""
+    if not exp.get("prompt_config"):
+        return ds
+    from infra.run_eval import _resolve_protocol, blind_message_templates
+
+    messages, prompt_vars = blind_message_templates(exp, _resolve_protocol(exp))
+    return {**ds, "choice_messages": messages, "choice_prompt_vars": prompt_vars}
 
 
 def main() -> None:
@@ -68,7 +94,7 @@ def main() -> None:
     ds = dict(exp.get("dataset") or {})
     family = get_family(ds.pop("type", None))
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
-    env = family.source(ds)
+    env = family.source(blind_choice_dataset(exp, ds))
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])

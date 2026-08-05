@@ -36,7 +36,7 @@ from infra.envs.debate.prompts import (
 )
 from infra.envs.debate.round import DebateState, SlotRecord, render_context
 from infra.envs.debate.protocol import Protocol
-from infra.envs.monitoringbench import (
+from infra.envs.tasks.monitoringbench import (
     MB_POSITION_ATTACK,
     MB_POSITION_HONEST,
     MonitoringBenchFamily,
@@ -235,7 +235,8 @@ def test_family_grade_and_flags():
 
 
 def test_family_source_rejects_unknown_keys(tmp_path):
-    with pytest.raises(ValueError, match="unknown key"):
+    # Message shape comes from the shared tasks.base reject_unknown_keys.
+    with pytest.raises(ValueError, match=r"unknown.*key\(s\).*typo_key"):
         MonitoringBenchFamily().source({"files": ["x.jsonl"], "typo_key": 1})
 
 
@@ -846,6 +847,45 @@ turns:
         assert "judge" not in cue.lower()
         for tmpl in (system, cue, traj):
             render(tmpl, {"BACKGROUND_TEXT": "x"}, vars_)  # renders fully
+
+
+def test_rlvr_task_source_prompt_matches_eval_arm(tmp_path):
+    """The parity configs/mb_rlvr.yaml promises: run_rlvr's blind_choice_dataset
+    and run_eval.build_task_source hand the task source the same blind
+    templates (both call blind_message_templates with the same entry + turns),
+    so for the same row the RLVR Task.messages are byte-identical to the eval
+    arm's blind view."""
+    from infra.envs.tasks import get_family
+    from infra.run_rlvr import blind_choice_dataset
+
+    files = [_write_rows(tmp_path)]
+    topo = yaml.safe_load(
+        """
+turns:
+  - alice: [{name: blind_assessment, kind: solution}]
+    bob:   [{name: pre_opening_speech}]
+  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
+"""
+    )
+    exp = {
+        "prompt_config": {
+            "file_path": "infra/prompts/debate/monitoringbench.yaml",
+            "entry": "mb_debate_choice",
+        },
+        "protocol": topo,
+        "choice_positions": True,
+        "dataset": {"files": files, "seed": 0},
+    }
+    eval_src = run_eval.build_task_source(exp, task_ids=None, seed=None)
+    rlvr_env = get_family("monitoringbench").source(
+        blind_choice_dataset(exp, {"files": files, "seed": 0})
+    )
+    eval_msgs = [t.messages for t in eval_src.tasks(2)]
+    rlvr_msgs = [t.messages for t in rlvr_env.tasks(2, split="test")]
+    assert eval_msgs == rlvr_msgs
+    assert [m["role"] for m in rlvr_msgs[0]] == ["system", "user", "user"]
+    # plain task sources pass through untouched
+    assert blind_choice_dataset({}, {"files": files}) == {"files": files}
 
 
 MB_DEBATE_CHOICE_TOPO = Protocol.parse(

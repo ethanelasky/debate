@@ -171,7 +171,7 @@ def _choice_wiring(exp: dict, protocol: Protocol):
     debaters (two = debate arm, judged competitively; one = single-consultancy
     arm, judge GRADES the consultant — collaborative schema). The solution
     extractor itself comes from MonitoringBenchFamily."""
-    from infra.envs.monitoringbench import choice_retry_feedback, make_choice_position_binder
+    from infra.envs.tasks.monitoringbench import choice_retry_feedback, make_choice_position_binder
 
     decision = protocol.decision_slot
     judge_speaker = decision.speaker if decision is not None else None
@@ -257,7 +257,7 @@ def blind_message_templates(
 
 def build_eval_env(exp: dict, task_source) -> DebateEnv:
     """Experiment dict + task source -> all-frozen DebateEnv (pure eval)."""
-    from infra.envs.monitoringbench import MonitoringBenchFamily
+    from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 
     validate_experiment(exp)
     frozen = _frozen_settings(exp)
@@ -293,7 +293,7 @@ def build_task_source(exp: dict, task_ids: Optional[list[str]], seed: Optional[i
     """dataset block -> MonitoringBenchTaskSource. Imported lazily: the module
     is only needed on the real-data path (tests inject synthetic sources).
     CLI task_ids/seed override the dataset block's."""
-    from infra.envs.monitoringbench import MonitoringBenchTaskSource
+    from infra.envs.tasks.monitoringbench import MonitoringBenchTaskSource
 
     ds = exp.get("dataset") or {}
     files = ds.get("files")

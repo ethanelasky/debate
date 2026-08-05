@@ -228,7 +228,12 @@ fi
 
 case "$MODE" in
   debate) RUNNER=infra.run_debate; CONFIG=configs/math_pc_olmo.yaml ;;
-  rlvr)   RUNNER=infra.run_rlvr;   CONFIG=configs/math_rlvr_olmo.yaml ;;
+  rlvr)   RUNNER=infra.run_rlvr
+          # config file by experiment-name prefix: mb_* is MonitoringBench
+          case "$EXP" in
+            mb_*) CONFIG=configs/mb_rlvr.yaml ;;
+            *)    CONFIG=configs/math_rlvr_olmo.yaml ;;
+          esac ;;
   *) echo "unknown mode $MODE (debate|rlvr)" >&2; exit 2 ;;
 esac
 

@@ -4,10 +4,12 @@ implementing TaskFamily + one entry here."""
 from infra.envs.tasks.base import TaskFamily
 from infra.envs.tasks.codecontests import CodeContestsFamily
 from infra.envs.tasks.math import MathFamily
+from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 
 TASK_FAMILIES: dict[str, type[TaskFamily]] = {
     "codecontests": CodeContestsFamily,
     "math": MathFamily,
+    "monitoringbench": MonitoringBenchFamily,
 }
 
 

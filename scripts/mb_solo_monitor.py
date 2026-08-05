@@ -56,7 +56,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import yaml  # noqa: E402
 
-from infra.envs.monitoringbench import (  # noqa: E402
+from infra.envs.tasks.monitoringbench import (  # noqa: E402
     load_rows as load_mb_rows,
     render_transcript,
 )

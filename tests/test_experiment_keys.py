@@ -91,6 +91,19 @@ def test_rlvr_rejects_debate_only_keys():
     assert "agents" in str(exc.value)
 
 
+def test_rlvr_prompt_config_and_protocol_come_together():
+    # MB blind choice needs both (blind_choice_dataset); one alone is a typo.
+    for lone in ("prompt_config", "protocol"):
+        exp = _rlvr_exp()
+        exp[lone] = {"x": 1} if lone == "prompt_config" else {"turns": []}
+        with pytest.raises(ValueError, match="come together"):
+            validate_rlvr(exp)
+    exp = _rlvr_exp()
+    exp["prompt_config"] = {"file_path": "x.yaml", "entry": "e"}
+    exp["protocol"] = {"turns": []}
+    validate_rlvr(exp)
+
+
 def _shipped_experiments():
     for path in sorted(CONFIG_DIR.glob("*.yaml")):
         resolved = resolve_experiments_from_file(path)

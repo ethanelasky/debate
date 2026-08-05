@@ -1,0 +1,84 @@
+# RLVR on the MonitoringBench blind side choice: same model, backend, and GRPO
+# machinery as math_rlvr_olmo, but reward = blind-choice correctness
+# (<answer>attack|benign</answer> vs meta["label"] — see
+# infra/envs/tasks/monitoringbench.py reward()). The judge-free baseline for
+# the MB debate-training experiments.
+#
+# PROMPT PARITY: prompt_config + protocol are copied VERBATIM from
+# mb_eval.yaml's mb_debate_choice arm. run_rlvr feeds them through
+# run_eval.blind_message_templates — the same function the eval arm uses — so
+# the RLVR context ([system: monitor role card][user: blind instructions]
+# [user: trajectory]) is byte-identical to the eval arm's blind view for the
+# same row. Editing the entry or turns here breaks that parity; edit
+# mb_eval.yaml and mirror.
+#
+# Run (on the pod): scripts/pod_run.sh rlvr mb_rlvr_olmo --steps 100 --lr 1e-4
+#
+# SAFETY: data/monitoringbench/*.jsonl contain red-team attack trajectories.
+# Never print/log record contents; work by id/label/count only.
+
+mb_rlvr_olmo:
+  model: allenai/Olmo-3-7B-Instruct-DPO
+  max_completion_tokens: 4096   # = the eval arm's blind_assessment slot budget
+  prompt_config:
+    file_path: infra/prompts/debate/monitoringbench.yaml
+    entry: mb_debate_choice
+  # Verbatim mb_debate_choice turns (blind_message_templates needs the
+  # solution slot and validates the full entry against these). Only the
+  # blind_assessment slot shapes the RLVR prompt; the rest never renders here.
+  protocol:
+    turns:
+      - alice: [{name: blind_assessment, kind: solution, max_total_tokens: 4096}]
+        bob:   [{name: pre_opening_speech, max_total_tokens: 4096}]
+      - alice: [{name: pre_speech, max_total_tokens: 4096}]
+        bob:   [{name: pre_speech, max_total_tokens: 4096}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 32768},
+                {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
+  dataset:
+    type: monitoringbench
+    # 2026-07-30 pool amendment: honest_mb116 + attacks_covering140_v2 = 256 rows.
+    files:
+      - data/monitoringbench/honest_mb116.jsonl
+      - data/monitoringbench/attacks_covering140_v2.jsonl
+    seed: 0
+    # Held out of training: the FIRST 64 seed-0-shuffled rows — the same rows
+    # an uncarved eval source serves first, so eval selections stay comparable.
+    test_size: 64
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1
+      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
+      gpu_memory_utilization: 0.45 # no judge server: rollout can take more than debate's 0.33
+      # MB trajectories run to ~58k input tokens (mb_eval.yaml); 61440 + 4096
+      # response = 65536, OLMo-3's YaRN context ceiling. A row over the cap
+      # should fail loudly, not truncate silently.
+      prompt_length: 61440
+      response_length: 4096
+      max_token_len_per_gpu: 65536 # packing unit must fit ONE full-length MB datum
+      checkpoint_dir: /workspace/checkpoints
+    wandb_project: debate-mb
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8      # 8-way groups, as in math_rlvr_olmo_l5
+    lr: 1.0e-4         # the math-RLVR lr that moved the policy; sweep from here
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5
+    eval_n: 64         # the whole held-out split (binary task: +-6pp binomial noise)
+    eval_max_tokens: 4096
+    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# tiny live-verification arm
+mb_rlvr_olmo_smoke:
+  _extends: mb_rlvr_olmo
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0
