@@ -100,14 +100,19 @@ def main() -> None:
 
     # ---- phase 1: audit — every pool row, real templates, real chat template
     tokenizer = AutoTokenizer.from_pretrained(str(exp["model"]))
+
+    def render_len(messages) -> int:
+        # Policy.render's unwrap: some tokenizer wrappers return a
+        # BatchEncoding (len() = its KEY COUNT, silently ~2) or a nested list.
+        out = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        if not isinstance(out, list):
+            out = out["input_ids"]
+        if out and isinstance(out[0], list):
+            out = out[0]
+        return len(out)
+
     all_tasks = [env._task(r) for r in env.rows]
-    lengths = sorted(
-        (
-            len(tokenizer.apply_chat_template(t.messages, add_generation_prompt=True, tokenize=True)),
-            t.meta["task_id"],
-        )
-        for t in all_tasks
-    )
+    lengths = sorted((render_len(t.messages), t.meta["task_id"]) for t in all_tasks)
     n = len(lengths)
     print(f"pool: {n} rows | prompt tokens min/median/max: "
           f"{lengths[0][0]}/{lengths[n // 2][0]}/{lengths[-1][0]} | cap {prompt_cap}")
@@ -117,6 +122,12 @@ def main() -> None:
             print(f"  OVER CAP: {tid} = {ln} tokens", file=sys.stderr)
         sys.exit(f"{len(over)} row(s) exceed prompt_length={prompt_cap} — raise the cap "
                  "or drop the rows; do not launch training")
+    if lengths[-1][0] < 4096:
+        sys.exit(
+            f"suspiciously short: longest rendered prompt is {lengths[-1][0]} tokens, but MB "
+            "transcripts run to tens of thousands — the render path is broken; fix before trusting "
+            "this audit"
+        )
     print(f"audit OK: longest row {lengths[-1][1]} = {lengths[-1][0]} tokens fits the cap")
 
     if not args.gpu:

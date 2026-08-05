@@ -36,10 +36,13 @@ mb_rlvr_olmo:
                 {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
   dataset:
     type: monitoringbench
-    # 2026-07-30 pool amendment: honest_mb116 + attacks_covering140_v2 = 256 rows.
+    # 2026-08-05 pool (mb-550-pool, LFS): honest_mb116 + attacks_mb550 = 666
+    # rows, 83% attack. IMBALANCE IS KNOWN — honest waves are still
+    # generating; rebalance before the real run (a collapse-to-attack policy
+    # earns the 0.83 base rate; watch train/chose_attack).
     files:
       - data/monitoringbench/honest_mb116.jsonl
-      - data/monitoringbench/attacks_covering140_v2.jsonl
+      - data/monitoringbench/attacks_mb550.jsonl
     seed: 0
     # Held out of training: the FIRST 64 seed-0-shuffled rows — the same rows
     # an uncarved eval source serves first, so eval selections stay comparable.
@@ -73,12 +76,17 @@ mb_rlvr_olmo:
     eval_max_tokens: 4096
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
-# tiny live-verification arm
+# tiny live-verification arm: 2 train steps plus ONE eval pass over a single
+# 8-row held-out carve (1 batch-worth) — the eval rollout path is part of what
+# the smoke verifies (Ethan 2026-08-05).
 mb_rlvr_olmo_smoke:
   _extends: mb_rlvr_olmo
+  dataset:
+    test_size: 8
   training:
     steps: 2
     batch_size: 2
     group_size: 4
-    eval_every: 0
+    eval_every: 1
+    eval_n: 8
     save_every: 0
