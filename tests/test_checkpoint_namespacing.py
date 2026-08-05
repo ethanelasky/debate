@@ -10,7 +10,7 @@ and a fresh run refuses to start on top of an existing lineage.
 
 import pytest
 
-from infra.run_debate import (
+from infra.run_common import (
     build_backend,
     check_fresh_run_over_existing_checkpoints,
     check_legacy_checkpoint_layout,

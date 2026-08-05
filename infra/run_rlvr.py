@@ -21,16 +21,15 @@ prompt is byte-identical to the eval arm's blind view for the same row.
 
 from __future__ import annotations
 
-import argparse
-
 from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
-from infra.run_debate import (
+from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
     build_backend,
     run_identity_suffix,
+    runner_parser,
     training_config_kwargs,
 )
 from infra.train import Config, train
@@ -44,7 +43,7 @@ def validate_experiment(exp: dict) -> None:
     Same contract as run_debate.validate_experiment: a typo must fail at
     launch instead of silently falling back to a default. Adding a new
     `exp.get(...)`/`tr.get(...)` read means adding the key here (or to
-    run_debate.TRAINING_KEYS / VERL_KEYS, which this shares).
+    run_common.TRAINING_KEYS / VERL_KEYS, which both runners share).
     """
     reject_unknown_keys(exp, EXPERIMENT_KEYS, "rlvr experiment")
     tr = exp.get("training") or {}
@@ -73,18 +72,7 @@ def blind_choice_dataset(exp: dict, ds: dict) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment-file", required=True)
-    parser.add_argument("--experiment", required=True)
-    parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
-    parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
-    parser.add_argument("--steps", type=int, default=None, help="override training.steps")
-    parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
-    parser.add_argument("--levels", default=None, help="override dataset.levels (e.g. 4 or 3-4)")
-    parser.add_argument("--group-size", type=int, default=None, help="override training.group_size")
-    parser.add_argument("--batch-size", type=int, default=None, help="override training.batch_size")
-    parser.add_argument("--load", default=None)
-    args = parser.parse_args()
+    args = runner_parser(__doc__).parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
