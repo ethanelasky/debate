@@ -166,6 +166,23 @@ class VerlBackendConfig:
         ]
 
 
+def _release_training_cache(*_args, **_kwargs):
+    """Runs INSIDE the training worker (dispatched via execute_func_rank_zero;
+    must stay module-level picklable). Returns MiB (allocated, reserved)
+    before and after the flush so the driver can tell real allocations from
+    cache when a wake still OOMs."""
+    import gc
+
+    import torch
+
+    mib = 1024 * 1024
+    before = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
+    gc.collect()
+    torch.cuda.empty_cache()
+    after = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
+    return {"before": before, "after": after}
+
+
 class VerlBackend(Backend):
     def __init__(self, config: VerlBackendConfig):
         import ray
@@ -187,7 +204,17 @@ class VerlBackend(Backend):
             self.verl_config = compose(config_name=config.config_name, overrides=config.hydra_overrides())
 
         if not ray.is_initialized():
-            ray.init()
+            # expandable_segments lets the training allocator hand freed
+            # segments back to CUDA, so the slept vLLM's wake-time re-pin can
+            # claim them. Without it, MB-length steps (65k-token packing
+            # units, ~79GB train peak) OOM inside wake_up at every
+            # gpu_memory_utilization that can still serve a 65k KV
+            # (2026-08-05 smoke + memprobe bisection).
+            ray.init(
+                runtime_env={
+                    "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+                }
+            )
 
         pool = RayResourcePool(process_on_nodes=[config.n_gpus])
         self.wg = RayWorkerGroup(
@@ -218,6 +245,14 @@ class VerlBackend(Backend):
     # ------------------------------------------------------------- sampling
 
     def sync_sampler(self) -> None:
+        # Flush the training actor's allocator BEFORE the slept vLLM re-pins
+        # its pools: wake-time create_and_map competes for the same physical
+        # memory, and at MB lengths (65k packing units, ~79GB train peak) the
+        # cached-but-free segments alone are the difference between wake and
+        # OOM (2026-08-05 bisection). RANK_ZERO is exact for n_gpus=1; on
+        # multi-GPU this flushes only rank 0 — revisit then.
+        stats = self.wg.execute_func_rank_zero(_release_training_cache)
+        print(f"[verl] train-actor CUDA MiB (alloc/reserved) before->after flush: {stats}")
         # Wakes the rollout engine and pushes current FSDP weights (CUDA IPC).
         self.checkpoint_manager.update_weights(self._global_step)
         self._rollout_awake = True

@@ -81,6 +81,10 @@ def main() -> None:
     parser.add_argument("--experiment", default="mb_rlvr_olmo")
     parser.add_argument("--top-k", type=int, default=4, help="longest rows to probe on GPU")
     parser.add_argument("--gpu", action="store_true", help="run the gen + train phases (pod)")
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=None,
+        help="override training.verl.gpu_memory_utilization for this probe run",
+    )
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -92,6 +96,9 @@ def main() -> None:
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
     v = exp["training"]["verl"]
+    if args.gpu_memory_utilization is not None:
+        v["gpu_memory_utilization"] = args.gpu_memory_utilization
+        print(f"OVERRIDE gpu_memory_utilization={args.gpu_memory_utilization}")
     prompt_cap, resp_cap = int(v["prompt_length"]), int(v["response_length"])
 
     ds = dict(exp["dataset"])
@@ -171,7 +178,18 @@ def main() -> None:
     with GpuPeak() as peak:
         backend.forward_backward(datums, loss)
         backend.optim_step(OptimParams(lr=float(exp["training"]["lr"])))
-    print(f"train OK: {len(datums)} datums x {len(datums[0].tokens)} tokens | "
+    lens = sorted(len(d.tokens) for d in datums)
+    print(f"train OK: {len(datums)} datums, {lens[0]}-{lens[-1]} tokens | "
+          f"peak GPU {peak.peak_mib} MiB")
+
+    # The transition the first smoke died on (2026-08-05): waking the slept
+    # vLLM AFTER a train step re-pins its ~32GB against whatever the training
+    # allocator still holds. A probe that stops at optim_step certifies
+    # nothing about a real step boundary — this phase is the point.
+    with GpuPeak() as peak:
+        backend.sync_sampler()
+        wake_out = policy.predict([tasks[0].messages], n=1)
+    print(f"wake+resample OK: {len(wake_out[0][0].tokens)} completion tokens | "
           f"peak GPU {peak.peak_mib} MiB")
     print("memprobe PASSED — smoke is safe to launch at these lengths")
 
