@@ -351,7 +351,7 @@ import sys
 from urllib.parse import urlparse
 
 from infra.config import load_experiment
-from infra.run_debate import check_legacy_checkpoint_layout
+from infra.run_common import check_legacy_checkpoint_layout
 
 exp = load_experiment(sys.argv[1], sys.argv[2])
 ms = ((exp.get("agents") or {}).get("judge") or {}).get("model_settings") or {}

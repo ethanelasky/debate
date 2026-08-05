@@ -99,3 +99,82 @@ math_pc_olmo_smoke:
     group_size: 4   # group 2 risks all-identical verdicts -> every datum dropped
     eval_every: 0
     save_every: 0
+
+# Mirror of the successful math_rlvr_olmo_l5 run (wandb debate-rebuild,
+# 2026-08-04, final eval 77.3%): group 8, lr 1e-4, and the proposal budget
+# raised to RLVR's 2000-token completion cap — the post-ff3820c step-by-step
+# answer prompt runs long, and 1000 truncated proposals would poison the judge
+# signal. Standalone entry, same reason as math_pc_olmo_l5: protocol turn
+# lists merge BY INDEX under _extends.
+math_pc_olmo_l5_g8:
+  protocol:
+    turns:
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
+                {name: proposal, kind: solution, max_total_tokens: 2000}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: critique, max_total_tokens: 500}]
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: defense, max_total_tokens: 500}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: rebuttal, max_total_tokens: 500}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math.yaml
+    entry: math_proposer_critic
+  fresh_positions: true
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: proposer-alice
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: critic-bob
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 2                      # 2xH100 pod (4x had no US-CA-2 stock 2026-08-05);
+                                     # judge still colocates on GPU 0 at 0.18
+      strategy: fsdp2
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.33
+      prompt_length: 8192
+      response_length: 2048          # largest slot cap (proposal 2000)
+      max_token_len_per_gpu: 16384
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8      # as in math_rlvr_olmo_l5; halves advantage noise vs the g4 runs
+    lr: 1.0e-4         # the RLVR lr that reached 77.3%; 1e-5 was dead here
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5      # RLVR eval: greedy MathEnv accuracy on held-out L5 test
+    eval_n: 256
+    eval_max_tokens: 2000
+    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
