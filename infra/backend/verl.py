@@ -150,6 +150,13 @@ class VerlBackendConfig:
             # engine KV sizing: without this vllm sizes for the MODEL'S native max
             f"actor_rollout_ref.rollout.max_model_len={self.prompt_length + self.response_length}",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={self.gpu_memory_utilization}",
+            # Pinned ON rather than trusting the engine default: debate contexts
+            # are built for it (each seat's turn-t context strictly extends its
+            # turn t-1 context; GRPO groups share the whole task prefix), and
+            # the cache shares the existing KV pool via LRU — no extra memory
+            # budget. If the pod's verl snapshot predates this key, hydra fails
+            # at launch: drop the override there and upgrade verl.
+            "actor_rollout_ref.rollout.enable_prefix_caching=True",
             "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
             f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={self.max_token_len_per_gpu}",
             "actor_rollout_ref.rollout.checkpoint_engine.backend=naive",
