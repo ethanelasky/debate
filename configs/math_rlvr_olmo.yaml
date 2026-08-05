@@ -19,7 +19,7 @@ math_rlvr_olmo_l5:
       response_length: 2000
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
-    wandb_project: debate-rebuild
+    wandb_project: debate-math
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1
