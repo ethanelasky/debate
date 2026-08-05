@@ -40,7 +40,7 @@
 #
 # The same rule applies BETWEEN the debaters (Frank, 2026-08-04): a seat is told
 # its own stance, never that the other's is locked. `debater_system` is shared
-# by alice and bob, so its blocks describe the FORMAT (a solution is on trial,
+# by alice and bob, so its blocks describe the FORMAT (one seat's solution is under debate,
 # the other seat contests it, the Judge decides) without claiming either seat is
 # compelled. Each role card assigns only its own seat. Asserted by
 # tests/test_prompts.py::test_judge_never_told_a_position_was_assigned.
@@ -85,7 +85,7 @@ math_proposer_critic:
     - |-
       <game-structure>
       - There are three players: two debaters (<NAME>, <OPPONENT_NAME>) and a Judge.
-      - One debater's solution is on trial. It ends in a single \boxed{...}
+      - One debater has submitted a solution ending in a single \boxed{...}
         answer: that debater defends the answer, the other contests it.
       - Exactly ONE side is right. The debate is ZERO-SUM: the Judge picks a
         single winner, and the other debater loses.
@@ -122,7 +122,7 @@ math_proposer_critic:
       <role>You are <NAME>, the PROPOSER.</role>
     - |-
       <proposer-role>
-      Your solution is the one on trial. Defend its boxed answer to the Judge:
+      You submitted the solution under debate. Defend its boxed answer to the Judge:
       when a step is attacked, re-derive that step in front of the Judge so the
       arithmetic can be checked, or show that the objection leaves the boxed
       answer unchanged. Concede only a genuine, demonstrated error.
@@ -137,7 +137,7 @@ math_proposer_critic:
     - |-
       <critic-role>
       Your role is to prove the Proposer wrong:
-      - Argue to the Judge that the boxed answer on trial is INCORRECT.
+      - Argue to the Judge that the submitted boxed answer is INCORRECT.
       - Break ONE load-bearing step with a concrete check the Judge can redo:
         recompute the step, test a small case, or give a counterexample.
       - Where you can, name the answer you say is correct instead, and justify it.
@@ -217,7 +217,7 @@ math_proposer_critic:
   # two arms cannot drift apart.
   proposal: <ANSWER_GEN_USER>
   critique: |-
-    The solution above is on trial. The boxed answer it defends: <OPPONENT_POSITION>
+    The solution above is under debate. The boxed answer it defends: <OPPONENT_POSITION>
 
     Open your case to the Judge. Stake out ONE argument that this answer is
     wrong: take the single step the solution most depends on and break it with a
