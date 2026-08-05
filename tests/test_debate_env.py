@@ -289,6 +289,27 @@ def test_grade_exception_recorded_not_propagated():
     assert env.last_rollout_info["grade_errors"] == 1
 
 
+def test_grading_goes_through_grade_batch():
+    """The seam a learned verifier overrides: when a family provides its own
+    grade_batch, DebateEnv must use it — per-pair grade() is never called."""
+
+    class BatchOnlyFamily(MathFamily):
+        def grade(self, meta, solution):
+            raise AssertionError("per-pair grade() bypasses the grade_batch seam")
+
+        def grade_batch(self, items):
+            self.last_grade_errors = 0
+            return [True for _ in items]
+
+    backend = ScriptedBackend(["\\boxed{2}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [GOOD_VERDICT], family=BatchOnlyFamily())
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+    (t,) = groups[0]
+    assert t.info["solution_correct"] == 1.0
+    assert env.last_rollout_info["grade_errors"] == 0
+
+
 def test_unscoreable_verdict_drops_debate():
     backend = ScriptedBackend(["\\boxed{2}", "Defense."])
     policy = Policy(backend, SamplingParams(max_tokens=128))

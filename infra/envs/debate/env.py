@@ -13,7 +13,6 @@ per-datum advantage offsets in grpo_pack.
 
 from __future__ import annotations
 
-import concurrent.futures
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -131,8 +130,9 @@ class DebateEnv(Env):
     Task.meta carries {"question"} plus whatever the family's grade() reads
     (any TaskFamily.source() qualifies). `family` (a TaskFamily, duck-typed
     to keep this module import-light) owns everything task-specific:
-    extractor() binds solution slots to positions, grade() scores them,
-    format_flags() feeds shaping terms."""
+    extractor() binds solution slots to positions, grade_batch() scores them
+    (owning the execution shape — pool, batched call, whatever the verifier
+    wants), format_flags() feeds shaping terms."""
 
     def __init__(self, config: DebateEnvConfig, task_source, family, relaxed_extraction: bool = True):
         self.config = config
@@ -549,10 +549,10 @@ class DebateEnv(Env):
     def _grade_solutions(
         self, states: list[DebateState]
     ) -> tuple[dict[tuple[Any, str], Optional[bool]], int]:
-        """family.grade for every (task, solution) pair _trajectories will
-        need, deduped and run in a thread pool (grading may shell out to slow
-        subprocesses; math grading is trivially fast and unharmed by the pool).
-        A grade call that raises records None — it must never kill a rollout."""
+        """Every (task, solution) pair _trajectories will need, deduped, then
+        graded through family.grade_batch — the family owns the execution
+        shape (thread pool for subprocess verifiers, one batched call for a
+        learned one) and the never-raises contract; this side owns the dedup."""
         pending: dict[tuple[Any, str], tuple[dict[str, Any], Any]] = {}
         for st in states:
             if st.failed is not None:
@@ -569,21 +569,11 @@ class DebateEnv(Env):
                 key = self._grade_key(st, solution)
                 if key not in pending:
                     pending[key] = (st.meta.get("task") or {}, solution)
-        grades: dict[tuple[Any, str], Optional[bool]] = {}
-        errors = 0
-        if pending:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {
-                    key: pool.submit(self.family.grade, meta, solution)
-                    for key, (meta, solution) in pending.items()
-                }
-                for key, fut in futures.items():
-                    try:
-                        grades[key] = fut.result()
-                    except Exception:  # noqa: BLE001
-                        grades[key] = None
-                        errors += 1
-        return grades, errors
+        if not pending:
+            return {}, 0
+        keys = list(pending)
+        results = self.family.grade_batch([pending[k] for k in keys])
+        return dict(zip(keys, results)), int(getattr(self.family, "last_grade_errors", 0))
 
     def _attach_labels(
         self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]

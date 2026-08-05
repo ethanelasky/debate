@@ -8,6 +8,7 @@ import json
 import pytest
 
 from infra.envs.debate.judge_accuracy import from_jsonl, judge_was_right, tally
+from infra.envs.tasks.base import TaskFamily
 
 A, B = "Debater_A", "Debater_B"
 
@@ -164,7 +165,10 @@ def test_label_survives_export_where_the_ground_truth_cannot(tmp_path):
                 for _ in range(n)
             ]
 
-    class TestCaseFamily:
+    class TestCaseFamily(TaskFamily):
+        def source(self, ds):
+            raise NotImplementedError("test family; the source is TestCaseSource")
+
         def extractor(self, relaxed):
             return lambda text: text.strip() or None
 

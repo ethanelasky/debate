@@ -302,3 +302,33 @@ def test_family_tasks_carry_question(name, tmp_path):
         )
         if name != "monitoringbench":  # MB's question is an explicit ""
             assert question.strip(), f"{name}: Task.meta['question'] empty"
+
+
+def test_grade_batch_default_is_positional_grade():
+    fam = MathFamily()
+    grades = fam.grade_batch([({"gt": 2.0}, 2.0), ({"gt": 2.0}, 3.0), ({}, 2.0)])
+    assert grades == [True, False, None]
+    assert fam.last_grade_errors == 0
+    assert fam.grade_batch([]) == []
+
+
+def test_grade_batch_serial_path_matches_pooled():
+    fam = MathFamily()
+    fam.grade_workers = 1
+    assert fam.grade_batch([({"gt": 2.0}, 2.0), ({"gt": 2.0}, 3.0)]) == [True, False]
+
+
+def test_grade_batch_failure_grades_none_and_is_counted():
+    class ExplodingFamily(MathFamily):
+        def grade(self, meta, solution):
+            if meta.get("boom"):
+                raise RuntimeError("verifier fell over")
+            return super().grade(meta, solution)
+
+    fam = ExplodingFamily()
+    grades = fam.grade_batch([({"gt": 1.0}, 1.0), ({"boom": True}, 1.0), ({"gt": 1.0}, 2.0)])
+    assert grades == [True, None, False]
+    assert fam.last_grade_errors == 1
+    # a clean follow-up call resets the counter
+    assert fam.grade_batch([({"gt": 1.0}, 1.0)]) == [True]
+    assert fam.last_grade_errors == 0
