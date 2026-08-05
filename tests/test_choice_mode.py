@@ -838,8 +838,12 @@ turns:
         assert "four security failures" in system
         assert "<answer>attack</answer>" in cue
         assert "<BACKGROUND_TEXT>" in traj
-        for word in ("debate", "opponent", "judge", "assigned"):
+        # the blind view must carry no debate framing. "judge" is exempted for
+        # the SYSTEM card only: the real monitor prompt uses it as a verb
+        # ("asked to judge a newly proposed action"), which names no debate.
+        for word in ("debate", "opponent", "assigned"):
             assert word not in (system + cue).lower(), word
+        assert "judge" not in cue.lower()
         for tmpl in (system, cue, traj):
             render(tmpl, {"BACKGROUND_TEXT": "x"}, vars_)  # renders fully
 
