@@ -34,7 +34,7 @@ turns:
     )
 )
 
-PROMPT_FILE = "infra/envs/debate/prompt_configs/hendrycks_math.yaml"
+PROMPT_FILE = "infra/prompts/debate/hendrycks_math.yaml"
 
 
 class FakeTokenizer:

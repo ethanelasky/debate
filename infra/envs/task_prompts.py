@@ -1,4 +1,4 @@
-"""Loader for task-family answer-generation prompts (infra/envs/tasks/prompt_configs/*).
+"""Loader for task-family answer-generation prompts (infra/prompts/tasks/*).
 
 Lives outside the tasks package so env modules can import it without pulling in
 the family registry (infra.envs.tasks.__init__ imports the env modules).
@@ -31,7 +31,7 @@ from typing import Optional
 
 import yaml
 
-PROMPT_CONFIG_DIR = Path(__file__).resolve().parent / "tasks" / "prompt_configs"
+PROMPT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "infra" / "prompts" / "tasks"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 PROBLEM_PLACEHOLDER = "<PROBLEM>"
 _NOTES_PLACEHOLDER = "<FORMAT_NOTES>"

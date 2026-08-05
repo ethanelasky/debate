@@ -203,7 +203,7 @@ def _debate_env(env):
     return DebateEnv(
         DebateEnvConfig(
             protocol=_pc_protocol(),
-            prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
+            prompt_file="infra/prompts/debate/codecontests.yaml",
             prompt_entry="codecontests_proposer_critic",
             trained_speakers=["alice"],
             frozen_models={"bob": object(), "judge": object()},

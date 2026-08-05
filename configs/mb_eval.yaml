@@ -56,7 +56,7 @@ _models:
 # parent protocol's `turns` would silently inherit leftover parent turns.
 _mb_base:
   prompt_config:
-    file_path: infra/envs/debate/prompt_configs/monitoringbench.yaml
+    file_path: infra/prompts/debate/monitoringbench.yaml
   fresh_positions: false   # positions come from task.meta gold/distractor
   flip: false              # fixed seating: alice/Debater_A argues "attack"
   # POST-GENERATION visible truncation of non-judge speech slots; must equal
@@ -112,7 +112,7 @@ mb_debate:
       # the debater rounds, e.g.
       #   - judge: [{name: judge_question_generation, max_total_tokens: 4096}]
       # using the question templates ported into
-      # infra/envs/debate/prompt_configs/monitoringbench.yaml (quality.yaml
+      # infra/prompts/debate/monitoringbench.yaml (quality.yaml
       # wording). Blocked on infra support for binding the judge's questions
       # into <JUDGE_QUESTIONS> for the debaters' next slot
       # (pre_judge_question_for_debater); see MB_PROMPT_DELTAS.md delta 11.

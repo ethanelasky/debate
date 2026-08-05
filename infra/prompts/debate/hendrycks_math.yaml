@@ -57,7 +57,7 @@
 # `answer_generation_user` composition (including the answer-format sentence
 # that used to be the ANSWER_FORMAT_INSTRUCTION var), which the RLVR arm sends
 # verbatim too, so it is single-sourced from
-# infra/envs/tasks/prompt_configs/math.yaml and spliced in by DebateEnv wherever
+# infra/prompts/tasks/math.yaml and spliced in by DebateEnv wherever
 # this pack writes <ANSWER_GEN_USER>. Both arms then render the same bytes. Edit
 # the wording THERE, not here. The codecontests pack works the same way.
 _math_base: {}

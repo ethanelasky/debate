@@ -18,8 +18,8 @@ def task_prompts(name: str):
     return load_generation_prompts(resolve_prompt_file(None, name))
 
 
-MATH_YAML = "infra/envs/debate/prompt_configs/hendrycks_math.yaml"
-CODECONTESTS_YAML = "infra/envs/debate/prompt_configs/codecontests.yaml"
+MATH_YAML = "infra/prompts/debate/hendrycks_math.yaml"
+CODECONTESTS_YAML = "infra/prompts/debate/codecontests.yaml"
 
 # DESIGN-debate-env.md §1, proposer_critic_2round.
 PC_TOPOLOGY = {
@@ -461,7 +461,7 @@ def test_preview_shows_block_placement():
     )
     lib = splice_task_prompts(
         load_prompt_library(
-            "infra/envs/debate/prompt_configs/hendrycks_math.yaml", "math_proposer_critic", proto
+            "infra/prompts/debate/hendrycks_math.yaml", "math_proposer_critic", proto
         ),
         "math.yaml",
     )

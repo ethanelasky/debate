@@ -259,7 +259,7 @@ class DebateEnv(Env):
                 f"prompt entry {self.config.prompt_entry!r} references {missing}, which the task "
                 f"source must supply, but {type(self.task_source).__name__} supplied "
                 f"{sorted(available) or 'nothing'}. These come from the task family's "
-                "answer-generation config (infra/envs/tasks/prompt_configs/<family>.yaml)."
+                "answer-generation config (infra/prompts/tasks/<family>.yaml)."
             )
         if not requested:
             return

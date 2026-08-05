@@ -117,7 +117,7 @@ def test_math_debate_pack_splices_the_rlvr_prompt():
     from infra.envs.debate.protocol import Protocol
 
     lib = load_prompt_library(
-        "infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+        "infra/prompts/debate/hendrycks_math.yaml",
         "math_proposer_critic",
         Protocol.parse(
             {
@@ -166,7 +166,7 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
                     ]
                 }
             ),
-            prompt_file="infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+            prompt_file="infra/prompts/debate/hendrycks_math.yaml",
             prompt_entry="math_proposer_critic",
             trained_speakers=["alice"],
             frozen_models={"bob": object(), "judge": object()},
@@ -199,7 +199,7 @@ def test_prompt_file_override(tmp_path):
 
 def test_prompt_file_relative_path_resolves_against_repo_root():
     prompts = load_generation_prompts(
-        resolve_prompt_file("infra/envs/tasks/prompt_configs/math.yaml", "codecontests.yaml")
+        resolve_prompt_file("infra/prompts/tasks/math.yaml", "codecontests.yaml")
     )
     assert prompts.answer_gen_system == MATH_SYSTEM
 

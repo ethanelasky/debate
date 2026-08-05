@@ -64,7 +64,7 @@ def create_app(
     app.state.prompts_dir = (
         Path(prompts_dir)
         if prompts_dir
-        else _REPO_ROOT / "infra" / "envs" / "debate" / "prompt_configs"
+        else _REPO_ROOT / "infra" / "prompts" / "debate"
     )
     app.state.templates = Jinja2Templates(directory=str(_PKG_DIR / "templates"))
 

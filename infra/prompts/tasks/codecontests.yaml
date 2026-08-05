@@ -11,7 +11,7 @@
 # arms. The RLVR user message and the debate proposal slot are the SAME
 # composition rendered byte-for-byte identically: DebateEnv splices
 # answer_gen_user into the proposal slot wherever
-# infra/envs/debate/prompt_configs/codecontests.yaml writes <ANSWER_GEN_USER>,
+# infra/prompts/debate/codecontests.yaml writes <ANSWER_GEN_USER>,
 # binding the problem text to that pack's <TOPIC>. Editing the wording here
 # changes both arms together, which is the point — do not restate it there.
 # math.yaml works the same way; the two families are not treated differently.

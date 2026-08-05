@@ -13,7 +13,7 @@ _base_math_pc:
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 768},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
-    file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
+    file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
   agents:

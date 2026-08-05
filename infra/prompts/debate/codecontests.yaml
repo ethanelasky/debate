@@ -78,7 +78,7 @@
 
 # The proposal cue's text is NOT written here — it is the task family's
 # answer-generation user message, spliced in wherever this pack writes
-# <ANSWER_GEN_USER>. Edit it in infra/envs/tasks/prompt_configs/codecontests.yaml.
+# <ANSWER_GEN_USER>. Edit it in infra/prompts/tasks/codecontests.yaml.
 _codecontests_base: {}
 
 codecontests_proposer_critic:

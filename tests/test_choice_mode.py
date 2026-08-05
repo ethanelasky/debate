@@ -824,7 +824,7 @@ turns:
     ):
         exp = {
             "prompt_config": {
-                "file_path": "infra/envs/debate/prompt_configs/monitoringbench.yaml",
+                "file_path": "infra/prompts/debate/monitoringbench.yaml",
                 "entry": entry,
             }
         }
@@ -872,12 +872,12 @@ def test_real_choice_entries_cache_invariants():
     import re
 
     dbg = load_prompt_library(
-        "infra/envs/debate/prompt_configs/monitoringbench.yaml",
+        "infra/prompts/debate/monitoringbench.yaml",
         "mb_debate_choice",
         MB_DEBATE_CHOICE_TOPO,
     )
     sc = load_prompt_library(
-        "infra/envs/debate/prompt_configs/monitoringbench.yaml",
+        "infra/prompts/debate/monitoringbench.yaml",
         "mb_single_consultancy_choice",
         MB_SC_CHOICE_TOPO,
     )

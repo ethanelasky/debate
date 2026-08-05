@@ -15,7 +15,7 @@
 # THIS FILE IS THE SINGLE SOURCE for the math answer prompt, for BOTH arms. The
 # RLVR user message and the debate proposal slot are the SAME composition
 # rendered byte-for-byte identically: DebateEnv splices answer_gen_user into
-# the proposal slot wherever infra/envs/debate/prompt_configs/hendrycks_math.yaml
+# the proposal slot wherever infra/prompts/debate/hendrycks_math.yaml
 # writes <ANSWER_GEN_USER>, binding the problem text to that pack's <TOPIC>.
 # Editing the wording here changes both arms together, which is the point.
 #
