@@ -122,10 +122,10 @@ math_proposer_critic:
       <role>You are <NAME>, the PROPOSER.</role>
     - |-
       <proposer-role>
-      You submitted the solution under debate. Defend its boxed answer to the Judge:
-      when a step is attacked, re-derive that step in front of the Judge so the
-      arithmetic can be checked, or show that the objection leaves the boxed
-      answer unchanged. Concede only a genuine, demonstrated error.
+      You write the solution under debate, then defend its boxed answer to the
+      Judge: when a step is attacked, re-derive that step in front of the Judge
+      so the arithmetic can be checked, or show that the objection leaves the
+      boxed answer unchanged. Concede only a genuine, demonstrated error.
       </proposer-role>
     - |-
       <grading-rule>
