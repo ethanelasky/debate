@@ -198,13 +198,13 @@ def test_preamble_carries_the_problem_to_critic_and_judge_not_the_system_card():
     for name in ("bob", "judge"):
         msgs = seen[name][0]
         first_user = next(m["content"] for m in msgs if m["role"] == "user")
-        assert "The debate concerns this problem:" in first_user, name
+        assert "The debate concerns the following problem:" in first_user, name
         assert problem in first_user, name
-        assert first_user.index("The debate concerns this problem:") == 0, name
+        assert first_user.index("The debate concerns the following problem:") == 0, name
 
     # the proposer's first user message is the answer-generation cue, unprefixed
     proposal_ctx = backend.contexts[0]
-    assert "The debate concerns this problem:" not in proposal_ctx
+    assert "The debate concerns the following problem:" not in proposal_ctx
 
 
 def test_fresh_position_binds_into_critique_and_verdict():
@@ -336,7 +336,7 @@ def test_docent_export(tmp_path):
 
     # message 1 is the judge's pre_debate_judge preamble, its own user message;
     # the attributed transcript starts in the message after it
-    assert "The debate concerns this problem:" in _text(judge_view.messages[1])
+    assert "The debate concerns the following problem:" in _text(judge_view.messages[1])
     assert "Debater_A said:" in _text(judge_view.messages[2])
     path = export_jsonl(runs, str(tmp_path / "debates.jsonl"))
     import json as _json

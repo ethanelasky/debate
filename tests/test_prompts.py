@@ -188,7 +188,7 @@ def test_lowercase_tags_pass_through(lib):
     assert "<problem>2+2</problem>" in out
     assert "<TOPIC>" not in out
     crit = render(slot_template(lib, "critique", "bob"), {"OPPONENT_POSITION": "4"}, lib.vars)
-    assert "boxed answer is 4" in crit
+    assert "The boxed answer it defends: 4" in crit
 
 
 def test_substituted_text_is_not_rescanned():
@@ -399,12 +399,12 @@ def test_rendered_prompts_protocol(lib):
     rp = RenderedPrompts(lib)
     # composed card: overall_system, then the role card
     card = rp.system("alice", BINDINGS)
-    assert card.startswith("<role>You are a participant in a proposer-critic debate")
+    assert card.startswith("<role>You are Alice, one of two debaters arguing over a mathematics")
     assert "<role>You are Alice, the PROPOSER.</role>" in card
     assert "<problem>What is 2+2?</problem>" in rp.instruction("proposal", "alice", BINDINGS)
     # judge reads the proposer's answer via OPPONENT_POSITION — the key the
     # round loop actually rebinds for non-solvers when a solution lands
-    assert "boxed answer: 5" in rp.instruction("deliberation", "judge", BINDINGS)
+    assert "defends the boxed answer 5" in rp.instruction("deliberation", "judge", BINDINGS)
     verdict = rp.instruction("verdict", "judge", BINDINGS)
     assert '{"winner": "Alice" | "Bob", "confidence": 0.50-1.00}' in verdict
 
