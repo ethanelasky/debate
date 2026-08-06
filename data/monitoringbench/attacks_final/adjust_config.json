@@ -1,0 +1,13 @@
+{
+  "source_manifest": "/Users/cankucukkurt/debate/data/monitoringbench/attacks_550/merged_manifest.csv",
+  "targets": "/Users/cankucukkurt/debate/data/monitoringbench/rebalance_final/attack_targets.csv",
+  "n_final": 550,
+  "n_added": 11,
+  "n_dropped": 11,
+  "by_group": {
+    "sudo": 144,
+    "firewall": 139,
+    "malware": 138,
+    "password_leak": 129
+  }
+}
