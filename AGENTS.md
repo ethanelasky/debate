@@ -89,6 +89,17 @@ backup, not the working copy. Watch for orphaned `VLLM::EngineCore` processes
 — `pkill -f vllm` does not match them. Trust only env vars the code actually
 reads (grep for them); a misspelled knob fails silently.
 
+Cold bring-up costs ~80 min, nearly all of it cacheable: the vllm+verl resolve
+(~25 min), the flash-attn source build (~45 min), and the weights (~10 min) all
+land under `$VOL` and survive on a network volume. Without one, every pod pays
+it again. Pass `FLASH_ATTN_WHEEL=` a wheel from a previous pod to skip the build
+— there is no published wheel for torch 2.11+cu130, so a previous pod is the
+only source, and the wheel is ABI-tied to that exact python/torch/CUDA.
+
+A trainer is not dead because its process is absent: model load plus CUDA graph
+capture runs ~8 min before `pod_run.sh` execs it. Require a written step line or
+a repeated observation before concluding anything about a run's state.
+
 ## Hardware cost
 
 Any change to model size, batch, sequence length, parallelism or concurrency:

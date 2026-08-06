@@ -258,15 +258,18 @@ class VerlBackend(Backend):
             group = []
             for out in outputs[i * n : (i + 1) * n]:
                 tokens = list(out.token_ids)
-                # vLLM's stop_reason can be the matched stop STRING; normalize
-                # to the base contract ("stop" | "length").
-                raw_reason = str(out.stop_reason or "stop")
+                # verl's TokenOutput.stop_reason is 'completed' | 'aborted' |
+                # None (replica.py:39) — it never carries "length", so it cannot
+                # tell us whether generation was truncated. Hitting max_tokens
+                # exactly is that signal, and it is the one the base contract
+                # ("stop" | "length") asks for.
+                truncated = params.max_tokens is not None and len(tokens) >= params.max_tokens
                 group.append(
                     Sample(
                         tokens=tokens,
                         logprobs=list(out.log_probs) if out.log_probs is not None else [],
                         text=self.tokenizer.decode(tokens),
-                        stop_reason="length" if raw_reason == "length" else "stop",
+                        stop_reason="length" if truncated else "stop",
                     )
                 )
             result.append(group)
