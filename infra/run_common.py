@@ -46,7 +46,7 @@ def wandb_config_kwargs(
             raise ValueError(f"W&B group component {label} must not be empty")
         if "/" in component:
             raise ValueError(f"W&B group component {label} must not contain '/': {component!r}")
-    if configured_project not in (None, WANDB_PROJECT):
+    if enabled and configured_project not in (None, WANDB_PROJECT):
         raise ValueError(
             f"W&B project must be {WANDB_PROJECT!r}, got {configured_project!r}"
         )

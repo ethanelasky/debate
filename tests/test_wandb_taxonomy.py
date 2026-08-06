@@ -62,6 +62,19 @@ def test_wandb_config_kwargs_marks_smoke_and_can_disable_logging():
     assert kwargs["wandb_tags"][-1] == "scope:smoke"
 
 
+def test_wandb_config_kwargs_ignores_legacy_project_when_logging_disabled():
+    kwargs = wandb_config_kwargs(
+        domain="math",
+        run_type="rlvr",
+        experiment="legacy_arm",
+        model_path="model/path",
+        enabled=False,
+        configured_project="legacy-project",
+    )
+
+    assert kwargs["wandb_project"] is None
+
+
 def test_wandb_config_kwargs_rejects_noncanonical_project():
     with pytest.raises(ValueError, match="debate-rebuild"):
         wandb_config_kwargs(

@@ -210,7 +210,7 @@ def _make_logger(cfg: Config):
     return log
 
 
-def main() -> None:
+def _direct_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", choices=["math"], default="math")
     parser.add_argument("--base-model", default=Config.base_model)
@@ -225,7 +225,18 @@ def main() -> None:
     parser.add_argument("--eval-n", type=int, default=Config.eval_n)
     parser.add_argument("--wandb-project", choices=["debate-rebuild"], default=None)
     parser.add_argument("--load", default=None, help="checkpoint path to resume from")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--wandb-resume",
+        default=None,
+        metavar="RUN_ID",
+        help="append to this existing wandb run (resume='must') instead of "
+        "starting a new one — for continuations via --load",
+    )
+    return parser
+
+
+def main() -> None:
+    args = _direct_parser().parse_args()
 
     from infra.run_common import wandb_config_kwargs
 
@@ -240,6 +251,7 @@ def main() -> None:
         sampling=SamplingParams(max_tokens=args.max_tokens),
         eval_every=args.eval_every,
         eval_n=args.eval_n,
+        wandb_run_id=args.wandb_resume,
         **wandb_config_kwargs(
             domain="math",
             run_type="rlvr",
