@@ -12,6 +12,15 @@ Config shape:
       training: {backend: verl, verl: {...}, lora_rank: 32, loss: {...},
                  steps: 100, batch_size: 8, group_size: 8, lr: 1e-4, ...}
 
+`enable_thinking` (optional) is the debate runner's per-seat knob at RLVR's one
+policy: it becomes Config.chat_template_kwargs, so it reaches training AND eval
+rollouts through the same Policy. Hybrid-thinking models (Qwen3.x) render an
+empty <think></think> block at False and open <think> at True; the toggle is
+verified against the tokenizer at launch (see _check_thinking_toggle) rather
+than trusted, because a template that ignores the kwarg drops it in silence —
+the same latent failure the OpenRouter seats hit (MB_DEBATE_PLAN 2026-08-02).
+Omit the key for models without a thinking mode.
+
 MB blind choice (dataset.type: monitoringbench) needs nothing extra: the task
 source renders its RLVR prompt from the family's answer-generation config
 (infra/prompts/tasks/monitoringbench.yaml, dataset.prompt_file to override) —
@@ -36,7 +45,35 @@ from infra.run_common import (
 )
 from infra.train import Config, train
 
-EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
+EXPERIMENT_KEYS = {"model", "enable_thinking", "max_completion_tokens", "dataset", "training"}
+
+
+def _check_thinking_toggle(tokenizer, enable_thinking: bool) -> None:
+    """Fail unless the policy's chat template actually reads enable_thinking.
+
+    apply_chat_template passes unknown kwargs into the Jinja globals, where a
+    template that never references them ignores them without a word — so a
+    config declaring a no-think arm would train a thinking one and nothing in
+    the logs would say so. Rendering the same probe both ways separates the two
+    cases: a template that honors the knob produces different tokens.
+    """
+    probe = [{"role": "user", "content": "probe"}]
+
+    def render(value: bool):
+        out = tokenizer.apply_chat_template(
+            probe, add_generation_prompt=True, tokenize=True, enable_thinking=value
+        )
+        if not isinstance(out, list):
+            out = out["input_ids"]
+        return out[0] if out and isinstance(out[0], list) else out
+
+    if render(True) == render(False):
+        raise ValueError(
+            f"enable_thinking: {str(enable_thinking).lower()} was set, but this model's chat "
+            "template renders identically with enable_thinking True and False — the setting "
+            "would be silently dropped. Remove the key (models without a thinking mode need "
+            "no toggle) or point the arm at a hybrid-thinking model."
+        )
 
 
 def validate_experiment(exp: dict) -> None:
@@ -81,9 +118,16 @@ def main() -> None:
     if max_tokens is None:
         raise ValueError("set max_completion_tokens (per-generation budget) in the experiment")
 
+    enable_thinking = exp.get("enable_thinking")
+    if enable_thinking is not None:
+        _check_thinking_toggle(backend.tokenizer, bool(enable_thinking))
+
     cfg = Config(
         base_model=model_path,
         sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
+        chat_template_kwargs=(
+            None if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
+        ),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
