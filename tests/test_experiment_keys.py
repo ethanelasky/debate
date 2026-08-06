@@ -91,17 +91,15 @@ def test_rlvr_rejects_debate_only_keys():
     assert "agents" in str(exc.value)
 
 
-def test_rlvr_prompt_config_and_protocol_come_together():
-    # MB blind choice needs both (blind_choice_dataset); one alone is a typo.
-    for lone in ("prompt_config", "protocol"):
+def test_rlvr_rejects_prompt_config_and_protocol():
+    # Debate-layer keys: RLVR builds its prompt from the family's
+    # answer-generation config, so these are typos here (they were legal
+    # before MB's blind view moved to infra/prompts/tasks/monitoringbench.yaml).
+    for key, value in (("prompt_config", {"x": 1}), ("protocol", {"turns": []})):
         exp = _rlvr_exp()
-        exp[lone] = {"x": 1} if lone == "prompt_config" else {"turns": []}
-        with pytest.raises(ValueError, match="come together"):
+        exp[key] = value
+        with pytest.raises(ValueError, match=key):
             validate_rlvr(exp)
-    exp = _rlvr_exp()
-    exp["prompt_config"] = {"file_path": "x.yaml", "entry": "e"}
-    exp["protocol"] = {"turns": []}
-    validate_rlvr(exp)
 
 
 def _shipped_experiments():

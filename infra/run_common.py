@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 
 from infra.backend.base import LossSpec
 
@@ -95,7 +96,33 @@ def runner_parser(description: str | None) -> argparse.ArgumentParser:
         "--batch-size", type=int, default=None, help="override training.batch_size (sweeps)"
     )
     parser.add_argument("--load", default=None)
+    parser.add_argument(
+        "--wandb-resume",
+        default=None,
+        metavar="RUN_ID",
+        help="append to this existing wandb run (resume='must') instead of "
+        "starting a new one — for continuations via --load",
+    )
+    parser.add_argument(
+        "--start-step",
+        type=int,
+        default=None,
+        help="first step index of a continuation; the loop runs [start-step, steps) "
+        "so saves/evals keep the original lineage's numbering. Default: inferred "
+        "from a --load path ending in step-NNNNN, else 0",
+    )
     return parser
+
+
+def resolved_start_step(args: argparse.Namespace) -> int:
+    """--start-step, else the step number in a `--load .../step-NNNNN` path."""
+    if getattr(args, "start_step", None) is not None:
+        return args.start_step
+    if getattr(args, "load", None):
+        m = re.search(r"step-(\d+)/?$", args.load)
+        if m:
+            return int(m.group(1))
+    return 0
 
 
 def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
@@ -106,6 +133,11 @@ def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
     for k in ("steps", "batch_size", "group_size", "lr"):
         if getattr(args, k) is not None:
             kw[k] = getattr(args, k)
+    start = resolved_start_step(args)
+    if start:
+        kw["start_step"] = start
+    if getattr(args, "wandb_resume", None):
+        kw["wandb_run_id"] = args.wandb_resume
     return kw
 
 

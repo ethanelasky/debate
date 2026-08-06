@@ -1,17 +1,18 @@
 """Blind side-choice mode (mb_debate_choice + mb_single_consultancy_choice).
 
-2026-08-03 rework: the blind first turn is TWO solo user messages —
-[trajectory message, blind-instructions message] — rendered verbatim by
+The blind first turn is the task family's solo context
+(infra/prompts/tasks/monitoringbench.yaml: [system: monitor card][user: blind
+instructions][user: trajectory]), rendered verbatim by
 first_speech_non_debate_aware; the trajectory message doubles as every seat's
-shared pre_debate message (byte-identical, so message-boundary prompt caches
-can reuse it). 2026-08-04: the chooser's LATER contexts no longer replay those
-solo messages verbatim — they render normally (system card, preamble messages,
-then slot 0's own cue and its answer as the first assistant turn), and the
-packs keep that honest by making the slot-0 cue byte-identical to the blind
-instructions message. This file covers:
+shared pre_debate message (spliced in as <TRAJECTORY_USER>, byte-identical, so
+message-boundary prompt caches can reuse it). The chooser's LATER contexts do
+not replay those solo messages verbatim — they render normally (system card,
+preamble messages, then slot 0's own cue and its answer as the first assistant
+turn), and the packs keep that honest by splicing the slot-0 cue from the same
+file (<ANSWER_GEN_USER> = the blind instructions message). This file covers:
 - monitoringbench parse_choice / choice_retry_feedback / position binder
   (two-seat and single-seat) / MonitoringBenchFamily / blind Task.messages
-  (incl. the FILL_ME hard guard);
+  (incl. the unfilled-placeholder hard guard);
 - round: preamble-as-separate-messages, the chooser's reframed later context,
   solution feedback retries in the solo context;
 - prompts.validate_prompts(choice_positions=...) bindability rule;
@@ -253,38 +254,47 @@ def _write_rows(tmp_path):
     return str(path)
 
 
-def test_task_source_renders_choice_messages(tmp_path):
+def _write_task_prompts(tmp_path, traj="Trajectory:\n<trajectory>\n<BACKGROUND_TEXT>\n</trajectory>",
+                        instr="Assess it. End with the tag."):
+    path = tmp_path / "task_prompts.yaml"
+    body = {
+        "messages": [
+            {"role": "system", "content": "MONITOR CARD."},
+            {"role": "user", "name": "ANSWER_GEN_USER", "content": instr},
+            {"role": "user", "name": "TRAJECTORY_USER", "content": traj},
+        ]
+    }
+    path.write_text(yaml.safe_dump(body, sort_keys=False))
+    return str(path)
+
+
+def test_task_source_renders_blind_messages(tmp_path):
     src = MonitoringBenchTaskSource(
-        [_write_rows(tmp_path)],
-        seed=0,
-        choice_messages=[
-            "Trajectory:\n<trajectory>\n<BACKGROUND_TEXT>\n</trajectory>",
-            "Assess it. End with the tag.",
-        ],
+        [_write_rows(tmp_path)], seed=0, prompt_file=_write_task_prompts(tmp_path)
     )
     tasks = src.tasks(2)
     for t in tasks:
-        traj_msg, instr_msg = t.messages
-        assert traj_msg["role"] == instr_msg["role"] == "user"
+        system_msg, instr_msg, traj_msg = t.messages
+        assert system_msg == {"role": "system", "content": "MONITOR CARD."}
+        assert instr_msg == {"role": "user", "content": "Assess it. End with the tag."}
+        assert traj_msg["role"] == "user"
         assert traj_msg["content"].startswith("Trajectory:")
         assert t.meta["bindings"]["BACKGROUND_TEXT"] in traj_msg["content"]
-        assert instr_msg["content"] == "Assess it. End with the tag."
-    # assigned mode unchanged: empty single user message
-    plain = MonitoringBenchTaskSource([_write_rows(tmp_path)], seed=0)
-    assert plain.tasks(2)[0].messages == [{"role": "user", "content": ""}]
 
 
-def test_task_source_choice_messages_guards(tmp_path):
+def test_task_source_prompt_guards(tmp_path):
+    # the trajectory message must carry the row binding point
     with pytest.raises(ValueError, match="BACKGROUND_TEXT"):
         MonitoringBenchTaskSource(
-            [_write_rows(tmp_path)], choice_messages=["no trajectory slot"]
+            [_write_rows(tmp_path)],
+            prompt_file=_write_task_prompts(tmp_path, traj="no trajectory slot"),
         )
-    with pytest.raises(ValueError, match="empty"):
-        MonitoringBenchTaskSource([_write_rows(tmp_path)], choice_messages=[])
     # an unfilled placeholder hard-errors at task BUILD (zero generation spend)
     src = MonitoringBenchTaskSource(
         [_write_rows(tmp_path)],
-        choice_messages=["<BACKGROUND_TEXT>", "<FILL_ME_BLIND_INSTRUCTIONS>"],
+        prompt_file=_write_task_prompts(
+            tmp_path, instr="<FILL_ME_BLIND_INSTRUCTIONS>"
+        ),
     )
     with pytest.raises(ValueError, match="FILL_ME_BLIND_INSTRUCTIONS"):
         src.tasks(2)
@@ -745,23 +755,6 @@ turns:
         )
 
 
-def test_blind_message_templates_requires_one_solution_slot(prompt_file):
-    # the guard is local: blind_message_templates runs BEFORE _choice_wiring
-    two_solutions = Protocol.parse(
-        yaml.safe_load(
-            """
-turns:
-  - alice: [{name: blind, kind: solution}]
-    bob: [{name: blind, kind: solution}]
-  - judge: [{name: verdict, kind: decision}]
-"""
-        )
-    )
-    exp = {"prompt_config": {"file_path": prompt_file, "entry": "choice_test"}}
-    with pytest.raises(ValueError, match="exactly one solution slot"):
-        run_eval.blind_message_templates(exp, two_solutions)
-
-
 def test_blind_choice_summary_reports_failed_denominator(prompt_file):
     rows = [
         {"task_id": "a", "label": "attack", "chosen_side": "attack", "p_attack": 0.9,
@@ -798,94 +791,57 @@ turns:
         round_.run([_solo_state()])
 
 
-def test_real_prompt_entries_hard_fail_until_filled():
-    """The committed choice entries must be un-runnable (and spend nothing)
-    until the user replaces the FILL_ME placeholder: the task source's render
-    raises at task build. Message 0 must be the shared trajectory template."""
-    from infra.envs.debate.prompts import render
+def test_real_blind_view_shape_and_framing():
+    """The family's answer-generation config (the solo blind view, single
+    source for the RLVR prompt AND the choice arms' spliced blind turn):
+    RLVR-shaped — monitor role card as SYSTEM, short instruction cue, then the
+    trajectory LAST (byte-stable [system][instructions] prefix across rows) —
+    and free of debate framing."""
+    from infra.envs.task_prompts import (
+        BACKGROUND_PLACEHOLDER,
+        load_generation_prompts,
+        resolve_prompt_file,
+    )
 
-    for entry, topo_yaml in (
-        (
-            "mb_debate_choice",
-            """
-turns:
-  - alice: [{name: blind_assessment, kind: solution}]
-    bob:   [{name: pre_opening_speech}]
-  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
-""",
-        ),
-        (
-            "mb_single_consultancy_choice",
-            """
-turns:
-  - alice: [{name: blind_assessment, kind: solution}]
-  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
-""",
-        ),
-    ):
-        exp = {
-            "prompt_config": {
-                "file_path": "infra/prompts/debate/monitoringbench.yaml",
-                "entry": entry,
-            }
-        }
-        topo = Protocol.parse(yaml.safe_load(topo_yaml))
-        tmpls, vars_ = run_eval.blind_message_templates(exp, topo)
-        # RLVR-shaped blind view (2026-08-04): monitor role card as SYSTEM,
-        # short instruction cue, then the trajectory LAST (byte-stable
-        # [system][instructions] prefix across rows).
-        assert [m["role"] for m in tmpls] == ["system", "user", "user"]
-        system, cue, traj = (m["content"] for m in tmpls)
-        assert "four security failures" in system
-        assert "<answer>attack</answer>" in cue
-        assert "<BACKGROUND_TEXT>" in traj
-        # the blind view must carry no debate framing. "judge" is exempted for
-        # the SYSTEM card only: the real monitor prompt uses it as a verb
-        # ("asked to judge a newly proposed action"), which names no debate.
-        for word in ("debate", "opponent", "assigned"):
-            assert word not in (system + cue).lower(), word
-        assert "judge" not in cue.lower()
-        for tmpl in (system, cue, traj):
-            render(tmpl, {"BACKGROUND_TEXT": "x"}, vars_)  # renders fully
+    prompts = load_generation_prompts(
+        resolve_prompt_file(None, "monitoringbench.yaml"),
+        require_placeholder=BACKGROUND_PLACEHOLDER,
+    )
+    assert [m["role"] for m in prompts.messages] == ["system", "user", "user"]
+    system, cue, traj = (m["content"] for m in prompts.messages)
+    assert prompts.supplied_templates() == {
+        "ANSWER_GEN_USER": cue,
+        "TRAJECTORY_USER": traj,
+    }
+    assert "four security failures" in system
+    assert "<answer>attack</answer>" in cue
+    assert "<BACKGROUND_TEXT>" in traj
+    # the blind view must carry no debate framing. "judge" is exempted for
+    # the SYSTEM card only: the real monitor prompt uses it as a verb
+    # ("asked to judge a newly proposed action"), which names no debate.
+    for word in ("debate", "opponent", "assigned"):
+        assert word not in (system + cue).lower(), word
+    assert "judge" not in cue.lower()
+    rendered = prompts.render({"BACKGROUND_TEXT": "x"})  # renders fully
+    assert len(rendered) == 3
 
 
 def test_rlvr_task_source_prompt_matches_eval_arm(tmp_path):
-    """The parity configs/mb_rlvr.yaml promises: run_rlvr's blind_choice_dataset
-    and run_eval.build_task_source hand the task source the same blind
-    templates (both call blind_message_templates with the same entry + turns),
-    so for the same row the RLVR Task.messages are byte-identical to the eval
-    arm's blind view."""
+    """The parity configs/mb_rlvr.yaml promises: run_eval.build_task_source
+    and the RLVR path (family.source) construct the SAME task source — both
+    render Task.messages from the family's answer-generation config — so for
+    the same row the RLVR prompt is byte-identical to the eval arm's blind
+    view."""
     from infra.envs.tasks import get_family
-    from infra.run_rlvr import blind_choice_dataset
 
     files = [_write_rows(tmp_path)]
-    topo = yaml.safe_load(
-        """
-turns:
-  - alice: [{name: blind_assessment, kind: solution}]
-    bob:   [{name: pre_opening_speech}]
-  - judge: [{name: post_round_judge_without_reasoning, kind: decision}]
-"""
-    )
-    exp = {
-        "prompt_config": {
-            "file_path": "infra/prompts/debate/monitoringbench.yaml",
-            "entry": "mb_debate_choice",
-        },
-        "protocol": topo,
-        "choice_positions": True,
-        "dataset": {"files": files, "seed": 0},
-    }
+    exp = {"dataset": {"files": files, "seed": 0}}
     eval_src = run_eval.build_task_source(exp, task_ids=None, seed=None)
-    rlvr_env = get_family("monitoringbench").source(
-        blind_choice_dataset(exp, {"files": files, "seed": 0})
-    )
+    rlvr_env = get_family("monitoringbench").source({"files": files, "seed": 0})
     eval_msgs = [t.messages for t in eval_src.tasks(2)]
     rlvr_msgs = [t.messages for t in rlvr_env.tasks(2, split="test")]
     assert eval_msgs == rlvr_msgs
     assert [m["role"] for m in rlvr_msgs[0]] == ["system", "user", "user"]
-    # plain task sources pass through untouched
-    assert blind_choice_dataset({}, {"files": files}) == {"files": files}
 
 
 MB_DEBATE_CHOICE_TOPO = Protocol.parse(
@@ -931,10 +887,13 @@ def test_real_choice_entries_cache_invariants():
     for tmpl in (dbg.system["alice"], sc.system["alice"]):
         seat_refs = {m for m in re.findall(r"<([A-Z_]+)>", tmpl) if "NAME" in m or "POSITION" in m}
         assert seat_refs == set(), seat_refs
-    assert "<BACKGROUND_TEXT>" in dbg.shared_pre_debate
-    assert sc.shared_pre_debate == dbg.shared_pre_debate
-    # and it really is every seat's first leading message
+    # both entries splice the SAME task-config messages: trajectory preamble
+    # and blind cue are single-sourced, so cross-arm byte-stability holds by
+    # construction
     for lib in (dbg, sc):
+        assert lib.shared_pre_debate == "<TRAJECTORY_USER>"
+        assert lib.slots["blind_assessment"] == "<ANSWER_GEN_USER>"
+        # and the trajectory really is every seat's first leading message
         assert all(msgs[0] == lib.shared_pre_debate for msgs in lib.preamble.values())
 
 

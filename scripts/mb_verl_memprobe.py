@@ -91,7 +91,7 @@ def main() -> None:
 
     from infra.config import load_experiment
     from infra.envs.tasks import get_family
-    from infra.run_rlvr import blind_choice_dataset, validate_experiment
+    from infra.run_rlvr import validate_experiment
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
@@ -103,7 +103,7 @@ def main() -> None:
 
     ds = dict(exp["dataset"])
     ds.pop("type")
-    env = get_family("monitoringbench").source(blind_choice_dataset(exp, ds))
+    env = get_family("monitoringbench").source(ds)
 
     # ---- phase 1: audit — every pool row, real templates, real chat template
     tokenizer = AutoTokenizer.from_pretrained(str(exp["model"]))

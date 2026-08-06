@@ -4,13 +4,13 @@
 # verbatim), and the "Provide your answer:" cue. The old
 # <background>/<grading_criteria> sections are dropped: this repo binds the
 # whole problem as the question and never shows debaters the test cases. The
-# two sentences closing answer_gen_system are verbatim from the old repo's
+# two sentences closing the system message are verbatim from the old repo's
 # shared.yaml "Direct Code Generation" prompt.
 #
 # THIS FILE IS THE SINGLE SOURCE for the codecontests answer prompt, for BOTH
 # arms. The RLVR user message and the debate proposal slot are the SAME
 # composition rendered byte-for-byte identically: DebateEnv splices
-# answer_gen_user into the proposal slot wherever
+# the ANSWER_GEN_USER message into the proposal slot wherever
 # infra/prompts/debate/codecontests.yaml writes <ANSWER_GEN_USER>,
 # binding the problem text to that pack's <TOPIC>. Editing the wording here
 # changes both arms together, which is the point — do not restate it there.
@@ -34,15 +34,19 @@ format_notes: |-
   - Print output to stdout using print().
   - Do NOT wrap your solution in a function or class unless the problem requires it.
   - Import any libraries you use.
-answer_gen_system: |-
-  Solve the programming problem.
-  Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
-answer_gen_user: |-
-  Context:
+messages:
+  - role: system
+    content: |-
+      Solve the programming problem.
+      Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
+  - role: user
+    name: ANSWER_GEN_USER
+    content: |-
+      Context:
 
-  <question><PROBLEM></question>
+      <question><PROBLEM></question>
 
-  Notes:
-  <FORMAT_NOTES>
+      Notes:
+      <FORMAT_NOTES>
 
-  Provide your answer:
+      Provide your answer:

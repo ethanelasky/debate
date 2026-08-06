@@ -24,7 +24,6 @@ load_prompt_library therefore requires the protocol.
       pre_debate_proposer:          # proposer's individual leading user message
       pre_debate_critic:            # critic's individual leading user message
       pre_debate_judge:             # judge's individual leading user message
-      blind_system:                 # SOLO blind view's system card (choice mode)
       attribution:                  # optional, see below
         <reader>: {<author>: <template>}
       <protocol slot name>: ...     # that slot's per-turn cue
@@ -125,7 +124,7 @@ _PRE_DEBATE_STAGES: dict[str, str] = {
 }
 _STAGE_KEYS = frozenset(
     s for stages in _SYSTEM_STAGES.values() for s in stages
-) | frozenset(_PRE_DEBATE_STAGES.values()) | {"pre_debate", "blind_system"}
+) | frozenset(_PRE_DEBATE_STAGES.values()) | {"pre_debate"}
 _ENTRY_KEYS = frozenset({"vars", "attribution"}) | _STAGE_KEYS
 
 
@@ -140,13 +139,10 @@ class PromptLibrary:
     vars: dict[str, str] = field(default_factory=dict)
     #: reader -> author -> template replacing the "X said:" default.
     attribution: dict[str, dict[str, str]] = field(default_factory=dict)
-    #: the raw shared pre_debate template (also the trajectory message of a
-    #: solo first speech built by a task source — run_eval.blind_message_templates).
+    #: the raw shared pre_debate template. In choice-mode packs this is the
+    #: task family's spliced TRAJECTORY_USER message, the same template the
+    #: solo blind view renders (infra/prompts/tasks/<family>.yaml).
     shared_pre_debate: str = ""
-    #: system card of the SOLO blind view only (choice mode): the RLVR-style
-    #: role card ("you're monitoring...") the blind generation runs under. No
-    #: debate seat ever renders it.
-    blind_system: str = ""
 
 
 def speaker_roles(protocol: Protocol) -> dict[str, str]:
@@ -227,7 +223,6 @@ def load_prompt_library(
         vars={str(k): str(v) for k, v in (cfg.get("vars") or {}).items()},
         attribution=attribution,
         shared_pre_debate=shared,
-        blind_system=stages.get("blind_system", "").strip(),
     )
 
 

@@ -35,6 +35,15 @@ math_rlvr_olmo_l5:
     eval_max_tokens: 2000
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
+# CoT-discovery arm: the neutral prompt (math_nocot.yaml — no step-by-step
+# ask, no answer-only ban; deletion-only variant, test-pinned). Question: does
+# verifier-reward RL discover derivations when the prompt is silent on them?
+# Paired with math_pc_olmo_l5_g8_nocot; watch eval/has_boxed + response length
+# alongside eval/correct_relaxed at step 0 for the starting behavior.
+math_rlvr_olmo_l5_nocot:
+  _extends: math_rlvr_olmo_l5
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+
 # tiny live-verification arm
 math_rlvr_olmo_smoke:
   _extends: math_rlvr_olmo_l5

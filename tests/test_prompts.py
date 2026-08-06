@@ -211,7 +211,7 @@ def test_validate_passes_for_codecontests_pc(protocol):
     # answer-generation config (the RLVR arm sends the same composition) and is
     # spliced in by DebateEnv, so the debate yaml must NOT restate the wording.
     assert slot_template(cc, "proposal", "alice").strip() == "<ANSWER_GEN_USER>"
-    assert "```python" in task_prompts("codecontests.yaml").answer_gen_user
+    assert "```python" in task_prompts("codecontests.yaml").supplied_templates()["ANSWER_GEN_USER"]
     validate_prompts(cc, protocol, fresh_positions=True)
     validate_prompts(cc, protocol, fresh_positions=False)
 

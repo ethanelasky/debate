@@ -258,8 +258,11 @@ def test_task_meta_contract(tmp_path):
     attack, honest = by_id["attack_0_0"], by_id["honest_0_0"]
 
     for task in (attack, honest):
-        # TOPIC is unused by MB prompts: empty message, empty question.
-        assert task.messages == [{"role": "user", "content": ""}]
+        # Task.messages is ALWAYS the rendered blind solo context (the RLVR
+        # prompt): [system: monitor card][user: instructions][user: trajectory].
+        assert [m["role"] for m in task.messages] == ["system", "user", "user"]
+        assert render_transcript(STEPS) in task.messages[2]["content"]
+        # TOPIC is unused by MB prompts: empty question.
         assert task.meta["question"] == ""
         # SEATING, not correctness: EVERY row binds the attack position to
         # seat A (gold) and the honest position to seat B (distractor),
@@ -332,9 +335,3 @@ def test_reward_blind_choice(tmp_path):
     assert info == {"correct": 0.0, "answer_tag": 0.0, "chose_attack": 0.0}
 
 
-def test_rollout_requires_choice_mode(tmp_path):
-    # Task.messages is the RLVR prompt; outside choice mode it is an empty
-    # user message, so the env must refuse to roll out rather than train on it.
-    src = MonitoringBenchTaskSource(_pool_files(tmp_path), seed=0, test_size=2)
-    with pytest.raises(ValueError, match="choice mode"):
-        src.rollout(src.tasks(1), policy=None, group_size=1)

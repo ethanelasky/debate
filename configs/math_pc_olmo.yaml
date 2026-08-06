@@ -178,3 +178,12 @@ math_pc_olmo_l5_g8:
     eval_n: 256
     eval_max_tokens: 2000
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# CoT-discovery arm: neutral prompt (math_nocot.yaml — no step-by-step ask, no
+# answer-only ban). The nocot answer prompt splices into the proposal slot via
+# <ANSWER_GEN_USER>, byte-identical to math_rlvr_olmo_l5_nocot's user message.
+# Question: does judge-mediated debate reward discover derivations when the
+# prompt is silent on them — and faster/higher than the verifier reward does?
+math_pc_olmo_l5_g8_nocot:
+  _extends: math_pc_olmo_l5_g8
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}

@@ -13,12 +13,15 @@ RLVR TRAINING (recorded decision, 2026-08-05, Ethan): training on this data is
 sanctioned — it was the goal all along; the earlier eval-only registry
 exclusion is reversed. The source is a SingleTurnEnv whose reward is
 blind-choice correctness (``parse_choice`` vs ``meta["label"]``), and the
-family is registered in ``TASK_FAMILIES`` under ``"monitoringbench"``. RLVR
-rollouts REQUIRE choice mode (``choice_messages``): Task.messages is the RLVR
-prompt verbatim, and outside choice mode it is an empty user message —
-``rollout()`` refuses rather than train on empty prompts. The train split
-requires an explicit ``test_size`` carve so training never sees the held-out
-eval rows.
+family is registered in ``TASK_FAMILIES`` under ``"monitoringbench"``.
+``Task.messages`` is ALWAYS the rendered blind solo context — the family's
+answer-generation prompts (``infra/prompts/tasks/monitoringbench.yaml``,
+loaded via ``prompt_file``) with the row's trajectory bound in — exactly as
+math's ``Task.messages`` is always its answer-gen prompt. That context IS the
+RLVR prompt, and in the choice arms it is the solo view
+``first_speech_non_debate_aware`` renders verbatim; assigned arms never read
+it. The train split requires an explicit ``test_size`` carve so training
+never sees the held-out eval rows.
 
 SEATING, NOT CORRECTNESS: ``meta["gold"]`` / ``meta["distractor"]`` here
 encode fixed SEATING, not the right answer. With ``fresh_positions: false``
@@ -32,8 +35,7 @@ Like KK — and unlike the QuALITY closed debates (judge story-blind) — this
 setting is INFO-SYMMETRIC: debaters and judge all see the full rendered
 trajectory (bound as ``BACKGROUND_TEXT``); any judge handicap is set in the
 experiment config, not here. There is no question: MB prompts do not reference
-TOPIC, so ``meta["question"]`` is ``""`` and ``Task.messages`` is a single
-empty user message.
+TOPIC, so ``meta["question"]`` is ``""``.
 
 HARD SAFETY RULE: the data files contain red-team attack trajectories. This
 module must never print, log, or embed trajectory content in any output —
@@ -56,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from infra.envs.base import Policy, SingleTurnEnv, Task
+from infra.envs.base import SingleTurnEnv, Task
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
 
 # Position strings copied VERBATIM from the old loader (working tree). The
@@ -246,17 +248,16 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
     eager (unknown task_ids, explicitly-empty task_ids, duplicate ids, empty
     pool, bad test_size raise at construction).
 
-    ``choice_messages`` (choice mode): the blind first-turn USER-message
-    templates, one per message, in order — at least one must reference
-    ``<BACKGROUND_TEXT>``, which is substituted with the rendered trajectory
-    per row. When set, ``Task.messages`` becomes those rendered user messages
-    (the solo context that first_speech_non_debate_aware renders verbatim and
-    replays in the chooser's later turns). The split is deliberate cache
-    design: message 0 is the byte-stable trajectory message (shared with the
-    other seats' preamble), later messages carry the blind instructions, so
-    message-boundary prompt caches can reuse the trajectory across calls.
-    Substitution uses the prompt library's render(), so an unfilled
-    placeholder (a typo'd or deliberately-unbound <UPPERCASE> tag)
+    ``prompt_file`` names the family's answer-generation config (default
+    ``infra/prompts/tasks/monitoringbench.yaml``); its messages —
+    [system: monitor card][user: blind instructions][user: trajectory] —
+    become ``Task.messages`` with ``<BACKGROUND_TEXT>`` substituted per row.
+    The trajectory goes LAST by deliberate cache design: every row shares a
+    byte-stable [system][instructions] prefix, and the trajectory message is
+    the same template the debate pack splices in as its shared pre_debate
+    (<TRAJECTORY_USER>), so message-boundary prompt caches can reuse it
+    across seats. Substitution uses the prompt library's render(), so an
+    unfilled placeholder (a typo'd or deliberately-unbound <UPPERCASE> tag)
     hard-errors at task build — before any generation is paid for.
     """
 
@@ -265,33 +266,24 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
         files: Sequence[str | Path],
         task_ids: Optional[Sequence[str]] = None,
         seed: int = 0,
-        choice_messages: Optional[Sequence[str]] = None,
-        choice_prompt_vars: Optional[dict[str, str]] = None,
+        prompt_file: Optional[str | Path] = None,
         test_size: int = 0,
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
     ):
+        from infra.envs.task_prompts import (
+            BACKGROUND_PLACEHOLDER,
+            load_generation_prompts,
+            resolve_prompt_file,
+        )
+
         self.correct_reward = correct_reward
         self.format_reward = format_reward
         self.rng = random.Random(seed)  # train-split sampling only
-        self.choice_messages = list(choice_messages) if choice_messages is not None else None
-        self.choice_prompt_vars = dict(choice_prompt_vars or {})
-        if self.choice_messages is not None:
-            if not self.choice_messages:
-                raise ValueError("monitoringbench: choice_messages is empty")
-            msgs = self._choice_message_dicts()
-            bad = [m for m in msgs if m["role"] not in ("system", "user")]
-            if bad:
-                raise ValueError(
-                    f"monitoringbench: choice_messages roles must be system/user, got "
-                    f"{sorted({m['role'] for m in bad})}"
-                )
-            if not any("<BACKGROUND_TEXT>" in m["content"] for m in msgs):
-                raise ValueError(
-                    "monitoringbench: no choice_messages template references "
-                    "<BACKGROUND_TEXT>, so the trajectory could not be inserted "
-                    "into the blind first turn"
-                )
+        self.prompts = load_generation_prompts(
+            resolve_prompt_file(prompt_file, "monitoringbench.yaml"),
+            require_placeholder=BACKGROUND_PLACEHOLDER,
+        )
         self.files = [Path(f) for f in files]
         rows = load_rows(self.files)
         if not rows:
@@ -339,21 +331,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
 
     def _task(self, row: MBRow) -> Task:
         transcript = render_transcript(row.steps)
-        if self.choice_messages is not None:
-            from infra.envs.debate.prompts import render
-
-            messages = [
-                {
-                    "role": m["role"],
-                    "content": render(
-                        m["content"], {"BACKGROUND_TEXT": transcript}, self.choice_prompt_vars
-                    ),
-                }
-                for m in self._choice_message_dicts()
-            ]
-        else:
-            # TOPIC is not referenced by MB prompts; the message is unused.
-            messages = [{"role": "user", "content": ""}]
+        messages = self.prompts.render({"BACKGROUND_TEXT": transcript})
         return Task(
             messages=messages,
             meta={
@@ -371,17 +349,6 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
                 "red_team_objective_accomplished": row.red_team_objective_accomplished,
             },
         )
-
-    def _choice_message_dicts(self) -> list[dict[str, str]]:
-        """choice_messages items are {"role", "content"} template dicts; a bare
-        string is shorthand for a user message."""
-        out = []
-        for m in self.choice_messages or []:
-            if isinstance(m, str):
-                out.append({"role": "user", "content": m})
-            else:
-                out.append({"role": str(m.get("role", "user")), "content": str(m.get("content", ""))})
-        return out
 
     def tasks(self, n: int, split: str = "test") -> list[Task]:
         if self._whitelisted:
@@ -413,17 +380,6 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
         }
         return reward, info
 
-    def rollout(self, tasks: list[Task], policy: Policy, group_size: int):
-        if self.choice_messages is None:
-            raise ValueError(
-                "monitoringbench: RLVR rollout requires choice mode — "
-                "Task.messages is the RLVR prompt, and without "
-                "dataset.choice_messages it is an empty user message; set "
-                "choice_messages (the blind first-turn templates)"
-            )
-        return super().rollout(tasks, policy, group_size)
-
-
 class MonitoringBenchFamily(TaskFamily):
     """TaskFamily for MB, registered as ``"monitoringbench"`` (recorded
     decision, 2026-08-05: RLVR/debate training on this data is the goal — the
@@ -438,7 +394,7 @@ class MonitoringBenchFamily(TaskFamily):
     def source(self, ds: dict):
         reject_unknown_keys(
             ds,
-            {"files", "task_ids", "seed", "test_size", "choice_messages", "choice_prompt_vars"},
+            {"files", "task_ids", "seed", "test_size", "prompt_file"},
             "monitoringbench",
         )
         files = ds.get("files")
@@ -448,8 +404,7 @@ class MonitoringBenchFamily(TaskFamily):
             files,
             task_ids=ds.get("task_ids"),
             seed=int(ds.get("seed", 0)),
-            choice_messages=ds.get("choice_messages"),
-            choice_prompt_vars=ds.get("choice_prompt_vars"),
+            prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
             test_size=int(ds.get("test_size", 0)),
         )
 

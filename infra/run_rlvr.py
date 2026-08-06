@@ -12,14 +12,16 @@ Config shape:
       training: {backend: verl, verl: {...}, lora_rank: 32, loss: {...},
                  steps: 100, batch_size: 8, group_size: 8, lr: 1e-4, ...}
 
-MB blind choice (dataset.type: monitoringbench) additionally carries
-`prompt_config` + `protocol` — the SAME entry and turns as the eval arm
-(mb_debate_choice). The blind first-turn templates are built through
-run_eval.blind_message_templates, the function the eval arm uses, so the RLVR
-prompt is byte-identical to the eval arm's blind view for the same row.
+MB blind choice (dataset.type: monitoringbench) needs nothing extra: the task
+source renders its RLVR prompt from the family's answer-generation config
+(infra/prompts/tasks/monitoringbench.yaml, dataset.prompt_file to override) —
+the same file the eval arm's debate packs splice their blind view from, so the
+RLVR prompt is byte-identical to the eval arm's blind view by construction.
 """
 
 from __future__ import annotations
+
+import os
 
 from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
@@ -34,7 +36,7 @@ from infra.run_common import (
 )
 from infra.train import Config, train
 
-EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training", "prompt_config", "protocol"}
+EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
 
 
 def validate_experiment(exp: dict) -> None:
@@ -49,26 +51,6 @@ def validate_experiment(exp: dict) -> None:
     tr = exp.get("training") or {}
     reject_unknown_keys(tr, TRAINING_KEYS, "training")
     reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
-    if bool(exp.get("prompt_config")) != bool(exp.get("protocol")):
-        raise ValueError(
-            "prompt_config and protocol come together: both are needed to build "
-            "the MB blind-choice templates (blind_choice_dataset), neither for "
-            "plain task sources like math"
-        )
-
-
-def blind_choice_dataset(exp: dict, ds: dict) -> dict:
-    """MB choice mode: when the experiment carries prompt_config + protocol,
-    render the blind first-turn templates through the SAME function the eval
-    arm uses (run_eval.blind_message_templates, same entry + turns), so the
-    RLVR prompt is byte-identical to the eval arm's blind view for the same
-    row. Plain task sources (no prompt_config) pass through untouched."""
-    if not exp.get("prompt_config"):
-        return ds
-    from infra.run_eval import _resolve_protocol, blind_message_templates
-
-    messages, prompt_vars = blind_message_templates(exp, _resolve_protocol(exp))
-    return {**ds, "choice_messages": messages, "choice_prompt_vars": prompt_vars}
 
 
 def main() -> None:
@@ -82,7 +64,7 @@ def main() -> None:
     ds = dict(exp.get("dataset") or {})
     family = get_family(ds.pop("type", None))
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
-    env = family.source(blind_choice_dataset(exp, ds))
+    env = family.source(ds)
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])
@@ -108,6 +90,20 @@ def main() -> None:
         run_name=run_name,
         **training_config_kwargs(tr, args),
     )
+
+    # Comprehensive docent capture, single-turn twin of run_debate's: every
+    # training rollout's kept samples -> docent/step-NNNNN.jsonl.
+    def _export_docent(step: int, env_) -> None:
+        from infra.envs.debate.docent_export import export_jsonl
+        from infra.envs.singleturn_docent import agent_runs
+
+        records = getattr(env_, "last_rollout_records", None)
+        if not records:
+            return
+        os.makedirs("docent", exist_ok=True)
+        export_jsonl(agent_runs(records), f"docent/step-{step:05d}.jsonl")
+
+    cfg.on_rollout = _export_docent
     train(env, backend, cfg)
 
 

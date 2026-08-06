@@ -247,7 +247,7 @@ codecontests_proposer_critic:
     # block, so they are replaced by the "you cannot see these tests" clause
     # taken verbatim from the old `judge_standard_grading_details`. The
     # proposer still gets the dropped sentences: they are in its
-    # <grading-rule> card and in the task family's answer_gen_system.
+    # <grading-rule> card and in the task family's system message.
     - |-
       Hidden test cases determine if the implementation is correct. You cannot see these tests, but your goal is to determine whether the solution will pass them based on the problem, the code, and the discussion.
   pre_debate_judge:

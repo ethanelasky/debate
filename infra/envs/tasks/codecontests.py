@@ -472,7 +472,7 @@ class CodeContestsEnv(SingleTurnEnv):
         # inputs/outputs are verifier test cases only — they are NOT public
         # examples and must never be rendered into any prompt or transcript.
         return Task(
-            messages=self.prompts.messages(row["problem"]),
+            messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={
                 "question": row["problem"],
                 "name": row["name"],

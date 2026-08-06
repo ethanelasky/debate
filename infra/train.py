@@ -37,6 +37,12 @@ class Config:
     wandb_project: str | None = None  # None = no wandb
     log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
     run_name: str | None = None
+    # Continuation plumbing: start_step makes the loop run [start_step, steps)
+    # so step indices, save names, and eval cadence continue the original
+    # lineage; wandb_run_id appends to that existing wandb run (resume="must")
+    # instead of starting a new one at x=0.
+    start_step: int = 0
+    wandb_run_id: str | None = None
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
 
@@ -105,7 +111,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     optim = cfg.optim or OptimParams(lr=cfg.lr)
 
-    for step in range(cfg.steps):
+    for step in range(cfg.start_step, cfg.steps):
         t0 = time.monotonic()
         backend.sync_sampler()
         groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
@@ -171,7 +177,14 @@ def _make_logger(cfg: Config):
     if cfg.wandb_project:
         import wandb
 
-        run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
+        if cfg.wandb_run_id:
+            # resume="must": appending to the named run is the entire point; a
+            # silent fallback to a fresh run would re-split the x-axis.
+            run = wandb.init(
+                project=cfg.wandb_project, id=cfg.wandb_run_id, resume="must"
+            )
+        else:
+            run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:

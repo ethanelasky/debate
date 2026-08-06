@@ -104,7 +104,7 @@ MATH_USER = (
 
 def test_math_prompt_matches_old_repo_composition():
     prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
-    assert prompts.messages("What is $1 + 1$?") == [
+    assert prompts.render({"PROBLEM": "What is $1 + 1$?"}) == [
         {"role": "system", "content": MATH_SYSTEM},
         {"role": "user", "content": MATH_USER},
     ]
@@ -154,7 +154,10 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
 
         def tasks(self, n, split="train"):
             return [
-                Task(messages=self.prompts.messages(problem), meta={"question": problem})
+                Task(
+                    messages=self.prompts.render({"PROBLEM": problem}),
+                    meta={"question": problem},
+                )
             ] * n
 
     debate = DebateEnv(
@@ -185,16 +188,24 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
     assert rendered == MATH_USER
 
 
+def _messages_body(system="SYS", user="<PROBLEM>\n\nGo."):
+    return {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "name": "ANSWER_GEN_USER", "content": user},
+        ]
+    }
+
+
 def _write_prompt_yaml(path, system="SYS", user="<PROBLEM>\n\nGo."):
-    body = {"answer_gen_system": system, "answer_gen_user": user}
-    path.write_text(yaml.safe_dump(body))
+    path.write_text(yaml.safe_dump(_messages_body(system, user), sort_keys=False))
     return path
 
 
 def test_prompt_file_override(tmp_path):
     path = _write_prompt_yaml(tmp_path / "alt.yaml", system="Be terse.", user="Q: <PROBLEM>")
     prompts = load_generation_prompts(resolve_prompt_file(str(path), "math.yaml"))
-    assert prompts.messages("2+2") == [
+    assert prompts.render({"PROBLEM": "2+2"}) == [
         {"role": "system", "content": "Be terse."},
         {"role": "user", "content": "Q: 2+2"},
     ]
@@ -204,29 +215,47 @@ def test_prompt_file_relative_path_resolves_against_repo_root():
     prompts = load_generation_prompts(
         resolve_prompt_file("infra/prompts/tasks/math.yaml", "codecontests.yaml")
     )
-    assert prompts.answer_gen_system == MATH_SYSTEM
+    assert prompts.messages[0] == {"role": "system", "content": MATH_SYSTEM}
 
 
-def test_format_notes_substituted_into_every_field(tmp_path):
+def test_format_notes_substituted_into_every_message(tmp_path):
     path = tmp_path / "notes.yaml"
     path.write_text(
-        "format_notes: |-\n  - be brief\nanswer_gen_system: |-\n  Do it.\n  <FORMAT_NOTES>\n"
-        "answer_gen_user: |-\n  <PROBLEM>\n\n  Notes:\n  <FORMAT_NOTES>\n"
+        "format_notes: |-\n  - be brief\n"
+        "messages:\n"
+        "  - role: system\n    content: |-\n      Do it.\n      <FORMAT_NOTES>\n"
+        "  - role: user\n    content: |-\n      <PROBLEM>\n\n      Notes:\n      <FORMAT_NOTES>\n"
     )
     prompts = load_generation_prompts(path)
-    assert prompts.answer_gen_system == "Do it.\n- be brief"
-    assert prompts.answer_gen_user == "<PROBLEM>\n\nNotes:\n- be brief"
+    assert prompts.messages[0]["content"] == "Do it.\n- be brief"
+    assert prompts.messages[1]["content"] == "<PROBLEM>\n\nNotes:\n- be brief"
 
 
 @pytest.mark.parametrize(
     "body, needle",
     [
-        ({"answer_gen_system": "S"}, "answer_gen_user"),                          # missing key
-        ({"answer_gen_system": "S", "answer_gen_user": "no placeholder"}, "<PROBLEM>"),
-        ({"answer_gen_system": "S", "answer_gen_user": "<PROBLEM>", "extra": 1}, "extra"),
-        ({"answer_gen_system": "S", "answer_gen_user": 3}, "must be a string"),
+        ({}, "messages"),                                                       # missing key
+        ({"messages": []}, "non-empty list"),
+        ({"messages": [{"role": "user", "content": "no placeholder"}]}, "<PROBLEM>"),
+        ({"messages": [{"role": "user", "content": "<PROBLEM>"}], "extra": 1}, "extra"),
+        ({"messages": [{"role": "user", "content": 3}]}, "must be a string"),
+        ({"messages": [{"role": "tool", "content": "<PROBLEM>"}]}, "role"),
+        ({"messages": [{"content": "<PROBLEM>"}]}, "role/content"),
         (
-            {"answer_gen_system": "<FORMAT_NOTES>", "answer_gen_user": "<PROBLEM>"},
+            {"messages": [{"role": "user", "content": "<PROBLEM>", "name": "NOT_REGISTERED"}]},
+            "registered splice name",
+        ),
+        (
+            {
+                "messages": [
+                    {"role": "user", "content": "<PROBLEM>", "name": "ANSWER_GEN_USER"},
+                    {"role": "user", "content": "x", "name": "ANSWER_GEN_USER"},
+                ]
+            },
+            "duplicate",
+        ),
+        (
+            {"messages": [{"role": "user", "content": "<PROBLEM>\n<FORMAT_NOTES>"}]},
             "format_notes is not set",
         ),
     ],

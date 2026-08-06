@@ -87,10 +87,22 @@ def debate_sample_rows(states: list, step: int) -> list[list[Any]]:
 
 
 def _write_singleturn_jsonl(records: list[dict], path: str) -> int:
-    with open(path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, default=str) + "\n")
-    return len(records)
+    """Docent-format AgentRuns, matching the debate path: RLVR transcripts
+    belong in docent too (Ethan, 2026-08-06), and one artifact format means
+    one ingest path. Falls back to raw records only if the docent build fails
+    — a lost analysis view is acceptable, a lost archive is not."""
+    from infra.envs.debate.docent_export import export_jsonl
+    from infra.envs.singleturn_docent import agent_runs
+
+    try:
+        export_jsonl(agent_runs(records), path)
+        return len(records)
+    except Exception as e:
+        print(f"[transcripts] single-turn docent build failed ({type(e).__name__}: {e}); writing raw records")
+        with open(path, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, default=str) + "\n")
+        return len(records)
 
 
 def log_rollout_transcripts(step: int, env, split: str) -> None:

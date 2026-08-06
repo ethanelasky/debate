@@ -228,9 +228,11 @@ class DebateEnv(Env):
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
     def _inject_task_prompt_templates(self) -> None:
-        """Splice the task's answer-generation prompt into any slot that asks
-        for it by <ANSWER_GEN_USER>, so the debate proposal IS the RLVR user
-        message rather than a re-typed copy that can drift from it.
+        """Splice the task's answer-generation messages into any template that
+        asks for one by its splice name (<ANSWER_GEN_USER>: math/CC proposal
+        slot, MB blind_assessment cue; <TRAJECTORY_USER>: MB shared pre_debate
+        trajectory message), so the debate stage IS the RLVR message rather
+        than a re-typed copy that can drift from it.
 
         This is a template-level splice, not a var substitution: the spliced
         text still carries placeholders (the task config's <PROBLEM> is rebound

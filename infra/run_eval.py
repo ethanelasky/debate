@@ -208,53 +208,6 @@ def _choice_wiring(exp: dict, protocol: Protocol):
     return binder, int(exp.get("choice_retries", 4)), choice_retry_feedback
 
 
-def blind_message_templates(
-    exp: dict, protocol: Protocol
-) -> tuple[list[dict[str, str]], dict[str, str]]:
-    """Choice mode: the blind first-turn message templates + prompt vars,
-    RLVR-shaped (2026-08-04): [system: blind_system role card, user:
-    blind-instructions SLOT CUE, user: trajectory]. The trajectory message is
-    BY CONSTRUCTION the entry's pre_debate stage (containing
-    <BACKGROUND_TEXT>), the same template every seat renders as its first
-    preamble message — and it goes LAST, so the blind calls share a
-    byte-stable [system][instructions] prefix across every row
-    (message-boundary cache reuse). The task source substitutes
-    <BACKGROUND_TEXT> per row into Task.messages (rendered verbatim by
-    first_speech_non_debate_aware).
-
-    Runs before build_eval_env's _choice_wiring, so the one-solution-slot rule
-    is re-checked here rather than relied on from a distance."""
-    from infra.envs.debate.prompts import load_prompt_library, slot_template
-
-    sols = protocol.solution_slots
-    if len(sols) != 1:
-        raise ValueError(
-            f"choice_positions: expected exactly one solution slot (the blind choice "
-            f"slot), got {sorted(sols)}"
-        )
-    lib = load_prompt_library(
-        exp["prompt_config"]["file_path"], exp["prompt_config"]["entry"], protocol
-    )
-    if "<BACKGROUND_TEXT>" not in lib.shared_pre_debate:
-        raise ValueError(
-            "choice_positions: the prompt entry's pre_debate stage must be the shared "
-            "trajectory template containing <BACKGROUND_TEXT> — it doubles as the blind "
-            "first-turn's trajectory message"
-        )
-    if not lib.blind_system:
-        raise ValueError(
-            "choice_positions: the prompt entry must define blind_system — the solo "
-            "blind view's system role card (the RLVR-style monitor card)"
-        )
-    (sol,) = sols.values()
-    messages = [
-        {"role": "system", "content": lib.blind_system},
-        {"role": "user", "content": slot_template(lib, sol.slot.name, sol.speaker)},
-        {"role": "user", "content": lib.shared_pre_debate},
-    ]
-    return messages, dict(lib.vars)
-
-
 def build_eval_env(exp: dict, task_source) -> DebateEnv:
     """Experiment dict + task source -> all-frozen DebateEnv (pure eval)."""
     from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
@@ -299,15 +252,11 @@ def build_task_source(exp: dict, task_ids: Optional[list[str]], seed: Optional[i
     files = ds.get("files")
     if not files:
         raise ValueError("experiment missing 'dataset.files' (list of jsonl paths)")
-    choice_messages, choice_vars = (None, None)
-    if exp.get("choice_positions"):
-        choice_messages, choice_vars = blind_message_templates(exp, _resolve_protocol(exp))
     return MonitoringBenchTaskSource(
         files,
         task_ids=task_ids if task_ids is not None else ds.get("task_ids"),
         seed=seed if seed is not None else int(ds.get("seed", 0)),
-        choice_messages=choice_messages,
-        choice_prompt_vars=choice_vars,
+        prompt_file=ds.get("prompt_file"),
     )
 
 
