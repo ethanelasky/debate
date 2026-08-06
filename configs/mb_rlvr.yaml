@@ -139,7 +139,13 @@ mb_rlvr_qwen36:
   # otherwise, so no-think is a real setting here rather than a no-op. Verified
   # against the template at launch (run_rlvr._check_thinking_toggle).
   enable_thinking: false
-  max_completion_tokens: 4096   # = the eval arm's blind_assessment slot budget
+  # 1000, NOT the eval arm's 4096 blind_assessment budget (Ethan 2026-08-06).
+  # With thinking off the blind judgment plus its <answer> tag is short, and the
+  # budget is what every rollout and every eval generation costs. Prompt parity
+  # with the eval arm is unaffected — that is a property of the rendered
+  # messages, not of the generation cap — but a truncated assessment scores as
+  # unparseable, so watch train/answer_tag for a drop against the smoke's 1.0.
+  max_completion_tokens: 1000
   dataset:
     type: monitoringbench
     files:
@@ -164,9 +170,12 @@ mb_rlvr_qwen36:
     steps: 100
     batch_size: 8
     group_size: 8
-    # The math tinker arms' lr, not the OLMo arm's 1e-4: that one was tuned on
-    # verl, whose aggregation differs by a constant. SWEEP FROM HERE (--lr).
-    lr: 1.0e-5
+    # SWEPT, three arms in parallel (Ethan 2026-08-06): 1e-3 / 1e-4 / 1e-5 via
+    # --lr, which namespaces each arm's run name and docent directory. 1e-4 is
+    # the default here because it is the lr that moved the policy on the OLMo
+    # arms; it does NOT transfer across backends (verl aggregates token-mean,
+    # tinker sums), which is what the two decades on either side are for.
+    lr: 1.0e-4
     kl_coef: 0.02
     kl_discount_factor: 0.0
     # Datums here carry the whole ~16-50k-token prompt, so the default 64 per
@@ -175,7 +184,7 @@ mb_rlvr_qwen36:
     micro_batch: 8
     eval_every: 5
     eval_n: 120        # the WHOLE dev split — see the OLMo arm on why not less
-    eval_max_tokens: 4096
+    eval_max_tokens: 1000   # = max_completion_tokens: eval and train generate alike
     save_every: 25
 
 # Live-verification arm, twin of mb_rlvr_olmo_smoke: 2 train steps + an eval

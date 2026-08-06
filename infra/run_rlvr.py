@@ -159,7 +159,13 @@ def main() -> None:
     )
 
     # Comprehensive docent capture, single-turn twin of run_debate's: every
-    # training rollout's kept samples -> docent/step-NNNNN.jsonl.
+    # training rollout's kept samples -> docent/<run>/step-NNNNN.jsonl. The run
+    # name carries the sweep suffix, for the same reason checkpoints do: arms of
+    # one sweep run concurrently from the same working directory, and a shared
+    # docent/step-NNNNN.jsonl would have them overwrite each other's rollouts
+    # step for step, leaving one file per step drawn from whichever arm wrote last.
+    docent_dir = os.path.join("docent", run_name)
+
     def _export_docent(step: int, env_) -> None:
         from infra.envs.debate.docent_export import export_jsonl
         from infra.envs.singleturn_docent import agent_runs
@@ -167,8 +173,8 @@ def main() -> None:
         records = getattr(env_, "last_rollout_records", None)
         if not records:
             return
-        os.makedirs("docent", exist_ok=True)
-        export_jsonl(agent_runs(records), f"docent/step-{step:05d}.jsonl")
+        os.makedirs(docent_dir, exist_ok=True)
+        export_jsonl(agent_runs(records), os.path.join(docent_dir, f"step-{step:05d}.jsonl"))
 
     cfg.on_rollout = _export_docent
     train(env, backend, cfg)
