@@ -8,6 +8,7 @@ eval machinery.
 from __future__ import annotations
 
 import concurrent.futures
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
@@ -159,7 +160,12 @@ class SingleTurnEnv(Env):
         are means over all samples rather than over whichever branch set it."""
 
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        # Split generation from scoring: they are the two halves of a rollout and
+        # have completely different cost drivers (GPU token throughput vs CPU
+        # subprocess execution), so a combined number hides which one to attack.
+        _t0 = time.monotonic()
         results = policy.predict([t.messages for t in tasks], n=group_size)
+        _t_generate = time.monotonic() - _t0
         groups: list[list[Trajectory]] = [[] for _ in tasks]
         kept: list[tuple[int, Sample]] = []
         n_dropped = 0
@@ -170,6 +176,7 @@ class SingleTurnEnv(Env):
                     continue
                 kept.append((gi, s))
 
+        _t1 = time.monotonic()
         workers = max(1, self.grade_workers)
         if workers > 1 and kept:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -183,6 +190,9 @@ class SingleTurnEnv(Env):
         # suite is how proposer accuracy gets measured after the run. Without
         # this the completions are gone the moment the step ends.
         self.last_rollout: list[dict[str, Any]] = []
+        _t_reward = time.monotonic() - _t1
+        self.last_phase_seconds = {"generate": _t_generate, "reward": _t_reward}
+
         for (gi, s), (reward, info) in zip(kept, scored):
             # Length is priced here rather than in reward(), which only sees
             # text; token counts live on the Sample.

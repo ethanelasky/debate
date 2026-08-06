@@ -196,6 +196,19 @@ codecontests_rlvr_olmo31_32b_smoke10:
     eval_n: 32
     save_every: 0
 
+# Phase-timing run: 3 steps at the real 8x8 shape, NO eval, no save. Exists to
+# fill in the phase/* panels (generate vs reward vs KL vs fwd/bwd vs sleep/wake)
+# so the 141s residual in a 171s step stops being a guess. Keep it to 3 steps —
+# step 0 carries init, so steps 1-2 are the ones that matter.
+codecontests_rlvr_olmo31_32b_phases:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 3
+    batch_size: 8
+    group_size: 8
+    eval_every: 0
+    save_every: 0
+
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
 codecontests_rlvr_olmo31_32b_smoke:
