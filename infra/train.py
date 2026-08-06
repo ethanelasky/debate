@@ -35,6 +35,7 @@ class Config:
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
+    log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
     run_name: str | None = None
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
@@ -80,6 +81,18 @@ def _rollout_info_metrics(env: Env, prefix: str) -> dict[str, float]:
     return out
 
 
+def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
+    """Transcript capture must never kill training (same stance as on_rollout)."""
+    if not (cfg.log_transcripts and cfg.wandb_project):
+        return
+    try:
+        from infra.transcript_log import log_rollout_transcripts
+
+        log_rollout_transcripts(step, env, split)
+    except Exception as e:
+        print(f"[transcripts] {type(e).__name__}: {e}")
+
+
 def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
     groups = env.rollout(env.tasks(n, split="test"), policy.greedy(), group_size=1)
     return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
@@ -103,6 +116,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 print(f"[on_rollout] {type(e).__name__}: {e}")
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
+        _log_transcripts(cfg, step, env, "train")
 
         datums, pack_stats = grpo_pack(
             groups,
@@ -141,6 +155,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                     policy.chat_template_kwargs,
                 )
             metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
+            _log_transcripts(cfg, step, eval_env or env, "eval")
         if cfg.save_every and step > 0 and step % cfg.save_every == 0:
             metrics["checkpoint_saved"] = 1.0
             backend.save(f"step-{step:05d}")

@@ -135,9 +135,16 @@ class SingleTurnEnv(Env):
     `grade_workers`: > 1 runs reward() in a thread pool, for verifiers that
     shell out to a subprocess (code execution). Pure-python graders leave it at
     1 and score inline rather than pay for a pool they cannot use.
+
+    Each rollout() overwrites `last_rollout_records` — one dict per KEPT
+    sample (prompt messages, completion, reward, info) — retained for
+    transcript export (wandb; the single-turn twin of DebateEnv.last_states).
+    meta is copied without "bindings": its values (e.g. a 60k-token MB
+    trajectory) are already rendered into the messages.
     """
 
     grade_workers: int = 1
+    last_rollout_records: list[dict[str, Any]] = []
 
     @abstractmethod
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
@@ -165,8 +172,21 @@ class SingleTurnEnv(Env):
         else:
             scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
 
+        records = []
         for (gi, s), (reward, info) in zip(kept, scored):
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
+            records.append(
+                {
+                    "task_index": gi,
+                    "meta": {k: v for k, v in tasks[gi].meta.items() if k != "bindings"},
+                    "messages": tasks[gi].messages,
+                    "completion": s.text,
+                    "stop_reason": s.stop_reason,
+                    "reward": reward,
+                    "info": info,
+                }
+            )
+        self.last_rollout_records = records
         # Deliberately violates the every-branch rule in reward()'s docstring:
         # a batch-level counter stamped on one sample (and lost when the first
         # group is empty). Pinned by tests; fixing it means a new channel for

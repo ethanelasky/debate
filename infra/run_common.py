@@ -37,6 +37,7 @@ TRAINING_KEYS = {
     "eval_n",
     "save_every",
     "wandb_project",
+    "log_transcripts",
 }
 
 # training-block keys that map 1:1 onto Config fields, with their YAML casts.
@@ -57,6 +58,7 @@ CONFIG_CASTS: tuple[tuple[str, type], ...] = (
     ("eval_max_tokens", int),
     ("eval_n", int),
     ("save_every", int),
+    ("log_transcripts", bool),
 )
 
 
