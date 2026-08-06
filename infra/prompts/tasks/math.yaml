@@ -45,3 +45,21 @@ messages:
       - End with your final answer as EXACTLY one \boxed{...} on the last line.
 
       Provide your solution:
+
+# The plan-turn cue (splice name PLAN_USER; see infra/envs/task_prompts.py).
+# NOT part of the solo messages above: plain single-turn arms keep rendering
+# exactly `messages`. Plan-then-answer arms (RLVR via plan_tokens, debate via
+# a pre-proposal `plan` slot spliced as <PLAN_USER>) render this as the user
+# message of a private scratchpad turn before ANSWER_GEN_USER — the CoT
+# surrogate when thinking is off. Wording is arm-neutral on purpose: it
+# renders under the math system card in RLVR and under the debater card in
+# debate, byte-identically (2026-08-06).
+plan: |-
+  Consider this mathematics problem.
+
+  <problem><PROBLEM></problem>
+
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Work the problem: try an approach, do the key computations, and
+  settle on the answer you will commit to. Notes only; do not write the final
+  solution yet.

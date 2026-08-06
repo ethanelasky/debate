@@ -30,3 +30,16 @@ messages:
       - End with your final answer as EXACTLY one \boxed{...} on the last line.
 
       Provide your solution:
+
+# Neutral plan cue, derived from math.yaml's `plan` by DELETION ONLY: the
+# "work the problem / do the key computations" coaching is removed — this arm's
+# question is whether reasoning emerges when nothing asks for it, and a
+# scratchpad instruction to compute would answer it by fiat. The private-turn
+# structure itself stays, matching the debate arm's plan slot.
+plan: |-
+  Consider this mathematics problem.
+
+  <problem><PROBLEM></problem>
+
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Use it however you like before giving your solution.

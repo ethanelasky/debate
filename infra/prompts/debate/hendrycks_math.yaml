@@ -206,6 +206,16 @@ math_proposer_critic:
 
   # -------------------------------------------- per-turn cues (protocol slots)
 
+  # Pre-proposal private planning slot. Spliced whole from the task family's
+  # `plan` template (infra/prompts/tasks/math*.yaml), like the proposal cue:
+  # this is where the PROPOSER first sees the problem (it gets no pre_debate
+  # preamble — see the header), and the RLVR plan-then-answer arm
+  # (plan_tokens; infra/envs/planned.py) renders the SAME bytes as its plan
+  # turn, so the two arms' plan turns cannot drift apart. The generic
+  # `scratchpad` cue below is dispute-phase wording ("redo the disputed
+  # steps") and would be doubly wrong here: no problem in context yet, and no
+  # dispute to work on (2026-08-06).
+  plan: <PLAN_USER>
   scratchpad: |-
     PRIVATE scratchpad — nothing you write here reaches the Judge or the other
     debater. Work the mathematics: redo the disputed steps, try a small case,

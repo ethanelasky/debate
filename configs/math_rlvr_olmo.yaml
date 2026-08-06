@@ -44,6 +44,25 @@ math_rlvr_olmo_l5_nocot:
   _extends: math_rlvr_olmo_l5
   dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
 
+# Plan-then-answer arms: the RLVR twins of the math_pc_olmo debate entries,
+# which give the proposer a private 1000-token plan slot before the proposal
+# (the CoT surrogate with thinking off). Without this, the debate arm gets
+# extra sequential compute the RLVR arm doesn't — a confound on top of the
+# reward-source difference. The plan turn renders the task family's `plan` cue
+# (math*.yaml), byte-identical to the debate plan slot's spliced <PLAN_USER>.
+# prompt_length grows: the answer turn's prompt now carries the plan cue plus
+# up to 1000 plan tokens.
+math_rlvr_olmo_l5_plan:
+  _extends: math_rlvr_olmo_l5
+  plan_tokens: 1000
+  training:
+    verl:
+      prompt_length: 4096
+
+math_rlvr_olmo_l5_plan_nocot:
+  _extends: math_rlvr_olmo_l5_plan
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+
 # tiny live-verification arm
 math_rlvr_olmo_smoke:
   _extends: math_rlvr_olmo_l5

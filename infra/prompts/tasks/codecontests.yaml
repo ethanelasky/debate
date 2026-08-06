@@ -50,3 +50,17 @@ messages:
       <FORMAT_NOTES>
 
       Provide your answer:
+
+# The plan-turn cue (splice name PLAN_USER); same contract as math.yaml's:
+# NOT part of the solo messages, rendered as a private scratchpad turn before
+# ANSWER_GEN_USER by plan-then-answer arms (RLVR plan_tokens; debate `plan`
+# slot), byte-identically in both.
+plan: |-
+  Consider this programming problem.
+
+  <question><PROBLEM></question>
+
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Work the problem: pin down the algorithm, the edge cases, and the
+  I/O format you will implement. Notes only; do not write the final solution
+  yet.

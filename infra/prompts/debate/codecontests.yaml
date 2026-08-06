@@ -270,6 +270,12 @@ codecontests_proposer_critic:
 
   # -------------------------------------------- per-turn cues (protocol slots)
 
+  # Pre-proposal private planning slot, spliced whole from the task family's
+  # `plan` template (infra/prompts/tasks/codecontests.yaml) — the proposer has
+  # no pre_debate preamble, so this is where it first sees the problem, and
+  # the RLVR plan-then-answer arm renders the same bytes as its plan turn.
+  # Mirrors hendrycks_math.yaml (2026-08-06).
+  plan: <PLAN_USER>
   scratchpad: |-
     PRIVATE scratchpad — nothing you write here is shown to anyone. Plan your
     next contribution: work through the algorithm, trace the disputed code on

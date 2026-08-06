@@ -45,7 +45,14 @@ from infra.run_common import (
 )
 from infra.train import Config, train
 
-EXPERIMENT_KEYS = {"model", "enable_thinking", "max_completion_tokens", "dataset", "training"}
+EXPERIMENT_KEYS = {
+    "model",
+    "enable_thinking",
+    "max_completion_tokens",
+    "plan_tokens",
+    "dataset",
+    "training",
+}
 
 
 def _check_thinking_toggle(tokenizer, enable_thinking: bool) -> None:
@@ -102,6 +109,14 @@ def main() -> None:
     family = get_family(ds.pop("type", None))
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
     env = family.source(ds)
+    # plan_tokens: two-turn plan-then-answer rollouts (train AND eval — one
+    # env, one rollout path), matching the debate arm's pre-solution scratchpad
+    # slot. See infra/envs/planned.py.
+    plan_tokens = exp.get("plan_tokens")
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        env = PlannedEnv(env, int(plan_tokens))
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])

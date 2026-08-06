@@ -93,7 +93,7 @@ SOLO_PROPOSAL = {"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}
 
 def test_extends_merges_vars_over_parent(lib, tmp_path):
     assert set(lib.system) == {"alice", "bob", "judge"}
-    assert set(lib.slots) == {"scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
+    assert set(lib.slots) == {"plan", "scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
 
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY)

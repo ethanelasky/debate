@@ -14,6 +14,14 @@ message list it renders to — one schema for every family:
                       the message template, and a message that a debate pack
                       may splice in whole carries a `name` from
                       TASK_SUPPLIED_TEMPLATES (see below).
+    plan              optional; the private plan-turn cue (splice name
+                      PLAN_USER), NOT part of the solo messages. Plan-then-
+                      answer rollouts (envs/planned.py) render it as the
+                      user message of a scratchpad turn BEFORE the solo
+                      context's eliciting message; debate packs splice it as
+                      a pre-solution scratchpad slot's cue. It must carry the
+                      family's row placeholder — the plan turn is where the
+                      problem first reaches the speaker.
 
 The row's content binds via a placeholder the FAMILY owns — <PROBLEM> for
 math/codecontests (the problem text, mid-message), <BACKGROUND_TEXT> for
@@ -61,7 +69,13 @@ _MESSAGE_KEYS = {"role", "content", "name"}
 # supplied no message with it — no silent fallback, no failure deferred to
 # generation time. The registry is what makes that check possible: env code
 # can tell "task-supplied template" from an ordinary binding placeholder.
-TASK_SUPPLIED_TEMPLATES = ("ANSWER_GEN_USER", "TRAJECTORY_USER")
+TASK_SUPPLIED_TEMPLATES = ("ANSWER_GEN_USER", "TRAJECTORY_USER", "PLAN_USER")
+
+#: The `plan` key's fixed splice name. Unlike the message-list names, the plan
+#: cue is its own top-level key: it is NOT part of the solo context (plain
+#: single-turn RLVR must keep rendering exactly `messages`), so it cannot live
+#: in the messages list without changing that arm's prompt.
+PLAN_TEMPLATE_NAME = "PLAN_USER"
 
 
 @dataclass(frozen=True)
@@ -121,11 +135,11 @@ def load_generation_prompts(
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping of prompt keys")
 
-    unknown = sorted(set(data) - {"messages", "format_notes"})
+    unknown = sorted(set(data) - {"messages", "format_notes", "plan"})
     if unknown or "messages" not in data:
         raise ValueError(
             f"{path}: bad prompt keys (missing {sorted({'messages'} - set(data))}, "
-            f"unknown {unknown}); required ['messages'], optional ['format_notes']"
+            f"unknown {unknown}); required ['messages'], optional ['format_notes', 'plan']"
         )
     notes = data.get("format_notes")
     if notes is not None and not isinstance(notes, str):
@@ -152,15 +166,33 @@ def load_generation_prompts(
         content = _fill_notes(content, notes, path, f"messages[{i}]")
         if "name" in m:
             name = m["name"]
-            if name not in TASK_SUPPLIED_TEMPLATES:
+            if name not in TASK_SUPPLIED_TEMPLATES or name == PLAN_TEMPLATE_NAME:
                 raise ValueError(
                     f"{path}: messages[{i}] name {name!r} is not a registered splice "
                     f"name {TASK_SUPPLIED_TEMPLATES}"
+                    + (
+                        " (PLAN_USER comes from the top-level `plan` key — a plan cue "
+                        "inside `messages` would change the plain single-turn prompt)"
+                        if name == PLAN_TEMPLATE_NAME
+                        else ""
+                    )
                 )
             if name in named:
                 raise ValueError(f"{path}: duplicate message name {name!r}")
             named[name] = content
         messages.append({"role": role, "content": content})
+
+    plan = data.get("plan")
+    if plan is not None:
+        if not isinstance(plan, str):
+            raise ValueError(f"{path}: plan must be a string, got {type(plan).__name__}")
+        plan = _fill_notes(plan, notes, path, "plan")
+        if require_placeholder not in plan:
+            raise ValueError(
+                f"{path}: plan does not contain the {require_placeholder} placeholder — "
+                "the plan turn is where the problem first reaches the speaker"
+            )
+        named[PLAN_TEMPLATE_NAME] = plan
 
     if not any(require_placeholder in m["content"] for m in messages):
         raise ValueError(

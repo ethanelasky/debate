@@ -59,6 +59,7 @@ EXPERIMENT_KEYS = {
     "fresh_positions",
     "flip",
     "first_speech_non_debate_aware",
+    "plan_tokens",
 }
 
 AGENT_KEYS = {"trained", "model_settings"}
@@ -214,8 +215,17 @@ def main() -> None:
     cfg.on_rollout = _export_docent
 
     # RLVR evals: measure proposal accuracy on the held-out split via the
-    # task source itself (MathEnv), not a debate
-    train(env, backend, cfg, eval_env=env.task_source)
+    # task source itself (MathEnv), not a debate. plan_tokens wraps the eval in
+    # the same plan-then-answer shape as the protocol's pre-proposal plan slot,
+    # so the policy is measured in the mode it is trained in (set it to that
+    # slot's max_total_tokens).
+    eval_env = env.task_source
+    plan_tokens = exp.get("plan_tokens")
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        eval_env = PlannedEnv(eval_env, int(plan_tokens))
+    train(env, backend, cfg, eval_env=eval_env)
 
 
 if __name__ == "__main__":

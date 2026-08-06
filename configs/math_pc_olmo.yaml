@@ -10,7 +10,12 @@
 math_pc_olmo_l5:
   protocol:
     turns:
-      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
+      # `plan`, not `scratchpad`: the pre-proposal slot has its own cue
+      # (spliced <PLAN_USER>) carrying the problem — the proposer has no
+      # pre_debate preamble, so the generic scratchpad cue left alice
+      # planning blind (2026-08-06). Later scratchpads keep the generic cue:
+      # by then the problem/dispute is in context.
+      - alice: [{name: plan, visibility: private, max_total_tokens: 1000},
                 {name: proposal, kind: solution, max_total_tokens: 1000}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
                 {name: critique, max_total_tokens: 500}]
@@ -24,6 +29,9 @@ math_pc_olmo_l5:
     file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
+  # RLVR evals run plan-then-answer (same shape as alice's plan slot, same
+  # 1000-token cap) so the policy is measured in the mode it is trained in.
+  plan_tokens: 1000
   agents:
     alice:
       trained: true
@@ -109,7 +117,8 @@ math_pc_olmo_smoke:
 math_pc_olmo_l5_g8:
   protocol:
     turns:
-      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
+      # plan (not scratchpad): see math_pc_olmo_l5's protocol comment.
+      - alice: [{name: plan, visibility: private, max_total_tokens: 1000},
                 {name: proposal, kind: solution, max_total_tokens: 2000}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
                 {name: critique, max_total_tokens: 500}]
@@ -123,6 +132,9 @@ math_pc_olmo_l5_g8:
     file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
+  # RLVR evals run plan-then-answer (same shape as alice's plan slot, same
+  # 1000-token cap) so the policy is measured in the mode it is trained in.
+  plan_tokens: 1000
   agents:
     alice:
       trained: true
