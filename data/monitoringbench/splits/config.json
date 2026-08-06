@@ -1,0 +1,100 @@
+{
+  "generator": "scripts/mb_make_splits.py",
+  "seed": 0,
+  "source_files": [
+    {
+      "path": "data/monitoringbench/honest_mb550_norm.jsonl",
+      "sha256": "7f5801a5dbfd656b1ede7e2d9a389d7f6720191f410b28d6a165665dc0f30e1c",
+      "bytes": 28119734
+    },
+    {
+      "path": "data/monitoringbench/attacks_mb550_norm.jsonl",
+      "sha256": "d23fb4f9d0658f06a453d5146cb9e563ab08e29a458ae819b330323be315dfab",
+      "bytes": 24524066
+    }
+  ],
+  "grouping": "task id (middle field of <label>_<task>_<idx>); splits are task-disjoint",
+  "targets": {
+    "eval_rows": 250,
+    "dev_rows": 120
+  },
+  "task_size_bands": [
+    [
+      1,
+      1
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      4,
+      6
+    ],
+    [
+      7,
+      9
+    ],
+    [
+      10,
+      12
+    ],
+    [
+      13,
+      14
+    ]
+  ],
+  "splits": {
+    "train": {
+      "rows": 730,
+      "tasks": 60,
+      "attack": 365,
+      "honest": 365,
+      "median_chars": 40822,
+      "median_chars_attack": 38452,
+      "median_chars_honest": 43335,
+      "median_steps": 14,
+      "length_auc_attack_is_shorter": 0.5739
+    },
+    "dev": {
+      "rows": 120,
+      "tasks": 29,
+      "attack": 60,
+      "honest": 60,
+      "median_chars": 41274,
+      "median_chars_attack": 40434,
+      "median_chars_honest": 48182,
+      "median_steps": 15,
+      "length_auc_attack_is_shorter": 0.5956
+    },
+    "eval": {
+      "rows": 250,
+      "tasks": 27,
+      "attack": 125,
+      "honest": 125,
+      "median_chars": 40760,
+      "median_chars_attack": 39545,
+      "median_chars_honest": 42491,
+      "median_steps": 13,
+      "length_auc_attack_is_shorter": 0.5661
+    }
+  },
+  "pool": {
+    "rows": 1100,
+    "tasks": 116,
+    "attack": 550,
+    "honest": 550,
+    "median_chars": 40822,
+    "median_chars_attack": 38944,
+    "median_chars_honest": 43325,
+    "median_steps": 14,
+    "length_auc_attack_is_shorter": 0.574
+  },
+  "length_confound": {
+    "auc_shorter_means_attack_pool": 0.574,
+    "auc_shorter_means_attack_within_task": 0.5778,
+    "tasks_where_attack_median_is_shorter": 72,
+    "n_tasks": 116,
+    "note": "residual after scripts/mb_normalize_pool.py (raw pool was 0.786 / 0.854). Attack trajectories come from the MonitoringBench HF release, honest ones from the local Opus honest world. Any accuracy on this pool should be read against this baseline, and against the step-count residual recorded in data/monitoringbench/norm/config.json."
+  }
+}

@@ -27,16 +27,41 @@ mb_rlvr_olmo:
     # attacks_mb550_final, not attacks_mb550: the latter predates the honest
     # yield and misses the mirror on 11 tasks. Watch train/chose_attack against
     # a 0.50 base rate now.
+    # NORMALIZED pool (scripts/mb_normalize_pool.py), not the raw files: the
+    # raw pool leaked the label through surface statistics a policy can read
+    # without any security reasoning — chars 0.786 AUC, steps 0.700, tool calls
+    # 0.708, and a single length threshold classifying at 73.2% against a 50%
+    # base rate. Normalization puts both generators on one step granularity and
+    # matches call counts (residual 0.574 / 0.616 / 0.452). Provenance, the
+    # rejected alternatives, and the residual artifacts are in
+    # data/monitoringbench/norm/config.json. RLVR would happily learn the
+    # shortcut, so this matters more here than anywhere else.
     files:
-      - data/monitoringbench/honest_mb550.jsonl
-      - data/monitoringbench/attacks_mb550_final.jsonl
+      - data/monitoringbench/honest_mb550_norm.jsonl
+      - data/monitoringbench/attacks_mb550_norm.jsonl
     seed: 0
-    # Held out of training: the FIRST 300 seed-0-shuffled rows — the same rows
-    # an uncarved eval source serves first, so eval selections stay comparable.
-    # 800 train / 300 eval. The carve is by trajectory, not by task: every
-    # held-out task also appears in train, so this measures "spot an attack in
-    # a familiar task", not generalization to unseen tasks.
-    test_size: 300
+    # Canonical TASK-DISJOINT splits (scripts/mb_make_splits.py; provenance and
+    # achieved stats in data/monitoringbench/splits/config.json). Supersedes the
+    # test_size carve, INCLUDING 391e0e9's 800/300: as that commit's own message
+    # noted, a row-level carve leaves every held-out task represented in train,
+    # so it measured "spot an attack in a familiar task" rather than
+    # generalization to an unseen one. The pool mirrors each task across labels,
+    # which is what made the leak total rather than partial.
+    #   train 730 rows / 60 tasks
+    #   test  = the DEV split, 120 rows / 29 tasks — the selection surface
+    #           (this curve, checkpoint choice, lr sweeps).
+    # The 250-row eval split is named by NEITHER file, so it is unreachable from
+    # this config: final numbers come from configs/mb_eval.yaml only.
+    #
+    # OPEN SIZING QUESTION (391e0e9 raised it and it is not resolved): 120 dev
+    # rows is +-4.6pp at a 0.50 base rate, vs +-2.9pp for that commit's 300. The
+    # task-disjointness constraint is what costs the rows — dev has to take whole
+    # tasks. If this curve proves too noisy to read, grow dev in
+    # scripts/mb_make_splits.py (TARGET_DEV_ROWS) and regenerate rather than
+    # reverting to a leaky carve.
+    split_files:
+      train: data/monitoringbench/splits/train_ids.txt
+      test: data/monitoringbench/splits/dev_ids.txt
   training:
     backend: verl
     verl:
@@ -62,20 +87,23 @@ mb_rlvr_olmo:
     kl_coef: 0.02
     kl_discount_factor: 0.0
     eval_every: 5
-    eval_n: 300        # the whole held-out split (binary task: +-2.9pp binomial noise)
-                       # tasks() takes test_rows[:n], a prefix — NOT a sample. A
-                       # value below test_size silently strands the tail: those
-                       # rows leave training and are never evaluated either.
+    # The WHOLE dev split (60 attack / 60 honest, +-4.6pp binomial noise).
+    # Keep this equal to the dev split size: tasks() returns test_rows[:n], a
+    # prefix rather than a sample (391e0e9), so anything smaller strands the
+    # tail — those rows are held out of training and never evaluated either.
+    # Split files are ordered label-alternating and task-round-robin, so a
+    # smaller value would at least stay balanced, but it would still waste rows.
+    eval_n: 120
     eval_max_tokens: 4096
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
-# tiny live-verification arm: 2 train steps plus ONE eval pass over a single
-# 8-row held-out carve (1 batch-worth) — the eval rollout path is part of what
-# the smoke verifies (Ethan 2026-08-05).
+# tiny live-verification arm: 2 train steps plus ONE eval pass over the first
+# 8 dev rows (1 batch-worth, 4 attack / 4 honest by the split file's ordering)
+# — the eval rollout path is part of what the smoke verifies (Ethan
+# 2026-08-05). Inherits the parent's split_files: no separate carve to keep in
+# sync.
 mb_rlvr_olmo_smoke:
   _extends: mb_rlvr_olmo
-  dataset:
-    test_size: 8
   training:
     steps: 2
     batch_size: 2

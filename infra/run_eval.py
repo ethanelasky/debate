@@ -103,7 +103,7 @@ EXPERIMENT_KEYS = {
 
 AGENT_KEYS = {"trained", "model_settings"}  # trained must be false; _frozen_settings enforces
 
-DATASET_KEYS = {"files", "task_ids", "seed"}
+DATASET_KEYS = {"files", "task_ids", "task_ids_file", "seed", "prompt_file"}
 
 
 def validate_experiment(exp: dict) -> None:
@@ -245,7 +245,9 @@ def build_eval_env(exp: dict, task_source) -> DebateEnv:
 def build_task_source(exp: dict, task_ids: Optional[list[str]], seed: Optional[int]):
     """dataset block -> MonitoringBenchTaskSource. Imported lazily: the module
     is only needed on the real-data path (tests inject synthetic sources).
-    CLI task_ids/seed override the dataset block's."""
+    CLI task_ids/seed override the dataset block's — and a CLI whitelist also
+    overrides dataset.task_ids_file, so --task-ids can narrow a config that
+    pins a whole split."""
     from infra.envs.tasks.monitoringbench import MonitoringBenchTaskSource
 
     ds = exp.get("dataset") or {}
@@ -255,6 +257,7 @@ def build_task_source(exp: dict, task_ids: Optional[list[str]], seed: Optional[i
     return MonitoringBenchTaskSource(
         files,
         task_ids=task_ids if task_ids is not None else ds.get("task_ids"),
+        task_ids_file=None if task_ids is not None else ds.get("task_ids_file"),
         seed=seed if seed is not None else int(ds.get("seed", 0)),
         prompt_file=ds.get("prompt_file"),
     )

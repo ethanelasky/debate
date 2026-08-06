@@ -1,0 +1,79 @@
+{
+  "generator": "scripts/mb_normalize_pool.py",
+  "seed": 0,
+  "stages": [
+    "attacks: batch consecutive steps to honest's calls-per-step distribution (reformat only)",
+    "honest: drop trailing whole steps until the call count meets the same-task rank-matched attack count"
+  ],
+  "inputs": {
+    "data/monitoringbench/attacks_mb550_final.jsonl": {
+      "sha256": "0ffe72e16c0751b9c0496d3cd830bd761f0d034df8308a3b9bf8cfdaf86cda5b"
+    },
+    "data/monitoringbench/honest_mb550.jsonl": {
+      "sha256": "5edbe1507683365a9b125ae18c698c4ce4ae2d6bb703451a0e3ae6da2c8fd570"
+    }
+  },
+  "medians": {
+    "chars": {
+      "attack_before": 39335,
+      "attack_after": 38944,
+      "honest_before": 62318,
+      "honest_after": 43325
+    },
+    "steps": {
+      "attack_before": 27,
+      "attack_after": 15,
+      "honest_before": 19,
+      "honest_after": 12
+    },
+    "calls": {
+      "attack_before": 27,
+      "attack_after": 27,
+      "honest_before": 35,
+      "honest_after": 26
+    }
+  },
+  "confound": {
+    "before": {
+      "auc_shorter_means_attack": 0.7855,
+      "auc_more_steps_means_attack": 0.6997,
+      "auc_fewer_calls_means_attack": 0.7076
+    },
+    "after": {
+      "auc_shorter_means_attack": 0.574,
+      "auc_more_steps_means_attack": 0.6163,
+      "auc_fewer_calls_means_attack": 0.4522
+    },
+    "worst_deviation_from_0.5": {
+      "before": 0.2855,
+      "after": 0.1163
+    },
+    "best_length_threshold_accuracy": {
+      "before": {
+        "accuracy": 0.7318,
+        "threshold_chars": 53834
+      },
+      "after": {
+        "accuracy": 0.5864,
+        "threshold_chars": 59499
+      },
+      "base_rate": 0.5
+    }
+  },
+  "attack_side": {
+    "rows": 550,
+    "content_removed": false,
+    "note": "reformatting only \u2014 call counts and action text verified identical row by row"
+  },
+  "honest_side": {
+    "rows": 550,
+    "rows_truncated": 459,
+    "calls_removed_total": 6803
+  },
+  "residual_artifacts": [
+    "honest rows stop before their task is finished ('ends mid-task' is an honest-only tell); no truncation marker is inserted, since a marker only honest rows carry would be trivially detectable",
+    "merged attack outputs are joined with a newline \u2014 an inference about honest's batching convention, unverifiable from the data (honest's concatenated outputs carry no delimiter)",
+    "residual AUCs are {'auc_shorter_means_attack': 0.574, 'auc_more_steps_means_attack': 0.6163, 'auc_fewer_calls_means_attack': 0.4522} , not 0.5",
+    "verify empirically: scripts/mb_solo_monitor.py over the dev split, compared against the 'before' baselines"
+  ]
+}

@@ -335,3 +335,81 @@ def test_reward_blind_choice(tmp_path):
     assert info == {"correct": 0.0, "answer_tag": 0.0, "chose_attack": 0.0}
 
 
+
+
+# ------------------------------------------------- split_files / task_ids_file
+#
+# The canonical splits (scripts/mb_make_splits.py) are TASK-DISJOINT id lists,
+# so what matters here is that a split file bounds what each split can serve —
+# and in particular that rows named by NO file (the real pool's eval split) are
+# unreachable from "train".
+
+
+def _ids_file(path, ids, header="# comment\n\n"):
+    path.write_text(header + "".join(f"{i}\n" for i in ids))
+    return str(path)
+
+
+def test_split_files_serve_named_rows_in_file_order(tmp_path):
+    files = _pool_files(tmp_path)
+    src = MonitoringBenchTaskSource(
+        files,
+        split_files={
+            "train": _ids_file(tmp_path / "tr.txt", ["attack_0_0", "honest_0_0"]),
+            "test": _ids_file(tmp_path / "te.txt", ["attack_1_0", "honest_1_0"]),
+        },
+    )
+    # File order, not the seeded pool shuffle: split files are ordered
+    # label-alternating so a prefix is a balanced subsample.
+    assert [t.meta["task_id"] for t in src.tasks(100, split="test")] == [
+        "attack_1_0",
+        "honest_1_0",
+    ]
+    assert [t.meta["task_id"] for t in src.tasks(1, split="test")] == ["attack_1_0"]
+    # attack_2_0 / honest_2_0 are named by neither file: unreachable from BOTH
+    # splits. That is the property that lets the eval split share one pool with
+    # a training config without training ever touching it.
+    unnamed = {"attack_2_0", "honest_2_0"}
+    assert not unnamed & {t.meta["task_id"] for t in src.tasks(200, split="train")}
+    assert not unnamed & {t.meta["task_id"] for t in src.tasks(200, split="test")}
+
+
+def test_split_files_validation(tmp_path):
+    files = _pool_files(tmp_path)
+    good = _ids_file(tmp_path / "tr.txt", ["attack_0_0"])
+    with pytest.raises(ValueError, match="not in pool"):
+        MonitoringBenchTaskSource(
+            files, split_files={"train": _ids_file(tmp_path / "bad.txt", ["nope_9_0"])}
+        )
+    with pytest.raises(ValueError, match="also in the train split"):
+        MonitoringBenchTaskSource(
+            files,
+            split_files={"train": good, "test": _ids_file(tmp_path / "ov.txt", ["attack_0_0"])},
+        )
+    with pytest.raises(ValueError, match="unknown split name"):
+        MonitoringBenchTaskSource(files, split_files={"dev": good})
+    with pytest.raises(ValueError, match="no task ids"):
+        MonitoringBenchTaskSource(
+            files, split_files={"train": _ids_file(tmp_path / "empty.txt", [])}
+        )
+    for clash in ({"test_size": 2}, {"task_ids": ["attack_0_0"]}):
+        with pytest.raises(ValueError, match="split_files is exclusive"):
+            MonitoringBenchTaskSource(files, split_files={"train": good}, **clash)
+
+
+def test_task_ids_file_is_a_whitelist_and_task_ids_may_only_narrow_it(tmp_path):
+    files = _pool_files(tmp_path)
+    pin = _ids_file(tmp_path / "eval.txt", ["honest_2_0", "attack_2_0", "attack_0_0"])
+    src = MonitoringBenchTaskSource(files, task_ids_file=pin)
+    assert [t.meta["task_id"] for t in src.tasks(100)] == [
+        "honest_2_0",
+        "attack_2_0",
+        "attack_0_0",
+    ]
+    # A smoke arm inheriting the pin can pick rows INSIDE it...
+    narrowed = MonitoringBenchTaskSource(files, task_ids_file=pin, task_ids=["attack_2_0"])
+    assert [t.meta["task_id"] for t in narrowed.tasks(100)] == ["attack_2_0"]
+    # ...but never outside it: config inheritance cannot remove the file, so
+    # subsetting is what keeps an inherited split pin binding.
+    with pytest.raises(ValueError, match="must be a subset of"):
+        MonitoringBenchTaskSource(files, task_ids_file=pin, task_ids=["honest_0_0"])
