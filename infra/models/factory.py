@@ -84,7 +84,14 @@ def instantiate_model(
     if mt == ModelType.LOCAL:
         from infra.models.local_model import LocalModel
 
-        kwargs = dict(common, endpoint=endpoint, reasoning_effort=settings.resolved_reasoning_effort)
+        kwargs = dict(
+            common,
+            endpoint=endpoint,
+            reasoning_effort=settings.resolved_reasoning_effort,
+            capture_token_logprobs=settings.capture_token_logprobs,
+        )
+        if settings.enable_thinking is not None:
+            kwargs["enable_thinking"] = settings.enable_thinking
         if settings.base_url is not None:
             kwargs["base_url"] = settings.base_url
         return LocalModel(**kwargs)

@@ -36,7 +36,7 @@ from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.protocol import Protocol
 from infra.envs.tasks import get_family
-from infra.models.base import ModelSettings, resolved_sampling_profile
+from infra.models.base import ModelSettings, ModelType, resolved_sampling_profile
 from infra.models.factory import instantiate_model
 from infra.run_common import (
     TRAINING_KEYS,
@@ -96,6 +96,60 @@ def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSe
     return trained, frozen
 
 
+# training.backend -> the model_type trained seats must declare: verl serves
+# rollouts through the local OpenAI shim, tinker samples through tinker.
+BACKEND_MODEL_TYPES = {"tinker": ModelType.TINKER, "verl": ModelType.LOCAL}
+
+
+def validate_trained_seats(trained: dict[str, ModelSettings], tr: dict) -> None:
+    """Trained seats share ONE adapter and only contribute model_file_path to
+    the backend, so a divergent path or a model_type that contradicts
+    training.backend would otherwise pass in silence."""
+    settings = list(trained.values())
+    if not settings:
+        return
+    lead_path = settings[0].model_file_path
+    paths = {s.model_file_path for s in settings}
+    if len(paths) != 1:
+        raise ValueError(
+            f"trained seats must share one base model (one shared adapter): "
+            f"expected every model_file_path to equal {lead_path!r}, got {sorted(map(str, paths))}"
+        )
+    backend_kind = str(tr.get("backend", "tinker"))
+    expected = BACKEND_MODEL_TYPES.get(backend_kind)
+    if expected is None:
+        return  # build_backend rejects unknown kinds with its own message
+    for speaker, s in trained.items():
+        if s.model_type is not expected:
+            got = s.model_type.name.lower() if isinstance(s.model_type, ModelType) else s.model_type
+            raise ValueError(
+                f"trained seat {speaker!r} declares model_type {got!r}, but "
+                f"training.backend {backend_kind!r} requires {expected.name.lower()!r} "
+                "for trained seats (the backend, not the model wrapper, serves them)"
+            )
+
+
+def debate_gen_budgets(protocol: Protocol, trained: dict[str, ModelSettings], tr: dict) -> dict:
+    """Named generation budgets for build_backend's response_length
+    cross-check. Only rollout-engine generations belong here: TRAINED seats'
+    protocol slot caps plus the RLVR eval budget. Judge-seat slots (and any
+    frozen debater's) are excluded — frozen seats generate on their own model
+    server, never through the verl rollout engine, so response_length cannot
+    truncate them and a large judge deliberation cap must not fail the build."""
+    budgets: dict = {"training.eval_max_tokens": (tr or {}).get("eval_max_tokens")}
+    for cs in protocol.compile():
+        if cs.speaker not in trained:
+            continue
+        cap = cs.slot.max_total_tokens
+        if cap is None:
+            continue
+        key = f"slot:{cs.slot.name}"
+        # same-named slots across trained speakers: the check compares maxima,
+        # so keeping the largest cap loses nothing
+        budgets[key] = max(cap, budgets.get(key) or 0)
+    return budgets
+
+
 def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, ModelSettings]) -> DebateEnv:
     proto_spec = exp["protocol"]
     if isinstance(proto_spec, str):
@@ -106,6 +160,14 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         speaker: instantiate_model(settings, is_debater=speaker != "judge", binding="train")
         for speaker, settings in frozen.items()
     }
+    # FrozenSeat forwards these per predict call — the factory bakes sampling
+    # into tinker seats only, so without this the local/API seats sample at
+    # server defaults instead of the YAML profile.
+    frozen_sampling = {
+        speaker: resolved_sampling_profile(settings, "train") for speaker, settings in frozen.items()
+    }
+    decision = protocol.decision_slot
+    judge_settings = frozen.get(decision.speaker) if decision is not None else None
 
     # Per-trained-seat sampling + template kwargs; trained seats must sample
     # UNBIASED (temp/top_p 1.0) — anything else corrupts the ratio anchor
@@ -147,6 +209,8 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         frozen_models=frozen_models,
         trained_sampling=trained_sampling,
         trained_chat_kwargs=trained_chat_kwargs,
+        frozen_sampling=frozen_sampling,
+        judge_model_settings=judge_settings,
         judge=JudgeConfig(**(exp.get("judge_config") or {})),
         scoring=ScoringConfig(**(exp.get("scoring") or {})),
         fresh_positions=exp.get("fresh_positions", True),
@@ -169,19 +233,22 @@ def main() -> None:
     if not trained:
         raise ValueError("no agent has trained: true")
     trained_settings = list(trained.values())
-    base_models = {s.model_file_path for s in trained_settings}
-    if len(base_models) != 1:
-        raise ValueError(f"trained seats must share one base model, got {base_models}")
+    tr = exp.get("training") or {}
+    validate_trained_seats(trained, tr)
 
     env = build_env(exp, trained, frozen)
-    tr = exp.get("training") or {}
     lead = trained_settings[0]
 
     run_name = args.experiment + run_identity_suffix(
         args.lr, args.levels, args.group_size, args.batch_size
     )
     backend = build_backend(
-        tr, lead.model_file_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+        tr,
+        lead.model_file_path,
+        run_name,
+        lr_override=args.lr,
+        load_given=bool(args.load),
+        gen_budgets=debate_gen_budgets(env.protocol, trained, tr),
     )
     if args.load:
         backend.load(args.load)

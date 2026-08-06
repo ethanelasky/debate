@@ -124,7 +124,15 @@ def main() -> None:
         args.lr, args.levels, args.group_size, args.batch_size
     )
     backend = build_backend(
-        tr, model_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+        tr,
+        model_path,
+        run_name,
+        lr_override=args.lr,
+        load_given=bool(args.load),
+        gen_budgets={
+            "max_completion_tokens": exp.get("max_completion_tokens"),
+            "training.eval_max_tokens": tr.get("eval_max_tokens"),
+        },
     )
     if args.load:
         backend.load(args.load)

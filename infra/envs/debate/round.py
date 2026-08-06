@@ -26,7 +26,7 @@ from typing import Any, Callable, Optional, Protocol as TypingProtocol
 from infra.backend.base import Datum, Sample, SamplingParams
 from infra.envs.base import Policy, SlotLimits, datum_from_sample
 from infra.envs.debate.protocol import CompiledSlot, Kind, Protocol, Visibility
-from infra.models.base import Model, ModelInput, ModelResponse
+from infra.models.base import Model, ModelInput, ModelResponse, SamplingProfile, SpeechStructure
 
 Message = dict[str, str]  # {"role": "system"|"user"|"assistant", "content": str}
 
@@ -110,6 +110,10 @@ class GenRequest:
     # instead of emitting the verdict object; grammar-forcing is the only cap
     # that binds.
     json_schema: Optional[dict] = None
+    # Decision slots generate under SpeechStructure.DECISION so wrappers that
+    # gate logprob capture on the structure (LocalModel) return the token
+    # channel the judge-logit scan reads.
+    decision: bool = False
 
 
 @dataclass
@@ -192,9 +196,17 @@ class FrozenSeat(SeatRunner):
 
     trained = False
 
-    def __init__(self, model: Model, default_max_tokens: int = 1024):
+    def __init__(
+        self,
+        model: Model,
+        default_max_tokens: int = 1024,
+        sampling: Optional[SamplingProfile] = None,
+    ):
         self.model = model
         self.default_max_tokens = default_max_tokens
+        # The seat's resolved sampling profile (env config plumbs the YAML's
+        # train profile here); without it the wrapper/server defaults apply.
+        self.sampling = sampling
         self._warned_limits = False
 
     def generate(self, requests: list[GenRequest]) -> list[SlotResult]:
@@ -205,6 +217,15 @@ class FrozenSeat(SeatRunner):
                 warnings.warn(f"seat {self.model.alias}: think/visible caps unenforceable on frozen API seats")
                 self._warned_limits = True
 
+        # Profile fields ride as predict kwargs; wrappers place the ones they
+        # support and ignore the rest.
+        sampling_kwargs: dict[str, Any] = {}
+        if self.sampling is not None:
+            for name in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+                value = getattr(self.sampling, name)
+                if value is not None:
+                    sampling_kwargs[name] = value
+
         results: list[Optional[SlotResult]] = [None] * len(requests)
         by_max: dict[int, list[int]] = {}
         for i, r in enumerate(requests):
@@ -214,13 +235,17 @@ class FrozenSeat(SeatRunner):
             inputs = [
                 [ModelInput(role=m["role"], content=m["content"]) for m in requests[i].messages] for i in idxs
             ]
-            # requests come from one protocol step, so json_schema is uniform
+            # requests come from one protocol step, so json_schema/decision are uniform
             schemas = {id(requests[i].json_schema) for i in idxs}
             if len(schemas) > 1:
                 raise ValueError(f"{self.model.alias}: mixed json_schema within one generate batch")
-            extra = {}
+            if len({requests[i].decision for i in idxs}) > 1:
+                raise ValueError(f"{self.model.alias}: mixed decision kinds within one generate batch")
+            extra = dict(sampling_kwargs)
             if requests[idxs[0]].json_schema is not None:
                 extra["json_schema"] = requests[idxs[0]].json_schema
+            if requests[idxs[0]].decision:
+                extra["speech_structure"] = SpeechStructure.DECISION
             responses = self.model.predict(inputs, max_new_tokens=max_tokens, num_return_sequences=1, **extra)
             if len(responses) != len(idxs):
                 raise RuntimeError(
@@ -503,9 +528,15 @@ class DebateRound:
             if not live:
                 break
             runner = self.seats[step.speaker]
-            schema = self.decision_json_schema if step.slot.kind == Kind.DECISION else None
+            decision = step.slot.kind == Kind.DECISION
+            schema = self.decision_json_schema if decision else None
             requests = [
-                GenRequest(render_context(states[i], step, self.prompts), slot_limits(step), json_schema=schema)
+                GenRequest(
+                    render_context(states[i], step, self.prompts),
+                    slot_limits(step),
+                    json_schema=schema,
+                    decision=decision,
+                )
                 for i in live
             ]
             results = runner.generate(requests)
@@ -596,7 +627,14 @@ class DebateRound:
                     {"role": "assistant", "content": results[j].text},
                     {"role": "user", "content": feedback(st, results[j].text, retries[j] + 1)},
                 ]
-                requests.append(GenRequest(messages, slot_limits(step), json_schema=json_schema))
+                requests.append(
+                    GenRequest(
+                        messages,
+                        slot_limits(step),
+                        json_schema=json_schema,
+                        decision=step.slot.kind == Kind.DECISION,
+                    )
+                )
             fresh = runner.generate(requests)
             for j, res in zip(bad, fresh):
                 retries[j] += 1

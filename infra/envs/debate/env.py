@@ -4,11 +4,10 @@ One rollout path (train + eval). Reward is judge-only (DESIGN-debate-env.md
 §5); gt correctness from solution slots lands in info as metrics.
 
 Trajectory granularity: one Trajectory per (debate, trained seat); datums are
-that seat's slot datums in flat order; reward = seat ladder/score value plus
-shaping deltas. NOTE: per_slot shaping deltas are folded into the trajectory
-reward sum for now — grpo_pack computes one advantage per trajectory, so
-slot-targeted penalties are totalized rather than per-datum. Upgrade path:
-per-datum advantage offsets in grpo_pack.
+that seat's slot datums in flat order. Rewards are per-datum
+(Trajectory.datum_rewards): each datum carries the shared outcome plus
+seat-level shaping deltas, and slot-targeted deltas land only on their own
+slot's datum; Trajectory.reward keeps the datum mean for logging.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ from infra.envs.debate.round import (
 )
 from infra.envs.debate.protocol import Kind, Protocol, Visibility
 from infra.envs.task_prompts import PROBLEM_PLACEHOLDER, TASK_SUPPLIED_TEMPLATES
-from infra.models.base import Model
+from infra.models.base import Model, ModelSettings
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
 
@@ -100,14 +99,26 @@ class DebateEnvConfig:
     # enable_thinking differing between proposer and critic).
     trained_sampling: dict[str, Any] = field(default_factory=dict)      # speaker -> SamplingParams
     trained_chat_kwargs: dict[str, dict] = field(default_factory=dict)  # speaker -> template kwargs
+    # Per-frozen-seat resolved sampling profiles (speaker -> SamplingProfile,
+    # train binding), forwarded per predict call by FrozenSeat; an absent
+    # speaker keeps the wrapper/server defaults.
+    frozen_sampling: dict[str, Any] = field(default_factory=dict)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    # The judge seat's ModelSettings, when the builder has them: lets the env
+    # check the scoring/judge sampling contract (validate_scoring) at
+    # construction. None (configs assembled without settings) skips the check.
+    judge_model_settings: Optional[ModelSettings] = None
     fresh_positions: bool = True
     flip: bool = False                          # assigned mode only: mirrored second arm
     # Opening solution slot generated under the task source's own messages
     # (byte-identical to the RLVR arm) instead of the debater system card.
     first_speech_non_debate_aware: bool = False
-    verdict_retries: int = 4
+    # Verdict retry count; None defers to judge.retries. Both spellings exist
+    # in the wild (runners set judge_config.retries, some tests set this
+    # field), so an explicit value here wins and None keeps judge.retries
+    # authoritative.
+    verdict_retries: Optional[int] = None
     # Post-hoc TRANSCRIPT-VISIBLE cap (cl100k tokens) on debater speech slots,
     # applied after generation, before the text enters any context. Judge
     # slots and decision/solution slots are never truncated. None = off.
@@ -152,6 +163,12 @@ class DebateEnv(Env):
         missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
         if missing:
             raise ValueError(f"speakers without models: {sorted(missing)}")
+        # The logit confidence channel is only P(sampled continuation) under an
+        # untouched judge distribution — checked here, not mid-run, whenever
+        # the builder supplied the judge's settings. json-source scoring
+        # passes through unconditionally (validate_scoring returns early).
+        if config.judge_model_settings is not None:
+            validate_scoring(config.scoring, config.judge_model_settings)
         if config.flip and (config.fresh_positions or config.position_binder is not None):
             raise ValueError("flip requires assigned positions (fresh/choice modes have no fixed sides)")
         if config.first_speech_non_debate_aware:
@@ -225,6 +242,26 @@ class DebateEnv(Env):
             choice_positions=config.position_binder is not None,
         )
         self.shaping = build_shaping(config.scoring.shaping)
+        # build_shaping accepts any slots/flag; a typo would silently zero the
+        # term's bonus, so the names are checked against the protocol and the
+        # family here.
+        slot_names = {cs.slot.name for cs in self.protocol.compile()}
+        flag_names = set(family.format_flags(""))
+        for term in self.shaping:
+            term_slots = getattr(term, "slots", None)
+            if term_slots is not None:
+                unknown_slots = sorted(set(term_slots) - slot_names)
+                if unknown_slots:
+                    raise ValueError(
+                        f"shaping term {type(term).__name__} targets unknown slot(s) "
+                        f"{unknown_slots}; protocol slots: {sorted(slot_names)}"
+                    )
+            term_flag = getattr(term, "flag", None)
+            if term_flag is not None and term_flag not in flag_names:
+                raise ValueError(
+                    f"shaping term {type(term).__name__} gates on unknown flag {term_flag!r}; "
+                    f"{type(family).__name__} format flags: {sorted(flag_names) or '(none)'}"
+                )
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
     def _inject_task_prompt_templates(self) -> None:
@@ -302,15 +339,17 @@ class DebateEnv(Env):
                 seat_policy = policy
                 if speaker in cfg.trained_sampling or speaker in cfg.trained_chat_kwargs:
                     # same backend/adapter. The seat override owns the token
-                    # ceiling; the INCOMING policy owns the sampling mode
-                    # (train temp vs greedy eval) — composing them keeps
-                    # policy.greedy() greedy on override seats.
+                    # ceiling and its train-time temperature/top_p; the
+                    # INCOMING policy owns the sampling MODE — greedy eval
+                    # (temperature 0) keeps its mode on override seats.
                     override = cfg.trained_sampling.get(speaker)
-                    params = (
-                        _replace(policy.params, max_tokens=override.max_tokens)
-                        if override is not None
-                        else policy.params
-                    )
+                    params = policy.params
+                    if override is not None:
+                        updates: dict[str, Any] = {"max_tokens": override.max_tokens}
+                        if params.temperature != 0.0:
+                            updates["temperature"] = override.temperature
+                            updates["top_p"] = override.top_p
+                        params = _replace(params, **updates)
                     seat_policy = Policy(
                         policy.backend,
                         params,
@@ -318,7 +357,9 @@ class DebateEnv(Env):
                     )
                 seats[speaker] = PolicySeat(seat_policy)
             else:
-                seats[speaker] = FrozenSeat(cfg.frozen_models[speaker])
+                seats[speaker] = FrozenSeat(
+                    cfg.frozen_models[speaker], sampling=cfg.frozen_sampling.get(speaker)
+                )
 
         arms = [False, True] if cfg.flip else [False]
         # base group id = (task index, arm): flip arms are separate GRPO groups.
@@ -358,7 +399,9 @@ class DebateEnv(Env):
             verdict_parser=lambda text: parse_verdict(
                 text, cfg.judge.schema_name, list(self.display.values())
             ),
-            verdict_retries=cfg.judge.retries,
+            verdict_retries=(
+                cfg.verdict_retries if cfg.verdict_retries is not None else cfg.judge.retries
+            ),
             judge_schema=cfg.judge.schema_name,
             solution_extractor=self.solution_extractor,
             fresh_positions=cfg.fresh_positions,

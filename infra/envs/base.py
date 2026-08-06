@@ -241,7 +241,9 @@ def budget_forced_sample(
     gets </think> force-injected (logprob 0.0, datum mask 0.0 via regions).
     Phase 2 continues from the extended prefix under the visible/total caps.
     A model that never opens <think> (and wasn't given one by the template)
-    is passed through as all-visible — think caps only bind on thinking.
+    is passed through as all-visible — think caps only bind on thinking — and
+    if phase 1's cap cut it off, generation continues under the remaining
+    visible/total budget (no injection).
     """
     close = _close_ids(tokenizer)
     eos_id = getattr(tokenizer, "eos_token_id", None)
@@ -278,7 +280,19 @@ def budget_forced_sample(
 
     buckets: dict[int, list[int]] = {}
     for j, e in enumerate(flat):
-        if e.get("all_visible") or e.get("died_in_think"):
+        if e.get("died_in_think"):
+            continue
+        if e.get("all_visible"):
+            # The think cap must not become a total cap: a never-thinking
+            # sample cut at the phase-1 cap continues under the remaining
+            # visible/total budget (its close is empty, so the shared bucket
+            # pass extends the raw prefix with no injection). Every phase-1
+            # token here is visible, so it counts against max_visible_tokens.
+            cont_cap = min(limits.max_visible_tokens or inf, total) - len(e["p1"].tokens)
+            if e["p1"].stop_reason != "length" or cont_cap <= 0:
+                continue
+            e["p2_cap"] = cont_cap
+            buckets.setdefault(cont_cap, []).append(j)
             continue
         p2_cap = min(limits.max_visible_tokens or inf, total - len(e["p1"].tokens) - len(e["close"]))
         if p2_cap <= 0:
@@ -297,13 +311,15 @@ def budget_forced_sample(
     for e in flat:
         p1: Sample = e["p1"]
         if e.get("all_visible"):
+            cont: Optional[Sample] = e["p2"]
+            tokens = p1.tokens + (cont.tokens if cont else [])
             results[e["pi"]].append(
                 Sample(
-                    tokens=p1.tokens,
-                    logprobs=p1.logprobs,
-                    text=tokenizer.decode(p1.tokens),
-                    stop_reason=p1.stop_reason,
-                    regions=(Region("visible", 0, len(p1.tokens)),),
+                    tokens=tokens,
+                    logprobs=p1.logprobs + (cont.logprobs if cont else []),
+                    text=tokenizer.decode(tokens),
+                    stop_reason=cont.stop_reason if cont is not None else p1.stop_reason,
+                    regions=(Region("visible", 0, len(tokens)),),
                 )
             )
             continue

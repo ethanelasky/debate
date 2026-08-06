@@ -56,3 +56,17 @@ def test_loop_range_runs_remaining_steps_only():
     cfg = Config(start_step=25, steps=100)
     assert list(range(cfg.start_step, cfg.steps))[0] == 25
     assert len(range(cfg.start_step, cfg.steps)) == 75
+
+
+def test_continuation_first_step_does_not_resave_loaded_checkpoint():
+    """start 25, save_every 25: step 25 must NOT save (it would clobber the
+    loaded step-00025); steps 50/75 must."""
+    cfg = Config(start_step=25, steps=100, save_every=25)
+    saves = [s for s in range(cfg.start_step, cfg.steps)
+             if cfg.save_every and s > cfg.start_step and s % cfg.save_every == 0]
+    assert saves == [50, 75]
+
+
+def test_lora_rank_reaches_config():
+    kw = training_config_kwargs({"lora_rank": 64}, _args([]))
+    assert Config(**kw).lora_rank == 64

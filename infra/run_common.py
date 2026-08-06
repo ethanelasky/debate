@@ -39,16 +39,32 @@ TRAINING_KEYS = {
     "save_every",
     "wandb_project",
     "log_transcripts",
+    "norm_adv_by_std",
+    "rl_seed",
 }
+
+def _strict_bool(value) -> bool:
+    """YAML bool cast: bool("false") is True, so a quoted string would set the
+    opposite of what the config spells. Only real bools (and 0/1 ints) pass."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(
+        f"expected a YAML bool (true/false, unquoted) or 0/1, got {value!r} — "
+        "a quoted string like \"false\" is truthy and would flip the knob"
+    )
+
 
 # training-block keys that map 1:1 onto Config fields, with their YAML casts.
 # Values pass through ONLY when the YAML sets them; everything absent falls to
 # Config's dataclass defaults — the single source of truth. No fallback
 # literals at the call sites: a default lives in exactly one place.
-CONFIG_CASTS: tuple[tuple[str, type], ...] = (
+CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("steps", int),
     ("batch_size", int),
     ("group_size", int),
+    ("lora_rank", int),
     ("micro_batch", int),
     ("lr", float),
     ("ppo_epochs", int),
@@ -59,8 +75,15 @@ CONFIG_CASTS: tuple[tuple[str, type], ...] = (
     ("eval_max_tokens", int),
     ("eval_n", int),
     ("save_every", int),
-    ("log_transcripts", bool),
+    ("log_transcripts", _strict_bool),
+    ("norm_adv_by_std", _strict_bool),
+    ("rl_seed", int),
 )
+
+# YAML key -> Config field where the names differ. The YAML key is rl_seed so
+# the training seed cannot be misread as dataset.seed; the Config field named
+# `seed` predates the distinction.
+CONFIG_FIELD_NAMES = {"rl_seed": "seed"}
 
 
 # training.verl — read only in build_backend.
@@ -127,7 +150,11 @@ def resolved_start_step(args: argparse.Namespace) -> int:
 
 def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
     """training block + CLI sweep overrides -> Config kwargs, present keys only."""
-    kw: dict = {k: cast(tr[k]) for k, cast in CONFIG_CASTS if tr.get(k) is not None}
+    kw: dict = {
+        CONFIG_FIELD_NAMES.get(k, k): cast(tr[k])
+        for k, cast in CONFIG_CASTS
+        if tr.get(k) is not None
+    }
     if tr.get("loss"):
         kw["loss"] = LossSpec(**tr["loss"])
     for k in ("steps", "batch_size", "group_size", "lr"):
@@ -224,6 +251,7 @@ def build_backend(
     run_name: str,
     lr_override: float | None = None,
     load_given: bool = False,
+    gen_budgets: dict | None = None,
 ):
     """training block -> Backend. Shared by the debate and RLVR runners.
 
@@ -233,10 +261,27 @@ def build_backend(
     `load_given` says whether the operator passed --load, which is the only
     form of resume there is; see check_fresh_run_over_existing_checkpoints.
 
+    `gen_budgets` names each caller-side generation budget ({label: max
+    tokens or None}) so the verl branch can cross-check them against
+    response_length: the rollout engine truncates any longer request at
+    response_length (stop_reason="length") with no other trace. run_rlvr
+    passes max_completion_tokens and training.eval_max_tokens; run_debate
+    passes its trained-seat slot caps plus eval_max_tokens (judge slots are
+    served elsewhere and excluded — see debate_gen_budgets).
+
     Same only-if-present rule as training_config_kwargs: knobs the YAML omits
     fall to the backend config's own dataclass defaults.
     """
     backend_kind = str(tr.get("backend", "tinker"))
+    if "verl" in tr and backend_kind != "verl":
+        # A verl block under any other backend is dead config: every knob in
+        # it (response_length, n_gpus, checkpoint_dir, ...) would be ignored
+        # without a word while the run trains on the other backend's defaults.
+        raise RuntimeError(
+            f"training.verl is set but training.backend resolved to {backend_kind!r}; "
+            "the entire verl block would be silently ignored. Set training.backend: "
+            "verl or remove the block."
+        )
     if backend_kind == "tinker":
         from infra.backend.tinker import TinkerBackend
 
@@ -252,7 +297,7 @@ def build_backend(
         ckpt_dir = os.path.join(ckpt_root, run_name)
         check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
         check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
-        verl_casts: tuple[tuple[str, type], ...] = (
+        verl_casts: tuple[tuple[str, object], ...] = (
             ("n_gpus", int),
             ("strategy", str),
             ("gpu_memory_utilization", float),
@@ -260,9 +305,19 @@ def build_backend(
             ("response_length", int),
             ("max_token_len_per_gpu", int),
             ("rollout_tp", int),
-            ("use_remove_padding", bool),
+            ("use_remove_padding", _strict_bool),
         )
         vkw: dict = {k: cast(v[k]) for k, cast in verl_casts if v.get(k) is not None}
+        response_length = int(vkw.get("response_length", VerlBackendConfig.response_length))
+        budgets = {k: int(b) for k, b in (gen_budgets or {}).items() if b is not None}
+        if any(b > response_length for b in budgets.values()):
+            named = ", ".join(f"{k}={b}" for k, b in budgets.items())
+            raise RuntimeError(
+                f"generation budget exceeds training.verl.response_length="
+                f"{response_length} ({named}); the rollout engine truncates such "
+                "requests at response_length with stop_reason='length' and no other "
+                "trace. Raise response_length or lower the budget."
+            )
         if tr.get("lora_rank") is not None:
             vkw["lora_rank"] = int(tr["lora_rank"])
         if lr_override is not None:

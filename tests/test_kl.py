@@ -101,3 +101,12 @@ def test_gspo_mask_excludes_forced_close():
     assert loss.item() == pytest.approx(-1.0)  # s=exp(0)=1, a=1 -> -1; masked token ignored
     loss.backward()
     assert lp.grad[1].item() == 0.0
+
+
+def test_grpo_pack_rejects_unknown_length_normalize():
+    import pytest
+
+    from infra.rl.datums import grpo_pack
+
+    with pytest.raises(ValueError, match="length_normalize"):
+        grpo_pack([], length_normalize="counts")

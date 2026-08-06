@@ -14,7 +14,7 @@ def grpo_pack(
     *,
     norm_by_std: bool = True,
     drop_zero_advantage: bool = True,
-    length_normalize: str = "none",  # "none" | "datum" | "trajectory"
+    length_normalize: str = "none",  # "none" | "datum" | "trajectory" | "count"
     shuffle_seed: int | None = None,
 ) -> tuple[list[Datum], dict[str, float]]:
     """Advantages per datum, normalized per (group, datum position): datum k of
@@ -38,6 +38,12 @@ def grpo_pack(
       "count"       /= datum count ONLY (no token scaling) — the seat-balance
                     mode for gspo, whose loss is already one term per sequence
     """
+    if length_normalize not in ("none", "datum", "trajectory", "count"):
+        # A typo'd mode previously fell through to scale=1.0 — a large, silent
+        # change to gradient mass. Fail at pack time instead.
+        raise ValueError(
+            f"length_normalize is {length_normalize!r}; expected none|datum|trajectory|count"
+        )
     rows: list[tuple[Datum, float, tuple[int, int], float]] = []  # datum, reward, (gid, pos), scale
     n_trajs = 0
     for gid, group in enumerate(groups):

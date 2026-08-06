@@ -162,7 +162,11 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 )
             metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
             _log_transcripts(cfg, step, eval_env or env, "eval")
-        if cfg.save_every and step > 0 and step % cfg.save_every == 0:
+        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
+        # can hit the save cadence (start 25, save_every 25) and would re-save
+        # step-00025 — overwriting the very checkpoint it just loaded with a
+        # one-step-newer lineage under the same name.
+        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
             metrics["checkpoint_saved"] = 1.0
             backend.save(f"step-{step:05d}")
 
@@ -180,8 +184,11 @@ def _make_logger(cfg: Config):
         if cfg.wandb_run_id:
             # resume="must": appending to the named run is the entire point; a
             # silent fallback to a fresh run would re-split the x-axis.
+            # config included on resume too: a continuation that changes lr or
+            # steps must not keep advertising the original run's values.
             run = wandb.init(
-                project=cfg.wandb_project, id=cfg.wandb_run_id, resume="must"
+                project=cfg.wandb_project, id=cfg.wandb_run_id, resume="must",
+                config=vars(cfg), allow_val_change=True,
             )
         else:
             run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
