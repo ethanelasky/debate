@@ -308,6 +308,15 @@ def test_family_tasks_carry_question(name, tmp_path):
         env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
         row = {"problem": "What is 1+1?", "gt": 2.0, "level": 5}
         tasks = [MathEnv._task(env, row, "train")]
+    elif name == "aime":
+        # Same shape as the math recipe: skip __init__ (dataset download),
+        # exercise task construction directly.
+        from infra.envs.tasks.aime import PROMPT_FILE, AimeEnv
+
+        env = object.__new__(AimeEnv)  # skip __init__ (dataset download)
+        env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
+        row = {"problem": "What is 1+1?", "gt": 2.0, "id": "1983-1"}
+        tasks = [AimeEnv._task(env, row, "train")]
     elif name == "monitoringbench":
         # SYNTHETIC rows only — the real data files are never read in tests.
         rows = [
