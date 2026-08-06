@@ -1,0 +1,153 @@
+# CodeContests proposer-critic on OLMo-3-7B-Instruct-DPO, all-on-pod via verl.
+# The code-domain sibling of math_pc_olmo.yaml: same machinery, same judge
+# server, different task family and prompt pack.
+#
+# Flow: alice plans privately -> submits a program (public, graded) -> bob
+# critiques -> alice defends -> bob rebuts (critic's last word) -> judge
+# deliberates privately -> emits the verdict. Thinking is OFF (OLMo); the
+# private scratchpad slots take its place.
+#
+# Judge = frozen Qwen3.5-4B on the pod's local vLLM (scripts/pod_run.sh derives
+# model + port from THIS file). Standalone entries on purpose: protocol turn
+# lists merge BY INDEX under _extends, which poisons mixed-shape protocols.
+#
+# Run (on the pod):
+#   debate-rl --experiment-file configs/codecontests_pc_olmo.yaml \
+#             --experiment codecontests_pc_olmo
+#
+# ---------------------------------------------------------------- sizing
+# Unlike MATH, the problem statement dominates the context. Measured over the
+# 365 usable train rows (approx tokens, chars/3.5):
+#   description  median 474   p90 845   p99 1323   max 1850
+# The judge's verdict context is the worst case in the protocol:
+#   judge system card                     ~550
+#   preamble: statement + program         ~2400   (p99 statement + a ~500tok program)
+#   four public speeches at their caps     3072   (1536 + 512 + 512 + 512)
+#   private deliberation                   1024
+#   cues + verdict instructions            ~350
+#                                        --------
+#                                          ~7400  -> prompt_length 12288 with headroom
+# response_length must cover the LARGEST slot cap (the proposal, 1536).
+# max_token_len_per_gpu >= prompt_length + response_length.
+#
+# THESE ARE ESTIMATES, not measured on a live rollout. The smoke arm at the
+# bottom exists to check them before a 100-step run: if verl reports truncation,
+# raise prompt_length first, then max_token_len_per_gpu, then drop
+# gpu_memory_utilization.
+
+codecontests_pc_olmo:
+  protocol:
+    turns:
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1024},
+                {name: proposal, kind: solution, max_total_tokens: 1536}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 512},
+                {name: critique, max_total_tokens: 512}]
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 512},
+                {name: defense, max_total_tokens: 512}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 512},
+                {name: rebuttal, max_total_tokens: 512}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1024},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/envs/debate/prompt_configs/codecontests.yaml
+    entry: codecontests_proposer_critic
+  fresh_positions: true
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local            # served by the pod's verl rollout engine
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: proposer-alice
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: critic-bob
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        # temp/top_p 1.0: the logit confidence channel is only honest here
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      # flag: code_fence, NOT math's strict_boxed. CodeContestsFamily.format_flags
+      # emits only {"code_fence"}; FormatReward silently pays nothing for a flag
+      # the family never sets, so a copy-paste from the math config would be a
+      # dead shaping term with no error. +0.1 on the proposal DATUM when the
+      # program came back in a properly CLOSED fence.
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: code_fence}
+  dataset:
+    type: codecontests
+    # Pinned JSONL, not a download: the loader drops rows the exact-output
+    # verifier would mis-grade (multi-answer phrasing) — 458 -> 365 train,
+    # 162 -> 116 test — so the training set is a function of these bytes.
+    # Train/test share zero problem names.
+    path: data/codecontests/train.jsonl
+    test_path: data/codecontests/test.jsonl
+    relaxed_extraction: true   # accept a fence truncated at the token cap
+    seed: 0
+    # Bounds a runaway program, not honest work. Measured over 632 real
+    # completions: the slowest PASSING program takes 5.3s, and 30 -> 10 gave
+    # 2.73x faster verification with 632/632 identical verdicts. 10s keeps ~2x
+    # headroom over that 5.3s; 6s was 4.2x but only 1.4x headroom, which a
+    # loaded or slower host could erase — a wrongly-timed-out correct program
+    # is a silent label error, so the margin is worth more than the seconds. 30s x 116 eval rows / 8
+    # concurrent verifiers ~ 7min worst case; the 90s default would be ~22min
+    # per eval, 20 times over a 100-step run.
+    timeout_seconds: 10
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1                      # H100/A100-80GB: 7B LoRA FSDP + colocated vllm + judge server
+      strategy: fsdp2                # needs the modeling_olmo3 rope patch (provision_pod.sh)
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.33   # judge 0.18 + rollout 0.33 + 7B FSDP init peak must fit 80GB
+      prompt_length: 12288           # see sizing note above (MATH needs 8192)
+      response_length: 1536          # largest slot cap (the proposal)
+      max_token_len_per_gpu: 16384   # >= prompt_length + response_length
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
+    wandb_project: debate-rebuild
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 4
+    lr: 1.0e-5
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    # RLVR eval: greedy CodeContestsEnv pass-rate on the held-out split, which
+    # RUNS THE VERIFIER (unlike math's, which just parses a number).
+    eval_every: 5
+    # The whole held-out split. Only 116 rows survive filtering, so a larger
+    # eval_n changes nothing — and +-4.6pp binomial noise at n=116 means small
+    # trends here are not callable. Read it as a floor/ceiling check, not a
+    # sensitive metric.
+    eval_n: 116
+    eval_max_tokens: 1536
+    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# Tiny live-verification arm: proves the pod path end to end (judge server,
+# verifier subprocesses, verl sizing) before committing to a real run.
+codecontests_pc_olmo_smoke:
+  _extends: codecontests_pc_olmo
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4   # group 2 risks all-identical verdicts -> every datum dropped
+    eval_every: 0
+    save_every: 0

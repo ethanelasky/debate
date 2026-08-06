@@ -19,6 +19,10 @@ math_rlvr_olmo_l5:
       response_length: 2000
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
     wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}

@@ -56,6 +56,10 @@ _base_math_pc:
   # old repo's own warning). L5 arm below for harder runs / the 9B.
   dataset: {type: math, levels: "3-4", relaxed_extraction: true, seed: 0}
   training:
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
     wandb_project: debate-rebuild
     lora_rank: 32   # the SHARED adapter's rank (one adapter across all trained seats)
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}   # GRPO = this + group-normalized advantages

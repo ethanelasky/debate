@@ -1,0 +1,161 @@
+# Where wall-clock goes in an RLVR training step.
+# Numbers MEASURED on codecontests_rlvr_olmo31_32b_smoke10 (Olmo-3.1-32B,
+# 8xH200, batch 8 x group 8 = 64 rollouts/step, response_length 8192).
+# Verifier timings re-measured locally by replaying all 640 completions.
+# Render: d2 docs/rlvr_wallclock.d2 docs/rlvr_wallclock.svg
+
+direction: down
+
+title: |md
+  # RLVR step: 171 s train-only, measured
+  Olmo-3.1-32B / 8xH200 / 64 rollouts per step. **MATH runs 48 s/step** on a
+  7B with `response_length: 2000` — the gap is model size x tokens generated.
+| {near: top-center}
+
+loop: "for step in range(cfg.steps)   —   infra/train.py:100" {
+  style.stroke-dash: 3
+
+  sync: |md
+    ### 1. sync_sampler
+    `train.py:101`
+    LoRA weights -> vLLM
+    **not separately measured**
+  |
+
+  rollout: "2. env.rollout()   —   train.py:102" {
+    style.fill: "#eef4fa"
+
+    gen: |md
+      ### generation (vLLM)
+      `envs/base.py:149` `policy.predict`
+      64 samples, TP=8
+
+      median **2663 tok**, p90 **8192**
+      **24% hit the 8192 cap**
+      72% of text is prose before
+      the code block
+
+      **the dominant cost**
+    |
+
+    verify: |md
+      ### verifier (subprocess)
+      `envs/base.py:162` pool ->
+      `tasks/codecontests.py:143`
+      `run_stdin_tests`
+
+      607/640 finish, median **0.415 s**
+      20/640 (3.2%) hit the **30 s** timeout
+
+      wallclock **~30 s/step (18%)**
+      = the single slowest program
+    |
+
+    dump: |md
+      ### on_rollout
+      `train.py:103` -> `run_rlvr.py`
+      writes rollouts/step-N.jsonl
+      **negligible**
+    |
+  }
+
+  pack: |md
+    ### 3. grpo_pack
+    `train.py:110`
+    CPU only — **negligible**
+  |
+
+  kl: |md
+    ### 4. apply_kl_penalty
+    `train.py:122` -> `rl/kl.py:54`
+    `backend.ref_logprobs(datums)`
+
+    **a FULL extra forward pass**
+    over every datum on the frozen
+    base, every step, to serve
+    `kl_coef: 0.02`
+
+    **UNMEASURED** — no phase timer
+  |
+
+  fb: |md
+    ### 5. forward_backward + optim
+    `train.py:133-135`
+    micro_batch 64, n_datums ~48
+    -> 1 call per epoch
+
+    **UNMEASURED**
+  |
+
+  ev: |md
+    ### 6. evaluate  (only if step % eval_every == 0)
+    `train.py:136` -> `train.py:87`
+    greedy rollout on the TEST split + the same verifier
+
+    measured **4.7 s per eval sample**
+    at `eval_n: 256` that is **~20 min per eval**
+    at `eval_every: 5` over 100 steps -> **6.7 h = 58% of the run**
+
+    ### this is redundant
+    accuracy is supposed to come from the OFFLINE
+    CodeContests-O pass over the dumped rollouts
+    (`tasks/codecontests.py` module docstring)
+  | {style.fill: "#fdecea"; style.stroke: "#c0392b"}
+
+  save: |md
+    ### 7. save
+    `train.py:148` if `save_every`
+    `train.py:155` `save("final")` — **always**, 3.1 GB
+  |
+
+  sync -> rollout -> pack -> kl -> fb -> ev -> save
+}
+
+known: |||md
+  ## What is measured vs not
+
+  | phase | per step | source |
+  |---|---|---|
+  | verifier | **30 s** (18%) | replayed 640 completions locally |
+  | eval (n=32) | **151 s** | step_seconds delta on eval steps |
+  | one-off init | **403 s** | step 0 minus mean eval step |
+  | generation + KL + fwd/bwd | **~141 s** | **residual — not attributed** |
+
+  `train.py:150` records only `step_seconds`. Splitting the residual needs
+  phase timers around each call above (~10 lines).
+||| {style.fill: "#f4f6f8"}
+
+levers: |||md
+  ## Levers, 100 steps at \$36.72/h
+
+  | change | run time | cost |
+  |---|---|---|
+  | as configured (`eval_n 256`, `eval_every 5`) | 11.6 h | **\$425** |
+  | drop in-run eval (use the offline pass) | 4.9 h | **\$179** |
+  | + `timeout_seconds` 30 -> 5 | 4.2 h | **\$154** |
+  | + `response_length` 8192 -> 2048 | not yet measured | — |
+
+  Concurrency is NOT a lever: 8 vs 64 verifier workers measured 30.1 s vs
+  30.2 s, because wallclock is the slowest single program, not throughput.
+||| {style.fill: "#eaf5ea"}
+
+bug: |md
+  ## Bug found while measuring
+
+  `backend/verl.py:263`
+  ```
+  raw_reason = str(out.stop_reason or "stop")
+  ```
+  vLLM puts "stop"/"length" in **`finish_reason`**; `stop_reason` is the
+  matched stop STRING and is `None` for both natural EOS and truncation.
+  So `or "stop"` labels **everything** "stop".
+
+  All 640 completions report `stop` while **24% sit exactly at the 8192
+  cap** — those are truncated, usually mid-program, and are trained on as
+  if they finished. It also hides truncation from `fidelity_ok()`
+  (`backend/base.py:70`).
+| {style.fill: "#fdecea"; style.stroke: "#c0392b"}
+
+loop -> known: {style.stroke-dash: 2}
+known -> levers: {style.stroke-dash: 2}
+levers -> bug: {style.stroke-dash: 2}

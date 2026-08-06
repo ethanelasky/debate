@@ -16,6 +16,8 @@ Config shape:
 from __future__ import annotations
 
 import argparse
+import os
+import json
 
 from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
@@ -51,6 +53,7 @@ def main() -> None:
     parser.add_argument("--experiment-file", required=True)
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
+    parser.add_argument("--wandb-entity", default=None, help="override training.wandb_entity")
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     parser.add_argument("--steps", type=int, default=None, help="override training.steps")
     parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
@@ -88,12 +91,31 @@ def main() -> None:
     cfg = Config(
         base_model=model_path,
         sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
+        wandb_entity=(None if args.no_wandb else args.wandb_entity or tr.get("wandb_entity")),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
         run_name=run_name,
         **training_config_kwargs(tr, args),
     )
+
+    # Persist every training rollout. The RLVR arm's reward comes from a
+    # deliberately weak suite (<=10 public+private cases), so the accuracy that
+    # matters is recomputed AFTER the run by re-grading these completions
+    # against CodeContests-O offline — see infra/envs/tasks/codecontests.py.
+    # Without this the generated programs are discarded at the end of each step
+    # and that comparison becomes impossible. Mirrors run_debate.py's docent
+    # export; JSONL rather than transcripts because RLVR has no debate to shape.
+    def _dump_rollouts(step: int, env_) -> None:
+        rows = getattr(env_, "last_rollout", None)
+        if not rows:
+            return
+        os.makedirs("rollouts", exist_ok=True)
+        with open(f"rollouts/step-{step:05d}.jsonl", "w") as f:
+            for r in rows:
+                f.write(json.dumps({**r, "step": step}) + "\n")
+
+    cfg.on_rollout = _dump_rollouts
     train(env, backend, cfg)
 
 

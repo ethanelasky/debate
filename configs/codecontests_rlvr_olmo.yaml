@@ -1,0 +1,309 @@
+# RLVR baseline on CodeContests — the arm debate gets compared against.
+#
+# Reward = execute the model's program against that problem's `rlvr_tests`
+# (<=10 cases sampled from DeepMind's public+private). No judge, no debate.
+# Mirrors math_rlvr_olmo.yaml so the only difference from the MATH baseline is
+# the task family.
+#
+# Dataset: build it first, it is gitignored (132 MB):
+#   python scripts/build_codecontests_rlvr.py --out data/codecontests
+# The manifest pins revision + seed + sha256, so the build is reproducible
+# byte-for-byte rather than shipped.
+#
+# Run (on the pod): scripts/pod_run.sh rlvr codecontests_rlvr_olmo_smoke
+
+codecontests_rlvr_olmo:
+  model: allenai/Olmo-3-7B-Instruct-DPO
+  max_completion_tokens: 2048
+  dataset:
+    type: codecontests
+    path: data/codecontests/train.jsonl
+    test_path: data/codecontests/test.jsonl
+    relaxed_extraction: true   # accept a ```python fence truncated at the cap
+    seed: 0
+    # Bounds a runaway program, not honest work: the reward suite is <=10 small
+    # cases (2 MB total budget, enforced at build time), so a correct solution
+    # finishes in well under a second.
+    timeout_seconds: 10
+    # The whole held-out split: 501 problems, 109 contests, disjoint from train
+    # by contest so near-duplicates cannot straddle the boundary.
+    eval_subset_size: 501
+    # FLAT overshoot penalty: a completion past the budget loses a constant
+    # 0.1, regardless of how far over. The old repo RAMPED this between a soft
+    # 4096 and a hard 8192 (coef 0.10, so a half-way overshoot cost 0.05);
+    # flat is the deliberate change, so the gradient says "stay under" rather
+    # than "be marginally shorter" — the model learns the budget quickly.
+    #
+    # 1536 is measured, not guessed. Over 12,436 cached model completions on
+    # these problems (the old repo's answer cache), approx tokens:
+    #                 median   p90     p95    fits 1536   fits 2048
+    #   CORRECT   (n=4988)  505   1,272  1,842     92.5%      96.3%
+    #   INCORRECT (n=1590)  676   2,573  3,214     77.4%      85.2%
+    # Correct answers are SHORTER than wrong ones, so a 1536 budget blocks few
+    # correct policy updates while pricing a tail that skews wrong. Those
+    # samples were 122B/35B-class though; if OLMo-7B rambles more, the
+    # over_budget metric will show it in step 1.
+    #
+    # It only bites if response_length exceeds it — see below. It does NOT
+    # move the sampler cap; generation still stops at response_length.
+    soft_token_budget: 1536
+    overshoot_penalty: 0.1
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1
+      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
+      gpu_memory_utilization: 0.45 # no judge server here: rollout can take more than debate's 0.33
+      # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
+      # 1850 max, plus the answer-gen preamble.
+      prompt_length: 4096
+      # Headroom over the budget so the penalty has something to price; 2048
+      # still captures 96.3% of correct answers. A response_length at or below
+      # soft_token_budget would make the penalty dead config.
+      response_length: 2048
+      max_token_len_per_gpu: 8192    # >= prompt_length + response_length
+      checkpoint_dir: /workspace/checkpoints
+    # The TEAM, not the api key's personal default entity — without this,
+    # runs land in whoever launched them's own namespace and the rest of
+    # the team cannot see them.
+    wandb_entity: palaestra-research
+    wandb_project: debate-rebuild
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    # 8x8 = 64 rollouts/step. verl micro-batches against max_token_len_per_gpu,
+    # so batch size costs wall-clock, not peak memory; the 16x8 arm below is
+    # the same run at double the rollouts. Base arm is the cheaper one.
+    batch_size: 8
+    group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5
+    eval_n: 256        # +-3.1pp binomial noise
+    eval_max_tokens: 2048
+    save_every: 25
+
+# 1-step smoke: proves the whole path — dataset load, prompt render, rollout,
+# code extraction, subprocess verifier, reward, optimizer step — before
+# spending a real run.
+codecontests_rlvr_olmo_smoke:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 1
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0
+
+# Double the rollouts per step. Same memory profile (verl packs against
+# max_token_len_per_gpu); ~2x the wall-clock.
+codecontests_rlvr_olmo_16x8:
+  _extends: codecontests_rlvr_olmo
+  training:
+    batch_size: 16
+
+# Long-budget control. Only worth running if the smoke run shows OLMo's
+# completions clustering well above 1536 — i.e. if the measured distribution
+# above does not transfer from the 122B/35B-class samples it came from.
+# ~5x the generation of the base arm.
+codecontests_rlvr_olmo_long:
+  _extends: codecontests_rlvr_olmo
+  max_completion_tokens: 8192
+  dataset:
+    soft_token_budget: 4096
+  training:
+    verl:
+      response_length: 8192
+      max_token_len_per_gpu: 16384
+    eval_max_tokens: 8192
+
+# ---------------------------------------------------------------- 32B arm
+# The real baseline. Matches the OLD repo's CodeContests canary
+# (codecontests_olmo31_32b_canary_experiments.yaml): Olmo-3.1-32B-Instruct-DPO
+# on 8 GPUs, lora_rank 32, gpu_mem_util 0.45, max_new_tokens 8192.
+#
+# NOTE the model family: 3.1, not the 3-7B the MATH baselines in this repo use.
+# The arms above are 7B and exist to prove the code path cheaply; this is the
+# one whose numbers mean anything.
+#
+# Why 8 GPUs: 32B in bf16 is ~64 GB of weights, so vLLM's rollout copy plus
+# FSDP training state cannot share a single 80 GB card.
+#
+# The token budget goes back to the canary's 4096/8192 pair rather than the
+# 1536/2048 measured for the 7B arms — a 32B is the size class those cached
+# completions came from, so the short budget's evidence does not apply here.
+codecontests_rlvr_olmo31_32b:
+  _extends: codecontests_rlvr_olmo
+  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  max_completion_tokens: 8192
+  dataset:
+    soft_token_budget: 4096
+    overshoot_penalty: 0.1
+  training:
+    verl:
+      n_gpus: 8
+      # Shard the ROLLOUT across all 8 GPUs. Without this rollout_tp defaults
+      # to 1 and vLLM tries to put the whole 32B (~64 GB bf16) on ONE card;
+      # at gpu_memory_utilization 0.45 of a 143 GB H200 that is a 64 GB budget
+      # for 64 GB of weights, so it dies with "No available memory for the
+      # cache blocks" before a single token is generated. With tp=8 each card
+      # holds ~8 GB of weights and the rest of its 45% budget is KV cache.
+      rollout_tp: 8
+      response_length: 8192
+      max_token_len_per_gpu: 16384
+    eval_max_tokens: 8192
+
+# 2 steps with eval on every step: enough to draw a LINE in wandb rather than a
+# single point, and enough to see the policy actually move (grad_norm, kl,
+# entropy, reward between step 0 and 1). eval_n is small so the greedy pass
+# plus verifier stays under a minute.
+codecontests_rlvr_olmo_smoke2:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 1
+    eval_n: 8
+    save_every: 0
+
+# 10 steps at the REAL arm's rollout shape (8x8), so the curves reflect what a
+# full run would look like rather than 2x4 noise. eval every 2 steps on 32
+# held-out problems: enough points to see a trend, cheap enough to stay ~30min.
+codecontests_rlvr_olmo_smoke10:
+  _extends: codecontests_rlvr_olmo
+  training:
+    steps: 10
+    batch_size: 8
+    group_size: 8
+    eval_every: 2
+    eval_n: 32
+    save_every: 0
+
+# Cheap learning-signal test on the difficulty slice where the 7B inference
+# smoke produced useful reward variance. Bounds are inclusive: [800, 1100]
+# is Codeforces-rated problems below 1200. The lower bound is essential because
+# GDM records unmatched/unrated problems as cf_rating=0; a bare max would pull
+# 5,189 unknown-difficulty rows into the supposedly easy training set.
+# Inventory: 916 train, 82 held out. The smoke saw 54.5% mixed G=8 groups on
+# this combined slice, versus 21.9% by ratings 1300-1400.
+codecontests_rlvr_olmo_easy_smoke10:
+  _extends: codecontests_rlvr_olmo_smoke10
+  dataset:
+    min_cf_rating: 800
+    max_cf_rating: 1100
+    eval_subset_size: 82
+
+# Paired 25-step learning experiment on the viable 7B difficulty slice. Both
+# arms see the same seeded training stream and the complete 82-problem held-out
+# split. Intermediate + final checkpoints make the policy movement inspectable
+# even if correctness peaks before the last step.
+codecontests_rlvr_olmo_easy25_penalty:
+  _extends: codecontests_rlvr_olmo
+  dataset:
+    min_cf_rating: 800
+    max_cf_rating: 1100
+    eval_subset_size: 82
+  training:
+    steps: 25
+    batch_size: 8
+    group_size: 8
+    eval_every: 5
+    eval_n: 82
+    save_every: 10
+
+# Length-penalty ablation. The soft budget remains configured so over-budget
+# incidence is still measured, but a zero coefficient removes it from reward.
+# Everything else is byte-for-byte inherited from the paired control above.
+codecontests_rlvr_olmo_easy25_no_penalty:
+  _extends: codecontests_rlvr_olmo_easy25_penalty
+  dataset:
+    overshoot_penalty: 0.0
+
+# 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
+# worth reading: the 7B smoke showed the plumbing works but the model is too
+# weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
+codecontests_rlvr_olmo31_32b_smoke10:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 10
+    batch_size: 8
+    group_size: 8
+    eval_every: 2
+    eval_n: 32
+    save_every: 0
+
+# Phase-timing run: 3 steps at the real 8x8 shape, NO eval, no save. Exists to
+# fill in the phase/* panels (generate vs reward vs KL vs fwd/bwd vs sleep/wake)
+# so the 141s residual in a 171s step stops being a guess. Keep it to 3 steps —
+# step 0 carries init, so steps 1-2 are the ones that matter.
+codecontests_rlvr_olmo31_32b_phases:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 3
+    batch_size: 8
+    group_size: 8
+    eval_every: 0
+    save_every: 0
+
+# 4-GPU variant of the phase run: 8xH200 had no capacity. 32B at TP=4 is
+# 15GB of weights per 141GB card, leaving ~48GB for KV cache inside the 0.45
+# budget. Phase PROPORTIONS shift vs TP=8 (less per-token all-reduce, fewer
+# cards for compute) but the structure is what we are after.
+codecontests_rlvr_olmo31_32b_phases4:
+  _extends: codecontests_rlvr_olmo31_32b_phases
+  training:
+    verl:
+      n_gpus: 4
+      rollout_tp: 4
+
+# Token-cap sweep. Baseline is codecontests_rlvr_olmo31_32b_smoke10:
+# response_length 8192, soft budget 4096 (ratio 1/2). These keep that ratio so
+# only the CAP varies.
+#
+# Offline on 640 real 8192-budget completions, capping truncates the final code
+# block of anything ending past the cap:
+#   cap    passing kept   pass rate   generation cost
+#   1024        49.1%        22.2%          12%
+#   2048        63.3%        28.6%          25%
+#   8192       100.0%        45.2%         100%
+# That bounds the IMMEDIATE cost of truncation. It cannot say how the model
+# behaves when TRAINED under the cap — it may write tighter solutions (loss
+# smaller than measured) or collapse into degenerate short outputs. That is
+# what these runs are for.
+codecontests_rlvr_olmo31_32b_cap2048:
+  _extends: codecontests_rlvr_olmo31_32b_smoke10
+  max_completion_tokens: 2048
+  dataset:
+    soft_token_budget: 1024
+  training:
+    verl:
+      n_gpus: 4
+      rollout_tp: 4
+      response_length: 2048
+      max_token_len_per_gpu: 8192
+    eval_max_tokens: 2048
+
+codecontests_rlvr_olmo31_32b_cap1024:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048
+  max_completion_tokens: 1024
+  dataset:
+    soft_token_budget: 512
+  training:
+    verl:
+      response_length: 1024
+    eval_max_tokens: 1024
+
+# 1-step plumbing check for the 32B path: proves the weights load, shard across
+# 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
+codecontests_rlvr_olmo31_32b_smoke:
+  _extends: codecontests_rlvr_olmo31_32b
+  training:
+    steps: 1
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0

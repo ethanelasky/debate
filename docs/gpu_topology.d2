@@ -1,0 +1,128 @@
+# How the 8 GPUs are actually used in an RLVR run.
+# Verified against infra/backend/verl.py (hydra_overrides ~line 128,
+# RayResourcePool ~line 185) and measured on codecontests_rlvr_olmo31_32b_smoke10
+# (Olmo-3.1-32B, 8xH200 143GB, gpu_memory_utilization 0.45, rollout_tp 8).
+# Render: d2 docs/gpu_topology.d2 docs/gpu_topology.svg
+
+direction: down
+
+title: |||md
+  # 8 GPUs, one process group, two parallelism schemes
+  `RayResourcePool(process_on_nodes=[8])` — **verl.py:185** — creates 8 Ray workers,
+  one per GPU. Each worker is BOTH a training shard AND part of the rollout engine.
+  There is no separate inference cluster: **generation and training are colocated
+  on the same cards**, which is why the memory budget has to be split statically.
+||| {near: top-center}
+
+pool: "one RayWorkerGroup — 8 workers, 1 per GPU (verl.py:185-193)" {
+  style.stroke-dash: 3
+
+  card: |||md
+    ## Per H200 (143 GB), the static split
+
+    | region | size | set by |
+    |---|---|---|
+    | vLLM: weights/8 + KV cache | **64.4 GB** | `gpu_memory_utilization: 0.45` |
+    | FSDP training state | 78.7 GB budget | the remainder |
+    | *observed* torch reserved | **28–39 GB** | `loss/perf/max_memory_reserved_gb` |
+
+    32B bf16 = **64 GB of weights total**, so **8 GB per card** once sharded.
+    That is the whole reason `rollout_tp: 8` is mandatory — see the crash box.
+  |||
+}
+
+roll: |||md
+  ## Rollout: TENSOR parallel (`rollout_tp: 8`)
+  `verl.py:147` -> `rollout.tensor_model_parallel_size=8`
+
+  Each weight matrix is **split across all 8 cards**. Every GPU participates in
+  every token; layers all-reduce between cards. One logical vLLM engine.
+
+  - **pro:** a 32B that fits on no single card fits comfortably
+  - **con:** communication-bound, and all 8 cards are busy on one rollout —
+    there is no data-parallel rollout to overlap with
+
+  `rollout.mode=async` (verl.py:146), served via `LLMServerManager` (verl.py:196).
+  `max_model_len = prompt_length + response_length = 4096 + 8192 = 12288`
+  (verl.py:151) — this is what the KV cache must be sized for.
+|||
+
+train: |||md
+  ## Training: FSDP2 sharding (`strategy: fsdp2`, `n_gpus: 8`)
+  `verl.py:156` -> `trainer.n_gpus_per_node=8`
+
+  Parameters, gradients and optimizer state are **sharded across the 8 ranks**;
+  each rank sees different data and all-gathers the shard it needs per layer.
+
+  **LoRA rank 32** (`save_lora_only=True`, verl.py:128) means only the adapter
+  gets gradients and optimizer state — the 64 GB base is frozen. So training
+  memory is dominated by **activations**, not optimizer state. That is why
+  observed reserved memory (28–39 GB) sits far under the 78.7 GB budget.
+|||
+
+batching: |||md
+  ## Why batch size costs time, not memory
+  `use_dynamic_bsz=True` + `ppo_max_token_len_per_gpu=16384` (verl.py:136-137)
+
+  verl packs sequences into micro-batches up to **16384 tokens per GPU** rather
+  than a fixed sequence count. Raising `batch_size` produces MORE micro-batches
+  at the same peak memory — it buys wall-clock, not OOM.
+
+  `use_remove_padding=True` (verl.py:135): sequences are concatenated without
+  padding, so no FLOPs are spent on pad tokens. This needs flash-attn's varlen
+  kernels — which is why provisioning builds flash-attn from source at all.
+|||
+
+sync: |||md
+  ## The step-boundary handoff
+  `train.py:101` `backend.sync_sampler()`
+
+  After each optimizer step the updated **LoRA weights are pushed from the FSDP
+  ranks into the vLLM engine** so the next rollout samples from the current
+  policy. `rollout.checkpoint_engine.backend=naive` (verl.py:154).
+
+  This is also why `kl/policy_vs_ref_k1 ~= 0.001` is the health check that
+  matters: if trainer and sampler ever disagree about the weights, the PPO
+  ratio anchor is silently wrong.
+|||
+
+crash: |||md
+  ## The constraint we learned the hard way
+
+  First 32B launch died with:
+  ```
+  ValueError: No available memory for the cache blocks
+  ```
+  `rollout_tp` defaults to **1** (verl.py:50). With tp=1 each vLLM worker tries
+  to hold the **whole 64 GB** model inside a `0.45 x 143 = 64.4 GB` budget,
+  leaving ~0 for KV cache.
+
+  **Rule:** `weights_bytes / rollout_tp` must leave room for a KV cache big
+  enough for `max_model_len x concurrent sequences`, inside
+  `gpu_memory_utilization x card`.
+||| {style.fill: "#fdecea"; style.stroke: "#c0392b"}
+
+future: |||md
+  ## Constraints to carry into future experiments
+
+  1. **Colocation forces a static memory split.** Generation and training share
+     each card; `gpu_memory_utilization` is the dial and it cannot adapt at
+     runtime. Too high starves training, too low starves the KV cache.
+  2. **TP=8 means the rollout cannot be data-parallel.** All 8 cards serve one
+     engine. To overlap rollouts you would need a smaller TP and multiple
+     engines — but TP must stay large enough for the weights to fit.
+  3. **CPU RAM is not free:** 275 GB resident (`loss/perf/cpu_memory_used_gb`)
+     against a 234 GB cgroup limit on the earlier 1-GPU box. Pod RAM is a real
+     constraint, and `free`/`nproc` report the HOST, not the cgroup.
+  4. **`loss/mfu` reads 0.00** — model-FLOPs-utilisation is not being computed,
+     so we currently have no direct measure of how well the GPUs are used.
+     Worth wiring up before optimising the training half.
+||| {style.fill: "#eaf5ea"}
+
+pool -> roll: {style.stroke-dash: 2}
+pool -> train: {style.stroke-dash: 2}
+roll -> sync
+train -> sync
+sync -> batching: {style.stroke-dash: 2}
+batching -> crash: {style.stroke-dash: 2}
+crash -> future: {style.stroke-dash: 2}

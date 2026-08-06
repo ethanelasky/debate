@@ -5,6 +5,137 @@ Ported from the old repo (ai_debate/data_loader/codecontests_loader.py and
 ai_debate/experiments/verifiers/codecontests_verifier.py), slimmed: rows are
 held in memory (no lazy-JSONL dict) and there is no container sandbox — the
 runner is a plain subprocess.
+
+===========================================================================
+HOW THE TWO ARMS USE THIS FILE
+===========================================================================
+
+The experiment compares two ways of rewarding the same proposer model.
+
+RLVR arm (the baseline).  CodeContestsEnv.reward() below IS the reward: the
+model writes a program, we execute it against that problem's `rlvr_tests`,
+and reward = format_reward + correct_reward * (all tests passed). Execution
+decides the gradient.
+
+Debate arm.  DebateEnv never calls reward(). Its reward is judge-only: two
+debaters argue about the program and a judge picks a winner. NO test is run
+to produce that reward — the judge cannot execute code and never sees a test
+case. Execution appears only as a MEASUREMENT, via grade() below, which
+labels whether the proposer was actually right. That label lands in the
+transcript, never in the reward.
+
+That asymmetry is the whole experiment. If the verifier leaked into debate
+reward we would no longer be measuring whether debate produces a
+correct-detecting judge.
+
+===========================================================================
+TWO TEST SUITES PER PROBLEM, AND WHY
+===========================================================================
+
+Each row carries two disjoint suites, built by scripts/build_codecontests_rlvr.py:
+
+  rlvr_tests   <=10 cases sampled (seeded) from DeepMind's public_tests +
+               private_tests. The RLVR arm's REWARD. Deliberately small:
+               median 4 cases, and 27% of problems have exactly 1, because
+               that is all DeepMind publishes for them.
+
+  truth_tests  the cases the sample did NOT take. Ground truth for measuring
+               proposer accuracy. Disjoint from rlvr_tests by construction,
+               so we never score accuracy on a case the RLVR arm optimized
+               against. EMPTY for ~66% of problems (the sample consumed them
+               all); grade() returns None there rather than falling back to
+               rlvr_tests, which would be measuring on the training signal.
+
+Neither suite is ever rendered into a prompt. Models see the problem
+statement only. _task() puts test cases in Task.meta, and DebateEnv binds
+only meta["question"] into prompts; docent_export filters meta to scalars, so
+the list-valued suites cannot leak into a transcript either.
+
+One thing that looks like a leak and is not: some rlvr_tests cases DO appear
+verbatim in the problem statement (~16% of non-trivial cases across the test
+split). Those are the PUBLIC tests — DeepMind's public_tests are exactly the
+worked examples printed in a Codeforces problem, so a contestant sees them
+too. The model reading them off the statement is the intended setting, and it
+is part of why this reward is weak. Private tests never appear there.
+
+===========================================================================
+OFFLINE ACCURACY (the primary ground truth)
+===========================================================================
+
+truth_tests is a cheap in-run signal that exists for only a third of
+problems. The real accuracy pass happens AFTER a run, locally, with no GPU or
+API cost:
+
+  1. Training writes every rollout to docent/step-NNNNN.jsonl
+     (run_debate.py wires on_rollout -> docent_export). Each record contains
+     the full text of every speech, so the proposer's program is in there
+     verbatim, plus meta["name"] as a stable problem key.
+  2. Offline, re-extract the program from each proposal, run it against
+     CodeContests-O's corner cases, and recompute proposer and judge accuracy.
+
+This is worth the extra step because CCO's tests are much stronger, and
+running them during training would be slow (see the dataset note below).
+
+===========================================================================
+HOW THE VERIFIER WORKS
+===========================================================================
+
+run_stdin_tests() writes the program, the cases, and a runner script to a
+tempdir and spawns `python runner.py` in its OWN PROCESS GROUP so a timeout
+kills grandchildren too. The runner compiles the program once and exec()s it
+per case with stdin/stdout swapped to StringIO — one interpreter start per
+solution, not per test.
+
+The verdict is read from a FILE the runner writes, never from stdout: the
+untrusted program shares the runner's stdout and could otherwise print a
+forged {"passed": true} from an atexit hook after the StringIO swap unwinds.
+The runner also blanks sys.argv so the program cannot find and forge that
+file. Limits: RLIMIT_AS 4GB, RLIMIT_NPROC 256, RLIMIT_FSIZE 64MB (the last
+two are best-effort; macOS skips them).
+
+Comparison is whitespace-normalized with floats collapsed via %g, so
+"3.0000000000" and "3" match. Problems whose statements admit multiple valid
+outputs are dropped at BUILD time (_MULTI_ANSWER_PHRASES) because exact
+comparison would mis-grade them.
+
+===========================================================================
+TEST-CASE SELECTION AND TRUNCATION (all at build time, not here)
+===========================================================================
+
+scripts/build_codecontests_rlvr.py applies, per problem:
+  - drop if the statement matches a multi-answer phrase
+  - drop if it is not stdin/stdout (file-based I/O cannot be piped)
+  - drop any problem with a single case above 500 KB
+  - sample <=10 cases into rlvr_tests, subject to a 2 MB total budget
+    (ten 500 KB cases through a subprocess on every rollout is not viable)
+  - remainder becomes truth_tests
+Seed, caps, counts and sha256 are recorded in the dataset's manifest.json, so
+the exact split is reproducible.
+
+===========================================================================
+WHICH DATASET, AND WHY THREE OF THEM EXIST
+===========================================================================
+
+  deepmind/code_contests  — the original. public_tests (median 2) are what a
+      contestant sees; private_tests (median 2, but 40% of problems have
+      none) are held back; generated_tests (median 94) are mutations of
+      existing cases and stay SMALL — median input 45 bytes. Our two suites
+      are drawn from public+private, at pinned revision 802411c3010c.
+
+  CodeContests-O (caijanfeng)  — regenerates test cases with an iterative
+      feedback loop. ~34 cases per problem, and crucially the inputs are at
+      the problem's real constraint limits: median input 518 bytes but
+      reaching 690 KB on problems where scale matters, vs DeepMind's 45.
+      That is why it catches wrong-but-plausible solutions that pass small
+      tests — and why it costs ~1.3 MB per problem to run. Used offline only.
+
+  CodeContests+ (ByteDance-Seed)  — a third regeneration, ~27 cases with
+      validated true-positive/true-negative rates. NOT used: its test data is
+      ~11.5 MB per problem (130 GB for the config), and it is not what the
+      earlier inference runs used. See docs/codecontests-dataset-provenance.md.
+
+The short version: DeepMind = small and free, CCO = strong and expensive, and
+the design trains on the cheap one while measuring with the strong one.
 """
 
 from __future__ import annotations
@@ -31,9 +162,20 @@ PROMPT_FILE = "codecontests.yaml"
 
 logger = logging.getLogger(__name__)
 
-# Each verifier subprocess may use up to 4GB (RLIMIT_AS in the runner script),
-# so cap concurrency to keep total memory bounded.
-_MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "8"))
+# Concurrent verifier subprocesses. This is the limit that BINDS: the thread
+# pool in SingleTurnEnv.rollout also gates on this semaphore, so raising pool
+# workers alone changes nothing (measured three times before we noticed).
+#
+# Was 8, derived from "RLIMIT_AS is 4GB, so 8 x 4GB = 32GB". That arithmetic
+# mixed currencies: RLIMIT_AS bounds VIRTUAL address space, while the thing
+# worth budgeting is resident memory — measured at ~21MB per verifier process,
+# three orders of magnitude less. 4GB is still the right backstop against a
+# runaway allocation; it was never a sane basis for a concurrency budget.
+#
+# 32 measured 2.87x faster wallclock on 632 real completions with 632/632
+# identical verdicts. The floor is the timeout itself, not concurrency: a
+# fan-out cannot finish before its slowest item.
+_MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "32"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
 
 # Descriptions containing these admit multiple valid outputs, which exact
@@ -372,10 +514,14 @@ if __name__ == "__main__":
 
 
 def _load_rows(path: str) -> list[dict[str, Any]]:
+    """Read the built dataset. Eligibility (multi-answer, stdin/stdout, size
+    caps) was already applied by scripts/build_codecontests_rlvr.py, so the
+    only checks here are structural: a usable reward suite, and inputs paired
+    with outputs. The runner zips the two lists, so a length mismatch would
+    silently grade on a truncated suite rather than erroring."""
     rows: list[dict[str, Any]] = []
     n_total = 0
-    n_no_tests = 0
-    n_multi_answer = 0
+    n_no_rlvr = 0
     n_len_mismatch = 0
     with open(path) as f:
         for line in f:
@@ -383,40 +529,62 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
             if not line:
                 continue
             n_total += 1
-            entry = json.loads(line)
-            inputs, outputs = entry.get("inputs"), entry.get("outputs")
-            if not inputs or not outputs:
-                n_no_tests += 1
+            e = json.loads(line)
+            ri, ro = e.get("rlvr_inputs") or [], e.get("rlvr_outputs") or []
+            ti, to = e.get("truth_inputs") or [], e.get("truth_outputs") or []
+            if not ri or not ro:
+                n_no_rlvr += 1
                 continue
-            desc_lower = (entry.get("description", "") or "").lower()
-            if any(phrase in desc_lower for phrase in _MULTI_ANSWER_PHRASES):
-                n_multi_answer += 1
-                continue
-            if len(inputs) != len(outputs):
-                # the runner zips inputs with outputs, which would silently
-                # truncate to the shorter list and grade on partial cases
+            if len(ri) != len(ro) or len(ti) != len(to):
                 n_len_mismatch += 1
                 continue
             rows.append(
                 {
-                    "problem": str(entry.get("description", "")).strip(),
-                    "name": str(entry.get("name", "")).strip(),
-                    "inputs": list(inputs),
-                    "outputs": list(outputs),
+                    "problem": str(e.get("problem", "")).strip(),
+                    "name": str(e.get("name", "")).strip(),
+                    "rlvr_inputs": list(ri),
+                    "rlvr_outputs": list(ro),
+                    "truth_inputs": list(ti),
+                    "truth_outputs": list(to),
+                    "cf_rating": e.get("cf_rating"),
+                    "difficulty": e.get("difficulty"),
                 }
             )
+    n_truth = sum(1 for r in rows if r["truth_inputs"])
     logger.info(
         "codecontests rows from %s: total=%d kept=%d dropped=%d "
-        "(no_tests=%d multi_answer=%d len_mismatch=%d)",
-        path,
-        n_total,
-        len(rows),
-        n_no_tests + n_multi_answer + n_len_mismatch,
-        n_no_tests,
-        n_multi_answer,
-        n_len_mismatch,
+        "(no_rlvr_suite=%d len_mismatch=%d); %d/%d have a non-empty truth "
+        "suite (the rest are gradeable only by the offline CCO pass)",
+        path, n_total, len(rows), n_no_rlvr + n_len_mismatch,
+        n_no_rlvr, n_len_mismatch, n_truth, len(rows),
     )
     return rows
+
+
+def _filter_cf_rating(
+    rows: list[dict[str, Any]],
+    min_cf_rating: Optional[int],
+    max_cf_rating: Optional[int],
+) -> list[dict[str, Any]]:
+    """Keep rows inside an inclusive Codeforces rating range.
+
+    GDM uses ``0`` for problems without a matched Codeforces rating.  Requiring
+    a numeric value inside the requested interval therefore also keeps those
+    unrated rows from leaking into an "easy" slice.
+    """
+    if min_cf_rating is None and max_cf_rating is None:
+        return rows
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        rating = row.get("cf_rating")
+        if isinstance(rating, bool) or not isinstance(rating, (int, float)):
+            continue
+        if min_cf_rating is not None and rating < min_cf_rating:
+            continue
+        if max_cf_rating is not None and rating > max_cf_rating:
+            continue
+        kept.append(row)
+    return kept
 
 
 class CodeContestsEnv(SingleTurnEnv):
@@ -433,16 +601,49 @@ class CodeContestsEnv(SingleTurnEnv):
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
         prompt_file: Optional[str] = None,
+        soft_token_budget: Optional[int] = None,
+        overshoot_penalty: float = 0.0,
+        min_cf_rating: Optional[int] = None,
+        max_cf_rating: Optional[int] = None,
     ):
+        if (
+            min_cf_rating is not None
+            and max_cf_rating is not None
+            and min_cf_rating > max_cf_rating
+        ):
+            raise ValueError(
+                "codecontests min_cf_rating must be <= max_cf_rating "
+                f"(got {min_cf_rating} > {max_cf_rating})"
+            )
         self.rng = random.Random(seed)
+        # Flat penalty past the budget (see SingleTurnEnv). Inert unless the
+        # backend's response_length is set above the budget.
+        self.soft_token_budget = soft_token_budget
+        self.overshoot_penalty = overshoot_penalty
         self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
         self.timeout_seconds = timeout_seconds
         self.correct_reward = correct_reward
         self.format_reward = format_reward
 
-        self.train_rows = _load_rows(path)
+        loaded_train_rows = _load_rows(path)
+        self.train_rows = _filter_cf_rating(
+            loaded_train_rows, min_cf_rating, max_cf_rating
+        )
         if test_path is not None:
-            self.test_rows = _load_rows(test_path)
+            loaded_test_rows = _load_rows(test_path)
+            self.test_rows = _filter_cf_rating(
+                loaded_test_rows, min_cf_rating, max_cf_rating
+            )
+            if min_cf_rating is not None or max_cf_rating is not None:
+                logger.info(
+                    "codecontests cf_rating filter [%s, %s]: train=%d/%d test=%d/%d",
+                    min_cf_rating,
+                    max_cf_rating,
+                    len(self.train_rows),
+                    len(loaded_train_rows),
+                    len(self.test_rows),
+                    len(loaded_test_rows),
+                )
             overlap = {r["name"] for r in self.train_rows if r["name"]} & {
                 r["name"] for r in self.test_rows if r["name"]
             }
@@ -468,16 +669,25 @@ class CodeContestsEnv(SingleTurnEnv):
             )
 
     def _task(self, row: dict[str, Any], split: str) -> Task:
-        # meta["question"] is what DebateEnv binds as the debate TOPIC.
-        # inputs/outputs are verifier test cases only — they are NOT public
-        # examples and must never be rendered into any prompt or transcript.
+        # meta["question"] is what DebateEnv binds as the debate TOPIC — the
+        # problem statement, and the ONLY field that reaches a prompt.
+        #
+        # Both suites ride in meta for the graders to read. They are verifier
+        # inputs, not public examples: nothing renders them. `name` is the
+        # stable key the offline CCO accuracy pass joins on, so it must stay a
+        # scalar (docent_export keeps scalars and drops lists — which is also
+        # what keeps the suites out of exported transcripts).
         return Task(
             messages=self.prompts.messages(row["problem"]),
             meta={
                 "question": row["problem"],
                 "name": row["name"],
-                "inputs": row["inputs"],
-                "outputs": row["outputs"],
+                "rlvr_inputs": row["rlvr_inputs"],
+                "rlvr_outputs": row["rlvr_outputs"],
+                "truth_inputs": row["truth_inputs"],
+                "truth_outputs": row["truth_outputs"],
+                "cf_rating": row.get("cf_rating"),
+                "difficulty": row.get("difficulty"),
                 "split": split,
             },
         )
@@ -488,6 +698,9 @@ class CodeContestsEnv(SingleTurnEnv):
         return [self._task(row, split) for row in self.test_rows[:n]]
 
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
+        """THE RLVR ARM'S REWARD. Runs the program against rlvr_tests only —
+        never truth_tests, which exist to measure this arm, not to train it.
+        The debate arm does not call this at all (its reward is judge-only)."""
         code = extract_code(text, relaxed=True)
         # every key present in EVERY branch, so eval-time averages are means
         # over all samples rather than over the branch that happened to set it
@@ -506,9 +719,10 @@ class CodeContestsEnv(SingleTurnEnv):
             return self.format_reward, info
 
         result = run_stdin_tests(
-            code, task.meta["inputs"], task.meta["outputs"], timeout=self.timeout_seconds
+            code, task.meta["rlvr_inputs"], task.meta["rlvr_outputs"],
+            timeout=self.timeout_seconds,
         )
-        total = result.get("tests_total") or len(task.meta["inputs"])
+        total = result.get("tests_total") or len(task.meta["rlvr_inputs"])
         info["correct"] = float(bool(result.get("passed")))
         info["tests_passed_frac"] = result.get("tests_passed", 0) / total if total else 0.0
         # verifier breakage must be distinguishable from wrong answers
@@ -538,6 +752,10 @@ class CodeContestsFamily(TaskFamily):
                 "correct_reward",
                 "format_reward",
                 "prompt_file",
+                "soft_token_budget",
+                "overshoot_penalty",
+                "min_cf_rating",
+                "max_cf_rating",
             },
             "codecontests",
         )
@@ -558,15 +776,33 @@ class CodeContestsFamily(TaskFamily):
             correct_reward=float(ds.get("correct_reward", 1.0)),
             format_reward=float(ds.get("format_reward", 0.1)),
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
+            soft_token_budget=(int(ds["soft_token_budget"]) if ds.get("soft_token_budget") else None),
+            overshoot_penalty=float(ds.get("overshoot_penalty", 0.0)),
+            min_cf_rating=(
+                int(ds["min_cf_rating"]) if ds.get("min_cf_rating") is not None else None
+            ),
+            max_cf_rating=(
+                int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
+            ),
         )
 
     def extractor(self, relaxed: bool) -> Callable[[str], Any]:
         return lambda text: extract_code(text, relaxed=relaxed)
 
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
+        """GROUND-TRUTH LABEL, never a reward. DebateEnv calls this to record
+        whether the proposer was actually right; the label goes to the
+        transcript and to info["solution_correct"], and the judge never sees it.
+
+        Uses truth_tests, which the RLVR arm was NOT trained on. Returns None
+        when a problem has no truth suite (~66% of them — the <=10 sample
+        consumed every case). Deliberately no fallback to rlvr_tests: on an
+        RLVR-trained policy that would be scoring the training signal and
+        would read as inflated accuracy. Those problems get their label from
+        the offline CodeContests-O pass instead (see the module docstring)."""
         if solution is None:
             return None
-        inputs, outputs = meta.get("inputs"), meta.get("outputs")
+        inputs, outputs = meta.get("truth_inputs"), meta.get("truth_outputs")
         if not inputs or not outputs:
             return None
         if is_cpp_code(solution):

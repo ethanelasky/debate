@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +36,10 @@ class Config:
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
+    # wandb entity (team). None falls back to the API key's DEFAULT entity,
+    # which is a personal namespace — runs then land somewhere the rest of the
+    # team cannot see. Set it explicitly in the experiment config.
+    wandb_entity: str | None = None
     run_name: str | None = None
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
@@ -85,6 +90,32 @@ def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
     return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
 
 
+class _Phases:
+    """Wall-clock per phase of a step.
+
+    Everything here is synchronous from Python's side — verl's calls block until
+    the GPU work they wrapped is done — so plain monotonic deltas are honest.
+    That is NOT true of raw torch ops, which queue asynchronously and would need
+    a cuda synchronize before timing meant anything.
+    """
+
+    def __init__(self) -> None:
+        self.t: dict[str, float] = {}
+
+    @contextmanager
+    def __call__(self, name: str):
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            self.t[name] = self.t.get(name, 0.0) + time.monotonic() - t0
+
+    def metrics(self, total: float) -> dict[str, float]:
+        out = {f"phase/{k}_s": v for k, v in self.t.items()}
+        out["phase/unattributed_s"] = max(0.0, total - sum(self.t.values()))
+        return out
+
+
 def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
     """eval_env: evaluate on a DIFFERENT env than training (e.g. debate
     training with plain-RLVR MathEnv evals). None = eval on `env`."""
@@ -94,8 +125,11 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
 
     for step in range(cfg.steps):
         t0 = time.monotonic()
-        backend.sync_sampler()
-        groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
+        ph = _Phases()
+        with ph("sync_sampler"):
+            backend.sync_sampler()
+        with ph("rollout"):
+            groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
         if cfg.on_rollout is not None:
             try:
                 cfg.on_rollout(step, env)
@@ -104,12 +138,13 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
 
-        datums, pack_stats = grpo_pack(
-            groups,
-            norm_by_std=cfg.norm_adv_by_std,
-            length_normalize=cfg.adv_length_norm,
-            shuffle_seed=cfg.seed + step,
-        )
+        with ph("pack"):
+            datums, pack_stats = grpo_pack(
+                groups,
+                norm_by_std=cfg.norm_adv_by_std,
+                length_normalize=cfg.adv_length_norm,
+                shuffle_seed=cfg.seed + step,
+            )
         metrics.update(pack_stats)
 
         if datums:
@@ -117,18 +152,23 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
 
             metrics["train/policy_token_entropy"] = entropy_proxy(datums)
             if cfg.kl_coef > 0:
-                metrics.update(
-                    apply_kl_penalty(backend, datums, cfg.kl_coef, cfg.kl_discount_factor)
-                )
+                # ref_logprobs is a FULL forward pass over every datum on the
+                # frozen base — the cost of kl_coef, and worth seeing separately.
+                with ph("kl_ref_logprobs"):
+                    metrics.update(
+                        apply_kl_penalty(backend, datums, cfg.kl_coef, cfg.kl_discount_factor)
+                    )
             import random as _random
 
             for epoch in range(max(1, cfg.ppo_epochs)):
                 # later epochs go off-policy; the ratio in ppo/importance losses
                 # corrects against the stored sampler logprobs
                 _random.Random(cfg.seed * 1000 + step * 10 + epoch).shuffle(datums)
-                for i in range(0, len(datums), cfg.micro_batch):
-                    backend.forward_backward(datums[i : i + cfg.micro_batch], cfg.loss)
-                metrics.update(backend.optim_step(optim))
+                with ph("forward_backward"):
+                    for i in range(0, len(datums), cfg.micro_batch):
+                        backend.forward_backward(datums[i : i + cfg.micro_batch], cfg.loss)
+                with ph("optim_step"):
+                    metrics.update(backend.optim_step(optim))
 
         if cfg.eval_every and step % cfg.eval_every == 0:
             eval_policy = policy
@@ -140,12 +180,19 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                     _replace(policy.params, max_tokens=cfg.eval_max_tokens),
                     policy.chat_template_kwargs,
                 )
-            metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
+            with ph("evaluate"):
+                metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
         if cfg.save_every and step > 0 and step % cfg.save_every == 0:
             metrics["checkpoint_saved"] = 1.0
-            backend.save(f"step-{step:05d}")
+            with ph("save"):
+                backend.save(f"step-{step:05d}")
 
         metrics["step_seconds"] = time.monotonic() - t0
+        # SingleTurnEnv splits its rollout into generate/reward; fold that in so
+        # "rollout" is broken down rather than opaque.
+        for k, v in (getattr(env, "last_phase_seconds", None) or {}).items():
+            metrics[f"phase/rollout_{k}_s"] = float(v)
+        metrics.update(ph.metrics(metrics["step_seconds"]))
         logger(step, metrics)
 
     backend.save("final")
@@ -156,7 +203,12 @@ def _make_logger(cfg: Config):
     if cfg.wandb_project:
         import wandb
 
-        run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
+        run = wandb.init(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity,   # None -> wandb's default entity
+            name=cfg.run_name,
+            config=vars(cfg),
+        )
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:
@@ -181,6 +233,7 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=Config.eval_every)
     parser.add_argument("--eval-n", type=int, default=Config.eval_n)
     parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--load", default=None, help="checkpoint path to resume from")
     args = parser.parse_args()
 
@@ -196,6 +249,7 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_n=args.eval_n,
         wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
     )
 
     from infra.backend.tinker import TinkerBackend

@@ -254,9 +254,11 @@ def test_family_tasks_carry_question(name, tmp_path):
         rows = [
             {
                 "name": f"p{i}",
-                "description": f"Read one line and print {i}.",
-                "inputs": ["x"],
-                "outputs": [str(i)],
+                "problem": f"Read one line and print {i}.",
+                "rlvr_inputs": ["x"],
+                "rlvr_outputs": [str(i)],
+                "truth_inputs": ["y"],
+                "truth_outputs": [str(i)],
             }
             for i in range(4)
         ]
