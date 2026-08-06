@@ -1,0 +1,45 @@
+# Neutral (no-CoT-prompt) variant of math.yaml, for the CoT-discovery
+# experiments (Ethan, 2026-08-05): does RL learn to reason when the prompt
+# neither asks for a derivation nor forbids one? Derived from math.yaml by
+# DELETION ONLY — the step-by-step requirement bullet and the system line's
+# "Solve rigorously and end with one boxed answer" coaching are removed;
+# every remaining line is byte-identical to math.yaml's. The boxed-answer
+# requirement stays: extraction and the format reward depend on it, and it
+# constrains only the final line, not whether the model derives.
+#
+# The old CS285 prompt is NOT what this is: that one actively banned prose
+# ("Output only the boxed final answer"), so gains under it measured
+# instruction-overriding, not CoT discovery. See the 08-04/08-05 run analysis.
+#
+# Same single-source contract as math.yaml: select via
+# dataset: {type: math, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+# and BOTH arms (RLVR user message, debate proposal slot via
+# <ANSWER_GEN_USER>) render this composition byte-identically.
+messages:
+  - role: system
+    content: |-
+      You are an expert mathematician.
+  - role: user
+    name: ANSWER_GEN_USER
+    content: |-
+      Solve this mathematics problem.
+
+      <problem><PROBLEM></problem>
+
+      Requirements:
+      - End with your final answer as EXACTLY one \boxed{...} on the last line.
+
+      Provide your solution:
+
+# Neutral plan cue, derived from math.yaml's `plan` by DELETION ONLY: the
+# "work the problem / do the key computations" coaching is removed — this arm's
+# question is whether reasoning emerges when nothing asks for it, and a
+# scratchpad instruction to compute would answer it by fiat. The private-turn
+# structure itself stays, matching the debate arm's plan slot.
+plan: |-
+  Consider this mathematics problem.
+
+  <problem><PROBLEM></problem>
+
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Use it however you like before giving your solution.

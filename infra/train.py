@@ -40,7 +40,14 @@ class Config:
     # which is a personal namespace — runs then land somewhere the rest of the
     # team cannot see. Set it explicitly in the experiment config.
     wandb_entity: str | None = None
+    log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
     run_name: str | None = None
+    # Continuation plumbing: start_step makes the loop run [start_step, steps)
+    # so step indices, save names, and eval cadence continue the original
+    # lineage; wandb_run_id appends to that existing wandb run (resume="must")
+    # instead of starting a new one at x=0.
+    start_step: int = 0
+    wandb_run_id: str | None = None
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
 
@@ -85,6 +92,18 @@ def _rollout_info_metrics(env: Env, prefix: str) -> dict[str, float]:
     return out
 
 
+def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
+    """Transcript capture must never kill training (same stance as on_rollout)."""
+    if not (cfg.log_transcripts and cfg.wandb_project):
+        return
+    try:
+        from infra.transcript_log import log_rollout_transcripts
+
+        log_rollout_transcripts(step, env, split)
+    except Exception as e:
+        print(f"[transcripts] {type(e).__name__}: {e}")
+
+
 def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
     groups = env.rollout(env.tasks(n, split="test"), policy.greedy(), group_size=1)
     return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
@@ -123,7 +142,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     optim = cfg.optim or OptimParams(lr=cfg.lr)
 
-    for step in range(cfg.steps):
+    for step in range(cfg.start_step, cfg.steps):
         t0 = time.monotonic()
         ph = _Phases()
         with ph("sync_sampler"):
@@ -137,6 +156,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 print(f"[on_rollout] {type(e).__name__}: {e}")
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
+        _log_transcripts(cfg, step, env, "train")
 
         with ph("pack"):
             datums, pack_stats = grpo_pack(
@@ -182,7 +202,12 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 )
             with ph("evaluate"):
                 metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
-        if cfg.save_every and step > 0 and step % cfg.save_every == 0:
+                _log_transcripts(cfg, step, eval_env or env, "eval")
+        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
+        # can hit the save cadence (start 25, save_every 25) and would re-save
+        # step-00025 — overwriting the very checkpoint it just loaded with a
+        # one-step-newer lineage under the same name.
+        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
             metrics["checkpoint_saved"] = 1.0
             with ph("save"):
                 backend.save(f"step-{step:05d}")
@@ -203,12 +228,22 @@ def _make_logger(cfg: Config):
     if cfg.wandb_project:
         import wandb
 
-        run = wandb.init(
-            project=cfg.wandb_project,
-            entity=cfg.wandb_entity,   # None -> wandb's default entity
-            name=cfg.run_name,
-            config=vars(cfg),
-        )
+        if cfg.wandb_run_id:
+            # resume="must": appending to the named run is the entire point; a
+            # silent fallback to a fresh run would re-split the x-axis.
+            # config included on resume too: a continuation that changes lr or
+            # steps must not keep advertising the original run's values.
+            run = wandb.init(
+                project=cfg.wandb_project, entity=cfg.wandb_entity, id=cfg.wandb_run_id,
+                resume="must", config=vars(cfg), allow_val_change=True,
+            )
+        else:
+            run = wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity,   # None -> wandb's default entity
+                name=cfg.run_name,
+                config=vars(cfg),
+            )
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:

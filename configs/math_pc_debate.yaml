@@ -13,7 +13,7 @@ _base_math_pc:
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 768},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
-    file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
+    file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
   agents:
@@ -60,7 +60,7 @@ _base_math_pc:
     # runs land in whoever launched them's own namespace and the rest of
     # the team cannot see them.
     wandb_entity: palaestra-research
-    wandb_project: debate-rebuild
+    wandb_project: debate-math
     lora_rank: 32   # the SHARED adapter's rank (one adapter across all trained seats)
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}   # GRPO = this + group-normalized advantages
     ppo_epochs: 1

@@ -23,7 +23,7 @@ math_rlvr_olmo_l5:
     # runs land in whoever launched them's own namespace and the rest of
     # the team cannot see them.
     wandb_entity: palaestra-research
-    wandb_project: debate-rebuild
+    wandb_project: debate-math
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1
@@ -38,6 +38,34 @@ math_rlvr_olmo_l5:
     eval_n: 256        # +-3.1pp binomial noise
     eval_max_tokens: 2000
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# CoT-discovery arm: the neutral prompt (math_nocot.yaml — no step-by-step
+# ask, no answer-only ban; deletion-only variant, test-pinned). Question: does
+# verifier-reward RL discover derivations when the prompt is silent on them?
+# Paired with math_pc_olmo_l5_g8_nocot; watch eval/has_boxed + response length
+# alongside eval/correct_relaxed at step 0 for the starting behavior.
+math_rlvr_olmo_l5_nocot:
+  _extends: math_rlvr_olmo_l5
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+
+# Plan-then-answer arms: the RLVR twins of the math_pc_olmo debate entries,
+# which give the proposer a private 1000-token plan slot before the proposal
+# (the CoT surrogate with thinking off). Without this, the debate arm gets
+# extra sequential compute the RLVR arm doesn't — a confound on top of the
+# reward-source difference. The plan turn renders the task family's `plan` cue
+# (math*.yaml), byte-identical to the debate plan slot's spliced <PLAN_USER>.
+# prompt_length grows: the answer turn's prompt now carries the plan cue plus
+# up to 1000 plan tokens.
+math_rlvr_olmo_l5_plan:
+  _extends: math_rlvr_olmo_l5
+  plan_tokens: 1000
+  training:
+    verl:
+      prompt_length: 4096
+
+math_rlvr_olmo_l5_plan_nocot:
+  _extends: math_rlvr_olmo_l5_plan
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
 
 # tiny live-verification arm
 math_rlvr_olmo_smoke:

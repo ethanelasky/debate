@@ -10,7 +10,12 @@
 math_pc_olmo_l5:
   protocol:
     turns:
-      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1000},
+      # `plan`, not `scratchpad`: the pre-proposal slot has its own cue
+      # (spliced <PLAN_USER>) carrying the problem — the proposer has no
+      # pre_debate preamble, so the generic scratchpad cue left alice
+      # planning blind (2026-08-06). Later scratchpads keep the generic cue:
+      # by then the problem/dispute is in context.
+      - alice: [{name: plan, visibility: private, max_total_tokens: 1000},
                 {name: proposal, kind: solution, max_total_tokens: 1000}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
                 {name: critique, max_total_tokens: 500}]
@@ -21,9 +26,12 @@ math_pc_olmo_l5:
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
-    file_path: infra/envs/debate/prompt_configs/hendrycks_math.yaml
+    file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
+  # RLVR evals run plan-then-answer (same shape as alice's plan slot, same
+  # 1000-token cap) so the policy is measured in the mode it is trained in.
+  plan_tokens: 1000
   agents:
     alice:
       trained: true
@@ -75,7 +83,7 @@ math_pc_olmo_l5:
     # runs land in whoever launched them's own namespace and the rest of
     # the team cannot see them.
     wandb_entity: palaestra-research
-    wandb_project: debate-rebuild
+    wandb_project: debate-math
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1
@@ -103,3 +111,95 @@ math_pc_olmo_smoke:
     group_size: 4   # group 2 risks all-identical verdicts -> every datum dropped
     eval_every: 0
     save_every: 0
+
+# Mirror of the successful math_rlvr_olmo_l5 run (wandb debate-rebuild,
+# 2026-08-04, final eval 77.3%): group 8, lr 1e-4, and the proposal budget
+# raised to RLVR's 2000-token completion cap — the post-ff3820c step-by-step
+# answer prompt runs long, and 1000 truncated proposals would poison the judge
+# signal. Standalone entry, same reason as math_pc_olmo_l5: protocol turn
+# lists merge BY INDEX under _extends.
+math_pc_olmo_l5_g8:
+  protocol:
+    turns:
+      # plan (not scratchpad): see math_pc_olmo_l5's protocol comment.
+      - alice: [{name: plan, visibility: private, max_total_tokens: 1000},
+                {name: proposal, kind: solution, max_total_tokens: 2000}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: critique, max_total_tokens: 500}]
+      - alice: [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: defense, max_total_tokens: 500}]
+      - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
+                {name: rebuttal, max_total_tokens: 500}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math.yaml
+    entry: math_proposer_critic
+  fresh_positions: true
+  # RLVR evals run plan-then-answer (same shape as alice's plan slot, same
+  # 1000-token cap) so the policy is measured in the mode it is trained in.
+  plan_tokens: 1000
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: proposer-alice
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: allenai/Olmo-3-7B-Instruct-DPO
+        alias: critic-bob
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 2                      # 2xH100 pod (4x had no US-CA-2 stock 2026-08-05);
+                                     # judge still colocates on GPU 0 at 0.18
+      strategy: fsdp2
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.33
+      prompt_length: 8192
+      response_length: 2048          # largest slot cap (proposal 2000)
+      max_token_len_per_gpu: 16384
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8      # as in math_rlvr_olmo_l5; halves advantage noise vs the g4 runs
+    lr: 1.0e-4         # the RLVR lr that reached 77.3%; 1e-5 was dead here
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5      # RLVR eval: greedy MathEnv accuracy on held-out L5 test
+    eval_n: 256
+    eval_max_tokens: 2000
+    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
+
+# CoT-discovery arm: neutral prompt (math_nocot.yaml — no step-by-step ask, no
+# answer-only ban). The nocot answer prompt splices into the proposal slot via
+# <ANSWER_GEN_USER>, byte-identical to math_rlvr_olmo_l5_nocot's user message.
+# Question: does judge-mediated debate reward discover derivations when the
+# prompt is silent on them — and faster/higher than the verifier reward does?
+math_pc_olmo_l5_g8_nocot:
+  _extends: math_pc_olmo_l5_g8
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}

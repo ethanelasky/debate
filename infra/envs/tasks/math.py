@@ -96,7 +96,7 @@ class MathEnv(SingleTurnEnv):
 
     def _task(self, row: dict[str, Any], split: str) -> Task:
         return Task(
-            messages=self.prompts.messages(row["problem"]),
+            messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={"gt": row["gt"], "level": row["level"], "split": split, "question": row["problem"]},
         )
 

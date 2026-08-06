@@ -678,7 +678,7 @@ class CodeContestsEnv(SingleTurnEnv):
         # scalar (docent_export keeps scalars and drops lists — which is also
         # what keeps the suites out of exported transcripts).
         return Task(
-            messages=self.prompts.messages(row["problem"]),
+            messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={
                 "question": row["problem"],
                 "name": row["name"],

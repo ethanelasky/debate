@@ -1,0 +1,65 @@
+# Hendrycks MATH answer-generation prompts, reproducing the OLD repo's
+# hendrycks_math.yaml `answer_generation_user` VERBATIM (working tree at
+# /Users/ethanelasky/ai-debate/ai_debate/prompts/configs/hendrycks_math.yaml,
+# entry _MATH_Base), with its <TOPIC> rebound to this layer's <PROBLEM> and its
+# <ANSWER_FORMAT_INSTRUCTION> resolved from that pack's `_answer_format_instruction`
+# template. The system message is the old pack's own `answer_generation_system`
+# line, verbatim — the pair below is the old repo's actual answer-generation
+# composition, system and user together.
+#
+# The old CS285-ported system prompt that used to live here ("Output only the
+# boxed final answer", "Do not output XML, ####, or extra prose") is DROPPED:
+# it demanded answer-only output and directly contradicts the step-by-step
+# solution this user message asks for.
+#
+# THIS FILE IS THE SINGLE SOURCE for the math answer prompt, for BOTH arms. The
+# RLVR user message and the debate proposal slot are the SAME composition
+# rendered byte-for-byte identically: DebateEnv splices the ANSWER_GEN_USER
+# message into the proposal slot wherever
+# infra/prompts/debate/hendrycks_math.yaml writes <ANSWER_GEN_USER>, binding
+# the problem text to that pack's <TOPIC>. Editing the wording here changes
+# both arms together, which is the point. Schema: ../README.md.
+#
+# <PROBLEM> is substituted with the row's problem text. The lowercase <problem>
+# tags are literal prompt markup, not placeholders (the debate template layer
+# only ever binds UPPERCASE tags), and are part of the old repo's wording.
+#
+# DELIBERATE deviation from old-repo verbatim (Ethan, 2026-08-03): the
+# "competition" qualifiers are dropped ("expert competition mathematician" ->
+# "expert mathematician", "competition mathematics problem" -> "mathematics
+# problem") — they coach the model toward referencing memorized past contest
+# problems instead of reasoning in-context.
+messages:
+  - role: system
+    content: |-
+      You are an expert mathematician. Solve rigorously and end with one boxed answer.
+  - role: user
+    name: ANSWER_GEN_USER
+    content: |-
+      Solve this mathematics problem.
+
+      <problem><PROBLEM></problem>
+
+      Requirements:
+      - Give a rigorous, step-by-step solution.
+      - End with your final answer as EXACTLY one \boxed{...} on the last line.
+
+      Provide your solution:
+
+# The plan-turn cue (splice name PLAN_USER; see infra/envs/task_prompts.py).
+# NOT part of the solo messages above: plain single-turn arms keep rendering
+# exactly `messages`. Plan-then-answer arms (RLVR via plan_tokens, debate via
+# a pre-proposal `plan` slot spliced as <PLAN_USER>) render this as the user
+# message of a private scratchpad turn before ANSWER_GEN_USER — the CoT
+# surrogate when thinking is off. Wording is arm-neutral on purpose: it
+# renders under the math system card in RLVR and under the debater card in
+# debate, byte-identically (2026-08-06).
+plan: |-
+  Consider this mathematics problem.
+
+  <problem><PROBLEM></problem>
+
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Work the problem: try an approach, do the key computations, and
+  settle on the answer you will commit to. Notes only; do not write the final
+  solution yet.

@@ -27,91 +27,26 @@ optimization/loop knobs only):
 
 from __future__ import annotations
 
-import argparse
 import os
 
-from infra.backend.base import LossSpec, SamplingParams
+from infra.backend.base import SamplingParams
 from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.protocol import Protocol
 from infra.envs.tasks import get_family
-from infra.models.base import ModelSettings, resolved_sampling_profile
+from infra.models.base import ModelSettings, ModelType, resolved_sampling_profile
 from infra.models.factory import instantiate_model
-from infra.train import Config, train
-
-
-# Every key the runners actually read out of `training:` — the union of
-# run_debate.main, run_rlvr.main, and build_backend. run_rlvr imports these.
-TRAINING_KEYS = {
-    "backend",
-    "verl",
-    "lora_rank",
-    "loss",
-    "lr",
-    "steps",
-    "batch_size",
-    "group_size",
-    "micro_batch",
-    "ppo_epochs",
-    "adv_length_norm",
-    "kl_coef",
-    "kl_discount_factor",
-    "eval_every",
-    "eval_max_tokens",
-    "eval_n",
-    "save_every",
-    "wandb_project",
-    "wandb_entity",
-}
-
-# training-block keys that map 1:1 onto Config fields, with their YAML casts.
-# Values pass through ONLY when the YAML sets them; everything absent falls to
-# Config's dataclass defaults — the single source of truth. No fallback
-# literals at the call sites: a default lives in exactly one place.
-CONFIG_CASTS: tuple[tuple[str, type], ...] = (
-    ("steps", int),
-    ("batch_size", int),
-    ("group_size", int),
-    ("micro_batch", int),
-    ("lr", float),
-    ("ppo_epochs", int),
-    ("adv_length_norm", str),
-    ("kl_coef", float),
-    ("kl_discount_factor", float),
-    ("eval_every", int),
-    ("eval_max_tokens", int),
-    ("eval_n", int),
-    ("save_every", int),
+from infra.run_common import (
+    TRAINING_KEYS,
+    VERL_KEYS,
+    build_backend,
+    run_identity_suffix,
+    runner_parser,
+    training_config_kwargs,
 )
-
-
-def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
-    """training block + CLI sweep overrides -> Config kwargs, present keys only.
-    Shared by the debate and RLVR runners."""
-    kw: dict = {k: cast(tr[k]) for k, cast in CONFIG_CASTS if tr.get(k) is not None}
-    if tr.get("loss"):
-        kw["loss"] = LossSpec(**tr["loss"])
-    for k in ("steps", "batch_size", "group_size", "lr"):
-        if getattr(args, k) is not None:
-            kw[k] = getattr(args, k)
-    return kw
-
-
-# training.verl — read only in build_backend.
-VERL_KEYS = {
-    "n_gpus",
-    "strategy",
-    "gpu_memory_utilization",
-    "prompt_length",
-    "response_length",
-    "max_token_len_per_gpu",
-    "rollout_tp",
-    "use_remove_padding",
-    "checkpoint_dir",
-    "extra_overrides",
-}
+from infra.train import Config, train
 
 EXPERIMENT_KEYS = {
     "protocol",
@@ -124,6 +59,7 @@ EXPERIMENT_KEYS = {
     "fresh_positions",
     "flip",
     "first_speech_non_debate_aware",
+    "plan_tokens",
 }
 
 AGENT_KEYS = {"trained", "model_settings"}
@@ -160,6 +96,60 @@ def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSe
     return trained, frozen
 
 
+# training.backend -> the model_type trained seats must declare: verl serves
+# rollouts through the local OpenAI shim, tinker samples through tinker.
+BACKEND_MODEL_TYPES = {"tinker": ModelType.TINKER, "verl": ModelType.LOCAL}
+
+
+def validate_trained_seats(trained: dict[str, ModelSettings], tr: dict) -> None:
+    """Trained seats share ONE adapter and only contribute model_file_path to
+    the backend, so a divergent path or a model_type that contradicts
+    training.backend would otherwise pass in silence."""
+    settings = list(trained.values())
+    if not settings:
+        return
+    lead_path = settings[0].model_file_path
+    paths = {s.model_file_path for s in settings}
+    if len(paths) != 1:
+        raise ValueError(
+            f"trained seats must share one base model (one shared adapter): "
+            f"expected every model_file_path to equal {lead_path!r}, got {sorted(map(str, paths))}"
+        )
+    backend_kind = str(tr.get("backend", "tinker"))
+    expected = BACKEND_MODEL_TYPES.get(backend_kind)
+    if expected is None:
+        return  # build_backend rejects unknown kinds with its own message
+    for speaker, s in trained.items():
+        if s.model_type is not expected:
+            got = s.model_type.name.lower() if isinstance(s.model_type, ModelType) else s.model_type
+            raise ValueError(
+                f"trained seat {speaker!r} declares model_type {got!r}, but "
+                f"training.backend {backend_kind!r} requires {expected.name.lower()!r} "
+                "for trained seats (the backend, not the model wrapper, serves them)"
+            )
+
+
+def debate_gen_budgets(protocol: Protocol, trained: dict[str, ModelSettings], tr: dict) -> dict:
+    """Named generation budgets for build_backend's response_length
+    cross-check. Only rollout-engine generations belong here: TRAINED seats'
+    protocol slot caps plus the RLVR eval budget. Judge-seat slots (and any
+    frozen debater's) are excluded — frozen seats generate on their own model
+    server, never through the verl rollout engine, so response_length cannot
+    truncate them and a large judge deliberation cap must not fail the build."""
+    budgets: dict = {"training.eval_max_tokens": (tr or {}).get("eval_max_tokens")}
+    for cs in protocol.compile():
+        if cs.speaker not in trained:
+            continue
+        cap = cs.slot.max_total_tokens
+        if cap is None:
+            continue
+        key = f"slot:{cs.slot.name}"
+        # same-named slots across trained speakers: the check compares maxima,
+        # so keeping the largest cap loses nothing
+        budgets[key] = max(cap, budgets.get(key) or 0)
+    return budgets
+
+
 def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, ModelSettings]) -> DebateEnv:
     proto_spec = exp["protocol"]
     if isinstance(proto_spec, str):
@@ -170,6 +160,14 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         speaker: instantiate_model(settings, is_debater=speaker != "judge", binding="train")
         for speaker, settings in frozen.items()
     }
+    # FrozenSeat forwards these per predict call — the factory bakes sampling
+    # into tinker seats only, so without this the local/API seats sample at
+    # server defaults instead of the YAML profile.
+    frozen_sampling = {
+        speaker: resolved_sampling_profile(settings, "train") for speaker, settings in frozen.items()
+    }
+    decision = protocol.decision_slot
+    judge_settings = frozen.get(decision.speaker) if decision is not None else None
 
     # Per-trained-seat sampling + template kwargs; trained seats must sample
     # UNBIASED (temp/top_p 1.0) — anything else corrupts the ratio anchor
@@ -211,6 +209,8 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         frozen_models=frozen_models,
         trained_sampling=trained_sampling,
         trained_chat_kwargs=trained_chat_kwargs,
+        frozen_sampling=frozen_sampling,
+        judge_model_settings=judge_settings,
         judge=JudgeConfig(**(exp.get("judge_config") or {})),
         scoring=ScoringConfig(**(exp.get("scoring") or {})),
         fresh_positions=exp.get("fresh_positions", True),
@@ -222,158 +222,8 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     return DebateEnv(config, task_source, family, relaxed_extraction=relaxed)
 
 
-def run_identity_suffix(
-    lr: float | None,
-    levels: str | None,
-    group_size: int | None,
-    batch_size: int | None,
-) -> str:
-    """The `-lr…-L…-g…-b…` tail that distinguishes sweep arms of one experiment.
-
-    ONE definition, used for both the wandb run name and the checkpoint
-    namespace. Split them and two arms of an lr sweep get distinct wandb runs
-    but the same checkpoint directory, which is exactly the clobbering the
-    namespacing exists to prevent. Changing the format here changes existing
-    wandb run names too — leave it alone unless you mean to break that history.
-    """
-    return (
-        (f"-lr{lr:g}" if lr is not None else "")
-        + (f"-L{levels}" if levels is not None else "")
-        + (f"-g{group_size}" if group_size is not None else "")
-        + (f"-b{batch_size}" if batch_size is not None else "")
-    )
-
-
-def check_legacy_checkpoint_layout(root: str, namespaced: str) -> None:
-    """Refuse to run when `root` holds pre-namespacing checkpoints.
-
-    Checkpoints used to be written straight into training.verl.checkpoint_dir
-    with no experiment in the name, so two arms sharing a volume overwrote each
-    other's `final`. Now every run writes under <root>/<run name>. Leftovers
-    from the old layout are ambiguous — we cannot tell which arm produced them —
-    and leaving them where nothing will ever read them again both strands that
-    work and leaves the next arm free to overwrite it. Fail instead.
-    """
-    if not os.path.isdir(root):
-        return
-    stale = sorted(
-        e for e in os.listdir(root) if e == "final" or e.startswith("step-")
-    )
-    if not stale:
-        return
-    raise RuntimeError(
-        f"{root} contains checkpoints from the pre-namespacing layout: "
-        f"{', '.join(stale[:5])}{' ...' if len(stale) > 5 else ''}. "
-        "Checkpoints are now written per run, so these would be orphaned where "
-        "nothing reads them and a later arm could overwrite them. Move them "
-        f"into the run subdirectory they belong to (e.g. {namespaced}) or point "
-        "training.verl.checkpoint_dir somewhere else, then rerun."
-    )
-
-
-def check_fresh_run_over_existing_checkpoints(namespaced: str, load_given: bool) -> None:
-    """Refuse to start from scratch on top of a previous attempt's checkpoints.
-
-    There is no auto-resume: resume happens only when the operator passes
-    --load <path>. So the natural crash-recovery instinct — rerun the same
-    command — would train from step 0 and overwrite step-00025, step-00050,
-    final one at a time, leaving a directory whose entries come from two
-    different lineages and which no later --load can disambiguate. With --load
-    the operator has named a checkpoint deliberately, so overwrites are a
-    choice and this guard stands down.
-    """
-    if load_given or not os.path.isdir(namespaced):
-        return
-    existing = sorted(
-        e for e in os.listdir(namespaced) if e == "final" or e.startswith("step-")
-    )
-    if not existing:
-        return
-    raise RuntimeError(
-        f"{namespaced} already holds checkpoints from an earlier attempt: "
-        f"{', '.join(existing[:5])}{' ...' if len(existing) > 5 else ''}. "
-        "Starting fresh here would overwrite them one step at a time and mix "
-        "two lineages in one directory. Either pass --load <path> to continue "
-        "deliberately from an explicit checkpoint, or move/delete that "
-        "directory first, then rerun."
-    )
-
-
-def build_backend(
-    tr: dict,
-    model_path: str,
-    run_name: str,
-    lr_override: float | None = None,
-    load_given: bool = False,
-):
-    """training block -> Backend. Shared by the debate and RLVR runners.
-
-    `run_name` (experiment + sweep suffix) namespaces the checkpoint directory:
-    a shared network volume would otherwise have a 2-step smoke run's `final`
-    clobber a 100-step run's, and two arms of one sweep clobber each other's.
-    `load_given` says whether the operator passed --load, which is the only
-    form of resume there is; see check_fresh_run_over_existing_checkpoints.
-
-    Same only-if-present rule as training_config_kwargs: knobs the YAML omits
-    fall to the backend config's own dataclass defaults.
-    """
-    backend_kind = str(tr.get("backend", "tinker"))
-    if backend_kind == "tinker":
-        from infra.backend.tinker import TinkerBackend
-
-        # Tinker checkpoints live service-side under the run, not in a local
-        # directory, so there is nothing here to namespace.
-        kw = {"lora_rank": int(tr["lora_rank"])} if tr.get("lora_rank") is not None else {}
-        return TinkerBackend(model_path, **kw)
-    if backend_kind == "verl":
-        from infra.backend.verl import VerlBackend, VerlBackendConfig
-
-        v = dict(tr.get("verl") or {})
-        ckpt_root = str(v.get("checkpoint_dir", VerlBackendConfig.checkpoint_dir))
-        ckpt_dir = os.path.join(ckpt_root, run_name)
-        check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
-        check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
-        verl_casts: tuple[tuple[str, type], ...] = (
-            ("n_gpus", int),
-            ("strategy", str),
-            ("gpu_memory_utilization", float),
-            ("prompt_length", int),
-            ("response_length", int),
-            ("max_token_len_per_gpu", int),
-            ("rollout_tp", int),
-            ("use_remove_padding", bool),
-        )
-        vkw: dict = {k: cast(v[k]) for k, cast in verl_casts if v.get(k) is not None}
-        if tr.get("lora_rank") is not None:
-            vkw["lora_rank"] = int(tr["lora_rank"])
-        if lr_override is not None:
-            vkw["lr"] = float(lr_override)
-        elif tr.get("lr") is not None:
-            vkw["lr"] = float(tr["lr"])
-        if tr.get("loss"):
-            vkw["loss"] = LossSpec(**tr["loss"])
-        if v.get("extra_overrides"):
-            vkw["extra_overrides"] = tuple(v["extra_overrides"])
-        return VerlBackend(
-            VerlBackendConfig(model_path=model_path, checkpoint_dir=ckpt_dir, **vkw)
-        )
-    raise ValueError(f"training.backend must be tinker|verl, got {backend_kind!r}")
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment-file", required=True)
-    parser.add_argument("--experiment", required=True)
-    parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
-    parser.add_argument("--wandb-entity", default=None, help="override training.wandb_entity")
-    parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
-    parser.add_argument("--steps", type=int, default=None, help="override training.steps")
-    parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
-    parser.add_argument("--levels", default=None, help="override dataset.levels (e.g. 4 or 3-4)")
-    parser.add_argument("--group-size", type=int, default=None, help="override training.group_size (sweeps)")
-    parser.add_argument("--batch-size", type=int, default=None, help="override training.batch_size (sweeps)")
-    parser.add_argument("--load", default=None)
-    args = parser.parse_args()
+    args = runner_parser(__doc__).parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
@@ -383,19 +233,22 @@ def main() -> None:
     if not trained:
         raise ValueError("no agent has trained: true")
     trained_settings = list(trained.values())
-    base_models = {s.model_file_path for s in trained_settings}
-    if len(base_models) != 1:
-        raise ValueError(f"trained seats must share one base model, got {base_models}")
+    tr = exp.get("training") or {}
+    validate_trained_seats(trained, tr)
 
     env = build_env(exp, trained, frozen)
-    tr = exp.get("training") or {}
     lead = trained_settings[0]
 
     run_name = args.experiment + run_identity_suffix(
         args.lr, args.levels, args.group_size, args.batch_size
     )
     backend = build_backend(
-        tr, lead.model_file_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+        tr,
+        lead.model_file_path,
+        run_name,
+        lr_override=args.lr,
+        load_given=bool(args.load),
+        gen_budgets=debate_gen_budgets(env.protocol, trained, tr),
     )
     if args.load:
         backend.load(args.load)
@@ -410,6 +263,8 @@ def main() -> None:
             temperature=profile.temperature if profile.temperature is not None else 1.0,
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),
+        # The TEAM entity, not the API key's personal default namespace —
+        # without it, runs land where the rest of the team cannot see them.
         wandb_entity=(None if args.no_wandb else args.wandb_entity or tr.get("wandb_entity")),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
@@ -430,8 +285,17 @@ def main() -> None:
     cfg.on_rollout = _export_docent
 
     # RLVR evals: measure proposal accuracy on the held-out split via the
-    # task source itself (MathEnv), not a debate
-    train(env, backend, cfg, eval_env=env.task_source)
+    # task source itself (MathEnv), not a debate. plan_tokens wraps the eval in
+    # the same plan-then-answer shape as the protocol's pre-proposal plan slot,
+    # so the policy is measured in the mode it is trained in (set it to that
+    # slot's max_total_tokens).
+    eval_env = env.task_source
+    plan_tokens = exp.get("plan_tokens")
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        eval_env = PlannedEnv(eval_env, int(plan_tokens))
+    train(env, backend, cfg, eval_env=eval_env)
 
 
 if __name__ == "__main__":

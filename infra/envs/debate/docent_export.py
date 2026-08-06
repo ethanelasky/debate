@@ -92,6 +92,38 @@ def _speaker_view(state: DebateState, speaker: str, env) -> Optional[Transcript]
     return Transcript(name=f"view:{speaker}", messages=messages)
 
 
+def _solo_turn1_view(state: DebateState) -> Optional[Transcript]:
+    """The slot-0 GENERATION context, verbatim: what the solo author actually
+    saw when producing its first speech (first_speech_non_debate_aware — no
+    debate framing), plus that speech. The author's regular view presents the
+    same answer under the debate framing instead, so without this transcript
+    the context that really elicited turn 1 never reaches the export."""
+    solo = state.first_slot_messages
+    if solo is None:
+        return None
+    rec = next((r for r in state.records if r.slot.index == 0), None)
+    if rec is None:
+        return None
+    messages: list[Any] = []
+    for m in solo:
+        if m["role"] == "system":
+            messages.append(SystemMessage(content=m["content"]))
+        elif m["role"] == "user":
+            messages.append(UserMessage(content=m["content"]))
+        else:
+            messages.append(_assistant(m["content"]))
+    messages.append(
+        _assistant(
+            rec.text,
+            thinking=rec.thinking,
+            slot=rec.slot.slot.name,
+            extracted=None if rec.extracted is None else str(rec.extracted),
+            retries=rec.retries,
+        )
+    )
+    return Transcript(name=f"view:{rec.slot.speaker}@turn1", messages=messages)
+
+
 def state_before(state: DebateState, rec) -> DebateState:
     """A shallow view of the state as it was before `rec` was generated.
     dataclasses.replace so every field (present and future) carries over —
@@ -124,6 +156,9 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
     runs = []
     for i, st in enumerate(states):
         transcripts = [_omniscient_transcript(st)]
+        solo_view = _solo_turn1_view(st)
+        if solo_view is not None:
+            transcripts.append(solo_view)
         for speaker in env.protocol.speakers:
             view = _speaker_view(st, speaker, env)
             if view is not None:

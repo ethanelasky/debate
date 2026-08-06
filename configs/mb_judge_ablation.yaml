@@ -1,0 +1,30 @@
+# Judge-prompt ablation arm: mb_debate, pinned to the DEV split.
+#
+# Everything except the judge prompt is mb_debate exactly — same debaters, same
+# protocol, same verdict schema, same normalized pool. The judge prompt itself
+# is chosen per rung by scripts/mb_judge_ablation.py, which overrides
+# prompt_config with infra/prompts/debate/mb_judge_ablation.yaml + the rung
+# entry; the entry named below is only the default the driver replaces.
+#
+# DEV, NOT EVAL. Picking a judge prompt is selection: whichever set the choice
+# is made on gets an optimistic bias for the prompt that wins. The dev split
+# (120 rows / 29 tasks, task-disjoint from train and eval) exists for exactly
+# this, so configs/mb_eval.yaml's 250 eval rows stay untouched until there is a
+# final number to report.
+#
+# Run: .venv/bin/python scripts/mb_judge_ablation.py [--limit N] [--dry-run]
+#
+# SAFETY: data/monitoringbench/*.jsonl contain red-team attack trajectories.
+# Never print/log record contents; work by id/label/count only.
+
+_includes: [mb_eval.yaml]
+
+mb_judge_ablation:
+  _extends: mb_debate
+  dataset:
+    # Overrides the parent's eval pin. task_ids_file is an EXCLUSIVE whitelist,
+    # so this config cannot reach a train or eval row.
+    task_ids_file: data/monitoringbench/splits/dev_ids.txt
+  prompt_config:
+    file_path: infra/prompts/debate/mb_judge_ablation.yaml
+    entry: mb_judge_j4   # driver-overridden per rung; j4 == today's mb_debate

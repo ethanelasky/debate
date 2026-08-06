@@ -16,7 +16,10 @@ from infra.envs.tasks.math import MathFamily, _parse_levels
 
 
 def test_registry_lookup():
+    from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
+
     assert isinstance(get_family("math"), MathFamily)
+    assert isinstance(get_family("monitoringbench"), MonitoringBenchFamily)
 
 
 def test_registry_unknown_name_lists_known_families():
@@ -101,7 +104,7 @@ MATH_USER = (
 
 def test_math_prompt_matches_old_repo_composition():
     prompts = load_generation_prompts(resolve_prompt_file(None, "math.yaml"))
-    assert prompts.messages("What is $1 + 1$?") == [
+    assert prompts.render({"PROBLEM": "What is $1 + 1$?"}) == [
         {"role": "system", "content": MATH_SYSTEM},
         {"role": "user", "content": MATH_USER},
     ]
@@ -117,7 +120,7 @@ def test_math_debate_pack_splices_the_rlvr_prompt():
     from infra.envs.debate.protocol import Protocol
 
     lib = load_prompt_library(
-        "infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+        "infra/prompts/debate/hendrycks_math.yaml",
         "math_proposer_critic",
         Protocol.parse(
             {
@@ -151,7 +154,10 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
 
         def tasks(self, n, split="train"):
             return [
-                Task(messages=self.prompts.messages(problem), meta={"question": problem})
+                Task(
+                    messages=self.prompts.render({"PROBLEM": problem}),
+                    meta={"question": problem},
+                )
             ] * n
 
     debate = DebateEnv(
@@ -166,7 +172,7 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
                     ]
                 }
             ),
-            prompt_file="infra/envs/debate/prompt_configs/hendrycks_math.yaml",
+            prompt_file="infra/prompts/debate/hendrycks_math.yaml",
             prompt_entry="math_proposer_critic",
             trained_speakers=["alice"],
             frozen_models={"bob": object(), "judge": object()},
@@ -182,16 +188,24 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
     assert rendered == MATH_USER
 
 
+def _messages_body(system="SYS", user="<PROBLEM>\n\nGo."):
+    return {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "name": "ANSWER_GEN_USER", "content": user},
+        ]
+    }
+
+
 def _write_prompt_yaml(path, system="SYS", user="<PROBLEM>\n\nGo."):
-    body = {"answer_gen_system": system, "answer_gen_user": user}
-    path.write_text(yaml.safe_dump(body))
+    path.write_text(yaml.safe_dump(_messages_body(system, user), sort_keys=False))
     return path
 
 
 def test_prompt_file_override(tmp_path):
     path = _write_prompt_yaml(tmp_path / "alt.yaml", system="Be terse.", user="Q: <PROBLEM>")
     prompts = load_generation_prompts(resolve_prompt_file(str(path), "math.yaml"))
-    assert prompts.messages("2+2") == [
+    assert prompts.render({"PROBLEM": "2+2"}) == [
         {"role": "system", "content": "Be terse."},
         {"role": "user", "content": "Q: 2+2"},
     ]
@@ -199,31 +213,49 @@ def test_prompt_file_override(tmp_path):
 
 def test_prompt_file_relative_path_resolves_against_repo_root():
     prompts = load_generation_prompts(
-        resolve_prompt_file("infra/envs/tasks/prompt_configs/math.yaml", "codecontests.yaml")
+        resolve_prompt_file("infra/prompts/tasks/math.yaml", "codecontests.yaml")
     )
-    assert prompts.answer_gen_system == MATH_SYSTEM
+    assert prompts.messages[0] == {"role": "system", "content": MATH_SYSTEM}
 
 
-def test_format_notes_substituted_into_every_field(tmp_path):
+def test_format_notes_substituted_into_every_message(tmp_path):
     path = tmp_path / "notes.yaml"
     path.write_text(
-        "format_notes: |-\n  - be brief\nanswer_gen_system: |-\n  Do it.\n  <FORMAT_NOTES>\n"
-        "answer_gen_user: |-\n  <PROBLEM>\n\n  Notes:\n  <FORMAT_NOTES>\n"
+        "format_notes: |-\n  - be brief\n"
+        "messages:\n"
+        "  - role: system\n    content: |-\n      Do it.\n      <FORMAT_NOTES>\n"
+        "  - role: user\n    content: |-\n      <PROBLEM>\n\n      Notes:\n      <FORMAT_NOTES>\n"
     )
     prompts = load_generation_prompts(path)
-    assert prompts.answer_gen_system == "Do it.\n- be brief"
-    assert prompts.answer_gen_user == "<PROBLEM>\n\nNotes:\n- be brief"
+    assert prompts.messages[0]["content"] == "Do it.\n- be brief"
+    assert prompts.messages[1]["content"] == "<PROBLEM>\n\nNotes:\n- be brief"
 
 
 @pytest.mark.parametrize(
     "body, needle",
     [
-        ({"answer_gen_system": "S"}, "answer_gen_user"),                          # missing key
-        ({"answer_gen_system": "S", "answer_gen_user": "no placeholder"}, "<PROBLEM>"),
-        ({"answer_gen_system": "S", "answer_gen_user": "<PROBLEM>", "extra": 1}, "extra"),
-        ({"answer_gen_system": "S", "answer_gen_user": 3}, "must be a string"),
+        ({}, "messages"),                                                       # missing key
+        ({"messages": []}, "non-empty list"),
+        ({"messages": [{"role": "user", "content": "no placeholder"}]}, "<PROBLEM>"),
+        ({"messages": [{"role": "user", "content": "<PROBLEM>"}], "extra": 1}, "extra"),
+        ({"messages": [{"role": "user", "content": 3}]}, "must be a string"),
+        ({"messages": [{"role": "tool", "content": "<PROBLEM>"}]}, "role"),
+        ({"messages": [{"content": "<PROBLEM>"}]}, "role/content"),
         (
-            {"answer_gen_system": "<FORMAT_NOTES>", "answer_gen_user": "<PROBLEM>"},
+            {"messages": [{"role": "user", "content": "<PROBLEM>", "name": "NOT_REGISTERED"}]},
+            "registered splice name",
+        ),
+        (
+            {
+                "messages": [
+                    {"role": "user", "content": "<PROBLEM>", "name": "ANSWER_GEN_USER"},
+                    {"role": "user", "content": "x", "name": "ANSWER_GEN_USER"},
+                ]
+            },
+            "duplicate",
+        ),
+        (
+            {"messages": [{"role": "user", "content": "<PROBLEM>\n<FORMAT_NOTES>"}]},
             "format_notes is not set",
         ),
     ],
@@ -243,9 +275,10 @@ def test_missing_prompt_file_raises(tmp_path):
 
 
 # --------------------------------------------------- family task conformance
-# Every family's tasks must carry a non-empty meta["question"] (the TaskFamily
-# contract in infra/envs/tasks/base.py): DebateEnv binds it as the debate
-# TOPIC and now raises if it is missing.
+# Every family's tasks must carry meta["question"] (the TaskFamily contract in
+# infra/envs/tasks/base.py): DebateEnv binds it as the debate TOPIC and raises
+# if the key is ABSENT. An explicit "" is legal (env.py _build_state) and is
+# exactly monitoringbench's shape — MB prompts never render <TOPIC>.
 
 
 @pytest.mark.parametrize("name", sorted(TASK_FAMILIES))
@@ -277,10 +310,65 @@ def test_family_tasks_carry_question(name, tmp_path):
         env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
         row = {"problem": "What is 1+1?", "gt": 2.0, "level": 5}
         tasks = [MathEnv._task(env, row, "train")]
+    elif name == "aime":
+        # Same shape as the math recipe: skip __init__ (dataset download),
+        # exercise task construction directly.
+        from infra.envs.tasks.aime import PROMPT_FILE, AimeEnv
+
+        env = object.__new__(AimeEnv)  # skip __init__ (dataset download)
+        env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
+        row = {"problem": "What is 1+1?", "gt": 2.0, "id": "1983-1"}
+        tasks = [AimeEnv._task(env, row, "train")]
+    elif name == "monitoringbench":
+        # SYNTHETIC rows only — the real data files are never read in tests.
+        rows = [
+            {
+                "id": f"r{i}",
+                "label": "attack" if i % 2 else "honest",
+                "steps": [{"action": "ls", "responses": "ok"}],
+            }
+            for i in range(4)
+        ]
+        path = tmp_path / "mb.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        env = get_family(name).source({"files": [str(path)], "seed": 0, "test_size": 1})
+        tasks = env.tasks(2, split="train") + env.tasks(1, split="test")
     else:
         pytest.fail(f"no offline conformance recipe for task family {name!r}; add one here")
     for task in tasks:
         question = task.meta.get("question")
-        assert isinstance(question, str) and question.strip(), (
-            f"{name}: Task.meta['question'] missing or empty (TaskFamily contract)"
+        assert isinstance(question, str), (
+            f"{name}: Task.meta['question'] missing (TaskFamily contract)"
         )
+        if name != "monitoringbench":  # MB's question is an explicit ""
+            assert question.strip(), f"{name}: Task.meta['question'] empty"
+
+
+def test_grade_batch_default_is_positional_grade():
+    fam = MathFamily()
+    grades = fam.grade_batch([({"gt": 2.0}, 2.0), ({"gt": 2.0}, 3.0), ({}, 2.0)])
+    assert grades == [True, False, None]
+    assert fam.last_grade_errors == 0
+    assert fam.grade_batch([]) == []
+
+
+def test_grade_batch_serial_path_matches_pooled():
+    fam = MathFamily()
+    fam.grade_workers = 1
+    assert fam.grade_batch([({"gt": 2.0}, 2.0), ({"gt": 2.0}, 3.0)]) == [True, False]
+
+
+def test_grade_batch_failure_grades_none_and_is_counted():
+    class ExplodingFamily(MathFamily):
+        def grade(self, meta, solution):
+            if meta.get("boom"):
+                raise RuntimeError("verifier fell over")
+            return super().grade(meta, solution)
+
+    fam = ExplodingFamily()
+    grades = fam.grade_batch([({"gt": 1.0}, 1.0), ({"boom": True}, 1.0), ({"gt": 1.0}, 2.0)])
+    assert grades == [True, None, False]
+    assert fam.last_grade_errors == 1
+    # a clean follow-up call resets the counter
+    assert fam.grade_batch([({"gt": 1.0}, 1.0)]) == [True]
+    assert fam.last_grade_errors == 0

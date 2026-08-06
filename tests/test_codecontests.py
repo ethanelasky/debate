@@ -209,7 +209,14 @@ def test_rlvr_prompt_matches_old_repo_composition(env):
 
 def test_prompt_file_override(tmp_path):
     alt = tmp_path / "alt.yaml"
-    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
+    alt.write_text(
+        "messages:\n"
+        "  - role: system\n"
+        "    content: Terse.\n"
+        "  - role: user\n"
+        "    name: ANSWER_GEN_USER\n"
+        "    content: 'Q: <PROBLEM>'\n"
+    )
     path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
     env = CodeContestsEnv(
         path=path, test_path=path, timeout_seconds=TIMEOUT, prompt_file=str(alt)
@@ -244,7 +251,7 @@ def _debate_env(env):
     return DebateEnv(
         DebateEnvConfig(
             protocol=_pc_protocol(),
-            prompt_file="infra/envs/debate/prompt_configs/codecontests.yaml",
+            prompt_file="infra/prompts/debate/codecontests.yaml",
             prompt_entry="codecontests_proposer_critic",
             trained_speakers=["alice"],
             frozen_models={"bob": object(), "judge": object()},
@@ -281,7 +288,14 @@ def test_debate_raises_when_task_source_supplies_no_template(env, monkeypatch):
 
 def test_source_accepts_prompt_file_key(tmp_path):
     alt = tmp_path / "alt.yaml"
-    alt.write_text("answer_gen_system: |-\n  Terse.\nanswer_gen_user: |-\n  Q: <PROBLEM>\n")
+    alt.write_text(
+        "messages:\n"
+        "  - role: system\n"
+        "    content: Terse.\n"
+        "  - role: user\n"
+        "    name: ANSWER_GEN_USER\n"
+        "    content: 'Q: <PROBLEM>'\n"
+    )
     path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
     env = CodeContestsFamily().source(
         {"path": path, "test_path": path, "prompt_file": str(alt)}

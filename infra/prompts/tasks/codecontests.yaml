@@ -4,14 +4,14 @@
 # verbatim), and the "Provide your answer:" cue. The old
 # <background>/<grading_criteria> sections are dropped: this repo binds the
 # whole problem as the question and never shows debaters the test cases. The
-# two sentences closing answer_gen_system are verbatim from the old repo's
+# two sentences closing the system message are verbatim from the old repo's
 # shared.yaml "Direct Code Generation" prompt.
 #
 # THIS FILE IS THE SINGLE SOURCE for the codecontests answer prompt, for BOTH
 # arms. The RLVR user message and the debate proposal slot are the SAME
 # composition rendered byte-for-byte identically: DebateEnv splices
-# answer_gen_user into the proposal slot wherever
-# infra/envs/debate/prompt_configs/codecontests.yaml writes <ANSWER_GEN_USER>,
+# the ANSWER_GEN_USER message into the proposal slot wherever
+# infra/prompts/debate/codecontests.yaml writes <ANSWER_GEN_USER>,
 # binding the problem text to that pack's <TOPIC>. Editing the wording here
 # changes both arms together, which is the point — do not restate it there.
 # math.yaml works the same way; the two families are not treated differently.
@@ -34,15 +34,33 @@ format_notes: |-
   - Print output to stdout using print().
   - Do NOT wrap your solution in a function or class unless the problem requires it.
   - Import any libraries you use.
-answer_gen_system: |-
-  Solve the programming problem.
-  Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
-answer_gen_user: |-
-  Context:
+messages:
+  - role: system
+    content: |-
+      Solve the programming problem.
+      Your goal is to write code that is consistent with the specification in order to pass the hidden test cases. Do not include functionality or error handling beyond what is described.
+  - role: user
+    name: ANSWER_GEN_USER
+    content: |-
+      Context:
+
+      <question><PROBLEM></question>
+
+      Notes:
+      <FORMAT_NOTES>
+
+      Provide your answer:
+
+# The plan-turn cue (splice name PLAN_USER); same contract as math.yaml's:
+# NOT part of the solo messages, rendered as a private scratchpad turn before
+# ANSWER_GEN_USER by plan-then-answer arms (RLVR plan_tokens; debate `plan`
+# slot), byte-identically in both.
+plan: |-
+  Consider this programming problem.
 
   <question><PROBLEM></question>
 
-  Notes:
-  <FORMAT_NOTES>
-
-  Provide your answer:
+  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
+  or graded. Work the problem: pin down the algorithm, the edge cases, and the
+  I/O format you will implement. Notes only; do not write the final solution
+  yet.

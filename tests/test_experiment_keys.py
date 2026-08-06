@@ -10,6 +10,7 @@ import pytest
 
 from infra.config import resolve_experiments_from_file, runnable_experiments
 from infra.run_debate import validate_experiment as validate_debate
+from infra.run_eval import validate_experiment as validate_eval
 from infra.run_rlvr import validate_experiment as validate_rlvr
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -90,6 +91,17 @@ def test_rlvr_rejects_debate_only_keys():
     assert "agents" in str(exc.value)
 
 
+def test_rlvr_rejects_prompt_config_and_protocol():
+    # Debate-layer keys: RLVR builds its prompt from the family's
+    # answer-generation config, so these are typos here (they were legal
+    # before MB's blind view moved to infra/prompts/tasks/monitoringbench.yaml).
+    for key, value in (("prompt_config", {"x": 1}), ("protocol", {"turns": []})):
+        exp = _rlvr_exp()
+        exp[key] = value
+        with pytest.raises(ValueError, match=key):
+            validate_rlvr(exp)
+
+
 def _shipped_experiments():
     for path in sorted(CONFIG_DIR.glob("*.yaml")):
         resolved = resolve_experiments_from_file(path)
@@ -99,6 +111,15 @@ def _shipped_experiments():
 
 @pytest.mark.parametrize("exp", list(_shipped_experiments()))
 def test_shipped_configs_validate(exp):
-    """Regression net: the allowlists must not reject anything we ship."""
-    validate = validate_debate if "agents" in exp else validate_rlvr
+    """Regression net: the allowlists must not reject anything we ship.
+
+    Routing: no agents -> RLVR; agents + training -> debate trainer; agents
+    without training -> the eval-only runner (run_eval), whose allowlist
+    carries the eval-only keys (speech_token_limit, choice_positions, ...)."""
+    if "agents" not in exp:
+        validate = validate_rlvr
+    elif "training" in exp:
+        validate = validate_debate
+    else:
+        validate = validate_eval
     validate(copy.deepcopy(exp))

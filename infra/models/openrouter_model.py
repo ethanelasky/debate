@@ -75,6 +75,7 @@ class OpenRouterModel(OpenAIModel):
         quantizations: Optional[list[str]] = None,
         allow_fallbacks: Optional[bool] = None,
         data_collection: Optional[str] = None,
+        enable_thinking: Optional[bool] = None,
         **kwargs,
     ):
         from infra.models.base import Model
@@ -93,6 +94,14 @@ class OpenRouterModel(OpenAIModel):
         self.quantizations = list(quantizations) if quantizations else None
         self.allow_fallbacks = allow_fallbacks
         self.data_collection = data_collection
+
+        # OpenRouter's top-level reasoning toggle, sent as extra_body
+        # {"reasoning": {"enabled": ...}}. None = don't send (provider
+        # default). enable_thinking=False is how a hybrid-thinking model
+        # (e.g. qwen/qwen3.5-9b on parasail) is run as a no-think judge:
+        # verified 2026-07-31 that default requests emit reasoning while
+        # {"enabled": false} yields reasoning_tokens == 0.
+        self.enable_thinking = enable_thinking
 
         resolved_api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not resolved_api_key:
@@ -203,12 +212,22 @@ class OpenRouterModel(OpenAIModel):
             # The SDK rejects unknown top-level kwargs; provider options must
             # ride in extra_body.
             request["extra_body"] = {"provider": provider_opts}
-        if self.reasoning_effort:
-            # The parent forwards reasoning_effort only on the Responses-API
-            # branch. Without this a Harmony model runs at DEFAULT effort and
-            # can burn the whole max_tokens budget in the analysis channel,
-            # returning an empty final channel (no verdict).
-            request.setdefault("extra_body", {})["reasoning"] = {"effort": self.reasoning_effort}
+        # The parent forwards reasoning_effort only on the Responses-API
+        # branch. Without the effort override a Harmony model runs at DEFAULT
+        # effort and can burn the whole max_tokens budget in the analysis
+        # channel, returning an empty final channel (no verdict). OpenRouter
+        # INFERS "enabled" from "effort", so the two keys must never ship
+        # together: {"effort": ..., "enabled": false} is self-contradictory and
+        # the provider is free to honor either half.
+        reasoning_opts: dict[str, Any] = {}
+        if self.enable_thinking is False:
+            reasoning_opts["enabled"] = False
+        elif self.reasoning_effort:
+            reasoning_opts["effort"] = self.reasoning_effort
+        elif self.enable_thinking:
+            reasoning_opts["enabled"] = True
+        if reasoning_opts:
+            request.setdefault("extra_body", {})["reasoning"] = reasoning_opts
         if temperature is not None:
             request["temperature"] = temperature
         if top_p is not None:
@@ -343,4 +362,7 @@ class OpenRouterModel(OpenAIModel):
             quantizations=self.quantizations,
             allow_fallbacks=self.allow_fallbacks,
             data_collection=self.data_collection,
+            # Judges are produced via copy(); dropping this would silently
+            # turn a no-think judge back into a thinking one.
+            enable_thinking=self.enable_thinking,
         )

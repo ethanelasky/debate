@@ -103,10 +103,19 @@ class VerlBackendConfig:
         return overrides
 
     def hydra_overrides(self) -> list[str]:
-        eps_low = round(1.0 - self.loss.clip_low, 6)
-        eps_high = round(self.loss.clip_high - 1.0, 6)
-        if self.loss.kind == "importance_sampling":
-            eps_low, eps_high = 1.0, 1000.0  # effectively unclipped
+        # actor.clip_ratio_low/high feed only the vanilla (ppo) loss on this
+        # path; gspo/cispo/gpg do not consume them, so emitting values there
+        # would advertise a clip range the loss never applies.
+        clip_overrides: list[str] = []
+        if self.loss.kind in ("ppo", "importance_sampling"):
+            eps_low = round(1.0 - self.loss.clip_low, 6)
+            eps_high = round(self.loss.clip_high - 1.0, 6)
+            if self.loss.kind == "importance_sampling":
+                eps_low, eps_high = 1.0, 1000.0  # effectively unclipped
+            clip_overrides = [
+                f"actor_rollout_ref.actor.clip_ratio_low={eps_low}",
+                f"actor_rollout_ref.actor.clip_ratio_high={eps_high}",
+            ]
         loss_mode = {
             "ppo": "vanilla",
             "importance_sampling": "vanilla",
@@ -135,8 +144,7 @@ class VerlBackendConfig:
             f"actor_rollout_ref.model.use_remove_padding={self.use_remove_padding}",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",
             f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={self.max_token_len_per_gpu}",
-            f"actor_rollout_ref.actor.clip_ratio_low={eps_low}",
-            f"actor_rollout_ref.actor.clip_ratio_high={eps_high}",
+            *clip_overrides,
             "actor_rollout_ref.actor.loss_agg_mode=token-mean",
             "actor_rollout_ref.actor.use_kl_loss=False",
             "actor_rollout_ref.actor.entropy_coeff=0",
@@ -150,6 +158,13 @@ class VerlBackendConfig:
             # engine KV sizing: without this vllm sizes for the MODEL'S native max
             f"actor_rollout_ref.rollout.max_model_len={self.prompt_length + self.response_length}",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={self.gpu_memory_utilization}",
+            # Pinned ON rather than trusting the engine default: debate contexts
+            # are built for it (each seat's turn-t context strictly extends its
+            # turn t-1 context; GRPO groups share the whole task prefix), and
+            # the cache shares the existing KV pool via LRU — no extra memory
+            # budget. If the pod's verl snapshot predates this key, hydra fails
+            # at launch: drop the override there and upgrade verl.
+            "actor_rollout_ref.rollout.enable_prefix_caching=True",
             "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True",
             f"actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu={self.max_token_len_per_gpu}",
             "actor_rollout_ref.rollout.checkpoint_engine.backend=naive",
@@ -157,6 +172,54 @@ class VerlBackendConfig:
             "trainer.nnodes=1",
             *self.extra_overrides,
         ]
+
+
+def _reject_over_length_prompts(prompts: list[Tokens], prompt_length: int) -> None:
+    """The rollout server truncates prompts beyond rollout.prompt_length
+    without a word; the configs promise over-length rows fail loudly instead
+    of training on a silently clipped context."""
+    for prompt in prompts:
+        if len(prompt) > prompt_length:
+            raise ValueError(
+                f"prompt is {len(prompt)} tokens but training.verl.prompt_length "
+                f"is {prompt_length}; the engine would truncate it silently. "
+                "Raise prompt_length or shorten the prompt."
+            )
+
+
+def _token_weighted_loss_means(per_micro: list[tuple[dict, int]]) -> dict[str, float]:
+    """(metrics, n_completion_tokens) per micro-batch -> loss/* means weighted
+    by token count. The engine's metrics are token-means WITHIN a micro-batch,
+    and with use_dynamic_bsz the micro-batches carry unequal token counts — an
+    unweighted mean over them would let the small ones dominate."""
+    sums: dict[str, float] = {}
+    weights: dict[str, float] = {}
+    for out_metrics, n_tokens in per_micro:
+        for k, v in dict(out_metrics).items():
+            try:
+                val = float(v)
+            except (TypeError, ValueError):
+                continue
+            sums[f"loss/{k}"] = sums.get(f"loss/{k}", 0.0) + val * n_tokens
+            weights[f"loss/{k}"] = weights.get(f"loss/{k}", 0.0) + n_tokens
+    return {k: v / weights[k] if weights[k] else 0.0 for k, v in sums.items()}
+
+
+def _release_training_cache(*_args, **_kwargs):
+    """Runs INSIDE the training worker (dispatched via execute_func_rank_zero;
+    must stay module-level picklable). Returns MiB (allocated, reserved)
+    before and after the flush so the driver can tell real allocations from
+    cache when a wake still OOMs."""
+    import gc
+
+    import torch
+
+    mib = 1024 * 1024
+    before = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
+    gc.collect()
+    torch.cuda.empty_cache()
+    after = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
+    return {"before": before, "after": after}
 
 
 class VerlBackend(Backend):
@@ -180,7 +243,17 @@ class VerlBackend(Backend):
             self.verl_config = compose(config_name=config.config_name, overrides=config.hydra_overrides())
 
         if not ray.is_initialized():
-            ray.init()
+            # expandable_segments lets the training allocator hand freed
+            # segments back to CUDA, so the slept vLLM's wake-time re-pin can
+            # claim them. Without it, MB-length steps (65k-token packing
+            # units, ~79GB train peak) OOM inside wake_up at every
+            # gpu_memory_utilization that can still serve a 65k KV
+            # (2026-08-05 smoke + memprobe bisection).
+            ray.init(
+                runtime_env={
+                    "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+                }
+            )
 
         pool = RayResourcePool(process_on_nodes=[config.n_gpus])
         self.wg = RayWorkerGroup(
@@ -211,6 +284,14 @@ class VerlBackend(Backend):
     # ------------------------------------------------------------- sampling
 
     def sync_sampler(self) -> None:
+        # Flush the training actor's allocator BEFORE the slept vLLM re-pins
+        # its pools: wake-time create_and_map competes for the same physical
+        # memory, and at MB lengths (65k packing units, ~79GB train peak) the
+        # cached-but-free segments alone are the difference between wake and
+        # OOM (2026-08-05 bisection). RANK_ZERO is exact for n_gpus=1; on
+        # multi-GPU this flushes only rank 0 — revisit then.
+        stats = self.wg.execute_func_rank_zero(_release_training_cache)
+        print(f"[verl] train-actor CUDA MiB (alloc/reserved) before->after flush: {stats}")
         # Wakes the rollout engine and pushes current FSDP weights (CUDA IPC).
         self.checkpoint_manager.update_weights(self._global_step)
         self._rollout_awake = True
@@ -223,6 +304,9 @@ class VerlBackend(Backend):
     def sample(
         self, prompts: list[Tokens], params: SamplingParams, n: int = 1
     ) -> list[list[Sample]]:
+        # Before waking the engine: an over-length prompt must not cost a
+        # weight sync just to fail.
+        _reject_over_length_prompts(prompts, self.config.prompt_length)
         if not self._rollout_awake:
             self.sync_sampler()
         self._last_temperature = params.temperature
@@ -406,17 +490,12 @@ class VerlBackend(Backend):
     def optim_step(self, params: OptimParams) -> dict[str, float]:
         from verl.utils import tensordict_utils as tu
 
-        metrics: dict[str, float] = {}
-        for future, _ in self._pending_fwd_bwd:
-            output = future.get()
-            out_metrics = tu.get(output, "metrics") or {}
-            for k, v in dict(out_metrics).items():
-                try:
-                    metrics[f"loss/{k}"] = metrics.get(f"loss/{k}", 0.0) + float(v)
-                except (TypeError, ValueError):
-                    pass
-        n_micro = max(1, len(self._pending_fwd_bwd))
-        metrics = {k: v / n_micro for k, v in metrics.items()}
+        metrics: dict[str, float] = _token_weighted_loss_means(
+            [
+                (dict(tu.get(future.get(), "metrics") or {}), n_tokens)
+                for future, n_tokens in self._pending_fwd_bwd
+            ]
+        )
         self._pending_fwd_bwd.clear()
 
         # grad_clip is baked into the engine config; per-call override unsupported.

@@ -4,16 +4,15 @@ One rollout path (train + eval). Reward is judge-only (DESIGN-debate-env.md
 §5); gt correctness from solution slots lands in info as metrics.
 
 Trajectory granularity: one Trajectory per (debate, trained seat); datums are
-that seat's slot datums in flat order; reward = seat ladder/score value plus
-shaping deltas. NOTE: per_slot shaping deltas are folded into the trajectory
-reward sum for now — grpo_pack computes one advantage per trajectory, so
-slot-targeted penalties are totalized rather than per-datum. Upgrade path:
-per-datum advantage offsets in grpo_pack.
+that seat's slot datums in flat order. Rewards are per-datum
+(Trajectory.datum_rewards): each datum carries the shared outcome plus
+seat-level shaping deltas, and slot-targeted deltas land only on their own
+slot's datum; Trajectory.reward keeps the datum mean for logging.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -45,9 +44,38 @@ from infra.envs.debate.round import (
 )
 from infra.envs.debate.protocol import Kind, Protocol, Visibility
 from infra.envs.task_prompts import PROBLEM_PLACEHOLDER, TASK_SUPPLIED_TEMPLATES
-from infra.models.base import Model
+from infra.models.base import Model, ModelSettings
 
 DISPLAY_NAMES = ("Debater_A", "Debater_B")
+
+# The five binding keys _build_state owns; task-supplied bindings may not
+# collide with them.
+CORE_BINDING_KEYS = frozenset({"NAME", "TOPIC", "POSITION", "OPPONENT_NAME", "OPPONENT_POSITION"})
+_BINDING_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
+
+
+def task_bindings(meta: dict[str, Any]) -> dict[str, str]:
+    """Per-task extra bindings (task.meta['bindings']), validated eagerly:
+    keys are uppercase placeholder names, values are str, and none collide
+    with the core keys. Every violation is listed in one error. Only an
+    absent key (or explicit None) means "no bindings" — any other
+    non-mapping value, falsy included ([], "", 0), is malformed metadata."""
+    extra = meta.get("bindings")
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict):
+        raise ValueError(f"task meta 'bindings' must be a dict, got {type(extra).__name__}")
+    errors: list[str] = []
+    for k, v in extra.items():
+        if not isinstance(k, str) or _BINDING_KEY.fullmatch(k) is None:
+            errors.append(f"binding key {k!r} must match [A-Z_][A-Z0-9_]*")
+        elif k in CORE_BINDING_KEYS:
+            errors.append(f"binding key {k!r} collides with a core binding key")
+        if not isinstance(v, str):
+            errors.append(f"binding {k!r} value must be str, got {type(v).__name__}")
+    if errors:
+        raise ValueError("invalid task bindings:\n  " + "\n  ".join(errors))
+    return dict(extra)
 
 
 def _splice(template: str, subs: dict[str, str]) -> str:
@@ -71,14 +99,41 @@ class DebateEnvConfig:
     # enable_thinking differing between proposer and critic).
     trained_sampling: dict[str, Any] = field(default_factory=dict)      # speaker -> SamplingParams
     trained_chat_kwargs: dict[str, dict] = field(default_factory=dict)  # speaker -> template kwargs
+    # Per-frozen-seat resolved sampling profiles (speaker -> SamplingProfile,
+    # train binding), forwarded per predict call by FrozenSeat; an absent
+    # speaker keeps the wrapper/server defaults.
+    frozen_sampling: dict[str, Any] = field(default_factory=dict)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    # The judge seat's ModelSettings, when the builder has them: lets the env
+    # check the scoring/judge sampling contract (validate_scoring) at
+    # construction. None (configs assembled without settings) skips the check.
+    judge_model_settings: Optional[ModelSettings] = None
     fresh_positions: bool = True
     flip: bool = False                          # assigned mode only: mirrored second arm
     # Opening solution slot generated under the task source's own messages
     # (byte-identical to the RLVR arm) instead of the debater system card.
     first_speech_non_debate_aware: bool = False
-    verdict_retries: int = 4
+    # Verdict retry count; None defers to judge.retries. Both spellings exist
+    # in the wild (runners set judge_config.retries, some tests set this
+    # field), so an explicit value here wins and None keeps judge.retries
+    # authoritative.
+    verdict_retries: Optional[int] = None
+    # Post-hoc TRANSCRIPT-VISIBLE cap (cl100k tokens) on debater speech slots,
+    # applied after generation, before the text enters any context. Judge
+    # slots and decision/solution slots are never truncated. None = off.
+    speech_token_limit: Optional[int] = None
+    # CHOICE mode (round.PositionBinder): positions start UNBOUND (like fresh
+    # mode) and the binder maps a solution slot's extraction onto every seat's
+    # POSITION/OPPONENT_POSITION mid-round (e.g. MB blind side choice). When
+    # set, gold/distractor are ignored at state build and the default
+    # fresh-positions binding is replaced.
+    position_binder: Optional[Any] = None
+    # Feedback retries for unparseable solution slots (mirrors verdict
+    # retries); active only when a feedback builder (failed_text, attempt) ->
+    # str is supplied — its wording must match the solution prompt's format.
+    solution_retries: int = 0
+    solution_retry_feedback: Optional[Any] = None
 
 
 class DebateEnv(Env):
@@ -86,8 +141,9 @@ class DebateEnv(Env):
     Task.meta carries {"question"} plus whatever the family's grade() reads
     (any TaskFamily.source() qualifies). `family` (a TaskFamily, duck-typed
     to keep this module import-light) owns everything task-specific:
-    extractor() binds solution slots to positions, grade() scores them,
-    format_flags() feeds shaping terms."""
+    extractor() binds solution slots to positions, grade_batch() scores them
+    (owning the execution shape — pool, batched call, whatever the verifier
+    wants), format_flags() feeds shaping terms."""
 
     def __init__(self, config: DebateEnvConfig, task_source, family, relaxed_extraction: bool = True):
         self.config = config
@@ -107,13 +163,22 @@ class DebateEnv(Env):
         missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
         if missing:
             raise ValueError(f"speakers without models: {sorted(missing)}")
-        if config.flip and config.fresh_positions:
-            raise ValueError("flip requires assigned positions (fresh mode has no sides)")
+        # The logit confidence channel is only P(sampled continuation) under an
+        # untouched judge distribution — checked here, not mid-run, whenever
+        # the builder supplied the judge's settings. json-source scoring
+        # passes through unconditionally (validate_scoring returns early).
+        if config.judge_model_settings is not None:
+            validate_scoring(config.scoring, config.judge_model_settings)
+        if config.flip and (config.fresh_positions or config.position_binder is not None):
+            raise ValueError("flip requires assigned positions (fresh/choice modes have no fixed sides)")
         if config.first_speech_non_debate_aware:
-            if not config.fresh_positions:
+            # choice mode (position_binder) also qualifies: the side is the
+            # speaker's own blind choice, so nothing assigned is debate-aware.
+            if not (config.fresh_positions or config.position_binder is not None):
                 raise ValueError(
-                    "first_speech_non_debate_aware requires fresh_positions: an assigned "
-                    "position to defend is inherently debate-aware"
+                    "first_speech_non_debate_aware requires fresh_positions or a "
+                    "position_binder (choice mode): an assigned position to defend is "
+                    "inherently debate-aware"
                 )
             first = self.protocol.compile()[0]
             if first.slot.kind != Kind.SOLUTION or first.speaker == self.judge_speaker:
@@ -129,10 +194,12 @@ class DebateEnv(Env):
                     "the transcript as a public record (DESIGN-pc-format.md row 10)"
                 )
 
-        if not config.fresh_positions:
+        if not config.fresh_positions and config.position_binder is None:
             # Probe the contract up front: assigned mode reads meta["gold"] /
             # meta["distractor"] per debate, and a missing key would otherwise
             # die as a bare KeyError mid-rollout after backends are up.
+            # Choice mode (position_binder) binds sides from the blind choice
+            # instead, so it is exempt.
             probe = task_source.tasks(1)
             if probe and not {"gold", "distractor"} <= set(probe[0].meta):
                 raise ValueError(
@@ -165,14 +232,44 @@ class DebateEnv(Env):
         )
         self._inject_task_prompt_templates()
         self.prompts = RenderedPrompts(self.lib)
-        validate_prompts(self.lib, self.protocol, fresh_positions=config.fresh_positions)
+        # Choice mode (position_binder) defers position binding like fresh
+        # mode but binds BOTH deferred names for every speaker from the single
+        # solution slot; validate_prompts checks the matching bindability rule.
+        validate_prompts(
+            self.lib,
+            self.protocol,
+            fresh_positions=config.fresh_positions,
+            choice_positions=config.position_binder is not None,
+        )
         self.shaping = build_shaping(config.scoring.shaping)
+        # build_shaping accepts any slots/flag; a typo would silently zero the
+        # term's bonus, so the names are checked against the protocol and the
+        # family here.
+        slot_names = {cs.slot.name for cs in self.protocol.compile()}
+        flag_names = set(family.format_flags(""))
+        for term in self.shaping:
+            term_slots = getattr(term, "slots", None)
+            if term_slots is not None:
+                unknown_slots = sorted(set(term_slots) - slot_names)
+                if unknown_slots:
+                    raise ValueError(
+                        f"shaping term {type(term).__name__} targets unknown slot(s) "
+                        f"{unknown_slots}; protocol slots: {sorted(slot_names)}"
+                    )
+            term_flag = getattr(term, "flag", None)
+            if term_flag is not None and term_flag not in flag_names:
+                raise ValueError(
+                    f"shaping term {type(term).__name__} gates on unknown flag {term_flag!r}; "
+                    f"{type(family).__name__} format flags: {sorted(flag_names) or '(none)'}"
+                )
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
     def _inject_task_prompt_templates(self) -> None:
-        """Splice the task's answer-generation prompt into any slot that asks
-        for it by <ANSWER_GEN_USER>, so the debate proposal IS the RLVR user
-        message rather than a re-typed copy that can drift from it.
+        """Splice the task's answer-generation messages into any template that
+        asks for one by its splice name (<ANSWER_GEN_USER>: math/CC proposal
+        slot, MB blind_assessment cue; <TRAJECTORY_USER>: MB shared pre_debate
+        trajectory message), so the debate stage IS the RLVR message rather
+        than a re-typed copy that can drift from it.
 
         This is a template-level splice, not a var substitution: the spliced
         text still carries placeholders (the task config's <PROBLEM> is rebound
@@ -201,30 +298,25 @@ class DebateEnv(Env):
                 f"prompt entry {self.config.prompt_entry!r} references {missing}, which the task "
                 f"source must supply, but {type(self.task_source).__name__} supplied "
                 f"{sorted(available) or 'nothing'}. These come from the task family's "
-                "answer-generation config (infra/envs/tasks/prompt_configs/<family>.yaml)."
+                "answer-generation config (infra/prompts/tasks/<family>.yaml)."
             )
         if not requested:
             return
 
         subs = {k: available[k] for k in requested}
         self.lib.system = {s: _splice(t, subs) for s, t in self.lib.system.items()}
-        self.lib.preamble = {s: _splice(t, subs) for s, t in self.lib.preamble.items()}
-        self.lib.slots = {
-            name: (
-                {sp: _splice(t, subs) for sp, t in entry.items()}
-                if isinstance(entry, dict)
-                else _splice(entry, subs)
-            )
-            for name, entry in self.lib.slots.items()
+        self.lib.preamble = {
+            s: [_splice(t, subs) for t in msgs] for s, msgs in self.lib.preamble.items()
         }
+        self.lib.shared_pre_debate = _splice(self.lib.shared_pre_debate, subs)
+        self.lib.slots = {name: _splice(t, subs) for name, t in self.lib.slots.items()}
 
     def _all_templates(self):
         for tmpl in self.lib.system.values():
             yield tmpl
-        for tmpl in self.lib.preamble.values():
-            yield tmpl
-        for entry in self.lib.slots.values():
-            yield from (entry.values() if isinstance(entry, dict) else [entry])
+        for msgs in self.lib.preamble.values():
+            yield from msgs
+        yield from self.lib.slots.values()
 
     def _find_judge_speaker(self) -> str:
         d = self.protocol.decision_slot
@@ -247,15 +339,17 @@ class DebateEnv(Env):
                 seat_policy = policy
                 if speaker in cfg.trained_sampling or speaker in cfg.trained_chat_kwargs:
                     # same backend/adapter. The seat override owns the token
-                    # ceiling; the INCOMING policy owns the sampling mode
-                    # (train temp vs greedy eval) — composing them keeps
-                    # policy.greedy() greedy on override seats.
+                    # ceiling and its train-time temperature/top_p; the
+                    # INCOMING policy owns the sampling MODE — greedy eval
+                    # (temperature 0) keeps its mode on override seats.
                     override = cfg.trained_sampling.get(speaker)
-                    params = (
-                        _replace(policy.params, max_tokens=override.max_tokens)
-                        if override is not None
-                        else policy.params
-                    )
+                    params = policy.params
+                    if override is not None:
+                        updates: dict[str, Any] = {"max_tokens": override.max_tokens}
+                        if params.temperature != 0.0:
+                            updates["temperature"] = override.temperature
+                            updates["top_p"] = override.top_p
+                        params = _replace(params, **updates)
                     seat_policy = Policy(
                         policy.backend,
                         params,
@@ -263,7 +357,9 @@ class DebateEnv(Env):
                     )
                 seats[speaker] = PolicySeat(seat_policy)
             else:
-                seats[speaker] = FrozenSeat(cfg.frozen_models[speaker])
+                seats[speaker] = FrozenSeat(
+                    cfg.frozen_models[speaker], sampling=cfg.frozen_sampling.get(speaker)
+                )
 
         arms = [False, True] if cfg.flip else [False]
         # base group id = (task index, arm): flip arms are separate GRPO groups.
@@ -303,10 +399,17 @@ class DebateEnv(Env):
             verdict_parser=lambda text: parse_verdict(
                 text, cfg.judge.schema_name, list(self.display.values())
             ),
-            verdict_retries=cfg.judge.retries,
+            verdict_retries=(
+                cfg.verdict_retries if cfg.verdict_retries is not None else cfg.judge.retries
+            ),
+            judge_schema=cfg.judge.schema_name,
             solution_extractor=self.solution_extractor,
             fresh_positions=cfg.fresh_positions,
             decision_json_schema=decision_json_schema,
+            speech_token_limit=cfg.speech_token_limit,
+            position_binder=cfg.position_binder,
+            solution_retries=cfg.solution_retries,
+            solution_retry_feedback=cfg.solution_retry_feedback,
         )
         round_.run(states)
 
@@ -355,18 +458,23 @@ class DebateEnv(Env):
     def _build_state(self, task: Task, flipped: bool) -> DebateState:
         cfg = self.config
         question = task.meta.get("question")
-        if not question:
+        if question is None:
+            # An explicit "" is legal (MB binds its content via task bindings
+            # and never renders <TOPIC>); an ABSENT key is a broken contract.
             raise ValueError(
                 f"task source {type(self.task_source).__name__} produced a task "
-                'without a non-empty meta["question"]; the TaskFamily contract '
+                'without meta["question"]; the TaskFamily contract '
                 "(infra/envs/tasks/base.py) requires every Task.meta to carry "
                 '{"question": str} — it is what DebateEnv binds as the debate TOPIC'
             )
+        extra = task_bindings(task.meta)
         bindings: dict[str, dict[str, str]] = {}
         a, b = (self.debaters + [None, None])[:2]
         names = {s: self.display[s] for s in self.debaters}
         positions: dict[str, str] = {}
-        if not cfg.fresh_positions:
+        # Choice mode: positions stay unbound at build (the binder fills them
+        # once the solution slot's extraction lands), same as fresh mode.
+        if not cfg.fresh_positions and cfg.position_binder is None:
             gold, distractor = str(task.meta["gold"]), str(task.meta["distractor"])
             first, second = (distractor, gold) if flipped else (gold, distractor)
             positions = {a: first} if b is None else {a: first, b: second}
@@ -379,6 +487,7 @@ class DebateEnv(Env):
                 "POSITION": positions.get(s, ""),
                 "OPPONENT_NAME": names.get(other, "") if other else "",
                 "OPPONENT_POSITION": positions.get(other, "") if other else "",
+                **extra,
             }
         bindings[self.judge_speaker] = {
             "NAME": names.get(a, ""),
@@ -386,23 +495,32 @@ class DebateEnv(Env):
             "TOPIC": question,
             "POSITION": positions.get(a, ""),
             "OPPONENT_POSITION": positions.get(b, "") if b else "",
+            **extra,
         }
         state = DebateState(bindings=bindings)
         if cfg.first_speech_non_debate_aware:
             # Fail loud on malformed shapes rather than let render_context emit
-            # a non-alternating context or silently fall back to the library
-            # cue in the proposer's later history (row 10). Contract shape:
-            # optional leading system, then user/assistant alternation ending
-            # on the user message that serves as the solo cue.
+            # a malformed context or silently fall back to the library cue in
+            # the proposer's later history (row 10). Contract shape: optional
+            # leading system, then user/assistant messages STARTING and ENDING
+            # on user, with no consecutive assistant messages. Consecutive
+            # USER messages are legal by design: a byte-stable task message
+            # (e.g. the MB trajectory) may precede the eliciting cue as its
+            # own message so message-boundary prompt caches can reuse it.
             roles = [m.get("role") for m in task.messages]
             body = roles[1:] if roles[:1] == ["system"] else roles
-            if not body or body[-1] != "user" or any(
-                r != ("user" if i % 2 == 0 else "assistant") for i, r in enumerate(body)
+            if (
+                not body
+                or body[0] != "user"
+                or body[-1] != "user"
+                or any(r not in ("user", "assistant") for r in body)
+                or any(r1 == r2 == "assistant" for r1, r2 in zip(body, body[1:]))
             ):
                 raise ValueError(
                     "first_speech_non_debate_aware: task messages must be an optional "
-                    "system message then user/assistant alternation ending on the user "
-                    f"message that serves as the solo cue (got roles {roles})"
+                    "system message then user/assistant messages starting and ending "
+                    "on a user message, with no consecutive assistant messages "
+                    f"(got roles {roles})"
                 )
             state.first_slot_messages = list(task.messages)
         # ground truth about which arm produced this debate, carried into
@@ -425,11 +543,11 @@ class DebateEnv(Env):
             return None
         decode_fn = None
         seat = self.config.frozen_models.get(self.judge_speaker)
-        if seat is not None:
-            try:
-                decode_fn = seat.decode_tokens
-            except NotImplementedError:
-                decode_fn = None
+        # Attribute access never raises: the base Model.decode_tokens raises
+        # NotImplementedError only when CALLED. Detect support by override so
+        # a tokenizer-less seat yields NO_PIECES, not MISALIGNED.
+        if seat is not None and type(seat).decode_tokens is not Model.decode_tokens:
+            decode_fn = seat.decode_tokens
         return verdict_from_slot(
             rec.text,
             rec.response if rec.response is not None else rec.sample,
@@ -476,10 +594,10 @@ class DebateEnv(Env):
     def _grade_solutions(
         self, states: list[DebateState]
     ) -> tuple[dict[tuple[Any, str], Optional[bool]], int]:
-        """family.grade for every (task, solution) pair _trajectories will
-        need, deduped and run in a thread pool (grading may shell out to slow
-        subprocesses; math grading is trivially fast and unharmed by the pool).
-        A grade call that raises records None — it must never kill a rollout."""
+        """Every (task, solution) pair _trajectories will need, deduped, then
+        graded through family.grade_batch — the family owns the execution
+        shape (thread pool for subprocess verifiers, one batched call for a
+        learned one) and the never-raises contract; this side owns the dedup."""
         pending: dict[tuple[Any, str], tuple[dict[str, Any], Any]] = {}
         for st in states:
             if st.failed is not None:
@@ -496,21 +614,43 @@ class DebateEnv(Env):
                 key = self._grade_key(st, solution)
                 if key not in pending:
                     pending[key] = (st.meta.get("task") or {}, solution)
-        grades: dict[tuple[Any, str], Optional[bool]] = {}
-        errors = 0
-        if pending:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {
-                    key: pool.submit(self.family.grade, meta, solution)
-                    for key, (meta, solution) in pending.items()
-                }
-                for key, fut in futures.items():
-                    try:
-                        grades[key] = fut.result()
-                    except Exception:  # noqa: BLE001
-                        grades[key] = None
-                        errors += 1
-        return grades, errors
+        if not pending:
+            return {}, 0
+        keys = list(pending)
+        results = self.family.grade_batch([pending[k] for k in keys])
+        return dict(zip(keys, results)), int(getattr(self.family, "last_grade_errors", 0))
+
+    def _attach_labels(
+        self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]
+    ) -> None:
+        """Park each solution slot's ground-truth label on the debate it came
+        from, so transcript exports carry it.
+
+        Judge accuracy is derived from transcripts (winner x side x label),
+        never from aggregated metrics (AGENTS.md), and the label cannot be
+        recovered downstream: math's `gt` survives the export by being a
+        scalar, but codecontests' test cases are deliberately withheld from
+        every export, so re-grading offline would mean rejoining to the source
+        dataset and re-running the same 90s-timeout verifier that already ran
+        here.
+
+        st.meta["grades"][speaker] semantics, distinct on purpose:
+          absent -> never graded (no solution slot, or an untrained seat:
+                    _grade_solutions only grades trained_speakers)
+          None   -> graded and ungradeable (no ground truth, or grade raised)
+          bool   -> the label
+        """
+        for st in states:
+            if st.failed is not None:
+                continue
+            labels: dict[str, Optional[bool]] = {}
+            for r in st.records:
+                if r.slot.slot.kind != Kind.SOLUTION or r.extracted is None:
+                    continue
+                key = self._grade_key(st, r.extracted)
+                if key in grades:
+                    labels[r.slot.speaker] = grades[key]
+            st.meta["grades"] = labels
 
     def _attach_labels(
         self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]

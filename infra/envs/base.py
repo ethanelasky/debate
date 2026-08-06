@@ -136,9 +136,16 @@ class SingleTurnEnv(Env):
     `grade_workers`: > 1 runs reward() in a thread pool, for verifiers that
     shell out to a subprocess (code execution). Pure-python graders leave it at
     1 and score inline rather than pay for a pool they cannot use.
+
+    Each rollout() overwrites `last_rollout_records` — one dict per KEPT
+    sample (prompt messages, completion, reward, info) — retained for
+    transcript export (wandb; the single-turn twin of DebateEnv.last_states).
+    meta is copied without "bindings": its values (e.g. a 60k-token MB
+    trajectory) are already rendered into the messages.
     """
 
     grade_workers: int = 1
+    last_rollout_records: list[dict[str, Any]] = []
 
     #: Flat overshoot penalty. A sample longer than `soft_token_budget` loses
     #: `overshoot_penalty` from its reward — a constant, NOT scaled by how far
@@ -185,35 +192,35 @@ class SingleTurnEnv(Env):
         else:
             scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
 
-        # Retained for export: the generated text is the ONLY record of what the
-        # policy produced, and re-grading it offline against a stronger test
-        # suite is how proposer accuracy gets measured after the run. Without
-        # this the completions are gone the moment the step ends.
-        self.last_rollout: list[dict[str, Any]] = []
-        _t_reward = time.monotonic() - _t1
-        self.last_phase_seconds = {"generate": _t_generate, "reward": _t_reward}
+        self.last_phase_seconds = {"generate": _t_generate, "reward": time.monotonic() - _t1}
 
+        records = []
         for (gi, s), (reward, info) in zip(kept, scored):
             # Length is priced here rather than in reward(), which only sees
-            # text; token counts live on the Sample.
+            # text; token counts live on the Sample. Applied BEFORE the
+            # Trajectory and the record are built so both carry the same
+            # penalized reward the optimizer sees.
             over = bool(self.soft_token_budget and len(s.tokens) > self.soft_token_budget)
             info = {**info, "tokens": float(len(s.tokens)), "over_budget": float(over)}
             if over:
                 reward -= self.overshoot_penalty
-            meta = tasks[gi].meta
-            self.last_rollout.append({
-                # scalar identity only — never the test suites, which must not
-                # leave the process any more than they may enter a prompt
-                "name": meta.get("name"),
-                "question": (meta.get("question") or "")[:4000],
-                "split": meta.get("split"),
-                "cf_rating": meta.get("cf_rating"),
-                "text": s.text,
-                "reward": float(reward),
-                "stop_reason": s.stop_reason,
-                "info": {k: v for k, v in info.items() if isinstance(v, (int, float))},
-            })
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
+            records.append(
+                {
+                    "task_index": gi,
+                    "meta": {k: v for k, v in tasks[gi].meta.items() if k != "bindings"},
+                    "messages": tasks[gi].messages,
+                    "completion": s.text,
+                    "stop_reason": s.stop_reason,
+                    "reward": reward,
+                    "info": info,
+                }
+            )
+        self.last_rollout_records = records
+        # Deliberately violates the every-branch rule in reward()'s docstring:
+        # a batch-level counter stamped on one sample (and lost when the first
+        # group is empty). Pinned by tests; fixing it means a new channel for
+        # batch info, not spreading the key across trajectories.
         if n_dropped and groups and groups[0]:
             groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
         return groups
@@ -264,7 +271,9 @@ def budget_forced_sample(
     gets </think> force-injected (logprob 0.0, datum mask 0.0 via regions).
     Phase 2 continues from the extended prefix under the visible/total caps.
     A model that never opens <think> (and wasn't given one by the template)
-    is passed through as all-visible — think caps only bind on thinking.
+    is passed through as all-visible — think caps only bind on thinking — and
+    if phase 1's cap cut it off, generation continues under the remaining
+    visible/total budget (no injection).
     """
     close = _close_ids(tokenizer)
     eos_id = getattr(tokenizer, "eos_token_id", None)
@@ -301,7 +310,19 @@ def budget_forced_sample(
 
     buckets: dict[int, list[int]] = {}
     for j, e in enumerate(flat):
-        if e.get("all_visible") or e.get("died_in_think"):
+        if e.get("died_in_think"):
+            continue
+        if e.get("all_visible"):
+            # The think cap must not become a total cap: a never-thinking
+            # sample cut at the phase-1 cap continues under the remaining
+            # visible/total budget (its close is empty, so the shared bucket
+            # pass extends the raw prefix with no injection). Every phase-1
+            # token here is visible, so it counts against max_visible_tokens.
+            cont_cap = min(limits.max_visible_tokens or inf, total) - len(e["p1"].tokens)
+            if e["p1"].stop_reason != "length" or cont_cap <= 0:
+                continue
+            e["p2_cap"] = cont_cap
+            buckets.setdefault(cont_cap, []).append(j)
             continue
         p2_cap = min(limits.max_visible_tokens or inf, total - len(e["p1"].tokens) - len(e["close"]))
         if p2_cap <= 0:
@@ -320,13 +341,15 @@ def budget_forced_sample(
     for e in flat:
         p1: Sample = e["p1"]
         if e.get("all_visible"):
+            cont: Optional[Sample] = e["p2"]
+            tokens = p1.tokens + (cont.tokens if cont else [])
             results[e["pi"]].append(
                 Sample(
-                    tokens=p1.tokens,
-                    logprobs=p1.logprobs,
-                    text=tokenizer.decode(p1.tokens),
-                    stop_reason=p1.stop_reason,
-                    regions=(Region("visible", 0, len(p1.tokens)),),
+                    tokens=tokens,
+                    logprobs=p1.logprobs + (cont.logprobs if cont else []),
+                    text=tokenizer.decode(tokens),
+                    stop_reason=cont.stop_reason if cont is not None else p1.stop_reason,
+                    regions=(Region("visible", 0, len(tokens)),),
                 )
             )
             continue

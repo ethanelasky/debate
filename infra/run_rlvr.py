@@ -1,5 +1,5 @@
-"""RLVR runner: experiment YAML -> MathEnv (direct correctness reward) ->
-train loop. The judge-free baseline for the debate experiments: same model,
+"""RLVR runner: experiment YAML -> task-source env (direct verifiable reward)
+-> train loop. The judge-free baseline for the debate experiments: same model,
 same backend, same GRPO machinery — reward comes from answer verification
 instead of a judge, so it isolates optimization from reward quality.
 
@@ -11,27 +11,76 @@ Config shape:
       dataset: {type: math, levels: 5, seed: 0}
       training: {backend: verl, verl: {...}, lora_rank: 32, loss: {...},
                  steps: 100, batch_size: 8, group_size: 8, lr: 1e-4, ...}
+
+`enable_thinking` (optional) is the debate runner's per-seat knob at RLVR's one
+policy: it becomes Config.chat_template_kwargs, so it reaches training AND eval
+rollouts through the same Policy. Hybrid-thinking models (Qwen3.x) render an
+empty <think></think> block at False and open <think> at True; the toggle is
+verified against the tokenizer at launch (see _check_thinking_toggle) rather
+than trusted, because a template that ignores the kwarg drops it in silence —
+the same latent failure the OpenRouter seats hit (MB_DEBATE_PLAN 2026-08-02).
+Omit the key for models without a thinking mode.
+
+MB blind choice (dataset.type: monitoringbench) needs nothing extra: the task
+source renders its RLVR prompt from the family's answer-generation config
+(infra/prompts/tasks/monitoringbench.yaml, dataset.prompt_file to override) —
+the same file the eval arm's debate packs splice their blind view from, so the
+RLVR prompt is byte-identical to the eval arm's blind view by construction.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-import json
 
 from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
-from infra.run_debate import (
+from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
     build_backend,
     run_identity_suffix,
+    runner_parser,
     training_config_kwargs,
 )
 from infra.train import Config, train
 
-EXPERIMENT_KEYS = {"model", "max_completion_tokens", "dataset", "training"}
+EXPERIMENT_KEYS = {
+    "model",
+    "enable_thinking",
+    "max_completion_tokens",
+    "plan_tokens",
+    "dataset",
+    "training",
+}
+
+
+def _check_thinking_toggle(tokenizer, enable_thinking: bool) -> None:
+    """Fail unless the policy's chat template actually reads enable_thinking.
+
+    apply_chat_template passes unknown kwargs into the Jinja globals, where a
+    template that never references them ignores them without a word — so a
+    config declaring a no-think arm would train a thinking one and nothing in
+    the logs would say so. Rendering the same probe both ways separates the two
+    cases: a template that honors the knob produces different tokens.
+    """
+    probe = [{"role": "user", "content": "probe"}]
+
+    def render(value: bool):
+        out = tokenizer.apply_chat_template(
+            probe, add_generation_prompt=True, tokenize=True, enable_thinking=value
+        )
+        if not isinstance(out, list):
+            out = out["input_ids"]
+        return out[0] if out and isinstance(out[0], list) else out
+
+    if render(True) == render(False):
+        raise ValueError(
+            f"enable_thinking: {str(enable_thinking).lower()} was set, but this model's chat "
+            "template renders identically with enable_thinking True and False — the setting "
+            "would be silently dropped. Remove the key (models without a thinking mode need "
+            "no toggle) or point the arm at a hybrid-thinking model."
+        )
 
 
 def validate_experiment(exp: dict) -> None:
@@ -40,7 +89,7 @@ def validate_experiment(exp: dict) -> None:
     Same contract as run_debate.validate_experiment: a typo must fail at
     launch instead of silently falling back to a default. Adding a new
     `exp.get(...)`/`tr.get(...)` read means adding the key here (or to
-    run_debate.TRAINING_KEYS / VERL_KEYS, which this shares).
+    run_common.TRAINING_KEYS / VERL_KEYS, which both runners share).
     """
     reject_unknown_keys(exp, EXPERIMENT_KEYS, "rlvr experiment")
     tr = exp.get("training") or {}
@@ -49,19 +98,7 @@ def validate_experiment(exp: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment-file", required=True)
-    parser.add_argument("--experiment", required=True)
-    parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
-    parser.add_argument("--wandb-entity", default=None, help="override training.wandb_entity")
-    parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
-    parser.add_argument("--steps", type=int, default=None, help="override training.steps")
-    parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")
-    parser.add_argument("--levels", default=None, help="override dataset.levels (e.g. 4 or 3-4)")
-    parser.add_argument("--group-size", type=int, default=None, help="override training.group_size")
-    parser.add_argument("--batch-size", type=int, default=None, help="override training.batch_size")
-    parser.add_argument("--load", default=None)
-    args = parser.parse_args()
+    args = runner_parser(__doc__).parse_args()
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
@@ -72,6 +109,14 @@ def main() -> None:
     family = get_family(ds.pop("type", None))
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
     env = family.source(ds)
+    # plan_tokens: two-turn plan-then-answer rollouts (train AND eval — one
+    # env, one rollout path), matching the debate arm's pre-solution scratchpad
+    # slot. See infra/envs/planned.py.
+    plan_tokens = exp.get("plan_tokens")
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        env = PlannedEnv(env, int(plan_tokens))
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])
@@ -79,7 +124,15 @@ def main() -> None:
         args.lr, args.levels, args.group_size, args.batch_size
     )
     backend = build_backend(
-        tr, model_path, run_name, lr_override=args.lr, load_given=bool(args.load)
+        tr,
+        model_path,
+        run_name,
+        lr_override=args.lr,
+        load_given=bool(args.load),
+        gen_budgets={
+            "max_completion_tokens": exp.get("max_completion_tokens"),
+            "training.eval_max_tokens": tr.get("eval_max_tokens"),
+        },
     )
     if args.load:
         backend.load(args.load)
@@ -88,9 +141,18 @@ def main() -> None:
     if max_tokens is None:
         raise ValueError("set max_completion_tokens (per-generation budget) in the experiment")
 
+    enable_thinking = exp.get("enable_thinking")
+    if enable_thinking is not None:
+        _check_thinking_toggle(backend.tokenizer, bool(enable_thinking))
+
     cfg = Config(
         base_model=model_path,
         sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
+        chat_template_kwargs=(
+            None if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
+        ),
+        # The TEAM entity, not the API key's personal default namespace —
+        # without it, runs land where the rest of the team cannot see them.
         wandb_entity=(None if args.no_wandb else args.wandb_entity or tr.get("wandb_entity")),
         wandb_project=(
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
@@ -99,23 +161,25 @@ def main() -> None:
         **training_config_kwargs(tr, args),
     )
 
-    # Persist every training rollout. The RLVR arm's reward comes from a
-    # deliberately weak suite (<=10 public+private cases), so the accuracy that
-    # matters is recomputed AFTER the run by re-grading these completions
-    # against CodeContests-O offline — see infra/envs/tasks/codecontests.py.
-    # Without this the generated programs are discarded at the end of each step
-    # and that comparison becomes impossible. Mirrors run_debate.py's docent
-    # export; JSONL rather than transcripts because RLVR has no debate to shape.
-    def _dump_rollouts(step: int, env_) -> None:
-        rows = getattr(env_, "last_rollout", None)
-        if not rows:
-            return
-        os.makedirs("rollouts", exist_ok=True)
-        with open(f"rollouts/step-{step:05d}.jsonl", "w") as f:
-            for r in rows:
-                f.write(json.dumps({**r, "step": step}) + "\n")
+    # Comprehensive docent capture, single-turn twin of run_debate's: every
+    # training rollout's kept samples -> docent/<run>/step-NNNNN.jsonl. The run
+    # name carries the sweep suffix, for the same reason checkpoints do: arms of
+    # one sweep run concurrently from the same working directory, and a shared
+    # docent/step-NNNNN.jsonl would have them overwrite each other's rollouts
+    # step for step, leaving one file per step drawn from whichever arm wrote last.
+    docent_dir = os.path.join("docent", run_name)
 
-    cfg.on_rollout = _dump_rollouts
+    def _export_docent(step: int, env_) -> None:
+        from infra.envs.debate.docent_export import export_jsonl
+        from infra.envs.singleturn_docent import agent_runs
+
+        records = getattr(env_, "last_rollout_records", None)
+        if not records:
+            return
+        os.makedirs(docent_dir, exist_ok=True)
+        export_jsonl(agent_runs(records), os.path.join(docent_dir, f"step-{step:05d}.jsonl"))
+
+    cfg.on_rollout = _export_docent
     train(env, backend, cfg)
 
 

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Prompts · Config Viewer{% endblock %}
+
+{% block content %}
+<main class="page">
+    <div class="toolbar">
+        <div class="field">
+            <label for="search">Search</label>
+            <input type="search" id="search" class="input" placeholder="Filter components…" autocomplete="off">
+        </div>
+        <div class="field">
+            <label>Entries</label>
+            <div id="entrySelect"></div>
+        </div>
+        <div class="field">
+            <label>Components</label>
+            <div id="componentSelect"></div>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn" id="newEntryBtn" type="button">New entry</button>
+        <button class="btn" id="reloadBtn" type="button">Reload</button>
+        <button class="btn primary" id="saveBtn" type="button">Save</button>
+    </div>
+
+    <div class="file-errors" id="fileErrors" hidden></div>
+
+    <div class="diffbar" id="diffBar" hidden>
+        <span id="diffSummary"></span>
+        <button class="btn tiny" id="expandAll" type="button">Expand all</button>
+        <button class="btn tiny" id="collapseAll" type="button">Collapse all</button>
+    </div>
+
+    <div class="table-scroll" id="tableMount">
+        <div class="empty">Loading prompts…</div>
+    </div>
+</main>
+
+<div class="modal-backdrop" id="newEntryModal" hidden>
+    <div class="modal">
+        <h3>New prompt entry</h3>
+        <div class="field">
+            <label for="newEntryName">Entry name</label>
+            <input type="text" id="newEntryName" class="input" autocomplete="off">
+        </div>
+        <div class="field">
+            <label for="newEntryParent">Inherit from</label>
+            <select id="newEntryParent" class="select"></select>
+            <div class="hint">Uses _extends — override individual components afterwards.</div>
+        </div>
+        <div class="field">
+            <label for="newEntryFile">Save to file</label>
+            <select id="newEntryFile" class="select"></select>
+        </div>
+        <div class="actions">
+            <button class="btn" id="newEntryCancel" type="button">Cancel</button>
+            <button class="btn primary" id="newEntryCreate" type="button">Create</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block page_js %}
+<script src="/static/js/prompts.js"></script>
+{% endblock %}

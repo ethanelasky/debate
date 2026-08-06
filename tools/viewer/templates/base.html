@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Config Viewer{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/viewer.css">
+</head>
+<body>
+    <header class="topbar">
+        <span class="brand">Config Viewer</span>
+        <nav>
+            <a href="/prompts" {% if active == 'prompts' %}class="active"{% endif %}>Prompts</a>
+            <a href="/experiments" {% if active == 'experiments' %}class="active"{% endif %}>Experiments</a>
+        </nav>
+    </header>
+    {% block content %}{% endblock %}
+    <footer class="statusbar">
+        <span id="status" class="status">Ready</span>
+        <span id="dirty" class="dirty" hidden><span class="dot"></span>Unsaved changes</span>
+    </footer>
+    <script src="/static/js/viewer.js"></script>
+    {% block page_js %}{% endblock %}
+</body>
+</html>

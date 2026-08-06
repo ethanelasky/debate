@@ -111,6 +111,16 @@ def test_fidelity_failures_are_dropped_and_counted():
     assert env.calls == ["a", "ccc", "dddd"]  # never graded
 
 
+def test_drop_counter_lost_when_first_group_empty():
+    """The pre-existing quirk, pinned so a refactor cannot change it silently:
+    the counter rides on groups[0][0], so an empty first group discards it."""
+    env = ScoreByLength()
+    groups = env.rollout(env.tasks(2), _policy(["", "", "ccc", "dddd"]), group_size=2)
+
+    assert [len(g) for g in groups] == [0, 2]
+    assert all("samples_dropped_fidelity" not in t.info for g in groups for t in g)
+
+
 def test_datums_carry_prompt_tokens():
     env = ScoreByLength()
     groups = env.rollout(env.tasks(1), _policy(["abc"]), group_size=1)
@@ -129,3 +139,19 @@ def test_pooled_and_inline_agree(workers):
 
     assert [[t.reward for t in g] for g in groups] == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
     assert [[t.info["length"] for t in g] for g in groups] == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+
+
+class ExplodingGrader(ScoreByLength):
+    def reward(self, task, text):
+        if text == "boom":
+            raise RuntimeError("verifier crashed")
+        return super().reward(task, text)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_reward_exceptions_propagate(workers):
+    """A crashing grader must fail the rollout, pooled or not — never be
+    swallowed into a silent zero-reward trajectory."""
+    env = ExplodingGrader(workers=workers)
+    with pytest.raises(RuntimeError, match="verifier crashed"):
+        env.rollout(env.tasks(2), _policy(["a", "boom", "ccc", "dddd"]), group_size=2)

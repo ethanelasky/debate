@@ -226,15 +226,21 @@ if [ -n "$TRAINER_PIDS" ]; then
   exit 5
 fi
 
-# CONFIG is overridable so a mode is not welded to one task family — the
-# defaults are the MATH arms, but CodeContests (and anything added later) lives
-# in its own file:
+# CONFIG is overridable so a mode is not welded to one task family. The
+# defaults stay as they were — MATH, with mb_* routed to MonitoringBench by
+# experiment-name prefix — but CodeContests (and anything added later) lives in
+# its own file and is selected explicitly:
 #   CONFIG=configs/codecontests_rlvr_olmo.yaml bash scripts/pod_run.sh rlvr <exp>
 # The experiment name is still validated against whichever file is selected, so
 # a mismatched pair fails at load with the available names listed.
 case "$MODE" in
   debate) RUNNER=infra.run_debate; CONFIG="${CONFIG:-configs/math_pc_olmo.yaml}" ;;
-  rlvr)   RUNNER=infra.run_rlvr;   CONFIG="${CONFIG:-configs/math_rlvr_olmo.yaml}" ;;
+  rlvr)   RUNNER=infra.run_rlvr
+          case "$EXP" in
+            mb_*) DEFAULT_CONFIG=configs/mb_rlvr.yaml ;;
+            *)    DEFAULT_CONFIG=configs/math_rlvr_olmo.yaml ;;
+          esac
+          CONFIG="${CONFIG:-$DEFAULT_CONFIG}" ;;
   *) echo "unknown mode $MODE (debate|rlvr)" >&2; exit 2 ;;
 esac
 [ -f "$CONFIG" ] || { echo "FATAL: config $CONFIG not found (cwd $(pwd))" >&2; exit 2; }
@@ -353,7 +359,7 @@ import sys
 from urllib.parse import urlparse
 
 from infra.config import load_experiment
-from infra.run_debate import check_legacy_checkpoint_layout
+from infra.run_common import check_legacy_checkpoint_layout
 
 exp = load_experiment(sys.argv[1], sys.argv[2])
 ms = ((exp.get("agents") or {}).get("judge") or {}).get("model_settings") or {}
@@ -439,10 +445,14 @@ finally:
   # gpu-memory-utilization is a server-launch parameter, not a config field:
   # 0.18 leaves room for the trainer's rollout engine + FSDP init peak on 80GB.
   # Own process group so cleanup can reap EngineCore children as a unit.
+  # --enable-prefix-caching pinned ON (default-on in vLLM V1, explicit here so
+  # a V0-era engine behaves the same): the judge's verdict context strictly
+  # extends its deliberation context, and debate transcripts share long
+  # byte-stable prefixes. Reuse rides the existing 0.18 KV pool via LRU.
   setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$JUDGE_MODEL" --port "$JUDGE_PORT" \
     --gpu-memory-utilization 0.18 --max-model-len 16384 \
-    --max-num-seqs 32 \
+    --max-num-seqs 32 --enable-prefix-caching \
     > /root/judge_server.log 2>&1 9>&- &   # 9>&-: do not inherit the launch lock
   JUDGE_PID=$!
   JUDGE_PGID="$(ps -o pgid= -p "$JUDGE_PID" 2>/dev/null | tr -d ' ' || true)"
