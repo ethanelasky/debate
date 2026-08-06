@@ -213,6 +213,28 @@ PYEOF
 # because `log` itself succeeds.
 NVCC_VER="$(timeout -k 5s 30 nvcc --version | grep -o 'release [0-9.]*')" || {
   echo "FATAL: nvcc --version failed or hung >30s just before the flash-attn build (CUDA_HOME=$CUDA_HOME)" >&2; exit 1; }
+# A prebuilt wheel skips a ~45min source build entirely. There is no published
+# wheel for torch 2.11+cu130 (the matrix stops at 2.10), so the only source of
+# one is a previous pod: after a successful provision, copy
+#   $UV_CACHE_DIR/sdists-v9/pypi/flash-attn/*/*/flash_attn-*.whl
+# off the pod and pass it back here on the next one:
+#   FLASH_ATTN_WHEEL=/root/flash_attn-...whl bash scripts/provision_pod.sh
+# The wheel is tied to the exact python/torch/CUDA of the pod that built it, so
+# a mismatched one fails loudly at import rather than silently misbehaving —
+# which is why this verifies the import before continuing.
+if [ -n "${FLASH_ATTN_WHEEL:-}" ]; then
+  [ -f "$FLASH_ATTN_WHEEL" ] || { echo "FATAL: FLASH_ATTN_WHEEL=$FLASH_ATTN_WHEEL not found" >&2; exit 1; }
+  log "flash-attn from prebuilt wheel ($FLASH_ATTN_WHEEL) — skipping the source build"
+  timeout -k 30s 300 uv pip install -p "$P" "$FLASH_ATTN_WHEEL" || {
+    echo "FATAL: installing $FLASH_ATTN_WHEEL failed" >&2; exit 1; }
+  # torch FIRST: flash_attn_2_cuda links against libc10.so, which only lands on
+  # the loader path once torch is imported. Testing the extension alone reports
+  # a bogus "wheel built for a different torch".
+  timeout -k 10s 180 "$P" -c "import torch, flash_attn, flash_attn_2_cuda" || {
+    echo "FATAL: $FLASH_ATTN_WHEEL installed but its CUDA extension will not import — wheel was built for a different python/torch/CUDA. Unset FLASH_ATTN_WHEEL to build from source." >&2; exit 1; }
+  log "flash-attn wheel verified"
+else
+
 log "flash-attn (source build; wheel cached in \$UV_CACHE_DIR for later pods; nvcc: $NVCC_VER"
 timeout -k 30s 600 uv pip install -p "$P" ninja packaging || {
   echo "FATAL: installing ninja/packaging failed or exceeded 600s; without ninja the flash-attn build serializes and will not finish" >&2; exit 1; }
@@ -224,6 +246,7 @@ MAX_JOBS="$MAX_JOBS" timeout -k 30s 7200 uv pip install -p "$P" --no-build-isola
   echo "FATAL: flash-attn source build failed or exceeded 7200s with MAX_JOBS=$MAX_JOBS / archs $TORCH_CUDA_ARCH_LIST." >&2
   echo "  A build that merely OOM-Killed exits fast; a 2h wall means nvcc is thrashing (arch fan-out) or a cutlass unit is stuck — check dmesg and free -g." >&2
   exit 1; }
+fi
 
 log "exporting built wheel to $VOL/wheels"
 # Non-fatal (the env is already built) but NOT silent: an empty wheel cache
