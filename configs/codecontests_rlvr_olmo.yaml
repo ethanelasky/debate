@@ -197,6 +197,32 @@ codecontests_rlvr_olmo_easy_smoke10:
     max_cf_rating: 1100
     eval_subset_size: 82
 
+# Paired 25-step learning experiment on the viable 7B difficulty slice. Both
+# arms see the same seeded training stream and the complete 82-problem held-out
+# split. Intermediate + final checkpoints make the policy movement inspectable
+# even if correctness peaks before the last step.
+codecontests_rlvr_olmo_easy25_penalty:
+  _extends: codecontests_rlvr_olmo
+  dataset:
+    min_cf_rating: 800
+    max_cf_rating: 1100
+    eval_subset_size: 82
+  training:
+    steps: 25
+    batch_size: 8
+    group_size: 8
+    eval_every: 5
+    eval_n: 82
+    save_every: 10
+
+# Length-penalty ablation. The soft budget remains configured so over-budget
+# incidence is still measured, but a zero coefficient removes it from reward.
+# Everything else is byte-for-byte inherited from the paired control above.
+codecontests_rlvr_olmo_easy25_no_penalty:
+  _extends: codecontests_rlvr_olmo_easy25_penalty
+  dataset:
+    overshoot_penalty: 0.0
+
 # 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
 # worth reading: the 7B smoke showed the plumbing works but the model is too
 # weak on CodeContests (eval/correct ~0.03, a third of programs crashing).

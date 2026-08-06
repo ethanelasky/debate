@@ -561,6 +561,32 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _filter_cf_rating(
+    rows: list[dict[str, Any]],
+    min_cf_rating: Optional[int],
+    max_cf_rating: Optional[int],
+) -> list[dict[str, Any]]:
+    """Keep rows inside an inclusive Codeforces rating range.
+
+    GDM uses ``0`` for problems without a matched Codeforces rating.  Requiring
+    a numeric value inside the requested interval therefore also keeps those
+    unrated rows from leaking into an "easy" slice.
+    """
+    if min_cf_rating is None and max_cf_rating is None:
+        return rows
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        rating = row.get("cf_rating")
+        if isinstance(rating, bool) or not isinstance(rating, (int, float)):
+            continue
+        if min_cf_rating is not None and rating < min_cf_rating:
+            continue
+        if max_cf_rating is not None and rating > max_cf_rating:
+            continue
+        kept.append(row)
+    return kept
+
+
 class CodeContestsEnv(SingleTurnEnv):
     # Grading shells out to a subprocess per sample, so threads overlap.
     grade_workers = max(1, _MAX_CONCURRENT_VERIFIERS)
@@ -577,7 +603,18 @@ class CodeContestsEnv(SingleTurnEnv):
         prompt_file: Optional[str] = None,
         soft_token_budget: Optional[int] = None,
         overshoot_penalty: float = 0.0,
+        min_cf_rating: Optional[int] = None,
+        max_cf_rating: Optional[int] = None,
     ):
+        if (
+            min_cf_rating is not None
+            and max_cf_rating is not None
+            and min_cf_rating > max_cf_rating
+        ):
+            raise ValueError(
+                "codecontests min_cf_rating must be <= max_cf_rating "
+                f"(got {min_cf_rating} > {max_cf_rating})"
+            )
         self.rng = random.Random(seed)
         # Flat penalty past the budget (see SingleTurnEnv). Inert unless the
         # backend's response_length is set above the budget.
@@ -588,9 +625,25 @@ class CodeContestsEnv(SingleTurnEnv):
         self.correct_reward = correct_reward
         self.format_reward = format_reward
 
-        self.train_rows = _load_rows(path)
+        loaded_train_rows = _load_rows(path)
+        self.train_rows = _filter_cf_rating(
+            loaded_train_rows, min_cf_rating, max_cf_rating
+        )
         if test_path is not None:
-            self.test_rows = _load_rows(test_path)
+            loaded_test_rows = _load_rows(test_path)
+            self.test_rows = _filter_cf_rating(
+                loaded_test_rows, min_cf_rating, max_cf_rating
+            )
+            if min_cf_rating is not None or max_cf_rating is not None:
+                logger.info(
+                    "codecontests cf_rating filter [%s, %s]: train=%d/%d test=%d/%d",
+                    min_cf_rating,
+                    max_cf_rating,
+                    len(self.train_rows),
+                    len(loaded_train_rows),
+                    len(self.test_rows),
+                    len(loaded_test_rows),
+                )
             overlap = {r["name"] for r in self.train_rows if r["name"]} & {
                 r["name"] for r in self.test_rows if r["name"]
             }
@@ -701,6 +754,8 @@ class CodeContestsFamily(TaskFamily):
                 "prompt_file",
                 "soft_token_budget",
                 "overshoot_penalty",
+                "min_cf_rating",
+                "max_cf_rating",
             },
             "codecontests",
         )
@@ -723,6 +778,12 @@ class CodeContestsFamily(TaskFamily):
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
             soft_token_budget=(int(ds["soft_token_budget"]) if ds.get("soft_token_budget") else None),
             overshoot_penalty=float(ds.get("overshoot_penalty", 0.0)),
+            min_cf_rating=(
+                int(ds["min_cf_rating"]) if ds.get("min_cf_rating") is not None else None
+            ),
+            max_cf_rating=(
+                int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
+            ),
         )
 
     def extractor(self, relaxed: bool) -> Callable[[str], Any]:

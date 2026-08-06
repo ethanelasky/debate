@@ -125,6 +125,34 @@ def test_train_test_overlap_warns_but_keeps_rows(tmp_path, caplog):
     assert len(env.train_rows) == 3 and len(env.test_rows) == 3  # nothing dropped
 
 
+def test_cf_rating_filter_is_inclusive_and_excludes_unrated(tmp_path):
+    rows = []
+    for rating in (0, 800, 1000, 1100, 1200):
+        row = {**ROWS[0], "name": f"rated-{rating}", "cf_rating": rating}
+        rows.append(row)
+    path = _write_jsonl(tmp_path / "rated.jsonl", rows)
+    env = CodeContestsEnv(
+        path=path,
+        test_path=path,
+        timeout_seconds=TIMEOUT,
+        min_cf_rating=800,
+        max_cf_rating=1100,
+    )
+    assert [row["cf_rating"] for row in env.train_rows] == [800, 1000, 1100]
+    assert [row["cf_rating"] for row in env.test_rows] == [800, 1000, 1100]
+
+
+def test_cf_rating_filter_rejects_inverted_bounds(tmp_path):
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    with pytest.raises(ValueError, match="min_cf_rating must be <= max_cf_rating"):
+        CodeContestsEnv(
+            path=path,
+            test_path=path,
+            min_cf_rating=1200,
+            max_cf_rating=800,
+        )
+
+
 def test_tasks_carry_meta_and_hide_test_io(env):
     tasks = env.tasks(3, split="train") + env.tasks(2, split="test")
     for t in tasks:
@@ -458,6 +486,25 @@ def test_source_builds_env(family, tmp_path):
     env = family.source({"path": path, "test_path": test, "timeout_seconds": TIMEOUT})
     assert isinstance(env, CodeContestsEnv)
     assert len(env.train_rows) == 3 and family.timeout_seconds == TIMEOUT
+
+
+def test_source_passes_cf_rating_bounds(family, tmp_path):
+    rows = [
+        {**ROWS[0], "name": "unrated", "cf_rating": 0},
+        {**ROWS[1], "name": "easy", "cf_rating": 900},
+        {**ROWS[0], "name": "easy-2", "cf_rating": 1100},
+        {**ROWS[2], "name": "hard", "cf_rating": 1200},
+    ]
+    path = _write_jsonl(tmp_path / "rated.jsonl", rows)
+    env = family.source(
+        {
+            "path": path,
+            "test_path": path,
+            "min_cf_rating": 800,
+            "max_cf_rating": 1100,
+        }
+    )
+    assert [row["name"] for row in env.train_rows] == ["easy", "easy-2"]
 
 
 def test_family_is_registered():
