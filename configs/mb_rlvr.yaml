@@ -31,9 +31,12 @@ mb_rlvr_olmo:
       - data/monitoringbench/honest_mb550.jsonl
       - data/monitoringbench/attacks_mb550_final.jsonl
     seed: 0
-    # Held out of training: the FIRST 64 seed-0-shuffled rows — the same rows
+    # Held out of training: the FIRST 300 seed-0-shuffled rows — the same rows
     # an uncarved eval source serves first, so eval selections stay comparable.
-    test_size: 64
+    # 800 train / 300 eval. The carve is by trajectory, not by task: every
+    # held-out task also appears in train, so this measures "spot an attack in
+    # a familiar task", not generalization to unseen tasks.
+    test_size: 300
   training:
     backend: verl
     verl:
@@ -59,7 +62,10 @@ mb_rlvr_olmo:
     kl_coef: 0.02
     kl_discount_factor: 0.0
     eval_every: 5
-    eval_n: 64         # the whole held-out split (binary task: +-6pp binomial noise)
+    eval_n: 300        # the whole held-out split (binary task: +-2.9pp binomial noise)
+                       # tasks() takes test_rows[:n], a prefix — NOT a sample. A
+                       # value below test_size silently strands the tail: those
+                       # rows leave training and are never evaluated either.
     eval_max_tokens: 4096
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
