@@ -5,7 +5,7 @@ cadence, wandb x-axis) — the whole point of the flags.
 """
 
 from infra.run_common import resolved_start_step, runner_parser, training_config_kwargs
-from infra.train import Config, _direct_parser
+from infra.train import Config, _direct_parser, _direct_wandb_config_kwargs
 
 
 def _args(extra: list[str]):
@@ -52,14 +52,15 @@ def test_config_kwargs_omit_fields_on_fresh_runs():
     assert "start_step" not in kw and "wandb_run_id" not in kw
 
 
-def test_direct_train_parser_carries_wandb_resume_into_config():
+def test_direct_train_wandb_resume_enables_canonical_project():
     args = _direct_parser().parse_args(
         ["--load", "/workspace/checkpoints/direct/step-00025", "--wandb-resume", "abc123de"]
     )
 
-    cfg = Config(wandb_run_id=args.wandb_resume)
+    cfg = Config(**_direct_wandb_config_kwargs(args))
     assert args.load == "/workspace/checkpoints/direct/step-00025"
     assert cfg.wandb_run_id == "abc123de"
+    assert cfg.wandb_project == "debate-rebuild"
 
 
 def test_loop_range_runs_remaining_steps_only():

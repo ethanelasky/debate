@@ -235,10 +235,24 @@ def _direct_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _direct_wandb_config_kwargs(args: argparse.Namespace) -> dict:
+    from infra.run_common import wandb_config_kwargs
+
+    return {
+        "wandb_run_id": args.wandb_resume,
+        **wandb_config_kwargs(
+            domain="math",
+            run_type="rlvr",
+            experiment="direct",
+            model_path=args.base_model,
+            enabled=args.wandb_project is not None or args.wandb_resume is not None,
+            configured_project=args.wandb_project,
+        ),
+    }
+
+
 def main() -> None:
     args = _direct_parser().parse_args()
-
-    from infra.run_common import wandb_config_kwargs
 
     cfg = Config(
         base_model=args.base_model,
@@ -251,15 +265,7 @@ def main() -> None:
         sampling=SamplingParams(max_tokens=args.max_tokens),
         eval_every=args.eval_every,
         eval_n=args.eval_n,
-        wandb_run_id=args.wandb_resume,
-        **wandb_config_kwargs(
-            domain="math",
-            run_type="rlvr",
-            experiment="direct",
-            model_path=args.base_model,
-            enabled=args.wandb_project is not None,
-            configured_project=args.wandb_project,
-        ),
+        **_direct_wandb_config_kwargs(args),
     )
 
     from infra.backend.tinker import TinkerBackend
