@@ -111,3 +111,82 @@ mb_rlvr_olmo_smoke:
     eval_every: 1
     eval_n: 8
     save_every: 0
+
+# ---- Qwen3.6-35B-A3B arm (2026-08-06) ----
+# The RLVR baseline for the debate experiment whose DEBATER is this same model
+# (judge: Qwen/Qwen3.5-9B). Baseline and debate arm must share one policy, so
+# this supersedes mb_rlvr_olmo as the reference arm; the OLMo arm stays for its
+# recorded curve. Dataset block is a copy of mb_rlvr_olmo's — same normalized
+# pool, same canonical task-disjoint splits; the provenance and the
+# surface-statistic leak notes up there apply here unchanged and are not
+# repeated.
+#
+# BACKEND: tinker, not verl. Tinker hosts this model (and the 9B judge) at
+# max_context_length 65536, and Qwen3.6-35B-A3B is ~70GB in bf16 — it does not
+# fit the single 80GB H100 the OLMo arm trains on, and a verl port would mean
+# FSDP2+LoRA over qwen3_5_moe (hybrid linear attention, 256 experts, VL
+# wrapper, MTP head) on rented multi-GPU hardware. No verl block here: none of
+# those knobs are read on this backend.
+#
+# CONTEXT: measured, not assumed. scripts/mb_prompt_lengths.py over all 1100
+# rows under THIS tokenizer: max 49766 prompt tokens (train), p99 37964,
+# median 16350 — 0/1100 over the 61440 room that 65536 - 4096 leaves. The
+# OLMo-era "~58k" figure was that tokenizer's; Qwen's 248k vocab packs bash
+# transcripts far tighter. Re-run the census before changing model or pool.
+mb_rlvr_qwen36:
+  model: Qwen/Qwen3.6-35B-A3B
+  # Hybrid-thinking model: the template opens a <think> block unless told
+  # otherwise, so no-think is a real setting here rather than a no-op. Verified
+  # against the template at launch (run_rlvr._check_thinking_toggle).
+  enable_thinking: false
+  max_completion_tokens: 4096   # = the eval arm's blind_assessment slot budget
+  dataset:
+    type: monitoringbench
+    files:
+      - data/monitoringbench/honest_mb550_norm.jsonl
+      - data/monitoringbench/attacks_mb550_norm.jsonl
+    seed: 0
+    split_files:
+      train: data/monitoringbench/splits/train_ids.txt
+      test: data/monitoringbench/splits/dev_ids.txt
+  training:
+    backend: tinker
+    wandb_project: debate-mb
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    # datum, NOT the OLMo arm's count. Tinker's losses are token SUMS, so
+    # advantages need the token scaling to get token-mean semantics (verl
+    # aggregates token-mean itself, which is why that arm could leave it off).
+    # Note count is a no-op for single-turn RLVR anyway — one datum per
+    # trajectory means its divisor is always 1.
+    adv_length_norm: datum
+    steps: 100
+    batch_size: 8
+    group_size: 8
+    # The math tinker arms' lr, not the OLMo arm's 1e-4: that one was tuned on
+    # verl, whose aggregation differs by a constant. SWEEP FROM HERE (--lr).
+    lr: 1.0e-5
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    # Datums here carry the whole ~16-50k-token prompt, so the default 64 per
+    # forward_backward is 1-3M tokens in one call. Lower until a step is known
+    # to hold.
+    micro_batch: 8
+    eval_every: 5
+    eval_n: 120        # the WHOLE dev split — see the OLMo arm on why not less
+    eval_max_tokens: 4096
+    save_every: 25
+
+# Live-verification arm, twin of mb_rlvr_olmo_smoke: 2 train steps + an eval
+# pass over the first 8 dev rows. First thing to run — it is what proves tinker
+# will LoRA-train this model at this context, before 100 steps of spend.
+mb_rlvr_qwen36_smoke:
+  _extends: mb_rlvr_qwen36
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 1
+    eval_n: 8
+    save_every: 0
