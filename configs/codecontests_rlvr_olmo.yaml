@@ -183,6 +183,20 @@ codecontests_rlvr_olmo_smoke10:
     eval_n: 32
     save_every: 0
 
+# Cheap learning-signal test on the difficulty slice where the 7B inference
+# smoke produced useful reward variance. Bounds are inclusive: [800, 1100]
+# is Codeforces-rated problems below 1200. The lower bound is essential because
+# GDM records unmatched/unrated problems as cf_rating=0; a bare max would pull
+# 5,189 unknown-difficulty rows into the supposedly easy training set.
+# Inventory: 916 train, 82 held out. The smoke saw 54.5% mixed G=8 groups on
+# this combined slice, versus 21.9% by ratings 1300-1400.
+codecontests_rlvr_olmo_easy_smoke10:
+  _extends: codecontests_rlvr_olmo_smoke10
+  dataset:
+    min_cf_rating: 800
+    max_cf_rating: 1100
+    eval_subset_size: 82
+
 # 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
 # worth reading: the 7B smoke showed the plumbing works but the model is too
 # weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
@@ -208,6 +222,54 @@ codecontests_rlvr_olmo31_32b_phases:
     group_size: 8
     eval_every: 0
     save_every: 0
+
+# 4-GPU variant of the phase run: 8xH200 had no capacity. 32B at TP=4 is
+# 15GB of weights per 141GB card, leaving ~48GB for KV cache inside the 0.45
+# budget. Phase PROPORTIONS shift vs TP=8 (less per-token all-reduce, fewer
+# cards for compute) but the structure is what we are after.
+codecontests_rlvr_olmo31_32b_phases4:
+  _extends: codecontests_rlvr_olmo31_32b_phases
+  training:
+    verl:
+      n_gpus: 4
+      rollout_tp: 4
+
+# Token-cap sweep. Baseline is codecontests_rlvr_olmo31_32b_smoke10:
+# response_length 8192, soft budget 4096 (ratio 1/2). These keep that ratio so
+# only the CAP varies.
+#
+# Offline on 640 real 8192-budget completions, capping truncates the final code
+# block of anything ending past the cap:
+#   cap    passing kept   pass rate   generation cost
+#   1024        49.1%        22.2%          12%
+#   2048        63.3%        28.6%          25%
+#   8192       100.0%        45.2%         100%
+# That bounds the IMMEDIATE cost of truncation. It cannot say how the model
+# behaves when TRAINED under the cap — it may write tighter solutions (loss
+# smaller than measured) or collapse into degenerate short outputs. That is
+# what these runs are for.
+codecontests_rlvr_olmo31_32b_cap2048:
+  _extends: codecontests_rlvr_olmo31_32b_smoke10
+  max_completion_tokens: 2048
+  dataset:
+    soft_token_budget: 1024
+  training:
+    verl:
+      n_gpus: 4
+      rollout_tp: 4
+      response_length: 2048
+      max_token_len_per_gpu: 8192
+    eval_max_tokens: 2048
+
+codecontests_rlvr_olmo31_32b_cap1024:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048
+  max_completion_tokens: 1024
+  dataset:
+    soft_token_budget: 512
+  training:
+    verl:
+      response_length: 1024
+    eval_max_tokens: 1024
 
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
