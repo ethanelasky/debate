@@ -35,6 +35,10 @@ class Config:
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
+    wandb_entity: str | None = None
+    wandb_group: str | None = None
+    wandb_job_type: str | None = None
+    wandb_tags: list[str] = field(default_factory=list)
     log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
     run_name: str | None = None
     # Continuation plumbing: start_step makes the loop run [start_step, steps)
@@ -181,10 +185,21 @@ def _make_logger(cfg: Config):
             # resume="must": appending to the named run is the entire point; a
             # silent fallback to a fresh run would re-split the x-axis.
             run = wandb.init(
-                project=cfg.wandb_project, id=cfg.wandb_run_id, resume="must"
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                id=cfg.wandb_run_id,
+                resume="must",
             )
         else:
-            run = wandb.init(project=cfg.wandb_project, name=cfg.run_name, config=vars(cfg))
+            run = wandb.init(
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                name=cfg.run_name,
+                config=vars(cfg),
+                group=cfg.wandb_group,
+                job_type=cfg.wandb_job_type,
+                tags=cfg.wandb_tags,
+            )
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:
@@ -208,9 +223,11 @@ def main() -> None:
     parser.add_argument("--loss", choices=["ppo", "importance_sampling"], default="ppo")
     parser.add_argument("--eval-every", type=int, default=Config.eval_every)
     parser.add_argument("--eval-n", type=int, default=Config.eval_n)
-    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-project", choices=["debate-rebuild"], default=None)
     parser.add_argument("--load", default=None, help="checkpoint path to resume from")
     args = parser.parse_args()
+
+    from infra.run_common import wandb_config_kwargs
 
     cfg = Config(
         base_model=args.base_model,
@@ -223,7 +240,14 @@ def main() -> None:
         sampling=SamplingParams(max_tokens=args.max_tokens),
         eval_every=args.eval_every,
         eval_n=args.eval_n,
-        wandb_project=args.wandb_project,
+        **wandb_config_kwargs(
+            domain="math",
+            run_type="rlvr",
+            experiment="direct",
+            model_path=args.base_model,
+            enabled=args.wandb_project is not None,
+            configured_project=args.wandb_project,
+        ),
     )
 
     from infra.backend.tinker import TinkerBackend

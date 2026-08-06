@@ -17,6 +17,56 @@ import re
 from infra.backend.base import LossSpec
 
 
+WANDB_ENTITY = "palaestra-research"
+WANDB_PROJECT = "debate-rebuild"
+
+
+def wandb_config_kwargs(
+    *,
+    domain: str,
+    run_type: str,
+    experiment: str,
+    model_path: str,
+    enabled: bool = True,
+    configured_project: str | None = None,
+) -> dict:
+    """Build the canonical W&B metadata passed to :class:`infra.train.Config`.
+
+    Grouping is deliberately independent of ``run_name``: sweep suffixes keep
+    identifying individual runs and checkpoint directories, while every arm
+    of an experiment remains together under ``domain/run_type/experiment``.
+    """
+    components = {
+        "domain": domain,
+        "run_type": run_type,
+        "experiment": experiment,
+    }
+    for label, component in components.items():
+        if not component or not component.strip():
+            raise ValueError(f"W&B group component {label} must not be empty")
+        if "/" in component:
+            raise ValueError(f"W&B group component {label} must not contain '/': {component!r}")
+    if configured_project not in (None, WANDB_PROJECT):
+        raise ValueError(
+            f"W&B project must be {WANDB_PROJECT!r}, got {configured_project!r}"
+        )
+
+    scope = "smoke" if "smoke" in experiment.lower() else "full"
+    return {
+        "wandb_entity": WANDB_ENTITY,
+        "wandb_project": WANDB_PROJECT if enabled else None,
+        "wandb_group": f"{domain}/{run_type}/{experiment}",
+        "wandb_job_type": "train",
+        "wandb_tags": [
+            f"domain:{domain}",
+            f"run_type:{run_type}",
+            f"experiment:{experiment}",
+            f"model:{model_path}",
+            f"scope:{scope}",
+        ],
+    }
+
+
 # Every key the runners actually read out of `training:` — the union of
 # run_debate.main, run_rlvr.main, and build_backend.
 TRAINING_KEYS = {
@@ -84,7 +134,12 @@ def runner_parser(description: str | None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--experiment-file", required=True)
     parser.add_argument("--experiment", required=True)
-    parser.add_argument("--wandb-project", default=None, help="override training.wandb_project")
+    parser.add_argument(
+        "--wandb-project",
+        choices=[WANDB_PROJECT],
+        default=None,
+        help=f"W&B project (organization policy requires {WANDB_PROJECT})",
+    )
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     parser.add_argument("--steps", type=int, default=None, help="override training.steps")
     parser.add_argument("--lr", type=float, default=None, help="override training.lr (sweeps)")

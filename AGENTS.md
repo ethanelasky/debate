@@ -105,6 +105,20 @@ Keys live in `.env` (never committed). Never print key values; enumerate
 names only when verifying. If a needed key is absent, say so and ask — do not
 guess alternate names.
 
+## Weights & Biases organization
+
+- Training runs live in `palaestra-research/debate-rebuild`.
+- Groups use `<domain>/<run_type>/<experiment>`, where `run_type` is `pc` for
+  `infra.run_debate` and `rlvr` for `infra.run_rlvr`. Further breakdowns belong
+  in tags; do not change the run-name/checkpoint identity convention.
+- Fresh runs carry `domain:`, `run_type:`, `experiment:`, `model:`, and
+  `scope:` tags. Resumes append to the existing run and must not rewrite its
+  metadata.
+- Before mutating existing runs through the API, produce and review a dry-run
+  manifest. Tag updates must union new tags with existing tags, never replace
+  the existing set.
+- Never move or delete W&B runs or projects without explicit approval.
+
 <!-- Deliberately NOT ported from ai-debate's AGENTS.md (specific to that
 repo): Obsidian vault protocol, worktree-only rule + main-checkout hook,
 RunPod/verl AI_DEBATE_* runbook, serve_and_eval.sh, run.csv schema notes,

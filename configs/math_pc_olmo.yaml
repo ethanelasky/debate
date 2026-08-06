@@ -71,7 +71,7 @@ math_pc_olmo_l5:
       prompt_length: 8192
       response_length: 1024          # largest slot cap
       max_token_len_per_gpu: 16384
-    wandb_project: debate-math
+    wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1
@@ -163,7 +163,7 @@ math_pc_olmo_l5_g8:
       prompt_length: 8192
       response_length: 2048          # largest slot cap (proposal 2000)
       max_token_len_per_gpu: 16384
-    wandb_project: debate-math
+    wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1

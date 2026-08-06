@@ -50,7 +50,7 @@ mb_rlvr_olmo:
       response_length: 4096
       max_token_len_per_gpu: 65536 # packing unit must fit ONE full-length MB datum
       checkpoint_dir: /workspace/checkpoints
-    wandb_project: debate-mb
+    wandb_project: debate-rebuild
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 1

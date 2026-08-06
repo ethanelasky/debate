@@ -45,6 +45,7 @@ from infra.run_common import (
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
+    wandb_config_kwargs,
 )
 from infra.train import Config, train
 
@@ -195,12 +196,17 @@ def main() -> None:
             temperature=profile.temperature if profile.temperature is not None else 1.0,
             top_p=profile.top_p if profile.top_p is not None else 1.0,
         ),
-        wandb_project=(
-            None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
-        ),
         run_name=run_name,
         chat_template_kwargs=(
             {"enable_thinking": bool(lead.enable_thinking)} if lead.enable_thinking is not None else None
+        ),
+        **wandb_config_kwargs(
+            domain=str((exp.get("dataset") or {}).get("type") or ""),
+            run_type="pc",
+            experiment=args.experiment,
+            model_path=lead.model_file_path,
+            enabled=not args.no_wandb,
+            configured_project=args.wandb_project or tr.get("wandb_project"),
         ),
         **training_config_kwargs(tr, args),
     )

@@ -33,6 +33,7 @@ from infra.run_common import (
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
+    wandb_config_kwargs,
 )
 from infra.train import Config, train
 
@@ -84,10 +85,15 @@ def main() -> None:
     cfg = Config(
         base_model=model_path,
         sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
-        wandb_project=(
-            None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
-        ),
         run_name=run_name,
+        **wandb_config_kwargs(
+            domain=str((exp.get("dataset") or {}).get("type") or ""),
+            run_type="rlvr",
+            experiment=args.experiment,
+            model_path=model_path,
+            enabled=not args.no_wandb,
+            configured_project=args.wandb_project or tr.get("wandb_project"),
+        ),
         **training_config_kwargs(tr, args),
     )
 
