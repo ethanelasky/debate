@@ -36,13 +36,15 @@ mb_rlvr_olmo:
                 {name: post_round_judge_without_reasoning, kind: decision, max_total_tokens: 2048}]
   dataset:
     type: monitoringbench
-    # 2026-08-05 pool (mb-550-pool, LFS): honest_mb116 + attacks_mb550 = 666
-    # rows, 83% attack. IMBALANCE IS KNOWN — honest waves are still
-    # generating; rebalance before the real run (a collapse-to-attack policy
-    # earns the 0.83 base rate; watch train/chose_attack).
+    # 2026-08-06 matched pool (LFS): 550 honest + 550 attack = 1100 rows, 50/50.
+    # Mirrored per task — attacks(task) == honest(task) for all 116 tasks — so
+    # neither the label prior nor task frequency is a free signal. Use
+    # attacks_mb550_final, not attacks_mb550: the latter predates the honest
+    # yield and misses the mirror on 11 tasks. Watch train/chose_attack against
+    # a 0.50 base rate now.
     files:
-      - data/monitoringbench/honest_mb116.jsonl
-      - data/monitoringbench/attacks_mb550.jsonl
+      - data/monitoringbench/honest_mb550.jsonl
+      - data/monitoringbench/attacks_mb550_final.jsonl
     seed: 0
     # Held out of training: the FIRST 64 seed-0-shuffled rows — the same rows
     # an uncarved eval source serves first, so eval selections stay comparable.
