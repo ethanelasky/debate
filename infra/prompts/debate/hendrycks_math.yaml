@@ -1,6 +1,6 @@
 # MATH proposer-critic prompts, rewritten 2026-08-04 (Ethan) in the style of
 # the MonitoringBench pack (infra/prompts/debate/monitoringbench.yaml,
-# mb_debate / mb_debate_choice): tagged blocks (<role>, <game-structure>,
+# mb_debate / mb_debate): tagged blocks (<role>, <game-structure>,
 # <debate-style>, <evaluation-steps>, <important>), short game-like speech
 # rules, concrete verification instructions. The previous wording is gone; only
 # the phrases the tests pin as SEMANTICS (the critic's stance lines, the

@@ -259,9 +259,9 @@ def test_task_meta_contract(tmp_path):
 
     for task in (attack, honest):
         # Task.messages is ALWAYS the rendered blind solo context (the RLVR
-        # prompt): [system: monitor card][user: instructions][user: trajectory].
+        # prompt): [system: monitor card][user: trajectory][user: instructions].
         assert [m["role"] for m in task.messages] == ["system", "user", "user"]
-        assert render_transcript(STEPS) in task.messages[2]["content"]
+        assert render_transcript(STEPS) in task.messages[1]["content"]
         # TOPIC is unused by MB prompts: empty question.
         assert task.meta["question"] == ""
         # SEATING, not correctness: EVERY row binds the attack position to

@@ -1,8 +1,8 @@
-"""Blind side-choice mode (mb_debate_choice + mb_single_consultancy_choice).
+"""Blind side-choice mode (mb_debate + mb_single_consultancy_choice).
 
 The blind first turn is the task family's solo context
-(infra/prompts/tasks/monitoringbench.yaml: [system: monitor card][user: blind
-instructions][user: trajectory]), rendered verbatim by
+(infra/prompts/tasks/monitoringbench.yaml: [system: monitor card][user:
+trajectory][user: blind instructions]), rendered verbatim by
 first_speech_non_debate_aware; the trajectory message doubles as every seat's
 shared pre_debate message (spliced in as <TRAJECTORY_USER>, byte-identical, so
 message-boundary prompt caches can reuse it). The chooser's LATER contexts do
@@ -794,9 +794,9 @@ turns:
 def test_real_blind_view_shape_and_framing():
     """The family's answer-generation config (the solo blind view, single
     source for the RLVR prompt AND the choice arms' spliced blind turn):
-    RLVR-shaped — monitor role card as SYSTEM, short instruction cue, then the
-    trajectory LAST (byte-stable [system][instructions] prefix across rows) —
-    and free of debate framing."""
+    monitor role card as SYSTEM, then the trajectory, then the instruction cue
+    (2026-08-06 order: trajectory precedes the cue, matching the chooser's
+    later debate views) — and free of debate framing."""
     from infra.envs.task_prompts import (
         BACKGROUND_PLACEHOLDER,
         load_generation_prompts,
@@ -808,7 +808,7 @@ def test_real_blind_view_shape_and_framing():
         require_placeholder=BACKGROUND_PLACEHOLDER,
     )
     assert [m["role"] for m in prompts.messages] == ["system", "user", "user"]
-    system, cue, traj = (m["content"] for m in prompts.messages)
+    system, traj, cue = (m["content"] for m in prompts.messages)
     assert prompts.supplied_templates() == {
         "ANSWER_GEN_USER": cue,
         "TRAJECTORY_USER": traj,
@@ -873,7 +873,7 @@ def test_real_choice_entries_cache_invariants():
 
     dbg = load_prompt_library(
         "infra/prompts/debate/monitoringbench.yaml",
-        "mb_debate_choice",
+        "mb_debate",
         MB_DEBATE_CHOICE_TOPO,
     )
     sc = load_prompt_library(
@@ -900,7 +900,7 @@ def test_real_choice_entries_cache_invariants():
 def test_real_config_arms_resolve_offline():
     from infra.config import load_experiment
 
-    for name in ("mb_debate_choice", "mb_single_consultancy_choice"):
+    for name in ("mb_debate", "mb_single_consultancy_choice"):
         exp = load_experiment("configs/mb_eval.yaml", name)
         run_eval.validate_experiment(exp)
         assert exp["first_speech_non_debate_aware"] is True

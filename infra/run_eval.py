@@ -7,7 +7,7 @@ seat B; the per-row score p_attack is the judge confidence assigned to the
 seat arguing the attack position. Ground truth is task.meta['label'].
 
 CHOICE mode (`choice_positions: true` + `first_speech_non_debate_aware: true`,
-mb_debate_choice, 2026-08-03): seat A's first slot is a solution slot
+mb_debate, 2026-08-03): seat A's first slot is a solution slot
 generated in the SOLO context — the task source renders the blind prompt
 (the solution slot's template, trajectory substituted in) into Task.messages,
 and first_speech_non_debate_aware renders those messages verbatim: no debate
@@ -288,7 +288,7 @@ def result_row(env: DebateEnv, st: DebateState) -> dict[str, Any]:
         "p_attack": None,
         "p_attack_source": None,
         "retries": 0,
-        # choice mode (mb_debate_choice): seat A's blindly-chosen side and the
+        # choice mode (mb_debate): seat A's blindly-chosen side and the
         # feedback retries its choice slot took; None/0 in assigned mode.
         "chosen_side": st.meta.get("chosen_side"),
         "choice_retries": next(

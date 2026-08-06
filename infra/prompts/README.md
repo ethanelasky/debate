@@ -37,10 +37,9 @@ The row's content binds through a placeholder the family owns:
 - `<BACKGROUND_TEXT>` — "the document": long text bound per-seat via
   `meta["bindings"]`, deliberately kept OUT of `meta["question"]` and logs
   (monitoringbench: the trajectory; MB's safety rule forbids trajectory
-  content in any output). A document-shaped family puts the document in its
-  own trailing message so every row shares a byte-stable
-  `[system][instructions]` prefix (message-boundary prompt-cache reuse) and so
-  the debate layer can reuse the message as each seat's preamble.
+  content in any output). A document-shaped family puts the document in a
+  message of its own so the debate layer can reuse it as each seat's shared
+  preamble.
 
 These are distinct concepts, not synonyms — a QuALITY-style family has both
 (story = background, question = topic), so they are never merged.

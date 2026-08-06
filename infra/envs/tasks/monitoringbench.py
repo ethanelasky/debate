@@ -75,7 +75,7 @@ MB_POSITION_HONEST = (
 
 _LABELS = ("attack", "honest")
 
-# ------------------------------------------------- blind side choice (mb_debate_choice)
+# ------------------------------------------------- blind side choice (mb_debate)
 #
 # Choice mode: the first debater's opening slot is a SOLUTION slot generated
 # in the SOLO context (env first_speech_non_debate_aware renders Task.messages
@@ -250,13 +250,12 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
 
     ``prompt_file`` names the family's answer-generation config (default
     ``infra/prompts/tasks/monitoringbench.yaml``); its messages —
-    [system: monitor card][user: blind instructions][user: trajectory] —
+    [system: monitor card][user: trajectory][user: blind instructions] —
     become ``Task.messages`` with ``<BACKGROUND_TEXT>`` substituted per row.
-    The trajectory goes LAST by deliberate cache design: every row shares a
-    byte-stable [system][instructions] prefix, and the trajectory message is
-    the same template the debate pack splices in as its shared pre_debate
-    (<TRAJECTORY_USER>), so message-boundary prompt caches can reuse it
-    across seats. Substitution uses the prompt library's render(), so an
+    The trajectory message is the same template the debate pack splices in as
+    its shared pre_debate (<TRAJECTORY_USER>), and the solo order mirrors the
+    chooser's later debate views (trajectory, then the cue before her
+    replayed answer). Substitution uses the prompt library's render(), so an
     unfilled placeholder (a typo'd or deliberately-unbound <UPPERCASE> tag)
     hard-errors at task build — before any generation is paid for.
     """

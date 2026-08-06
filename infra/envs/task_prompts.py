@@ -17,10 +17,10 @@ message list it renders to — one schema for every family:
 
 The row's content binds via a placeholder the FAMILY owns — <PROBLEM> for
 math/codecontests (the problem text, mid-message), <BACKGROUND_TEXT> for
-monitoringbench (the rendered trajectory, a whole trailing message so every
-row shares a byte-stable [system][instructions] prefix for message-boundary
-prompt-cache reuse). The family's source passes its placeholder as
-`require_placeholder`, checked eagerly at load.
+monitoringbench (the rendered trajectory, a whole message of its own so the
+debate layer can reuse it as every seat's shared preamble). The family's
+source passes its placeholder as `require_placeholder`, checked eagerly at
+load.
 
 These messages are the RLVR prompt VERBATIM, and under
 first_speech_non_debate_aware they are also the debate first-slot context — so

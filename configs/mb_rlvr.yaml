@@ -4,8 +4,8 @@
 # infra/envs/tasks/monitoringbench.py reward()). The judge-free baseline for
 # the MB debate-training experiments.
 #
-# PROMPT PARITY: the RLVR context ([system: monitor role card][user: blind
-# instructions][user: trajectory]) comes from the family's answer-generation
+# PROMPT PARITY: the RLVR context ([system: monitor role card][user:
+# trajectory][user: blind instructions]) comes from the family's answer-generation
 # config, infra/prompts/tasks/monitoringbench.yaml — the SAME file the eval
 # arm's choice entries splice their blind view from — so it is byte-identical
 # to the eval arm's blind view for the same row by construction. Edit wording
