@@ -165,35 +165,45 @@ fail: "6 — Every failure we actually hit, and its fix" {
 }
 
 # ------------------------------------------------------------------ proposal
-fix: "7 — The missing piece: pod_create.sh" {
+fix: "7 — What we built in response" {
   p: |||md
-    ## What does not exist yet
+    ## Three scripts, each closing one failure above
 
-    `pod_up.sh` only resumes. There is **no create path in the repo**, which is
-    why creation has been ad-hoc `runpodctl` invocations — and why every mistake
-    above was possible. The gap is one script:
+    **`pod_create.sh`** — creation with a bounded downside.
+    Probe `datacenter list` (read-only) -> refuse unknown `(gpu, image)` pairs ->
+    create into a NAMED datacenter with the volume attached -> **readiness gate**:
+    poll until a port exists AND `ssh pod true` succeeds, deadline ~6 min, then
+    **delete the pod**. That last step is the point: it turns an open-ended bill
+    into a bounded one. Applied to 2026-08-07 it costs **$2 instead of $9**.
+    A volume is datacenter-local, so its DC overrides the probe.
 
-    ```
-    1. runpodctl datacenter list        # read-only capacity probe
-       -> pick DC by stockStatus for the requested gpuType
-    2. refuse unless (gpuType, imageName) is a KNOWN-GOOD pair
-       # the -cluster image ran on H200 and never started on H100
-    3. create --dataCenterId <picked> --networkVolumeId <ours> \
-              --ports '22/tcp' --startSSH
-    4. READINESS GATE, hard deadline ~6 min:
-         runtime.ports populated  AND  `ssh pod true` succeeds
-       on timeout: DELETE THE POD, exit nonzero, print why
-    5. print the ssh command
-    ```
+    **`pod_sync.sh`** — transfer, then prove it.
+    rsync, then sha256 both ends and diff PER FILE. Copy exit status is not
+    evidence: `scp` returned success having moved nothing, and a wheel arrived
+    truncated at 57,446,400 of 62,109,228 bytes. Per-file because GNU
+    `sha256sum` and BSD `shasum` disagree on path prefixes and sort order, so
+    an aggregate hash false-alarms even when every file matches.
 
-    Step 4 is the whole point: it converts an open-ended bill into a bounded
-    one. Applied to 2026-08-07 it would have cost **$2 instead of $9**, and
-    would have surfaced "this image does not start on this GPU" as a hard
-    failure in six minutes rather than a mystery in twenty-two.
-
-    Step 2 needs a recorded table of known-good pairs. We have exactly one
-    confirmed row today: `H200 + runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster`.
+    **`pod_watch.sh`** — a verdict only when one is earned.
+    Two consecutive misses AND past a 12-minute grace before believing a death;
+    completion requires the step COUNT to reach target. Absence is not success.
+    Model load plus graph capture runs ~8 min before the first step line, which
+    is how a healthy run got declared dead at 60 seconds.
   ||| {style.fill: "#eaf5ea"}
+
+  todo: |||md
+    ## Still open
+
+    **The volume exists** — `s3hz0k8153`, 1250 GB, **AP-IN-2**. It pins us to a
+    datacenter that stocks H100 but no H200. Using it means H100; using H200
+    means re-provisioning from scratch on every pod.
+
+    **Why the `-cluster` image never started a container on H100 is unknown.**
+    Both dead pods were created with NO `--dataCenterId`, so they landed
+    wherever RunPod chose — the failure may have been a bad host rather than the
+    GPU family. `pod_create.sh` refuses the pair rather than explaining it;
+    settling it costs one bounded ~$2 attempt.
+  ||| {style.fill: "#fff8e1"}
 }
 
 model -> life: {style.stroke-dash: 2}

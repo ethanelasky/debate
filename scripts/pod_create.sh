@@ -41,7 +41,7 @@ IMAGE="${IMAGE:-runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster}"
 DISK_GB="${DISK_GB:-200}"
 COST_CEILING="${COST_CEILING:-25.0}"
 READY_DEADLINE="${READY_DEADLINE:-420}"   # seconds; ~6min, vs the 22 we burned
-VOLUME_ID="${VOLUME_ID:-}"                # network volume: CANNOT be added later
+VOLUME_ID="${VOLUME_ID:-s3hz0k8153}"      # network volume: CANNOT be added later
 
 # Known-good (gpu, image) pairs. The -cluster image runs on H200 and never
 # started a container on H100 80GB HBM3 -- same arch family, same CUDA, still
@@ -71,22 +71,47 @@ fi
 # ---------------------------------------------------------------- 1. probe
 # Read-only. `create` is NOT a capacity query -- using it as one created two
 # unwanted pods on 2026-08-07.
+# A network volume is DATACENTER-LOCAL: a pod can only mount one in its own DC.
+# So when a volume is requested its DC WINS over the probe -- there is no point
+# finding better stock somewhere the volume cannot follow. That pinning is the
+# real cost of using a volume, and it is worth knowing before stock runs out.
+PINNED_DC=""
+if [ -n "$VOLUME_ID" ]; then
+  PINNED_DC=$(runpodctl network-volume list -o json 2>/dev/null | python3 -c "
+import sys, json
+vid = sys.argv[1]
+for v in json.load(sys.stdin):
+    if v.get('id') == vid:
+        print(v.get('dataCenterId') or '')
+" "$VOLUME_ID") || PINNED_DC=""
+  [ -n "$PINNED_DC" ] || { echo "FATAL: volume $VOLUME_ID not found on this account" >&2; exit 3; }
+  echo "volume $VOLUME_ID pins us to $PINNED_DC"
+fi
+
 echo "probing datacenters for $GPU_COUNT x $GPU_TYPE ..."
 DC=$(runpodctl datacenter list -o json 2>/dev/null | python3 -c "
 import sys, json
-want = sys.argv[1]
+want, pinned = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else '')
 rank = {'High': 0, 'Medium': 1, 'Low': 2}
 best = []
 for dc in json.load(sys.stdin):
+    if pinned and dc['id'] != pinned:
+        continue
     for g in dc.get('gpuAvailability') or []:
         if g.get('gpuId') == want and g.get('stockStatus'):
             best.append((rank.get(g['stockStatus'], 9), dc['id'], g['stockStatus']))
 best.sort()
 if best:
     print(f'{best[0][1]} {best[0][2]}')
-" "$GPU_TYPE") || DC=""
+" "$GPU_TYPE" "$PINNED_DC") || DC=""
 
 if [ -z "$DC" ]; then
+  if [ -n "$PINNED_DC" ]; then
+    echo "FATAL: $PINNED_DC (where volume $VOLUME_ID lives) has no $GPU_TYPE stock." >&2
+    echo "  Either wait, pick a GPU that DC has, or run with VOLUME_ID= (empty) to" >&2
+    echo "  go anywhere -- at the price of re-provisioning from scratch (~80min)." >&2
+    exit 3
+  fi
   echo "FATAL: no datacenter reports stock for $GPU_TYPE. Nothing created." >&2
   echo "  runpodctl datacenter list   # to see what IS available" >&2
   exit 3
@@ -99,6 +124,7 @@ VOL_ARG=(); [ -n "$VOLUME_ID" ] && VOL_ARG=(--networkVolumeId "$VOLUME_ID")
 [ -z "$VOLUME_ID" ] && echo "NOTE: no VOLUME_ID -- \$VOL will be container disk, so provisioning
       (~80min: resolve, flash-attn, 121GB of weights) repeats on every pod and
       a stop wipes it. A volume cannot be attached after creation." >&2
+[ -n "$VOLUME_ID" ] && echo "mounting volume $VOLUME_ID at /workspace"
 
 OUT=$(runpodctl create pod --name "$NAME" --gpuType "$GPU_TYPE" --gpuCount "$GPU_COUNT" \
   --imageName "$IMAGE" --containerDiskSize "$DISK_GB" --dataCenterId "$DC_ID" \
