@@ -95,7 +95,7 @@ MATH_USER = (
     "<problem>What is $1 + 1$?</problem>\n"
     "\n"
     "Requirements:\n"
-    "- Give a rigorous, step-by-step solution.\n"
+    "- Justify your answer in a concise but rigorous way.\n"
     "- End with your final answer as EXACTLY one \\boxed{...} on the last line.\n"
     "\n"
     "Provide your solution:"

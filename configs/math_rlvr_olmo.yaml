@@ -68,11 +68,11 @@ math_rlvr_olmo_l5_plan_nocot:
   dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
 
 # AIME RLVR on the 32B (Ethan, 2026-08-07): plan-then-answer (1000-token
-# private scratchpad, then the answer turn — the MB-style two-phase shape,
-# via PlannedEnv). Step-0 direct QA: 30.1% at a 3000-token cap, truncation-
-# limited (51.6% boxed) — hence the 4096 answer budget. AIME test split is
-# 93 rows; eval_n covers all of it (+-4.7pp binomial noise, so trend calls
-# need bigger moves than the L5 arms did).
+# private scratchpad, then a 1000-token answer — the MB scratchpad arm's
+# shape and budgets, via PlannedEnv). Step-0 direct QA: 30.1% at a 3000-token
+# cap under the old step-by-step prompt. AIME test split is 93 rows; eval_n
+# covers all of it (+-4.7pp binomial noise, so trend calls need bigger moves
+# than the L5 arms did).
 # Hardware: 2xH200 (or 2xB200), fsdp2 + rollout_tp 2 — a 64GB bf16 policy
 # can't colocate FSDP + a rollout replica on one 80-141GB card.
 # Run: HF_HOME=/root/hf bash scripts/pod_run.sh rlvr aime_rlvr_olmo32
@@ -80,7 +80,12 @@ math_rlvr_olmo_l5_plan_nocot:
 # volume's free space, and the volume must stay clear for checkpoints).
 aime_rlvr_olmo32:
   model: allenai/Olmo-3.1-32B-Instruct-DPO
-  max_completion_tokens: 4096
+  # 1000, matching the MB scratchpad arm's budgets (Ethan 2026-08-07): plan
+  # 1000 + answer 1000. The answer prompt asks for concise-but-rigorous
+  # justification, not the old step-by-step derivation; watch eval/has_boxed
+  # at step 0 for truncation regardless (direct QA truncated 48% at 3000
+  # under the old prompt).
+  max_completion_tokens: 1000
   plan_tokens: 1000
   dataset: {type: aime, seed: 0}
   training:
@@ -91,7 +96,7 @@ aime_rlvr_olmo32:
       rollout_tp: 2                # one TP2 rollout replica; 32B weights split across both cards
       gpu_memory_utilization: 0.50
       prompt_length: 4096          # problem + plan cue + up to 1000 plan tokens
-      response_length: 4096
+      response_length: 1024        # covers the 1000-token plan and answer caps
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
     wandb_entity: palaestra-research   # the TEAM (see the base entry's note)
@@ -108,7 +113,7 @@ aime_rlvr_olmo32:
     kl_discount_factor: 0.0
     eval_every: 5
     eval_n: 93         # the whole AIME held-out split
-    eval_max_tokens: 4096
+    eval_max_tokens: 1000
     save_every: 25
 
 # tiny live-verification arm for the 32B AIME arm

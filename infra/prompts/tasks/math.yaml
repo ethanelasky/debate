@@ -41,7 +41,7 @@ messages:
       <problem><PROBLEM></problem>
 
       Requirements:
-      - Give a rigorous, step-by-step solution.
+      - Justify your answer in a concise but rigorous way.
       - End with your final answer as EXACTLY one \boxed{...} on the last line.
 
       Provide your solution:
@@ -54,12 +54,17 @@ messages:
 # surrogate when thinking is off. Wording is arm-neutral on purpose: it
 # renders under the math system card in RLVR and under the debater card in
 # debate, byte-identically (2026-08-06).
+#
+# Scratchpad sentence and the "concise but rigorous" answer requirement are
+# Ethan's wording (2026-08-07): the scratchpad line is monitoringbench.yaml's
+# plan cue VERBATIM, replacing an earlier coached version ("try an approach,
+# do the key computations...") — coaching the scratchpad confounds whether RL
+# learns to use it. L5-era runs (through the 2026-08-06 2x2) used the coached
+# plan cue and the "rigorous, step-by-step" answer line; their numbers are not
+# byte-comparable to arms trained after this change.
 plan: |-
   Consider this mathematics problem.
 
   <problem><PROBLEM></problem>
 
-  This is your PRIVATE scratchpad — nothing you write here is shown to anyone
-  or graded. Work the problem: try an approach, do the key computations, and
-  settle on the answer you will commit to. Notes only; do not write the final
-  solution yet.
+  This is a private scratchpad. You can use this space to reason about the problem before you provide your answer.
