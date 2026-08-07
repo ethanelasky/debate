@@ -385,6 +385,8 @@ codecontests_rlvr_olmo31_32b_cap2048:
 codecontests_rlvr_olmo31_32b_cap2048_long:
   _extends: codecontests_rlvr_olmo31_32b_cap2048
   training:
+    verl:
+      gpu_memory_utilization: 0.40   # 80 GB cards; see cap1024_long
     steps: 100
     eval_every: 10
     eval_n: 256
@@ -402,6 +404,13 @@ codecontests_rlvr_olmo31_32b_cap2048_long:
 codecontests_rlvr_olmo31_32b_cap1024_long:
   _extends: codecontests_rlvr_olmo31_32b_cap1024
   training:
+    verl:
+      # Sized for 80 GB cards (H100), not the 143 GB H200 the earlier arms ran
+      # on. 0.45 x 80 = 36 GB for vLLM against 16 GB of sharded weights (64 GB
+      # bf16 / rollout_tp 4); 0.40 keeps a margin for the FSDP side, whose
+      # observed peak was 42-45 GB reserved. vLLM sleeps during training so the
+      # split is time-multiplexed, but the margin is what stops a step-0 OOM.
+      gpu_memory_utilization: 0.40
     steps: 100
     eval_every: 10
     eval_n: 256
