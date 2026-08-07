@@ -67,6 +67,60 @@ math_rlvr_olmo_l5_plan_nocot:
   _extends: math_rlvr_olmo_l5_plan
   dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
 
+# AIME RLVR on the 32B (Ethan, 2026-08-07): plan-then-answer (1000-token
+# private scratchpad, then the answer turn — the MB-style two-phase shape,
+# via PlannedEnv). Step-0 direct QA: 30.1% at a 3000-token cap, truncation-
+# limited (51.6% boxed) — hence the 4096 answer budget. AIME test split is
+# 93 rows; eval_n covers all of it (+-4.7pp binomial noise, so trend calls
+# need bigger moves than the L5 arms did).
+# Hardware: 2xH200 (or 2xB200), fsdp2 + rollout_tp 2 — a 64GB bf16 policy
+# can't colocate FSDP + a rollout replica on one 80-141GB card.
+# Run: HF_HOME=/root/hf bash scripts/pod_run.sh rlvr aime_rlvr_olmo32
+# (container-disk HF cache: the 65GB download does not fit the shared
+# volume's free space, and the volume must stay clear for checkpoints).
+aime_rlvr_olmo32:
+  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  max_completion_tokens: 4096
+  plan_tokens: 1000
+  dataset: {type: aime, seed: 0}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 2
+      strategy: fsdp2
+      rollout_tp: 2                # one TP2 rollout replica; 32B weights split across both cards
+      gpu_memory_utilization: 0.50
+      prompt_length: 4096          # problem + plan cue + up to 1000 plan tokens
+      response_length: 4096
+      max_token_len_per_gpu: 16384
+      checkpoint_dir: /workspace/checkpoints
+    wandb_entity: palaestra-research   # the TEAM (see the base entry's note)
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5
+    eval_n: 93         # the whole AIME held-out split
+    eval_max_tokens: 4096
+    save_every: 25
+
+# tiny live-verification arm for the 32B AIME arm
+aime_rlvr_olmo32_smoke:
+  _extends: aime_rlvr_olmo32
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0
+
 # tiny live-verification arm
 math_rlvr_olmo_smoke:
   _extends: math_rlvr_olmo_l5
