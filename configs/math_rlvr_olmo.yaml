@@ -94,6 +94,7 @@ aime_rlvr_olmo32:
       response_length: 4096
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
+    wandb_entity: palaestra-research   # the TEAM (see the base entry's note)
     wandb_project: debate-math
     lora_rank: 32
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
