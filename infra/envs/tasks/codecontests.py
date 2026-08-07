@@ -59,22 +59,34 @@ too. The model reading them off the statement is the intended setting, and it
 is part of why this reward is weak. Private tests never appear there.
 
 ===========================================================================
-OFFLINE ACCURACY (the primary ground truth)
+THE TWO EVAL SUITES (both graded in-run)
 ===========================================================================
 
-truth_tests is a cheap in-run signal that exists for only a third of
-problems. The real accuracy pass happens AFTER a run, locally, with no GPU or
-API cost:
+Evaluation runs the held-out split against TWO independent test suites and
+reports each separately, so the same policy is measured by a weak in-
+distribution suite and a strong out-of-distribution one on the same axis:
 
-  1. Training writes every rollout to docent/step-NNNNN.jsonl
-     (run_debate.py wires on_rollout -> docent_export). Each record contains
-     the full text of every speech, so the proposer's program is in there
-     verbatim, plus meta["name"] as a stable problem key.
-  2. Offline, re-extract the program from each proposal, run it against
-     CodeContests-O's corner cases, and recompute proposer and judge accuracy.
+  cc_eval    every public+private case DeepMind ships for that problem. Same
+             KIND of test the RLVR arm trains on, so this is the in-
+             distribution number: it says how well the policy does on the
+             signal it was optimized against, on problems it never saw. Note
+             this is ALL the cases, not the <=10 sample rlvr_tests draws --
+             on a held-out problem there is no reward suite to stay disjoint
+             from, so nothing has to be held back.
 
-This is worth the extra step because CCO's tests are much stronger, and
-running them during training would be slow (see the dataset note below).
+  cco_eval   CodeContests-O's corner cases (~34 per problem, inputs at the
+             problem's real constraint limits). Much stronger: it catches
+             wrong-but-plausible solutions that pass DeepMind's small cases.
+             Covers 460 of our 501 held-out problems (91.8%).
+
+The gap between the two curves is the quantity of interest. A policy that
+climbs on cc_eval while flat on cco_eval is learning to satisfy small tests
+rather than to solve problems.
+
+Both are graded during the run rather than reconstructed afterwards, so the
+curves are live in wandb and overlayable. Eval is 256 completions every 10
+steps, not the 64-per-step of training, which is what makes CCO's heavier
+cases affordable here.
 
 ===========================================================================
 HOW THE VERIFIER WORKS
@@ -127,15 +139,18 @@ WHICH DATASET, AND WHY THREE OF THEM EXIST
       the problem's real constraint limits: median input 518 bytes but
       reaching 690 KB on problems where scale matters, vs DeepMind's 45.
       That is why it catches wrong-but-plausible solutions that pass small
-      tests — and why it costs ~1.3 MB per problem to run. Used offline only.
+      tests — and why it costs ~1.3 MB per problem to run. Affordable at eval
+      (256 problems every 10 steps), which is why cco_eval is graded in-run;
+      it would NOT be affordable as a training reward at 64 rollouts a step.
+      Extracted for the held-out split only: 460 of 501 problems, ~600 MB.
 
   CodeContests+ (ByteDance-Seed)  — a third regeneration, ~27 cases with
-      validated true-positive/true-negative rates. NOT used: its test data is
-      ~11.5 MB per problem (130 GB for the config), and it is not what the
-      earlier inference runs used. See docs/codecontests-dataset-provenance.md.
+      validated true-positive/true-negative rates. NOT used: 951 GB across
+      five configs (46 GB for the smallest), and it is not what the earlier
+      inference runs used. See docs/codecontests-dataset-provenance.md.
 
-The short version: DeepMind = small and free, CCO = strong and expensive, and
-the design trains on the cheap one while measuring with the strong one.
+The short version: DeepMind = small and free, CCO = strong and affordable at
+eval scale. The design trains on the cheap suite and measures with both.
 """
 
 from __future__ import annotations
@@ -554,7 +569,7 @@ def _load_rows(path: str) -> list[dict[str, Any]]:
     logger.info(
         "codecontests rows from %s: total=%d kept=%d dropped=%d "
         "(no_rlvr_suite=%d len_mismatch=%d); %d/%d have a non-empty truth "
-        "suite (the rest are gradeable only by the offline CCO pass)",
+        "suite (the rest are covered by cco_eval)",
         path, n_total, len(rows), n_no_rlvr + n_len_mismatch,
         n_no_rlvr, n_len_mismatch, n_truth, len(rows),
     )
@@ -674,7 +689,7 @@ class CodeContestsEnv(SingleTurnEnv):
         #
         # Both suites ride in meta for the graders to read. They are verifier
         # inputs, not public examples: nothing renders them. `name` is the
-        # stable key the offline CCO accuracy pass joins on, so it must stay a
+        # stable key the CCO eval suite joins on, so it must stay a
         # scalar (docent_export keeps scalars and drops lists — which is also
         # what keeps the suites out of exported transcripts).
         return Task(
@@ -798,8 +813,8 @@ class CodeContestsFamily(TaskFamily):
         when a problem has no truth suite (~66% of them — the <=10 sample
         consumed every case). Deliberately no fallback to rlvr_tests: on an
         RLVR-trained policy that would be scoring the training signal and
-        would read as inflated accuracy. Those problems get their label from
-        the offline CodeContests-O pass instead (see the module docstring)."""
+        would read as inflated accuracy. Those problems are covered by the
+        cco_eval suite instead (see the module docstring)."""
         if solution is None:
             return None
         inputs, outputs = meta.get("truth_inputs"), meta.get("truth_outputs")

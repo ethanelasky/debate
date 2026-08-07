@@ -19,18 +19,26 @@ Two independent suites per problem, kept separate on purpose:
                OFTEN EMPTY, and that is fine: the median problem has only ~4
                public+private cases, so a <=10 sample usually consumes them
                all. Requiring a non-empty remainder dropped 30% of problems --
-               the typical ones -- which is why it is not required. The real
-               ground truth is the offline CCO pass; this suite is a free
-               in-run signal on the minority of problems rich enough to spare
-               cases.
+               the typical ones -- which is why it is not required.
 
-The debate arm uses NEITHER at training time (its reward is judge-only); both
-arms are scored on truth_tests afterwards.
+The debate arm uses NEITHER at training time (its reward is judge-only).
 
-CodeContests-O corner cases are the higher-quality ground truth (inputs at the
-problem's real constraint limits rather than DeepMind's small mutations), but
-they run to megabytes per problem. They are applied OFFLINE to exported
-transcripts after a run, not here — see docs/codecontests-dataset-provenance.md.
+The HELD-OUT split additionally carries two eval suites, which exist only
+there and are never touched during training:
+
+  cc_eval      every public+private case for that problem, not the <=10
+               sample. On a held-out problem there is no reward suite to stay
+               disjoint from, so nothing has to be held back. This is the
+               in-distribution eval: the same KIND of test the RLVR arm
+               trains on, on problems it never saw.
+
+  cco_eval     CodeContests-O corner cases (~34 per problem, inputs at the
+               problem's real constraint limits rather than DeepMind's small
+               mutations). Much stronger, and it covers 460 of the 501
+               held-out problems. Built by scripts/fetch_cco_eval.py, which
+               reads only the columns it needs so the 324 GB of CCO never
+               moves. Both suites are graded in-run, giving two overlayable
+               accuracy curves -- see docs/codecontests-dataset-provenance.md.
 
 Usage:
     python scripts/build_codecontests_rlvr.py --out data/codecontests
