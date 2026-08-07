@@ -41,7 +41,8 @@ IMAGE="${IMAGE:-runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster}"
 DISK_GB="${DISK_GB:-200}"
 COST_CEILING="${COST_CEILING:-25.0}"
 READY_DEADLINE="${READY_DEADLINE:-420}"   # seconds; ~6min, vs the 22 we burned
-VOLUME_ID="${VOLUME_ID:-s3hz0k8153}"      # network volume: CANNOT be added later
+VOLUME_ID="${VOLUME_ID-s3hz0k8153}"       # `-` not `:-`: VOLUME_ID= (empty) must mean
+                                          # "no volume", not "use the default". CANNOT be added later.
 
 # Known-good (gpu, image) pairs. The -cluster image runs on H200 and never
 # started a container on H100 80GB HBM3 -- same arch family, same CUDA, still
@@ -89,7 +90,12 @@ for v in json.load(sys.stdin):
 fi
 
 echo "probing datacenters for $GPU_COUNT x $GPU_TYPE ..."
-DC=$(runpodctl datacenter list -o json 2>/dev/null | python3 -c "
+# ALL candidates, best stock first -- not just the best one. A datacenter can
+# report stock and still refuse the create: "Low" is a per-GPU signal and says
+# nothing about whether GPU_COUNT of them are free TOGETHER on one host. AP-JP-1
+# reported Low for H200 and refused a 4-GPU create in the same breath. Trying a
+# single DC and giving up turns a transient shortage into a hard failure.
+DCS=$(runpodctl datacenter list -o json 2>/dev/null | python3 -c "
 import sys, json
 want, pinned = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else '')
 rank = {'High': 0, 'Medium': 1, 'Low': 2}
@@ -101,37 +107,34 @@ for dc in json.load(sys.stdin):
         if g.get('gpuId') == want and g.get('stockStatus'):
             best.append((rank.get(g['stockStatus'], 9), dc['id'], g['stockStatus']))
 best.sort()
-if best:
-    print(f'{best[0][1]} {best[0][2]}')
-" "$GPU_TYPE" "$PINNED_DC") || DC=""
+for _, dc_id, stock in best:
+    print(f'{dc_id}:{stock}')
+" "$GPU_TYPE" "$PINNED_DC") || DCS=""
 
-if [ -z "$DC" ]; then
-  if [ -n "$PINNED_DC" ]; then
-    echo "FATAL: $PINNED_DC (where volume $VOLUME_ID lives) has no $GPU_TYPE stock." >&2
-    echo "  Either wait, pick a GPU that DC has, or run with VOLUME_ID= (empty) to" >&2
-    echo "  go anywhere -- at the price of re-provisioning from scratch (~80min)." >&2
-    exit 3
-  fi
-  echo "FATAL: no datacenter reports stock for $GPU_TYPE. Nothing created." >&2
-  echo "  runpodctl datacenter list   # to see what IS available" >&2
-  exit 3
-fi
-DC_ID="${DC%% *}"; DC_STOCK="${DC##* }"
-echo "  -> $DC_ID (stock: $DC_STOCK)"
+echo "  candidates: $(echo "$DCS" | tr '\n' ' ')"
 
 # ---------------------------------------------------------------- 2. create
+# macOS ships bash 3.2, where expanding an EMPTY array under `set -u` is an
+# "unbound variable" error rather than nothing. The ${arr[@]+"${arr[@]}"} guard
+# is what makes the no-volume path work at all.
 VOL_ARG=(); [ -n "$VOLUME_ID" ] && VOL_ARG=(--networkVolumeId "$VOLUME_ID")
 [ -z "$VOLUME_ID" ] && echo "NOTE: no VOLUME_ID -- \$VOL will be container disk, so provisioning
       (~80min: resolve, flash-attn, 121GB of weights) repeats on every pod and
       a stop wipes it. A volume cannot be attached after creation." >&2
 [ -n "$VOLUME_ID" ] && echo "mounting volume $VOLUME_ID at /workspace"
 
-OUT=$(runpodctl create pod --name "$NAME" --gpuType "$GPU_TYPE" --gpuCount "$GPU_COUNT" \
-  --imageName "$IMAGE" --containerDiskSize "$DISK_GB" --dataCenterId "$DC_ID" \
-  --secureCloud --startSSH --ports '22/tcp' --cost "$COST_CEILING" "${VOL_ARG[@]}" 2>&1) || {
-    echo "FATAL: create refused:" >&2; echo "$OUT" >&2; exit 4; }
-POD=$(printf '%s' "$OUT" | sed -n 's/.*pod "\([a-z0-9]*\)" created.*/\1/p')
-[ -n "$POD" ] || { echo "FATAL: create returned no pod id:" >&2; echo "$OUT" >&2; exit 4; }
+POD=""; DC_ID=""
+for cand in $DCS; do
+  try_dc="${cand%%:*}"
+  echo "  trying $try_dc (${cand##*:}) ..."
+  OUT=$(runpodctl create pod --name "$NAME" --gpuType "$GPU_TYPE" --gpuCount "$GPU_COUNT" \
+    --imageName "$IMAGE" --containerDiskSize "$DISK_GB" --dataCenterId "$try_dc" \
+    --secureCloud --startSSH --ports '22/tcp' --cost "$COST_CEILING" ${VOL_ARG[@]+"${VOL_ARG[@]}"} 2>&1) || OUT="$OUT"
+  POD=$(printf '%s' "$OUT" | sed -n 's/.*pod "\([a-z0-9]*\)" created.*/\1/p')
+  if [ -n "$POD" ]; then DC_ID="$try_dc"; break; fi
+  echo "    refused: $(printf '%s' "$OUT" | grep -i error | head -1)"
+done
+[ -n "$POD" ] || { echo "FATAL: every candidate datacenter refused $GPU_COUNT x $GPU_TYPE. Nothing created." >&2; exit 4; }
 echo "created $POD in $DC_ID -- billing has STARTED"
 
 # ---------------------------------------------------------------- 3. readiness
