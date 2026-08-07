@@ -80,14 +80,21 @@ store: "3 — Storage: what survives what" {
     `uv/cache`, `wheels/`.
 
     **Survives stop AND remove.** Bills ~$0.07/GB/month while idle.
-    Attached at create with `--networkVolumeId`; **cannot be added later.**
+    Attached at create with `--networkVolumeId`; **cannot be added later**, and
+    it is DATACENTER-LOCAL — only six datacenters offer both volumes and H200.
+
+    **Reachable without any pod**, over S3:
+    `https://s3api-<dc-lowercased>.runpod.io`, bucket = volume id, using S3
+    credentials from the console (not the API key). Seed it, migrate it between
+    regions, or pull checkpoints off it from a laptop. Renting a GPU to run
+    `rsync` is paying a GPU rate to move bytes.
   ||| {style.fill: "#eaf5ea"}
 
   note: |||md
-    We have been running with **no network volume**, so `/workspace` was just
+    Every run so far has had **no network volume**, so `/workspace` was just
     container disk. That single fact explains the ~80 min of cold provisioning
     on every pod, and why every stop had to be a remove preceded by a manual
-    evacuation.
+    evacuation — an evacuation the S3 endpoint would have made unnecessary.
   ||| {style.fill: "#fff8e1"}
 }
 
@@ -157,6 +164,7 @@ fail: "6 — Every failure we actually hit, and its fix" {
     | accidentally created 2 pods while "probing" | used `create` as a query | `datacenter list` / `gpu list` are the read-only probes |
     | 45 min rebuilding flash-attn | no wheel input | `FLASH_ATTN_WHEEL=` (landed), and a network volume |
     | ~80 min cold provisioning, every time | no network volume | attach one at create — **it cannot be added later** |
+    | about to rebuild an env that already exists elsewhere | assumed a volume needs a pod to touch | it does not: S3 endpoint, no GPU, no hourly rate |
     | truncated wheel transfer; silent `scp` failure | trusted exit codes | `rsync` + sha256 both directions |
     | watcher declared a live run dead | process absence read as death | require a step line or 2 consecutive misses past an 8 min grace |
     | idle pod billing after a run | no watchdog armed | `pod_idle_stop.sh`, started by `pod_run.sh` |

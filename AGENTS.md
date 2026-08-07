@@ -96,6 +96,19 @@ it again. Pass `FLASH_ATTN_WHEEL=` a wheel from a previous pod to skip the build
 — there is no published wheel for torch 2.11+cu130, so a previous pod is the
 only source, and the wheel is ABI-tied to that exact python/torch/CUDA.
 
+**A network volume does not need a pod to read or write it.** RunPod serves them
+over an S3-compatible API at `https://s3api-<datacenter-lowercased>.runpod.io`
+(e.g. `s3api-us-ca-2.runpod.io`), with the volume id as the bucket and S3
+credentials generated in the console — separate from the regular API key. So use
+an S3 client from anywhere: no pod, no GPU, no hourly rate. Renting a GPU to run
+`rsync` is paying a GPU rate to move bytes.
+
+This is also how a volume gets seeded or migrated. Volumes are datacenter-local
+and not every datacenter offers them, so a GPU available only elsewhere forces a
+new region; COPY the built environment across rather than rebuilding it.
+Rebuilding costs the resolve, the flash-attn build and a re-download of every
+weight, at GPU prices, to re-derive an environment already known to work.
+
 A trainer is not dead because its process is absent: model load plus CUDA graph
 capture runs ~8 min before `pod_run.sh` execs it. Require a written step line or
 a repeated observation before concluding anything about a run's state.

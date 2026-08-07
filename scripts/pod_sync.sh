@@ -36,18 +36,26 @@ REMOTE="root@$IP"
 # GNU sha256sum (pod) and BSD shasum (mac) differ in path prefixes and default
 # sort order, so an aggregate hash of the two disagrees even when every file
 # matches -- that exact false alarm cost a round of panic. Compare per file.
-remote_sums() { $SSH "$REMOTE" "cd $1 && find . -type f $2 -exec sha256sum {} \; | sed 's#  \./#  #' | LC_ALL=C sort -k2"; }
-local_sums()  { (cd "$1" && find . -type f $2 -exec shasum -a 256 {} \; | sed 's#  \./#  #' | LC_ALL=C sort -k2); }
+#
+# Exclusions live in `find`, not in a grep afterwards. Two attempts at grepping
+# failed for two different reasons -- an unparenthesised `-name a -o -name b
+# -exec` group binds -exec only to the last branch (empty list on macOS), and
+# then `^\.venv/` anchored against "<hash>  <path>" matches the HASH column, not
+# the path. Both "failed" a sync that had actually worked. -not -path cannot
+# make either mistake.
+PRUNE='-not -path "./.git/*" -not -path "./.venv/*" -not -path "./data/*" -not -path "./.claude/*" -not -path "*/__pycache__/*"'
+CODE='\( -name "*.py" -o -name "*.yaml" -o -name "*.sh" \)'
+remote_sums() { $SSH "$REMOTE" "cd $1 && find . -type f $PRUNE $CODE -exec sha256sum {} \; | sed 's#  \./#  #' | LC_ALL=C sort -k2"; }
+local_sums()  { (cd "$1" && eval "find . -type f $PRUNE $CODE -exec shasum -a 256 {} \;" | sed 's#  \./#  #' | LC_ALL=C sort -k2); }
 
 echo "== repo -> $REMOTE:/root/debate"
 rsync -a --delete -e "$RSH" \
-  --exclude '.git' --exclude 'data' --exclude '.venv' --exclude '__pycache__' \
+  --exclude '.git' --exclude '.claude' --exclude 'data' --exclude '.venv' --exclude '__pycache__' \
   --exclude 'outputs' --exclude 'docent' --exclude 'rollouts' --exclude 'wandb' \
   "$REPO_ROOT/" "$REMOTE:/root/debate/"
 
 echo "== verifying repo"
-diff <(local_sums "$REPO_ROOT" "-name '*.py' -o -name '*.yaml' -o -name '*.sh'" | grep -v '/\.git/\|/\.venv/\|/data/\|__pycache__' || true) \
-     <(remote_sums /root/debate "-name '*.py' -o -name '*.yaml' -o -name '*.sh'" | grep -v '__pycache__' || true) \
+diff <(local_sums "$REPO_ROOT") <(remote_sums /root/debate) \
   > /tmp/pod_sync_repo.diff 2>&1 && echo "   repo OK" || {
     echo "FATAL: repo mismatch after sync -- first lines:" >&2; head -20 /tmp/pod_sync_repo.diff >&2; exit 3; }
 
@@ -61,8 +69,8 @@ if [ "$WITH_DATA" = "--with-data" ]; then
     "$REPO_ROOT/data/codecontests/" "$REMOTE:/root/debate/data/codecontests/"
 
   echo "== verifying datasets"
-  diff <(local_sums "$REPO_ROOT/data/codecontests" "") \
-       <(remote_sums /root/debate/data/codecontests "") \
+  diff <(cd "$REPO_ROOT/data/codecontests" && find . -type f -exec shasum -a 256 {} \; | sed 's#  \./#  #' | LC_ALL=C sort -k2) \
+       <($SSH "$REMOTE" "cd /root/debate/data/codecontests && find . -type f -exec sha256sum {} \; | sed 's#  \./#  #' | LC_ALL=C sort -k2") \
     > /tmp/pod_sync_data.diff 2>&1 && echo "   datasets OK" || {
       echo "FATAL: dataset mismatch after sync:" >&2; head -20 /tmp/pod_sync_data.diff >&2; exit 4; }
 fi
