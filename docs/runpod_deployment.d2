@@ -1,0 +1,204 @@
+# How RunPod actually behaves, and where our deployment breaks.
+# Grounded in scripts/{pod_up,provision_pod,pod_run,pod_idle_stop}.sh and in the
+# failures of 2026-08-06/07, which are annotated with what they cost.
+# Render: d2 docs/runpod_deployment.d2 docs/runpod_deployment.svg
+
+direction: down
+
+title: |||md
+  # RunPod deployment: the model, the money, and the failure modes
+
+  Two ideas drive almost every mistake below.
+  **(1) `desiredStatus: RUNNING` is a WISH, not an observation** — it is what we
+  asked for, not what happened. Billing follows the wish; the container may never
+  start. **(2) Only the network volume survives a stop.** Everything else is a
+  consequence of those two.
+||| {near: top-center}
+
+# ------------------------------------------------------------------ object model
+model: "1 — What a pod IS" {
+  style.stroke-dash: 3
+
+  m: |||md
+    ## Three nested things, each with its own failure mode
+
+    | layer | we choose | it can fail by |
+    |---|---|---|
+    | **datacenter** | `--dataCenterId` | having no capacity for the GPU |
+    | **machine** | *nothing* — RunPod picks | being in a maintenance window |
+    | **container** | `--imageName` | never starting on that GPU family |
+
+    We only ever control the ends. The MACHINE is assigned, which is why
+    `pod_up.sh` polls `myself.pods.machine.maintenance*` before resuming: a pod
+    started into a maintenance window bills while its volume is unreachable.
+  |||
+}
+
+# ------------------------------------------------------------------ lifecycle
+life: "2 — Lifecycle, and exactly where money starts" {
+  direction: right
+
+  created: "create accepted\npod id returned"
+  billing: "**BILLING STARTS**\ndesiredStatus RUNNING" {style.fill: "#fdecea"; style.stroke: "#c0392b"}
+  pulling: "image pull +\ncontainer start"
+  live: "runtime != null\nruntime.ports populated" {style.fill: "#eaf5ea"}
+  usable: "SSH answers\n= actually usable" {style.fill: "#eaf5ea"}
+
+  created -> billing -> pulling -> live -> usable
+
+  gap: |||md
+    ## The gap that cost us $9
+
+    Billing begins at **RUNNING**. Usability begins three states later. Nothing
+    in the API forces the middle to ever complete, and `runpodctl pod list`
+    reports `RUNNING` the whole time.
+
+    On 2026-08-07 two H100 pods sat in that gap for **13 and 22 minutes** and
+    never left it — `runtime: null`, `ports: []`, and the SSH proxy answering
+    `container not found`. They billed the entire time.
+
+    **The only honest readiness test is a command that runs ON the pod.**
+    `desiredStatus` cannot distinguish "booting" from "never going to boot".
+  ||| {style.fill: "#fdecea"; style.stroke: "#c0392b"}
+}
+
+# ------------------------------------------------------------------ storage
+store: "3 — Storage: what survives what" {
+  direction: right
+
+  disk: |||md
+    ### Container disk — `/root`
+    Holds the synced repo (`/root/debate`), logs, run outputs.
+
+    **WIPED on stop.** Destroyed on remove.
+    Sized by `--containerDiskSize` (we use 200 GB).
+  ||| {style.fill: "#fdecea"}
+
+  vol: |||md
+    ### Network volume — `/workspace`
+    `$VOL` in every script. Holds `envs/verl-main`, `hf/` (121 GB of weights),
+    `uv/cache`, `wheels/`.
+
+    **Survives stop AND remove.** Bills ~$0.07/GB/month while idle.
+    Attached at create with `--networkVolumeId`; **cannot be added later.**
+  ||| {style.fill: "#eaf5ea"}
+
+  note: |||md
+    We have been running with **no network volume**, so `/workspace` was just
+    container disk. That single fact explains the ~80 min of cold provisioning
+    on every pod, and why every stop had to be a remove preceded by a manual
+    evacuation.
+  ||| {style.fill: "#fff8e1"}
+}
+
+# ------------------------------------------------------------------ access
+access: "4 — Two ways in, and they fail differently" {
+  direction: right
+
+  tcp: |||md
+    ### Direct TCP
+    `--ports '22/tcp'` -> `runtime.ports[]` gives `ip:publicPort`.
+
+    Fast, supports `rsync`/`scp`. **Requires `runtime` to exist**, so it is
+    useless in exactly the failure above.
+    `scp` also silently fails host-key verification where `rsync -e ssh` with
+    the right flags succeeds — checksum every transfer, never trust exit codes.
+  |||
+
+  proxy: |||md
+    ### SSH proxy
+    `<podId>-<hash>@ssh.runpod.io`, needs `--startSSH` and a PTY (`ssh -tt`).
+
+    Works without any port mapping, which makes it the **diagnostic** channel:
+    it distinguishes "no route" from `container not found`. That is how the
+    2026-08-07 pods were finally diagnosed.
+  |||
+}
+
+# ------------------------------------------------------------------ pipeline
+pipe: "5 — Our script pipeline" {
+  direction: down
+
+  up: |||md
+    **`pod_up.sh`** — RESUME only, no create path.
+    Gates on maintenance windows (only visible on the authenticated GraphQL
+    API; the public status page omits them). Exit 8 is the one that means money.
+  |||
+  prov: |||md
+    **`provision_pod.sh`** — builds `$VOL/envs/verl-main`.
+    Joint vllm+verl resolve (~25 min), three source patches, flash-attn
+    (**~45 min from source, ~1s with `FLASH_ATTN_WHEEL=`**), sanity import gate.
+    Every step bounded by `timeout(1)`.
+  |||
+  run: |||md
+    **`pod_run.sh`** — launch lock, trainer guard, judge vLLM (debate mode),
+    then `exec`s the trainer and starts the idle watchdog.
+    Model load + CUDA graph capture takes **~8 min before the first step line** —
+    a trainer is not dead because its process is briefly absent.
+  |||
+  idle: |||md
+    **`pod_idle_stop.sh`** — STOPS, never removes. Evacuates `/root` to
+    `/workspace` first, because stop wipes the container disk.
+    Destroying a pod stays a human decision.
+  |||
+
+  up -> prov -> run -> idle
+}
+
+# ------------------------------------------------------------------ failures
+fail: "6 — Every failure we actually hit, and its fix" {
+  f: |||md
+    ## Observed, with cost
+
+    | failure | root cause | fix |
+    |---|---|---|
+    | "no instances available" | no `--dataCenterId`; RunPod picked a region with no stock. **H200 was available in 7 DCs the whole time** | query `runpodctl datacenter list` first, create into a named DC |
+    | pod bills, container never starts (**~$9**) | trusted `desiredStatus: RUNNING` | readiness gate: poll for `runtime.ports` **and** a successful remote command; auto-delete on deadline |
+    | accidentally created 2 pods while "probing" | used `create` as a query | `datacenter list` / `gpu list` are the read-only probes |
+    | 45 min rebuilding flash-attn | no wheel input | `FLASH_ATTN_WHEEL=` (landed), and a network volume |
+    | ~80 min cold provisioning, every time | no network volume | attach one at create — **it cannot be added later** |
+    | truncated wheel transfer; silent `scp` failure | trusted exit codes | `rsync` + sha256 both directions |
+    | watcher declared a live run dead | process absence read as death | require a step line or 2 consecutive misses past an 8 min grace |
+    | idle pod billing after a run | no watchdog armed | `pod_idle_stop.sh`, started by `pod_run.sh` |
+    | 10-step arms overwrote each other's rollouts | shared output dir | per-run namespacing (landed in the merge) |
+  ||| {style.fill: "#fdecea"}
+}
+
+# ------------------------------------------------------------------ proposal
+fix: "7 — The missing piece: pod_create.sh" {
+  p: |||md
+    ## What does not exist yet
+
+    `pod_up.sh` only resumes. There is **no create path in the repo**, which is
+    why creation has been ad-hoc `runpodctl` invocations — and why every mistake
+    above was possible. The gap is one script:
+
+    ```
+    1. runpodctl datacenter list        # read-only capacity probe
+       -> pick DC by stockStatus for the requested gpuType
+    2. refuse unless (gpuType, imageName) is a KNOWN-GOOD pair
+       # the -cluster image ran on H200 and never started on H100
+    3. create --dataCenterId <picked> --networkVolumeId <ours> \
+              --ports '22/tcp' --startSSH
+    4. READINESS GATE, hard deadline ~6 min:
+         runtime.ports populated  AND  `ssh pod true` succeeds
+       on timeout: DELETE THE POD, exit nonzero, print why
+    5. print the ssh command
+    ```
+
+    Step 4 is the whole point: it converts an open-ended bill into a bounded
+    one. Applied to 2026-08-07 it would have cost **$2 instead of $9**, and
+    would have surfaced "this image does not start on this GPU" as a hard
+    failure in six minutes rather than a mystery in twenty-two.
+
+    Step 2 needs a recorded table of known-good pairs. We have exactly one
+    confirmed row today: `H200 + runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster`.
+  ||| {style.fill: "#eaf5ea"}
+}
+
+model -> life: {style.stroke-dash: 2}
+life -> store: {style.stroke-dash: 2}
+store -> access: {style.stroke-dash: 2}
+access -> pipe: {style.stroke-dash: 2}
+pipe -> fail: {style.stroke-dash: 2}
+fail -> fix: {style.stroke-dash: 2}
