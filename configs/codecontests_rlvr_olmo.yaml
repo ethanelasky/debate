@@ -18,23 +18,24 @@ codecontests_rlvr_olmo:
   dataset:
     type: codecontests
     path: data/codecontests/train.jsonl
-    test_path: data/codecontests/test.jsonl
-    # Second eval suite: CCO corner cases for the held-out problems, capped
-    # exactly like the reward suite (<=10 cases, 500 KB each, 2 MB total) so the
-    # two eval curves differ in WHICH dataset generated the tests and nothing
-    # else. Setting this restricts eval to the 456 problems present in both, so
-    # eval/correct and eval/cco_correct score the same problems.
+    # Self-contained held-out intersection. Every row carries the same problem
+    # plus explicitly named <=10-case GDM and CCO suites, so one greedy
+    # completion produces overlayable eval/gdm_correct and eval/cco_correct.
+    # There is no runtime sidecar join.
     #   python scripts/fetch_cco_eval.py
-    cco_eval_path: data/codecontests/cco_eval.jsonl
+    #   python scripts/build_codecontests_paired_eval.py
+    paired_test_path: data/codecontests/paired_test.jsonl
     relaxed_extraction: true   # accept a ```python fence truncated at the cap
     seed: 0
     # Bounds a runaway program, not honest work: the reward suite is <=10 small
     # cases (2 MB total budget, enforced at build time), so a correct solution
     # finishes in well under a second.
     timeout_seconds: 10
-    # The whole held-out split: 501 problems, 109 contests, disjoint from train
-    # by contest so near-duplicates cannot straddle the boundary.
-    eval_subset_size: 501
+    # The complete paired intersection: 456 problems, still contest-disjoint
+    # from train. Four CCO matches with conflicting expected outputs were
+    # removed and 41 GDM held-out problems had no CCO match.
+    eval_subset_size: 456
+    expected_eval_size: 456
     # FLAT overshoot penalty: a completion past the budget loses a constant
     # 0.1, regardless of how far over. The old repo RAMPED this between a soft
     # 4096 and a hard 8192 (coef 0.10, so a half-way overshoot cost 0.05);
@@ -195,17 +196,18 @@ codecontests_rlvr_olmo_smoke10:
 # is Codeforces-rated problems below 1200. The lower bound is essential because
 # GDM records unmatched/unrated problems as cf_rating=0; a bare max would pull
 # 5,189 unknown-difficulty rows into the supposedly easy training set.
-# Inventory: 916 train, 82 held out. The smoke saw 54.5% mixed G=8 groups on
-# this combined slice, versus 21.9% by ratings 1300-1400.
+# Inventory: 916 train, 75 paired held out. The smoke saw 54.5% mixed G=8
+# groups on the original 82-problem slice, versus 21.9% by ratings 1300-1400.
 codecontests_rlvr_olmo_easy_smoke10:
   _extends: codecontests_rlvr_olmo_smoke10
   dataset:
     min_cf_rating: 800
     max_cf_rating: 1100
-    eval_subset_size: 82
+    eval_subset_size: 75
+    expected_eval_size: 75
 
 # Paired 25-step learning experiment on the viable 7B difficulty slice. Both
-# arms see the same seeded training stream and the complete 82-problem held-out
+# arms see the same seeded training stream and complete 75-problem paired held-out
 # split. Intermediate + final checkpoints make the policy movement inspectable
 # even if correctness peaks before the last step.
 codecontests_rlvr_olmo_easy25_penalty:
@@ -213,13 +215,14 @@ codecontests_rlvr_olmo_easy25_penalty:
   dataset:
     min_cf_rating: 800
     max_cf_rating: 1100
-    eval_subset_size: 82
+    eval_subset_size: 75
+    expected_eval_size: 75
   training:
     steps: 25
     batch_size: 8
     group_size: 8
     eval_every: 5
-    eval_n: 82
+    eval_n: 75
     save_every: 10
 
 # Length-penalty ablation. The soft budget remains configured so over-budget
@@ -232,8 +235,8 @@ codecontests_rlvr_olmo_easy25_no_penalty:
 
 # Three-seed follow-up on the stricter slice suggested by the 25-step result:
 # Codeforces ratings [800, 1000], i.e. strictly below 1100. This leaves 727
-# train / 60 contest-disjoint held-out problems. All seeds evaluate the same
-# complete held-out set at temperature 0; dataset.seed changes the training
+# train / 55 paired, contest-disjoint held-out problems. All seeds evaluate the
+# same complete paired set at temperature 0; dataset.seed changes the training
 # task stream while training.rl_seed changes GRPO packing/optimizer shuffles.
 # eval_every=7 includes step 49, so the last plotted point is the final update
 # rather than a post-hoc checkpoint evaluation with different plumbing.
@@ -242,14 +245,15 @@ codecontests_rlvr_olmo_easy1000_seed0_50:
   dataset:
     min_cf_rating: 800
     max_cf_rating: 1000
-    eval_subset_size: 60
+    eval_subset_size: 55
+    expected_eval_size: 55
     seed: 0
   training:
     steps: 50
     batch_size: 8
     group_size: 8
     eval_every: 7
-    eval_n: 60
+    eval_n: 55
     save_every: 25
     log_transcripts: true
     rl_seed: 0

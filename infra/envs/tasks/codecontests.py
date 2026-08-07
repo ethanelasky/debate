@@ -29,10 +29,11 @@ reward we would no longer be measuring whether debate produces a
 correct-detecting judge.
 
 ===========================================================================
-TWO TEST SUITES PER PROBLEM, AND WHY
+TRAINING AND PAIRED EVALUATION SUITES
 ===========================================================================
 
-Each row carries two disjoint suites, built by scripts/build_codecontests_rlvr.py:
+Training rows carry two disjoint suites built by
+scripts/build_codecontests_rlvr.py:
 
   rlvr_tests   <=10 cases sampled (seeded) from DeepMind's public_tests +
                private_tests. The RLVR arm's REWARD. Deliberately small:
@@ -46,10 +47,16 @@ Each row carries two disjoint suites, built by scripts/build_codecontests_rlvr.p
                all); grade() returns None there rather than falling back to
                rlvr_tests, which would be measuring on the training signal.
 
-Neither suite is ever rendered into a prompt. Models see the problem
-statement only. _task() puts test cases in Task.meta, and DebateEnv binds
-only meta["question"] into prompts; docent_export filters meta to scalars, so
-the list-valued suites cannot leak into a transcript either.
+The held-out artifact is built by scripts/build_codecontests_paired_eval.py.
+Each row is self-contained and carries stable problem metadata plus explicitly
+named ``gdm_inputs/gdm_outputs`` and ``cco_inputs/cco_outputs`` suites. The
+runtime never joins a sidecar.
+
+No suite is ever rendered into a prompt. Models see the problem
+statement only. _task() puts test cases in Task.meta and the prompt renderer
+binds only meta["question"]. Raw single-turn transcript records retain task
+metadata for reproducibility, including these lists, so artifact sizing must
+account for them; that metadata is never sent to the model.
 
 One thing that looks like a leak and is not: some rlvr_tests cases DO appear
 verbatim in the problem statement (~16% of non-trivial cases across the test
@@ -66,27 +73,24 @@ Evaluation runs the held-out split against TWO independent test suites and
 reports each separately, so the same policy is measured by a weak in-
 distribution suite and a strong out-of-distribution one on the same axis:
 
-  cc_eval    every public+private case DeepMind ships for that problem. Same
-             KIND of test the RLVR arm trains on, so this is the in-
-             distribution number: it says how well the policy does on the
-             signal it was optimized against, on problems it never saw. Note
-             this is ALL the cases, not the <=10 sample rlvr_tests draws --
-             on a held-out problem there is no reward suite to stay disjoint
-             from, so nothing has to be held back.
+  gdm_eval   the deterministic <=10-case sample of DeepMind public+private
+             tests. Same KIND of test the RLVR arm trains on, but evaluated on
+             contest-disjoint problems it never saw.
 
-  cco_eval   CodeContests-O's corner cases (~34 per problem, inputs at the
-             problem's real constraint limits). Much stronger: it catches
+  cco_eval   a deterministic <=10-case sample of CodeContests-O corner cases
+             (drawn from ~34/problem, with inputs at the real constraint
+             limits). Much stronger: it catches
              wrong-but-plausible solutions that pass DeepMind's small cases.
-             Covers 460 of our 501 held-out problems (91.8%).
+             The paired artifact covers 456 of 501 held-out problems after
+             four conflicting-output problems are removed.
 
 The gap between the two curves is the quantity of interest. A policy that
-climbs on cc_eval while flat on cco_eval is learning to satisfy small tests
+climbs on gdm_eval while flat on cco_eval is learning to satisfy small tests
 rather than to solve problems.
 
-Both are graded during the run rather than reconstructed afterwards, so the
-curves are live in wandb and overlayable. Eval is 256 completions every 10
-steps, not the 64-per-step of training, which is what makes CCO's heavier
-cases affordable here.
+The same greedy completion is graded against both during the run, so
+eval/gdm_correct and eval/cco_correct are live in wandb and overlayable. Both
+suites use the same <=10-case, 500 KB/case, 2 MB/problem caps.
 
 ===========================================================================
 HOW THE VERIFIER WORKS
@@ -139,10 +143,9 @@ WHICH DATASET, AND WHY THREE OF THEM EXIST
       the problem's real constraint limits: median input 518 bytes but
       reaching 690 KB on problems where scale matters, vs DeepMind's 45.
       That is why it catches wrong-but-plausible solutions that pass small
-      tests — and why it costs ~1.3 MB per problem to run. Affordable at eval
-      (256 problems every 10 steps), which is why cco_eval is graded in-run;
-      it would NOT be affordable as a training reward at 64 rollouts a step.
-      Extracted for the held-out split only: 460 of 501 problems, ~600 MB.
+      tests. We deterministically cap it to <=10 cases and 2 MB per problem,
+      pair it with GDM at build time, and use it only for held-out evaluation.
+      It never affects the training reward.
 
   CodeContests+ (ByteDance-Seed)  — a third regeneration, ~27 cases with
       validated true-positive/true-negative rates. NOT used: 951 GB across
@@ -528,12 +531,12 @@ if __name__ == "__main__":
 # ----------------------------------------------------------------------- env
 
 
-def _load_rows_raw(path: str) -> list[dict[str, Any]]:
-    """Read the CCO eval suite (scripts/fetch_cco_eval.py output).
+def _load_paired_rows(path: str) -> list[dict[str, Any]]:
+    """Read a self-contained GDM+CCO held-out evaluation artifact.
 
-    Its own schema, not the two-suite one _load_rows validates. Same structural
-    check though: the runner zips inputs with outputs, so a length mismatch
-    would silently grade against a truncated suite instead of failing.
+    Both suites are required on every row. Keeping the join at build time makes
+    the evaluated population inspectable and prevents a missing/stale runtime
+    sidecar from silently changing it.
     """
     rows: list[dict[str, Any]] = []
     n_bad = 0
@@ -543,19 +546,40 @@ def _load_rows_raw(path: str) -> list[dict[str, Any]]:
             if not line:
                 continue
             e = json.loads(line)
+            name = str(e.get("name", "")).strip()
+            problem = str(e.get("problem", "")).strip()
+            rating = e.get("cf_rating")
+            gi, go = e.get("gdm_inputs") or [], e.get("gdm_outputs") or []
             ci, co = e.get("cco_inputs") or [], e.get("cco_outputs") or []
-            if not ci or len(ci) != len(co):
+            if (
+                not name
+                or not problem
+                or isinstance(rating, bool)
+                or not isinstance(rating, (int, float))
+                or not gi
+                or not ci
+                or len(gi) != len(go)
+                or len(ci) != len(co)
+            ):
                 n_bad += 1
                 continue
             rows.append(
                 {
-                    "name": str(e.get("name", "")).strip(),
+                    "problem": problem,
+                    "name": name,
+                    "gdm_inputs": list(gi),
+                    "gdm_outputs": list(go),
                     "cco_inputs": list(ci),
                     "cco_outputs": list(co),
+                    "cf_contest_id": e.get("cf_contest_id"),
+                    "cf_index": e.get("cf_index"),
+                    "cf_rating": rating,
+                    "difficulty": e.get("difficulty"),
+                    "source": e.get("source"),
                 }
             )
     if n_bad:
-        logger.warning("cco eval suite: dropped %d malformed rows from %s", n_bad, path)
+        logger.warning("paired eval suite: dropped %d malformed rows from %s", n_bad, path)
     return rows
 
 
@@ -641,9 +665,10 @@ class CodeContestsEnv(SingleTurnEnv):
         self,
         path: str,
         test_path: Optional[str] = None,
-        cco_eval_path: Optional[str] = None,
+        paired_test_path: Optional[str] = None,
         seed: int = 0,
         eval_subset_size: int = 128,
+        expected_eval_size: Optional[int] = None,
         timeout_seconds: int = 90,
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
@@ -676,8 +701,14 @@ class CodeContestsEnv(SingleTurnEnv):
         self.train_rows = _filter_cf_rating(
             loaded_train_rows, min_cf_rating, max_cf_rating
         )
-        if test_path is not None:
-            loaded_test_rows = _load_rows(test_path)
+        if test_path is not None and paired_test_path is not None:
+            raise ValueError("codecontests accepts only one of test_path and paired_test_path")
+        if test_path is not None or paired_test_path is not None:
+            loaded_test_rows = (
+                _load_paired_rows(paired_test_path)
+                if paired_test_path is not None
+                else _load_rows(test_path)
+            )
             self.test_rows = _filter_cf_rating(
                 loaded_test_rows, min_cf_rating, max_cf_rating
             )
@@ -691,27 +722,6 @@ class CodeContestsEnv(SingleTurnEnv):
                     len(self.test_rows),
                     len(loaded_test_rows),
                 )
-            if cco_eval_path:
-                cco = {r["name"]: r for r in _load_rows_raw(cco_eval_path)}
-                before = len(self.test_rows)
-                # Eval draws from the INTERSECTION only. Both curves have to be
-                # computed over the same problems or their difference measures
-                # which problems each suite happened to cover, not which suite
-                # is stronger.
-                self.test_rows = [r for r in self.test_rows if r["name"] in cco]
-                for r in self.test_rows:
-                    r["cco_inputs"] = cco[r["name"]]["cco_inputs"]
-                    r["cco_outputs"] = cco[r["name"]]["cco_outputs"]
-                logger.info(
-                    "codecontests CCO eval suite: %d/%d held-out problems retained",
-                    len(self.test_rows), before,
-                )
-                if not self.test_rows:
-                    raise ValueError(
-                        f"cco_eval_path={cco_eval_path!r} matched none of the "
-                        f"{before} held-out problems -- check it was built from "
-                        "the same test split"
-                    )
             overlap = {r["name"] for r in self.train_rows if r["name"]} & {
                 r["name"] for r in self.test_rows if r["name"]
             }
@@ -721,7 +731,7 @@ class CodeContestsEnv(SingleTurnEnv):
                     "and test (%s); eval on the overlap measures memorization",
                     len(overlap),
                     path,
-                    test_path,
+                    paired_test_path or test_path,
                 )
         else:
             rng = random.Random(seed + 22222)
@@ -729,6 +739,11 @@ class CodeContestsEnv(SingleTurnEnv):
             rng.shuffle(rows)
             n_test = min(max(64, len(rows) // 10), max(0, len(rows) - 2))
             self.test_rows, self.train_rows = rows[:n_test], rows[n_test:]
+        if expected_eval_size is not None and len(self.test_rows) != expected_eval_size:
+            raise RuntimeError(
+                "codecontests paired eval population changed: "
+                f"expected {expected_eval_size}, got {len(self.test_rows)}"
+            )
         self.test_rows = self.test_rows[:eval_subset_size]
         if len(self.train_rows) < 2 or not self.test_rows:
             raise RuntimeError(
@@ -740,20 +755,20 @@ class CodeContestsEnv(SingleTurnEnv):
         # meta["question"] is what DebateEnv binds as the debate TOPIC — the
         # problem statement, and the ONLY field that reaches a prompt.
         #
-        # Both suites ride in meta for the graders to read. They are verifier
-        # inputs, not public examples: nothing renders them. `name` is the
-        # stable key the CCO eval suite joins on, so it must stay a
-        # scalar (docent_export keeps scalars and drops lists — which is also
-        # what keeps the suites out of exported transcripts).
+        # Suites ride in meta for the graders to read. They are verifier inputs,
+        # not public examples: nothing renders them. `name` stays scalar while
+        # docent_export drops the list-valued suites from exported transcripts.
         return Task(
             messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={
                 "question": row["problem"],
                 "name": row["name"],
-                "rlvr_inputs": row["rlvr_inputs"],
-                "rlvr_outputs": row["rlvr_outputs"],
-                "truth_inputs": row["truth_inputs"],
-                "truth_outputs": row["truth_outputs"],
+                "rlvr_inputs": row.get("rlvr_inputs"),
+                "rlvr_outputs": row.get("rlvr_outputs"),
+                "truth_inputs": row.get("truth_inputs"),
+                "truth_outputs": row.get("truth_outputs"),
+                "gdm_inputs": row.get("gdm_inputs"),
+                "gdm_outputs": row.get("gdm_outputs"),
                 "cco_inputs": row.get("cco_inputs"),
                 "cco_outputs": row.get("cco_outputs"),
                 "cf_rating": row.get("cf_rating"),
@@ -768,14 +783,11 @@ class CodeContestsEnv(SingleTurnEnv):
         return [self._task(row, split) for row in self.test_rows[:n]]
 
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
-        """THE RLVR ARM'S REWARD. Runs the program against rlvr_tests only —
-        never truth_tests, which exist to measure this arm, not to train it.
-        The debate arm does not call this at all (its reward is judge-only).
+        """GDM-only RLVR reward plus paired held-out measurement.
 
-        On HELD-OUT tasks the same program is additionally run against the CCO
-        suite and reported as cco_* — a second, independent measurement of the
-        very same completion. It never touches the returned reward. Train tasks
-        carry no CCO suite, so this costs nothing during training.
+        Training tasks use ``rlvr_inputs``. Paired held-out tasks use the
+        explicitly named ``gdm_inputs`` and additionally run the SAME extracted
+        program through CCO. CCO metrics never enter the returned reward.
         """
         code = extract_code(text, relaxed=True)
         # every key present in EVERY branch, so eval-time averages are means
@@ -784,6 +796,8 @@ class CodeContestsEnv(SingleTurnEnv):
             "correct": 0.0,
             "has_code": float(code is not None),
             "tests_passed_frac": 0.0,
+            "gdm_correct": 0.0,
+            "gdm_tests_passed_frac": 0.0,
             "cpp_code": 0.0,
             "exec_timeout": 0.0,
             "exec_error": 0.0,
@@ -809,13 +823,17 @@ class CodeContestsEnv(SingleTurnEnv):
                 cco.get("tests_passed", 0) / cco_total if cco_total else 0.0
             )
 
+        gdm_inputs = task.meta.get("gdm_inputs") or task.meta["rlvr_inputs"]
+        gdm_outputs = task.meta.get("gdm_outputs") or task.meta["rlvr_outputs"]
         result = run_stdin_tests(
-            code, task.meta["rlvr_inputs"], task.meta["rlvr_outputs"],
+            code, gdm_inputs, gdm_outputs,
             timeout=self.timeout_seconds,
         )
-        total = result.get("tests_total") or len(task.meta["rlvr_inputs"])
-        info["correct"] = float(bool(result.get("passed")))
-        info["tests_passed_frac"] = result.get("tests_passed", 0) / total if total else 0.0
+        total = result.get("tests_total") or len(gdm_inputs)
+        gdm_correct = float(bool(result.get("passed")))
+        gdm_passed_frac = result.get("tests_passed", 0) / total if total else 0.0
+        info["gdm_correct"] = info["correct"] = gdm_correct
+        info["gdm_tests_passed_frac"] = info["tests_passed_frac"] = gdm_passed_frac
         # verifier breakage must be distinguishable from wrong answers
         info["exec_timeout"] = float(bool(result.get("timeout")))
         info["exec_error"] = float(result.get("status") == "error")
@@ -837,9 +855,10 @@ class CodeContestsFamily(TaskFamily):
             {
                 "path",
                 "test_path",
-                "cco_eval_path",
+                "paired_test_path",
                 "seed",
                 "eval_subset_size",
+                "expected_eval_size",
                 "timeout_seconds",
                 "correct_reward",
                 "format_reward",
@@ -862,8 +881,16 @@ class CodeContestsFamily(TaskFamily):
         return CodeContestsEnv(
             path=str(path),
             test_path=(str(ds["test_path"]) if ds.get("test_path") else None),
+            paired_test_path=(
+                str(ds["paired_test_path"]) if ds.get("paired_test_path") else None
+            ),
             seed=int(ds.get("seed", 0)),
             eval_subset_size=int(ds.get("eval_subset_size", 128)),
+            expected_eval_size=(
+                int(ds["expected_eval_size"])
+                if ds.get("expected_eval_size") is not None
+                else None
+            ),
             timeout_seconds=self.timeout_seconds,
             correct_reward=float(ds.get("correct_reward", 1.0)),
             format_reward=float(ds.get("format_reward", 0.1)),

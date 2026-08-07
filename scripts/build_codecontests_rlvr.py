@@ -23,22 +23,10 @@ Two independent suites per problem, kept separate on purpose:
 
 The debate arm uses NEITHER at training time (its reward is judge-only).
 
-The HELD-OUT split additionally carries two eval suites, which exist only
-there and are never touched during training:
-
-  cc_eval      every public+private case for that problem, not the <=10
-               sample. On a held-out problem there is no reward suite to stay
-               disjoint from, so nothing has to be held back. This is the
-               in-distribution eval: the same KIND of test the RLVR arm
-               trains on, on problems it never saw.
-
-  cco_eval     CodeContests-O corner cases (~34 per problem, inputs at the
-               problem's real constraint limits rather than DeepMind's small
-               mutations). Much stronger, and it covers 460 of the 501
-               held-out problems. Built by scripts/fetch_cco_eval.py, which
-               reads only the columns it needs so the 324 GB of CCO never
-               moves. Both suites are graded in-run, giving two overlayable
-               accuracy curves -- see docs/codecontests-dataset-provenance.md.
+The held-out rows are subsequently joined at BUILD time with a deterministic
+<=10-case CodeContests-O sample by scripts/build_codecontests_paired_eval.py.
+That produces a self-contained ``paired_test.jsonl`` with explicit ``gdm_*``
+and ``cco_*`` suites. Runtime evaluation never joins a sidecar.
 
 Usage:
     python scripts/build_codecontests_rlvr.py --out data/codecontests

@@ -25,6 +25,10 @@ inflated by simply running more code.
 Names carry trailing whitespace in CCO ('584_B. Kolya and Tanya ') but not in
 DeepMind's release, so the join is on the stripped name.
 
+The HuggingFace revision is pinned below. This output is a build-stage input;
+production evaluation consumes the self-contained artifact emitted by
+scripts/build_codecontests_paired_eval.py, never this sidecar directly.
+
 Usage:
     python scripts/fetch_cco_eval.py --test data/codecontests/test.jsonl \
         --out data/codecontests/cco_eval.jsonl
@@ -43,6 +47,7 @@ import time
 from pathlib import Path
 
 HF_REPO = "caijanfeng/CodeContests-O"
+HF_REVISION = "1a765191567b429f633bbd1c6e67b5890dfaf267"
 N_SHARDS = 1386
 # Same three caps the reward suite uses (build_codecontests_rlvr.py:78-80), so
 # a CCO eval costs the same order as a DeepMind one and the two curves are not
@@ -56,7 +61,10 @@ SEED = 0
 
 
 def _shard(i: int) -> str:
-    return f"datasets/{HF_REPO}/data/train-{i:05d}-of-{N_SHARDS:05d}.parquet"
+    return (
+        f"datasets/{HF_REPO}@{HF_REVISION}/data/"
+        f"train-{i:05d}-of-{N_SHARDS:05d}.parquet"
+    )
 
 
 def _read(i: int, columns: list[str], retries: int = 3):
@@ -267,7 +275,7 @@ def main() -> None:
     n_cases = sum(len(r["cco_inputs"]) for r in rows)
     sha = hashlib.sha256(outp.read_bytes()).hexdigest()
     manifest = {
-        "source": HF_REPO,
+        "source": {"repo": HF_REPO, "revision": HF_REVISION},
         "n_shards": N_SHARDS,
         "held_out_problems": len(wanted),
         "matched": len(hits),

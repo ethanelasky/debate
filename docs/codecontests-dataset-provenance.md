@@ -13,6 +13,45 @@ used cases came from. No inference from timings, file sizes, or docstrings — a
 CodeContests+.** Every problem is 100% covered by CCO. The 6 CC+ hits are trivial collisions on
 single-digit inputs.
 
+## Current paired RLVR evaluation artifact
+
+The current `debate` repository does not use the old CCO-only preprocessed file
+as its RLVR training set. Training problems and rewards come from the original
+`deepmind/code_contests` release at pinned revision
+`802411c3010cb00d1b05bad57ca77365a3c699d6`. The reward suite is a seeded sample
+of at most 10 `public_tests+private_tests` cases under 500 KB/case and 2 MB total.
+
+Held-out evaluation is a build-time intersection of two independently produced
+suites on the same contest-disjoint problems:
+
+| JSONL fields | Source | Role |
+|---|---|---|
+| `gdm_inputs`, `gdm_outputs` | pinned DeepMind CodeContests | in-distribution |
+| `cco_inputs`, `cco_outputs` | pinned CodeContests-O revision `1a765191567b429f633bbd1c6e67b5890dfaf267` | out-of-distribution |
+
+Both suites retain the same deterministic limits: at most 10 cases, 500 KB per
+case, and 2 MB total per problem. `scripts/fetch_cco_eval.py` creates the CCO
+staging extraction; `scripts/build_codecontests_paired_eval.py` joins it with
+the GDM held-out rows and writes the self-contained runtime artifact:
+
+```bash
+python scripts/fetch_cco_eval.py
+python scripts/build_codecontests_paired_eval.py
+```
+
+`paired_test.manifest.json` records both upstream revisions and input hashes,
+the suite policies and caps, the output hash, and rating-slice counts. The
+current artifact has 456 paired problems; the inclusive Codeforces `[800,1000]`
+slice has exactly 55 and `[800,1100]` has 75. Production configs assert these
+counts at load time.
+
+At evaluation, one temperature-zero completion is extracted once and executed
+against both suites. W&B receives `eval/gdm_correct`,
+`eval/gdm_tests_passed_frac`, `eval/cco_correct`, and
+`eval/cco_tests_passed_frac`; `eval/correct` remains a backward-compatible GDM
+alias. CCO never enters the RLVR training reward. ByteDance CodeContests+ is not
+used by this pipeline.
+
 ---
 
 ## The datasets

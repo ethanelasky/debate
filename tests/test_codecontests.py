@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import logging
+import runpy
+from pathlib import Path
 
 import pytest
 
+from infra.config import resolve_experiments_from_file
 from infra.envs.tasks import get_family
 from infra.envs.tasks.codecontests import (
     CodeContestsEnv,
@@ -63,6 +66,12 @@ ROWS = [
 def _write_jsonl(path, rows):
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     return str(path)
+
+
+def _build_paired_rows(gdm_rows, cco_rows):
+    repo = Path(__file__).resolve().parents[1]
+    builder = runpy.run_path(str(repo / "scripts" / "build_codecontests_paired_eval.py"))
+    return builder["build_paired_rows"](gdm_rows, cco_rows)
 
 
 @pytest.fixture
@@ -417,6 +426,8 @@ def test_reward_correct_solution(env):
     assert reward == pytest.approx(1.1)
     assert info["correct"] == 1.0 and info["has_code"] == 1.0
     assert info["tests_passed_frac"] == pytest.approx(1.0)
+    assert info["gdm_correct"] == info["correct"]
+    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"]
 
 
 def test_reward_unfenced_text(env):
@@ -560,85 +571,178 @@ def test_flat_overshoot_penalty_is_constant_not_ramped(tmp_path):
     assert unpenalised[0] - rewards[0] == pytest.approx(0.25)
 
 
-# ---------------------------------------------------------------- CCO eval suite
+# --------------------------------------------------------- paired eval suite
 
-# Deliberately DISJOINT from the rlvr cases above, and stricter: "sum" gets an
-# input the rlvr suite never exercises. That is the point of the second suite —
-# if it shared cases with the reward suite it would measure nothing new.
-CCO_ROWS = [
-    {"name": "sum", "cco_inputs": ["10 20", "0 0"], "cco_outputs": ["30", "0"]},
-    {"name": "echo", "cco_inputs": ["zzz"], "cco_outputs": ["zzz"]},
-    # deliberately absent: "no_truth" — used to pin the intersection behaviour
+# Self-contained rows: the GDM and CCO suites are deliberately disjoint. A
+# runtime sidecar join is neither needed nor accepted.
+PAIRED_ROWS = [
+    {
+        "name": "sum",
+        "problem": ROWS[0]["problem"],
+        "gdm_inputs": ["1 2"],
+        "gdm_outputs": ["3"],
+        "cco_inputs": ["10 20", "0 0"],
+        "cco_outputs": ["30", "0"],
+        "cf_rating": 900,
+    },
+    {
+        "name": "echo",
+        "problem": ROWS[1]["problem"],
+        "gdm_inputs": ["hello"],
+        "gdm_outputs": ["hello"],
+        "cco_inputs": ["zzz"],
+        "cco_outputs": ["zzz"],
+        "cf_rating": 1000,
+    },
 ]
 
 
-def _cco_env(tmp_path, cco_rows=CCO_ROWS):
+def _paired_env(tmp_path, paired_rows=PAIRED_ROWS):
     train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
-    test = _write_jsonl(tmp_path / "test.jsonl", ROWS)
-    cco = _write_jsonl(tmp_path / "cco.jsonl", cco_rows)
+    paired = _write_jsonl(tmp_path / "paired.jsonl", paired_rows)
     return CodeContestsEnv(
-        path=train, test_path=test, cco_eval_path=cco, timeout_seconds=TIMEOUT
+        path=train, paired_test_path=paired, timeout_seconds=TIMEOUT
     )
 
 
-def test_cco_restricts_eval_pool_to_the_intersection(tmp_path):
-    """Both curves must be computed over the SAME problems, or their difference
-    measures which problems each suite covered rather than which is stronger."""
-    env = _cco_env(tmp_path)
+def test_paired_artifact_defines_the_eval_pool(tmp_path):
+    env = _paired_env(tmp_path)
     assert [r["name"] for r in env.test_rows] == ["sum", "echo"]
-    # training is untouched: the reward suite is the whole training signal
     assert {r["name"] for r in env.train_rows} >= {"sum", "echo", "no_truth"}
+    assert all(r["gdm_inputs"] and r["cco_inputs"] for r in env.test_rows)
 
 
-def test_cco_metrics_only_on_held_out_tasks(tmp_path):
-    env = _cco_env(tmp_path)
+def test_paired_builder_preserves_gdm_order_and_stable_metadata():
+    gdm = [
+        {
+            **ROWS[1],
+            "cf_contest_id": 2,
+            "cf_index": "B",
+            "cf_rating": 1000,
+            "difficulty": 3,
+            "source": 2,
+        },
+        {
+            **ROWS[0],
+            "cf_contest_id": 1,
+            "cf_index": "A",
+            "cf_rating": 900,
+            "difficulty": 2,
+            "source": 2,
+        },
+    ]
+    cco = [
+        {"name": "sum", "cco_inputs": ["10 20"], "cco_outputs": ["30"]},
+        {"name": "echo", "cco_inputs": ["zzz"], "cco_outputs": ["zzz"]},
+    ]
+    rows = _build_paired_rows(gdm, cco)
+    assert [row["name"] for row in rows] == ["echo", "sum"]
+    assert rows[0]["gdm_inputs"] == ROWS[1]["rlvr_inputs"]
+    assert rows[0]["cco_inputs"] == ["zzz"]
+    assert rows[0]["cf_contest_id"] == 2 and rows[0]["cf_index"] == "B"
+
+
+def test_paired_builder_rejects_ragged_or_duplicate_sources():
+    with pytest.raises(ValueError, match="malformed CCO"):
+        _build_paired_rows(
+            ROWS[:1],
+            [{"name": "sum", "cco_inputs": ["x"], "cco_outputs": []}],
+        )
+    with pytest.raises(ValueError, match="duplicate CCO"):
+        _build_paired_rows(
+            ROWS[:1],
+            [
+                {"name": "sum", "cco_inputs": ["x"], "cco_outputs": ["y"]},
+                {"name": "sum", "cco_inputs": ["a"], "cco_outputs": ["b"]},
+            ],
+        )
+
+
+def test_same_heldout_completion_reports_both_named_suites(tmp_path):
+    from infra.envs.base import Trajectory
+    from infra.train import _aggregate
+
+    env = _paired_env(tmp_path)
     test_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
-    _, info = env.reward(test_task, f"```python\n{SUM_SOLUTION}\n```")
-    assert info["correct"] == 1.0 and info["cco_correct"] == 1.0
+    reward, info = env.reward(test_task, f"```python\n{SUM_SOLUTION}\n```")
+    assert info["gdm_correct"] == info["correct"] == 1.0
+    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"] == 1.0
+    assert info["cco_correct"] == 1.0
+    assert info["cco_tests_passed_frac"] == 1.0
+    logged = _aggregate([Trajectory(datums=[], reward=reward, info=info)], "eval")
+    assert logged["eval/gdm_correct"] == 1.0
+    assert logged["eval/gdm_tests_passed_frac"] == 1.0
+    assert logged["eval/cco_correct"] == 1.0
+    assert logged["eval/cco_tests_passed_frac"] == 1.0
 
-    # train tasks carry no CCO suite, so grading one costs nothing extra
+    # Train tasks carry no CCO suite and retain the GDM-only reward path.
     train_task = env.tasks(1, split="train")[0]
     _, train_info = env.reward(train_task, f"```python\n{SUM_SOLUTION}\n```")
     assert "cco_correct" not in train_info
 
 
-def test_cco_does_not_change_the_reward(tmp_path):
+def test_cco_verdict_does_not_change_the_gdm_reward(tmp_path):
     """The second suite is a MEASUREMENT. If it leaked into reward the RLVR arm
     would be training on CCO, and the two curves would stop being independent."""
-    plain = CodeContestsEnv(
-        path=_write_jsonl(tmp_path / "a.jsonl", ROWS),
-        test_path=_write_jsonl(tmp_path / "b.jsonl", ROWS),
-        timeout_seconds=TIMEOUT,
-    )
-    env = _cco_env(tmp_path)
-    text = f"```python\n{SUM_SOLUTION}\n```"
-    p_task = next(t for t in plain.tasks(3, split="test") if t.meta["name"] == "sum")
-    c_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
-    assert plain.reward(p_task, text)[0] == env.reward(c_task, text)[0]
-
-
-def test_cco_failure_is_independent_of_rlvr_verdict(tmp_path):
-    """A program can pass the weak suite and fail the strong one — that gap is
-    the whole reason the CCO curve exists."""
-    rows = [{"name": "sum", "problem": "p", "rlvr_inputs": ["1 2"],
-             "rlvr_outputs": ["3"], "truth_inputs": [], "truth_outputs": []}]
-    cco = [{"name": "sum", "cco_inputs": ["10 20"], "cco_outputs": ["30"]}]
-    env = CodeContestsEnv(
-        path=_write_jsonl(tmp_path / "t.jsonl", rows * 3),
-        test_path=_write_jsonl(tmp_path / "e.jsonl", rows),
-        cco_eval_path=_write_jsonl(tmp_path / "c.jsonl", cco),
-        timeout_seconds=TIMEOUT,
-    )
+    env = _paired_env(tmp_path)
     # hardcodes the one rlvr case; passes it, fails the unseen CCO case
     cheat = "print(3)"
-    _, info = env.reward(env.tasks(1, split="test")[0], f"```python\n{cheat}\n```")
-    assert info["correct"] == 1.0
+    reward, info = env.reward(env.tasks(1, split="test")[0], f"```python\n{cheat}\n```")
+    assert reward == pytest.approx(1.1)
+    assert info["gdm_correct"] == info["correct"] == 1.0
     assert info["cco_correct"] == 0.0
 
 
-def test_cco_file_matching_nothing_raises(tmp_path):
-    """A CCO file built from a different split would silently empty the eval
-    pool; that must fail loudly rather than evaluate on zero problems."""
-    with pytest.raises(ValueError, match="matched none"):
-        _cco_env(tmp_path, [{"name": "nonexistent", "cco_inputs": ["x"],
-                             "cco_outputs": ["y"]}])
+def test_paired_loader_drops_rows_missing_either_suite(tmp_path):
+    malformed = [
+        {**PAIRED_ROWS[0], "cco_outputs": []},
+        {**PAIRED_ROWS[1], "gdm_inputs": []},
+    ]
+    train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    paired = _write_jsonl(tmp_path / "paired.jsonl", malformed)
+    with pytest.raises(RuntimeError, match="test=0"):
+        CodeContestsEnv(path=train, paired_test_path=paired, timeout_seconds=TIMEOUT)
+
+
+def test_runtime_rejects_paired_artifact_plus_side_test_file(tmp_path):
+    train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    paired = _write_jsonl(tmp_path / "paired.jsonl", PAIRED_ROWS)
+    with pytest.raises(ValueError, match="only one"):
+        CodeContestsEnv(path=train, test_path=train, paired_test_path=paired)
+
+
+def test_expected_paired_eval_size_fails_loudly(tmp_path):
+    train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    paired = _write_jsonl(tmp_path / "paired.jsonl", PAIRED_ROWS)
+    with pytest.raises(RuntimeError, match="expected 3, got 2"):
+        CodeContestsEnv(
+            path=train,
+            paired_test_path=paired,
+            expected_eval_size=3,
+            timeout_seconds=TIMEOUT,
+        )
+
+
+def test_resolved_production_config_reaches_family_and_paired_env(tmp_path):
+    """End-to-end regression for the exact boundary that dropped CCO before."""
+    repo = Path(__file__).resolve().parents[1]
+    exp = resolve_experiments_from_file(
+        repo / "configs" / "codecontests_rlvr_olmo.yaml"
+    )["codecontests_rlvr_olmo_easy1000_b16_seed0_50"]
+    assert exp["dataset"]["eval_subset_size"] == 55
+    assert exp["dataset"]["expected_eval_size"] == 55
+    assert exp["training"]["eval_n"] == 55
+
+    rated_train_rows = [{**row, "cf_rating": 900} for row in ROWS]
+    train = _write_jsonl(tmp_path / "train.jsonl", rated_train_rows)
+    paired = _write_jsonl(tmp_path / "paired.jsonl", PAIRED_ROWS)
+    ds = dict(exp["dataset"])
+    family = get_family(ds.pop("type"))
+    ds.pop("relaxed_extraction", None)
+    ds["path"] = train
+    ds["paired_test_path"] = paired
+    ds["expected_eval_size"] = 2
+    env = family.source(ds)
+    tasks = env.tasks(55, split="test")
+    assert len(tasks) == 2
+    assert all(task.meta["gdm_inputs"] and task.meta["cco_inputs"] for task in tasks)
