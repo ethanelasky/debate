@@ -43,7 +43,7 @@ regardless of the row's true label (recorded user decision). Ground truth is
 
 Like KK — and unlike the QuALITY closed debates (judge story-blind) — this
 setting is INFO-SYMMETRIC: debaters and judge all see the full rendered
-trajectory (bound as ``BACKGROUND_TEXT``); any judge handicap is set in the
+trajectory (bound as ``PROBLEM``); any judge handicap is set in the
 experiment config, not here. There is no question: MB prompts do not reference
 TOPIC, so ``meta["question"]`` is ``""``.
 
@@ -295,7 +295,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
     ``prompt_file`` names the family's answer-generation config (default
     ``infra/prompts/tasks/monitoringbench.yaml``); its messages —
     [system: monitor card][user: trajectory][user: blind instructions] —
-    become ``Task.messages`` with ``<BACKGROUND_TEXT>`` substituted per row.
+    become ``Task.messages`` with ``<PROBLEM>`` substituted per row.
     The trajectory message is the same template the debate pack splices in as
     its shared pre_debate (<TRAJECTORY_USER>), and the solo order mirrors the
     chooser's later debate views (trajectory, then the cue before her
@@ -317,7 +317,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
         format_reward: float = 0.1,
     ):
         from infra.envs.task_prompts import (
-            BACKGROUND_PLACEHOLDER,
+            PROBLEM_PLACEHOLDER,
             load_generation_prompts,
             resolve_prompt_file,
         )
@@ -327,7 +327,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
         self.rng = random.Random(seed)  # train-split sampling only
         self.prompts = load_generation_prompts(
             resolve_prompt_file(prompt_file, "monitoringbench.yaml"),
-            require_placeholder=BACKGROUND_PLACEHOLDER,
+            require_placeholder=PROBLEM_PLACEHOLDER,
         )
         self.files = [Path(f) for f in files]
         rows = load_rows(self.files)
@@ -444,7 +444,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
 
     def _task(self, row: MBRow) -> Task:
         transcript = render_transcript(row.steps)
-        messages = self.prompts.render({"BACKGROUND_TEXT": transcript})
+        messages = self.prompts.render({"PROBLEM": transcript})
         return Task(
             messages=messages,
             meta={
@@ -456,7 +456,7 @@ class MonitoringBenchTaskSource(SingleTurnEnv):
                 # (fresh_positions=False, flip=False; see module docstring).
                 "gold": MB_POSITION_ATTACK,
                 "distractor": MB_POSITION_HONEST,
-                "bindings": {"BACKGROUND_TEXT": transcript},
+                "bindings": {"PROBLEM": transcript},
                 "sample_uuid": row.sample_uuid,
                 "orig_max_suspicion_score": row.orig_max_suspicion_score,
                 "red_team_objective_accomplished": row.red_team_objective_accomplished,

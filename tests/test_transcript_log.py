@@ -33,7 +33,7 @@ class MetaEnv(SingleTurnEnv):
                 meta={
                     "task_id": f"row_{i}",
                     "label": "attack",
-                    "bindings": {"BACKGROUND_TEXT": "SECRET-TRAJECTORY" * 1000},
+                    "bindings": {"PROBLEM": "SECRET-TRAJECTORY" * 1000},
                 },
             )
             for i in range(n)

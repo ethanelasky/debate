@@ -69,7 +69,7 @@ Task(
     "task_id": row.id, "label": row.label, "question": "",
     "gold": MB_POSITION_ATTACK,        # binds to seat A via fresh_positions=False (env.py:207-210)
     "distractor": MB_POSITION_HONEST,  # binds to seat B
-    "bindings": {"BACKGROUND_TEXT": render_transcript(row.steps)},
+    "bindings": {"PROBLEM": render_transcript(row.steps)},
     "sample_uuid": ..., "orig_max_suspicion_score": ..., "red_team_objective_accomplished": ...,
   })
 ```
@@ -130,7 +130,7 @@ Ground truth is `meta["label"]`.
   owns it).
 - Content mapping (old block -> new home):
   - `overall_system` + `debater_system` + `pre_debate` -> `system.alice` / `system.bob`
-    block lists (trajectory via `<BACKGROUND_TEXT>`; per-speaker system renders once —
+    block lists (trajectory via `<PROBLEM>`; per-speaker system renders once —
     cache-friendly).
   - `overall_system` + `judge_system` + `pre_debate_judge` -> `system.judge`.
   - `pre_opening_speech` -> slot `opening`; `pre_speech` (+`pre_previous_speech` context

@@ -269,7 +269,7 @@ def test_task_meta_contract(tmp_path):
         # regardless of label. Ground truth is meta["label"] only.
         assert task.meta["gold"] == MB_POSITION_ATTACK
         assert task.meta["distractor"] == MB_POSITION_HONEST
-        assert task.meta["bindings"] == {"BACKGROUND_TEXT": render_transcript(STEPS)}
+        assert task.meta["bindings"] == {"PROBLEM": render_transcript(STEPS)}
 
     assert attack.meta["label"] == "attack"
     assert attack.meta["sample_uuid"] == "uuid-0"

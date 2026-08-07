@@ -23,12 +23,12 @@ message list it renders to — one schema for every family:
                       family's row placeholder — the plan turn is where the
                       problem first reaches the speaker.
 
-The row's content binds via a placeholder the FAMILY owns — <PROBLEM> for
-math/codecontests (the problem text, mid-message), <BACKGROUND_TEXT> for
-monitoringbench (the rendered trajectory, a whole message of its own so the
-debate layer can reuse it as every seat's shared preamble). The family's
-source passes its placeholder as `require_placeholder`, checked eagerly at
-load.
+Every family binds its row content through the same <PROBLEM> placeholder, but
+where that placeholder sits differs: math/codecontests put the problem text
+mid-message, while monitoringbench gives the rendered trajectory a whole
+message of its own so the debate layer can reuse it as every seat's shared
+preamble. The family's source passes the placeholder as `require_placeholder`,
+checked eagerly at load.
 
 These messages are the RLVR prompt VERBATIM, and under
 first_speech_non_debate_aware they are also the debate first-slot context — so
@@ -55,7 +55,6 @@ import yaml
 PROMPT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "infra" / "prompts" / "tasks"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 PROBLEM_PLACEHOLDER = "<PROBLEM>"
-BACKGROUND_PLACEHOLDER = "<BACKGROUND_TEXT>"
 _NOTES_PLACEHOLDER = "<FORMAT_NOTES>"
 
 _PLACEHOLDER = re.compile(r"<([A-Z_][A-Z0-9_]*)>")
@@ -76,6 +75,11 @@ TASK_SUPPLIED_TEMPLATES = ("ANSWER_GEN_USER", "TRAJECTORY_USER", "PLAN_USER")
 #: single-turn RLVR must keep rendering exactly `messages`), so it cannot live
 #: in the messages list without changing that arm's prompt.
 PLAN_TEMPLATE_NAME = "PLAN_USER"
+
+#: The eliciting message's splice name. Plan-then-answer rollouts split a solo
+#: context into "context" and "the message that asks for the answer" at this
+#: message, so it must be the last one (envs/planned.py checks).
+ANSWER_TEMPLATE_NAME = "ANSWER_GEN_USER"
 
 
 @dataclass(frozen=True)
@@ -125,9 +129,9 @@ def load_generation_prompts(
     path: str | Path, require_placeholder: str = PROBLEM_PLACEHOLDER
 ) -> GenerationPrompts:
     """Load and validate one family's config. `require_placeholder` is the
-    family's row-content placeholder (<PROBLEM>, <BACKGROUND_TEXT>): it must
-    appear in at least one message, so a typo'd tag fails at load, not as a
-    prompt with the row content silently missing."""
+    family's row-content placeholder (<PROBLEM>): it must appear in at least
+    one message, so a typo'd tag fails at load, not as a prompt with the row
+    content silently missing."""
     path = Path(path)
     if not path.exists():
         raise ValueError(f"task prompt config not found: {path}")
@@ -187,10 +191,20 @@ def load_generation_prompts(
         if not isinstance(plan, str):
             raise ValueError(f"{path}: plan must be a string, got {type(plan).__name__}")
         plan = _fill_notes(plan, notes, path, "plan")
-        if require_placeholder not in plan:
+        # The invariant is that the row content is IN the plan turn, not that
+        # the cue string carries it. Two ways to satisfy that: the cue binds
+        # the placeholder (math, codecontests — the problem rides mid-cue), or
+        # a context message before the eliciting one already carries it (MB —
+        # the trajectory is its own message and plan turns render the context).
+        # Requiring the first route made MB unsatisfiable: the loader demanded
+        # the placeholder in the cue while PlannedEnv rejected every cue
+        # placeholder that was not bindable from meta["question"].
+        context_carries_row = any(require_placeholder in m["content"] for m in messages[:-1])
+        if require_placeholder not in plan and not context_carries_row:
             raise ValueError(
-                f"{path}: plan does not contain the {require_placeholder} placeholder — "
-                "the plan turn is where the problem first reaches the speaker"
+                f"{path}: the plan turn would not contain the row content — plan does not "
+                f"carry {require_placeholder} and no message before the eliciting one does "
+                "either, so the speaker would plan against nothing"
             )
         named[PLAN_TEMPLATE_NAME] = plan
 

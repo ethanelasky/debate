@@ -69,10 +69,10 @@ mb_empty_keys:
 
 mb_knobs:
   _extends: mb_plain
-  pre_debate_proposer: "PREAMBLE for <NAME>: <BACKGROUND_TEXT>"
+  pre_debate_proposer: "PREAMBLE for <NAME>: <PROBLEM>"
   pre_debate_judge:
     - "Judge preamble block one."
-    - "Trajectory: <BACKGROUND_TEXT>"
+    - "Trajectory: <PROBLEM>"
   attribution:
     judge:
       alice: "The first debater (<NAME>) argued:"
@@ -90,7 +90,7 @@ def prompt_file(tmp_path_factory):
 
 
 def _bindings():
-    core = {"TOPIC": "", "POSITION": "ATT", "OPPONENT_POSITION": "HON", "BACKGROUND_TEXT": BACKGROUND}
+    core = {"TOPIC": "", "POSITION": "ATT", "OPPONENT_POSITION": "HON", "PROBLEM": BACKGROUND}
     return {
         "alice": {"NAME": "Debater_A", "OPPONENT_NAME": "Debater_B", **core},
         "bob": {"NAME": "Debater_B", "OPPONENT_NAME": "Debater_A", **core},
@@ -122,8 +122,8 @@ def test_new_keys_load_including_block_lists(prompt_file):
     lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     # preamble is per SPEAKER now, an ordered list of leading user messages,
     # resolved from the speaker's role (alice proposes, bob critiques)
-    assert lib.preamble["alice"] == ["PREAMBLE for <NAME>: <BACKGROUND_TEXT>"]
-    assert lib.preamble["judge"] == ["Judge preamble block one.\n\nTrajectory: <BACKGROUND_TEXT>"]
+    assert lib.preamble["alice"] == ["PREAMBLE for <NAME>: <PROBLEM>"]
+    assert lib.preamble["judge"] == ["Judge preamble block one.\n\nTrajectory: <PROBLEM>"]
     assert lib.preamble["bob"] == []
     assert lib.attribution["judge"]["alice"] == "The first debater (<NAME>) argued:"
     assert lib.attribution["alice"]["bob"] == "Your opponent <OPPONENT_NAME> said:"
@@ -333,7 +333,7 @@ def test_backward_compat_golden_context(prompt_file):
 def test_preview_renders_new_keys(prompt_file):
     lib = load_prompt_library(prompt_file, "mb_knobs", PROTOCOL)
     out = preview(lib, PROTOCOL)
-    assert "PREAMBLE for <alice:NAME>: <BACKGROUND_TEXT>" in out
+    assert "PREAMBLE for <alice:NAME>: <PROBLEM>" in out
     assert "The first debater (<judge:NAME>) argued:" in out
 
 

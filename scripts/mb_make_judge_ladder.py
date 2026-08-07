@@ -89,6 +89,7 @@ RUNGS: list[tuple[str, str, list[str], bool]] = [
     ("mb_judge_j3", "+ judge guidance", ["framing", "card", "role"], False),
     ("mb_judge_j4", "+ 3-step deliberation == mb_debate", ["framing", "card", "role"], True),
     ("mb_judge_j4_nocard", "j4 minus the monitor card", ["framing", "role"], True),
+    ("mb_judge_j0card", "one sentence + monitor card", ["one_sentence", "card"], False),
 ]
 
 

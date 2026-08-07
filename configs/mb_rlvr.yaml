@@ -187,6 +187,37 @@ mb_rlvr_qwen36:
     eval_max_tokens: 1000   # = max_completion_tokens: eval and train generate alike
     save_every: 25
 
+# ---- Scratchpad arm (2026-08-06) ----
+# Plan-then-answer: a private scratchpad turn before the blind assessment (the
+# CoT surrogate with thinking off), the RLVR twin of the debate seat's plan
+# slot. Without it the debate arm gets sequential compute this baseline does
+# not, which confounds the arm comparison on top of the reward-source
+# difference. PlannedEnv wraps train AND eval, so the policy is measured in the
+# mode it is trained in.
+#
+# The plan turn inherits the solo CONTEXT (monitor card + trajectory) and adds
+# the family's `plan` cue; the answer turn continues that conversation into the
+# unchanged blind instructions. The trajectory is rendered ONCE across both
+# turns — a second copy of a 49766-token row would not fit 65536 at all.
+#
+# Cost: two datums per trajectory, each carrying the full trajectory prompt, so
+# roughly 2x the tokens per rollout of the no-scratchpad arms (accepted, Ethan
+# 2026-08-06). The lr1e-3 arm of the no-scratchpad sweep collapsed to
+# all-attack by step ~70; only 1e-4 and 1e-5 are carried over here.
+mb_rlvr_qwen36_scratchpad_on:
+  _extends: mb_rlvr_qwen36
+  plan_tokens: 1000   # = the answer budget, and math's plan slot cap
+
+mb_rlvr_qwen36_scratchpad_on_smoke:
+  _extends: mb_rlvr_qwen36_scratchpad_on
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 1
+    eval_n: 8
+    save_every: 0
+
 # Live-verification arm, twin of mb_rlvr_olmo_smoke: 2 train steps + an eval
 # pass over the first 8 dev rows. First thing to run — it is what proves tinker
 # will LoRA-train this model at this context, before 100 steps of spend.

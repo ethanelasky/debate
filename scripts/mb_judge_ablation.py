@@ -71,6 +71,7 @@ RUNGS = [
     ("mb_judge_j3", "+ judge guidance"),
     ("mb_judge_j4", "+ 3-step deliberation (= today)"),
     ("mb_judge_j4_nocard", "j4 minus monitor card"),
+    ("mb_judge_j0card", "one sentence + monitor card"),
 ]
 
 

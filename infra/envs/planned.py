@@ -33,7 +33,12 @@ from infra.envs.base import (
     Trajectory,
     datum_from_sample,
 )
-from infra.envs.task_prompts import _PLACEHOLDER, PLAN_TEMPLATE_NAME, PROBLEM_PLACEHOLDER
+from infra.envs.task_prompts import (
+    _PLACEHOLDER,
+    ANSWER_TEMPLATE_NAME,
+    PLAN_TEMPLATE_NAME,
+    PROBLEM_PLACEHOLDER,
+)
 
 
 class PlannedEnv(Env):
@@ -47,6 +52,18 @@ class PlannedEnv(Env):
     def __init__(self, inner: SingleTurnEnv, plan_max_tokens: int):
         prompts = getattr(inner, "prompts", None)
         named = prompts.supplied_templates() if prompts is not None else {}
+        # The turn-1/turn-2 split is positional (everything but the last
+        # message is context; the last one elicits the answer), so the last
+        # message must BE the eliciting one. True for every family today;
+        # checked because a family that appended a message after its cue would
+        # otherwise silently plan against a truncated context.
+        if prompts is not None and ANSWER_TEMPLATE_NAME in named:
+            if named[ANSWER_TEMPLATE_NAME] != prompts.messages[-1]["content"]:
+                raise ValueError(
+                    f"plan-then-answer rollouts split context from cue positionally, but "
+                    f"{type(inner).__name__}'s {ANSWER_TEMPLATE_NAME} message is not the last "
+                    "of its solo context — reorder the family's answer-generation config"
+                )
         if PLAN_TEMPLATE_NAME not in named:
             raise ValueError(
                 f"plan-then-answer rollouts need a `plan` template, but "
@@ -71,6 +88,17 @@ class PlannedEnv(Env):
                 f"plan-then-answer rollout: task from {type(self.inner).__name__} has no "
                 'meta["question"] to bind the plan cue\'s <PROBLEM> placeholder'
             )
+        if PROBLEM_PLACEHOLDER in self.plan_template and not str(question).strip():
+            # Families whose row content is a context message of its own (MB)
+            # leave meta["question"] empty; a cue that still asks for <PROBLEM>
+            # would render an empty problem block and the plan turn would be
+            # about nothing — the exact failure 2e6ba0a fixed for math.
+            raise ValueError(
+                f"plan cue carries {PROBLEM_PLACEHOLDER} but "
+                f'{type(self.inner).__name__} tasks have an empty meta["question"] — '
+                "drop the placeholder (the row content reaches the plan turn as a "
+                "context message) or give the family a question to bind"
+            )
         # Same strictness as GenerationPrompts.render: the only placeholder a
         # plan cue may carry is the row-content one, single-pass substituted.
         extra = sorted(set(_PLACEHOLDER.findall(self.plan_template)) - {"PROBLEM"})
@@ -79,22 +107,28 @@ class PlannedEnv(Env):
         return self.plan_template.replace(PROBLEM_PLACEHOLDER, str(question)).strip()
 
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
-        # Turn 1: the task's leading system message (if any) + the plan cue.
+        # Turn 1: the task's CONTEXT (everything before the eliciting message)
+        # + the plan cue. For math/codecontests that context is just the system
+        # card and the problem rides in the cue's <PROBLEM>; for MB it is the
+        # card plus the trajectory message, which is how the row content
+        # reaches the plan turn without being rendered twice — a second copy of
+        # a 50k-token trajectory would not fit the context at all.
         plan_convos: list[list[dict[str, str]]] = []
         for t in tasks:
-            head = [dict(m) for m in t.messages[:1] if m["role"] == "system"]
+            head = [dict(m) for m in t.messages[:-1]]
             plan_convos.append(head + [{"role": "user", "content": self._plan_cue(t)}])
         plan_results = policy.predict(
             plan_convos, n=group_size, limits=SlotLimits(max_total_tokens=self.plan_max_tokens)
         )
 
-        # Turn 2: each surviving plan continues into the task's own messages
-        # (everything after the leading system message — the eliciting cue,
-        # rendered by the inner env exactly as its single-turn arm would).
+        # Turn 2: each surviving plan continues into the eliciting message,
+        # rendered by the inner env exactly as its single-turn arm would. The
+        # context is already in the conversation from turn 1, so only the cue
+        # is appended.
         pending: list[tuple[int, Any, list[dict[str, str]]]] = []
         n_dropped = 0
         for ti, samples in enumerate(plan_results):
-            body = [dict(m) for m in tasks[ti].messages if m["role"] != "system"]
+            body = [dict(tasks[ti].messages[-1])]
             for s in samples:
                 if not s.fidelity_ok():
                     n_dropped += 1

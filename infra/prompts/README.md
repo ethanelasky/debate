@@ -34,7 +34,7 @@ The row's content binds through a placeholder the family owns:
 - `<PROBLEM>` — "the question": short text, also carried in
   `meta["question"]`, logged in result rows, always shown to the judge
   (math, codecontests: the problem statement).
-- `<BACKGROUND_TEXT>` — "the document": long text bound per-seat via
+- `<PROBLEM>` — "the document": long text bound per-seat via
   `meta["bindings"]`, deliberately kept OUT of `meta["question"]` and logs
   (monitoringbench: the trajectory; MB's safety rule forbids trajectory
   content in any output). A document-shaped family puts the document in a

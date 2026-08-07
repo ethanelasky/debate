@@ -39,8 +39,8 @@ turns:
 # debater_system card serves them both, and the cues are keyed by slot name.
 PROMPTS_YAML = """
 mb_test:
-  debater_system: "You are <NAME>. Argue: <POSITION>. Transcript: <BACKGROUND_TEXT>"
-  judge_system: "Judge <NAME> vs <OPPONENT_NAME>. Transcript: <BACKGROUND_TEXT>"
+  debater_system: "You are <NAME>. Argue: <POSITION>. Transcript: <PROBLEM>"
+  judge_system: "Judge <NAME> vs <OPPONENT_NAME>. Transcript: <PROBLEM>"
   opening: "Give your opening statement, <NAME>."
   rebuttal: "Rebut your opponent, <NAME>."
   deliberation: "Deliberate privately."
@@ -70,7 +70,7 @@ def mb_task(i=0, label="attack", bindings=None):
             "question": "",
             "gold": ATTACK_POS,
             "distractor": HONEST_POS,
-            "bindings": {"BACKGROUND_TEXT": BACKGROUND} if bindings is None else bindings,
+            "bindings": {"PROBLEM": BACKGROUND} if bindings is None else bindings,
             "sample_uuid": f"uuid-{i}",
         },
     )
@@ -127,7 +127,7 @@ def test_task_bindings_merge_into_every_speaker(prompt_file):
     )
     st = env._build_state(mb_task(), flipped=False)
     for speaker in ("alice", "bob", "judge"):
-        assert st.bindings[speaker]["BACKGROUND_TEXT"] == BACKGROUND
+        assert st.bindings[speaker]["PROBLEM"] == BACKGROUND
     # core keys intact: seat A argues gold, seat B the distractor
     assert st.bindings["alice"]["POSITION"] == ATTACK_POS
     assert st.bindings["bob"]["POSITION"] == HONEST_POS
@@ -141,13 +141,13 @@ def test_task_bindings_validation_lists_all_errors(prompt_file):
         ScriptedModel("bob", ["b"]),
         ScriptedModel("judge", [GOOD_VERDICT]),
     )
-    bad = {"lower_case": "x", "NAME": "collides", "BACKGROUND_TEXT": 3, "FINE_KEY": "ok"}
+    bad = {"lower_case": "x", "NAME": "collides", "PROBLEM": 3, "FINE_KEY": "ok"}
     with pytest.raises(ValueError) as e:
         env._build_state(mb_task(bindings=bad), flipped=False)
     msg = str(e.value)
     assert "lower_case" in msg
     assert "NAME" in msg and "collides with a core binding key" in msg
-    assert "BACKGROUND_TEXT" in msg and "must be str" in msg
+    assert "PROBLEM" in msg and "must be str" in msg
     assert "FINE_KEY" not in msg
 
 

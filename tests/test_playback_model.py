@@ -65,7 +65,7 @@ class MBTaskSource:
                         "question": "",
                         "gold": MB_POSITION_ATTACK,
                         "distractor": MB_POSITION_HONEST,
-                        "bindings": {"BACKGROUND_TEXT": background},
+                        "bindings": {"PROBLEM": background},
                     },
                 )
             )

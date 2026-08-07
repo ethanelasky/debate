@@ -81,7 +81,7 @@ PROMPTS_YAML = """
 choice_test:
   debater_system: "NEUTRAL DEBATE SYSTEM."
   judge_system: "Judge <NAME> vs <OPPONENT_NAME>."
-  pre_debate: "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
+  pre_debate: "TRAJECTORY MESSAGE: <PROBLEM>"
   pre_debate_proposer: "You are <NAME>, a debater."
   pre_debate_critic: "You are <NAME>. Position: <POSITION> vs <OPPONENT_POSITION>"
   pre_debate_judge: "Assigned: <POSITION> vs <OPPONENT_POSITION>"
@@ -93,7 +93,7 @@ choice_test:
 sc_choice_test:
   debater_system: "NEUTRAL CONSULTANT SYSTEM."
   judge_system: "Grade the consultant <NAME>."
-  pre_debate: "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
+  pre_debate: "TRAJECTORY MESSAGE: <PROBLEM>"
   pre_debate_judge: "The consultant chose: <POSITION>"
   blind: "BLIND INSTRUCTIONS. End with the answer tag."
   pre_speech: "Develop, <NAME>. Position: <POSITION>"
@@ -101,7 +101,7 @@ sc_choice_test:
 """
 
 BACKGROUND = "SYNTHETIC-TRAJECTORY-TEXT do-not-print-me"
-TRAJ_TEMPLATE = "TRAJECTORY MESSAGE: <BACKGROUND_TEXT>"
+TRAJ_TEMPLATE = "TRAJECTORY MESSAGE: <PROBLEM>"
 TRAJ_MESSAGE = f"TRAJECTORY MESSAGE: {BACKGROUND}"
 # byte-identical to the `blind` cue: what makes the chooser's later view honest
 INSTR_MESSAGE = "BLIND INSTRUCTIONS. End with the answer tag."
@@ -128,7 +128,7 @@ def mb_task(i, label):
             "question": "",
             "gold": MB_POSITION_ATTACK,
             "distractor": MB_POSITION_HONEST,
-            "bindings": {"BACKGROUND_TEXT": BACKGROUND},
+            "bindings": {"PROBLEM": BACKGROUND},
         },
     )
 
@@ -254,7 +254,7 @@ def _write_rows(tmp_path):
     return str(path)
 
 
-def _write_task_prompts(tmp_path, traj="Trajectory:\n<trajectory>\n<BACKGROUND_TEXT>\n</trajectory>",
+def _write_task_prompts(tmp_path, traj="Trajectory:\n<trajectory>\n<PROBLEM>\n</trajectory>",
                         instr="Assess it. End with the tag."):
     path = tmp_path / "task_prompts.yaml"
     body = {
@@ -279,12 +279,12 @@ def test_task_source_renders_blind_messages(tmp_path):
         assert instr_msg == {"role": "user", "content": "Assess it. End with the tag."}
         assert traj_msg["role"] == "user"
         assert traj_msg["content"].startswith("Trajectory:")
-        assert t.meta["bindings"]["BACKGROUND_TEXT"] in traj_msg["content"]
+        assert t.meta["bindings"]["PROBLEM"] in traj_msg["content"]
 
 
 def test_task_source_prompt_guards(tmp_path):
     # the trajectory message must carry the row binding point
-    with pytest.raises(ValueError, match="BACKGROUND_TEXT"):
+    with pytest.raises(ValueError, match="PROBLEM"):
         MonitoringBenchTaskSource(
             [_write_rows(tmp_path)],
             prompt_file=_write_task_prompts(tmp_path, traj="no trajectory slot"),
@@ -310,7 +310,7 @@ def _bindings(with_bob=True):
         "POSITION": "",
         "OPPONENT_NAME": "",
         "OPPONENT_POSITION": "",
-        "BACKGROUND_TEXT": BACKGROUND,
+        "PROBLEM": BACKGROUND,
     }
     b = {
         "alice": {**core, "NAME": "Debater_A", "OPPONENT_NAME": "Debater_B" if with_bob else ""},
@@ -798,31 +798,41 @@ def test_real_blind_view_shape_and_framing():
     (2026-08-06 order: trajectory precedes the cue, matching the chooser's
     later debate views) — and free of debate framing."""
     from infra.envs.task_prompts import (
-        BACKGROUND_PLACEHOLDER,
+        PROBLEM_PLACEHOLDER,
         load_generation_prompts,
         resolve_prompt_file,
     )
 
     prompts = load_generation_prompts(
         resolve_prompt_file(None, "monitoringbench.yaml"),
-        require_placeholder=BACKGROUND_PLACEHOLDER,
+        require_placeholder=PROBLEM_PLACEHOLDER,
     )
     assert [m["role"] for m in prompts.messages] == ["system", "user", "user"]
     system, traj, cue = (m["content"] for m in prompts.messages)
-    assert prompts.supplied_templates() == {
+    # PLAN_USER is the plan-turn cue: supplied for splicing, but NOT one of
+    # `messages` — plain single-turn arms must keep rendering exactly the three
+    # above (asserted on the line before this one).
+    supplied = prompts.supplied_templates()
+    plan = supplied.pop("PLAN_USER")
+    assert supplied == {
         "ANSWER_GEN_USER": cue,
         "TRAJECTORY_USER": traj,
     }
+    # The plan cue renders in the RLVR plan turn and the debate plan slot from
+    # these same bytes, so it must stay free of either arm's framing and of the
+    # answer contract (checked with the rest below).
+    assert "<PROBLEM>" not in plan
     assert "four security failures" in system
     assert "<answer>attack</answer>" in cue
-    assert "<BACKGROUND_TEXT>" in traj
+    assert "<PROBLEM>" in traj
     # the blind view must carry no debate framing. "judge" is exempted for
     # the SYSTEM card only: the real monitor prompt uses it as a verb
     # ("asked to judge a newly proposed action"), which names no debate.
     for word in ("debate", "opponent", "assigned"):
-        assert word not in (system + cue).lower(), word
+        assert word not in (system + cue + plan).lower(), word
     assert "judge" not in cue.lower()
-    rendered = prompts.render({"BACKGROUND_TEXT": "x"})  # renders fully
+    assert "judge" not in plan.lower()
+    rendered = prompts.render({"PROBLEM": "x"})  # renders fully
     assert len(rendered) == 3
 
 
