@@ -528,6 +528,37 @@ if __name__ == "__main__":
 # ----------------------------------------------------------------------- env
 
 
+def _load_rows_raw(path: str) -> list[dict[str, Any]]:
+    """Read the CCO eval suite (scripts/fetch_cco_eval.py output).
+
+    Its own schema, not the two-suite one _load_rows validates. Same structural
+    check though: the runner zips inputs with outputs, so a length mismatch
+    would silently grade against a truncated suite instead of failing.
+    """
+    rows: list[dict[str, Any]] = []
+    n_bad = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            e = json.loads(line)
+            ci, co = e.get("cco_inputs") or [], e.get("cco_outputs") or []
+            if not ci or len(ci) != len(co):
+                n_bad += 1
+                continue
+            rows.append(
+                {
+                    "name": str(e.get("name", "")).strip(),
+                    "cco_inputs": list(ci),
+                    "cco_outputs": list(co),
+                }
+            )
+    if n_bad:
+        logger.warning("cco eval suite: dropped %d malformed rows from %s", n_bad, path)
+    return rows
+
+
 def _load_rows(path: str) -> list[dict[str, Any]]:
     """Read the built dataset. Eligibility (multi-answer, stdin/stdout, size
     caps) was already applied by scripts/build_codecontests_rlvr.py, so the
@@ -610,6 +641,7 @@ class CodeContestsEnv(SingleTurnEnv):
         self,
         path: str,
         test_path: Optional[str] = None,
+        cco_eval_path: Optional[str] = None,
         seed: int = 0,
         eval_subset_size: int = 128,
         timeout_seconds: int = 90,
@@ -659,6 +691,27 @@ class CodeContestsEnv(SingleTurnEnv):
                     len(self.test_rows),
                     len(loaded_test_rows),
                 )
+            if cco_eval_path:
+                cco = {r["name"]: r for r in _load_rows_raw(cco_eval_path)}
+                before = len(self.test_rows)
+                # Eval draws from the INTERSECTION only. Both curves have to be
+                # computed over the same problems or their difference measures
+                # which problems each suite happened to cover, not which suite
+                # is stronger.
+                self.test_rows = [r for r in self.test_rows if r["name"] in cco]
+                for r in self.test_rows:
+                    r["cco_inputs"] = cco[r["name"]]["cco_inputs"]
+                    r["cco_outputs"] = cco[r["name"]]["cco_outputs"]
+                logger.info(
+                    "codecontests CCO eval suite: %d/%d held-out problems retained",
+                    len(self.test_rows), before,
+                )
+                if not self.test_rows:
+                    raise ValueError(
+                        f"cco_eval_path={cco_eval_path!r} matched none of the "
+                        f"{before} held-out problems -- check it was built from "
+                        "the same test split"
+                    )
             overlap = {r["name"] for r in self.train_rows if r["name"]} & {
                 r["name"] for r in self.test_rows if r["name"]
             }
@@ -701,6 +754,8 @@ class CodeContestsEnv(SingleTurnEnv):
                 "rlvr_outputs": row["rlvr_outputs"],
                 "truth_inputs": row["truth_inputs"],
                 "truth_outputs": row["truth_outputs"],
+                "cco_inputs": row.get("cco_inputs"),
+                "cco_outputs": row.get("cco_outputs"),
                 "cf_rating": row.get("cf_rating"),
                 "difficulty": row.get("difficulty"),
                 "split": split,
@@ -715,7 +770,13 @@ class CodeContestsEnv(SingleTurnEnv):
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         """THE RLVR ARM'S REWARD. Runs the program against rlvr_tests only —
         never truth_tests, which exist to measure this arm, not to train it.
-        The debate arm does not call this at all (its reward is judge-only)."""
+        The debate arm does not call this at all (its reward is judge-only).
+
+        On HELD-OUT tasks the same program is additionally run against the CCO
+        suite and reported as cco_* — a second, independent measurement of the
+        very same completion. It never touches the returned reward. Train tasks
+        carry no CCO suite, so this costs nothing during training.
+        """
         code = extract_code(text, relaxed=True)
         # every key present in EVERY branch, so eval-time averages are means
         # over all samples rather than over the branch that happened to set it
@@ -727,11 +788,26 @@ class CodeContestsEnv(SingleTurnEnv):
             "exec_timeout": 0.0,
             "exec_error": 0.0,
         }
+        has_cco = bool(task.meta.get("cco_inputs"))
+        if has_cco:
+            info["cco_correct"] = 0.0
+            info["cco_tests_passed_frac"] = 0.0
         if code is None:
             return 0.0, info
         if is_cpp_code(code):
             info["cpp_code"] = 1.0
             return self.format_reward, info
+
+        if has_cco:
+            cco = run_stdin_tests(
+                code, task.meta["cco_inputs"], task.meta["cco_outputs"],
+                timeout=self.timeout_seconds,
+            )
+            cco_total = cco.get("tests_total") or len(task.meta["cco_inputs"])
+            info["cco_correct"] = float(bool(cco.get("passed")))
+            info["cco_tests_passed_frac"] = (
+                cco.get("tests_passed", 0) / cco_total if cco_total else 0.0
+            )
 
         result = run_stdin_tests(
             code, task.meta["rlvr_inputs"], task.meta["rlvr_outputs"],
@@ -761,6 +837,7 @@ class CodeContestsFamily(TaskFamily):
             {
                 "path",
                 "test_path",
+                "cco_eval_path",
                 "seed",
                 "eval_subset_size",
                 "timeout_seconds",

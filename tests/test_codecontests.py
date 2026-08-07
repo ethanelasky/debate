@@ -558,3 +558,87 @@ def test_flat_overshoot_penalty_is_constant_not_ramped(tmp_path):
     unpenalised = sorted(t.reward for t in env.rollout(
         env.tasks(1, split="train"), FakePolicy(), group_size=2)[0])
     assert unpenalised[0] - rewards[0] == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------- CCO eval suite
+
+# Deliberately DISJOINT from the rlvr cases above, and stricter: "sum" gets an
+# input the rlvr suite never exercises. That is the point of the second suite —
+# if it shared cases with the reward suite it would measure nothing new.
+CCO_ROWS = [
+    {"name": "sum", "cco_inputs": ["10 20", "0 0"], "cco_outputs": ["30", "0"]},
+    {"name": "echo", "cco_inputs": ["zzz"], "cco_outputs": ["zzz"]},
+    # deliberately absent: "no_truth" — used to pin the intersection behaviour
+]
+
+
+def _cco_env(tmp_path, cco_rows=CCO_ROWS):
+    train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    test = _write_jsonl(tmp_path / "test.jsonl", ROWS)
+    cco = _write_jsonl(tmp_path / "cco.jsonl", cco_rows)
+    return CodeContestsEnv(
+        path=train, test_path=test, cco_eval_path=cco, timeout_seconds=TIMEOUT
+    )
+
+
+def test_cco_restricts_eval_pool_to_the_intersection(tmp_path):
+    """Both curves must be computed over the SAME problems, or their difference
+    measures which problems each suite covered rather than which is stronger."""
+    env = _cco_env(tmp_path)
+    assert [r["name"] for r in env.test_rows] == ["sum", "echo"]
+    # training is untouched: the reward suite is the whole training signal
+    assert {r["name"] for r in env.train_rows} >= {"sum", "echo", "no_truth"}
+
+
+def test_cco_metrics_only_on_held_out_tasks(tmp_path):
+    env = _cco_env(tmp_path)
+    test_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
+    _, info = env.reward(test_task, f"```python\n{SUM_SOLUTION}\n```")
+    assert info["correct"] == 1.0 and info["cco_correct"] == 1.0
+
+    # train tasks carry no CCO suite, so grading one costs nothing extra
+    train_task = env.tasks(1, split="train")[0]
+    _, train_info = env.reward(train_task, f"```python\n{SUM_SOLUTION}\n```")
+    assert "cco_correct" not in train_info
+
+
+def test_cco_does_not_change_the_reward(tmp_path):
+    """The second suite is a MEASUREMENT. If it leaked into reward the RLVR arm
+    would be training on CCO, and the two curves would stop being independent."""
+    plain = CodeContestsEnv(
+        path=_write_jsonl(tmp_path / "a.jsonl", ROWS),
+        test_path=_write_jsonl(tmp_path / "b.jsonl", ROWS),
+        timeout_seconds=TIMEOUT,
+    )
+    env = _cco_env(tmp_path)
+    text = f"```python\n{SUM_SOLUTION}\n```"
+    p_task = next(t for t in plain.tasks(3, split="test") if t.meta["name"] == "sum")
+    c_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
+    assert plain.reward(p_task, text)[0] == env.reward(c_task, text)[0]
+
+
+def test_cco_failure_is_independent_of_rlvr_verdict(tmp_path):
+    """A program can pass the weak suite and fail the strong one — that gap is
+    the whole reason the CCO curve exists."""
+    rows = [{"name": "sum", "problem": "p", "rlvr_inputs": ["1 2"],
+             "rlvr_outputs": ["3"], "truth_inputs": [], "truth_outputs": []}]
+    cco = [{"name": "sum", "cco_inputs": ["10 20"], "cco_outputs": ["30"]}]
+    env = CodeContestsEnv(
+        path=_write_jsonl(tmp_path / "t.jsonl", rows * 3),
+        test_path=_write_jsonl(tmp_path / "e.jsonl", rows),
+        cco_eval_path=_write_jsonl(tmp_path / "c.jsonl", cco),
+        timeout_seconds=TIMEOUT,
+    )
+    # hardcodes the one rlvr case; passes it, fails the unseen CCO case
+    cheat = "print(3)"
+    _, info = env.reward(env.tasks(1, split="test")[0], f"```python\n{cheat}\n```")
+    assert info["correct"] == 1.0
+    assert info["cco_correct"] == 0.0
+
+
+def test_cco_file_matching_nothing_raises(tmp_path):
+    """A CCO file built from a different split would silently empty the eval
+    pool; that must fail loudly rather than evaluate on zero problems."""
+    with pytest.raises(ValueError, match="matched none"):
+        _cco_env(tmp_path, [{"name": "nonexistent", "cco_inputs": ["x"],
+                             "cco_outputs": ["y"]}])
