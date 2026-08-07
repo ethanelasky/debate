@@ -223,6 +223,44 @@ codecontests_rlvr_olmo_easy25_no_penalty:
   dataset:
     overshoot_penalty: 0.0
 
+# Three-seed follow-up on the stricter slice suggested by the 25-step result:
+# Codeforces ratings [800, 1000], i.e. strictly below 1100. This leaves 727
+# train / 60 contest-disjoint held-out problems. All seeds evaluate the same
+# complete held-out set at temperature 0; dataset.seed changes the training
+# task stream while training.rl_seed changes GRPO packing/optimizer shuffles.
+# eval_every=7 includes step 49, so the last plotted point is the final update
+# rather than a post-hoc checkpoint evaluation with different plumbing.
+codecontests_rlvr_olmo_easy1000_seed0_50:
+  _extends: codecontests_rlvr_olmo
+  dataset:
+    min_cf_rating: 800
+    max_cf_rating: 1000
+    eval_subset_size: 60
+    seed: 0
+  training:
+    steps: 50
+    batch_size: 8
+    group_size: 8
+    eval_every: 7
+    eval_n: 60
+    save_every: 25
+    log_transcripts: true
+    rl_seed: 0
+
+codecontests_rlvr_olmo_easy1000_seed1_50:
+  _extends: codecontests_rlvr_olmo_easy1000_seed0_50
+  dataset:
+    seed: 1
+  training:
+    rl_seed: 1
+
+codecontests_rlvr_olmo_easy1000_seed2_50:
+  _extends: codecontests_rlvr_olmo_easy1000_seed0_50
+  dataset:
+    seed: 2
+  training:
+    rl_seed: 2
+
 # 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
 # worth reading: the 7B smoke showed the plumbing works but the model is too
 # weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
@@ -286,6 +324,29 @@ codecontests_rlvr_olmo31_32b_cap2048:
       response_length: 2048
       max_token_len_per_gpu: 8192
     eval_max_tokens: 2048
+
+# The 2048 cap, run long enough to actually learn. The 10-step arms above
+# settled the INFERENCE cost of each cap (2048 loses ~6pp of train correctness
+# to the 8192 baseline, paired over the identical seeded problem stream, 9 steps
+# of 10; 1024 loses ~12pp and never moved off 1/32 on eval). None of them said
+# anything about TRAINING under a cap, because none of them trained: KL to the
+# reference policy after 10 steps was 0.0013 nats, i.e. the step-9 model is the
+# step-0 model. 640 rollouts over ~80 distinct problems at lr 1e-4 on a rank-32
+# adapter cannot move a 32B, and ~30% of every batch is dropped for zero
+# advantage on top of that (all-8-pass or all-8-fail groups teach nothing).
+#
+# eval_n goes back to the 256 the base config asks for. At n=32 the standard
+# error on a ~0.13 accuracy is +-0.06 — two problems — so 13% and 19% are the
+# same measurement, and a 100-step run would be unreadable. Every 10 steps
+# rather than every 5: an eval at n=256 costs ~334s against a 60s training step,
+# and mid-run eval points are not something we act on.
+codecontests_rlvr_olmo31_32b_cap2048_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048
+  training:
+    steps: 100
+    eval_every: 10
+    eval_n: 256
+    save_every: 25
 
 codecontests_rlvr_olmo31_32b_cap1024:
   _extends: codecontests_rlvr_olmo31_32b_cap2048
