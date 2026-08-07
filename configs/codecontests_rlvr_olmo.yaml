@@ -19,6 +19,13 @@ codecontests_rlvr_olmo:
     type: codecontests
     path: data/codecontests/train.jsonl
     test_path: data/codecontests/test.jsonl
+    # Second eval suite: CCO corner cases for the held-out problems, capped
+    # exactly like the reward suite (<=10 cases, 500 KB each, 2 MB total) so the
+    # two eval curves differ in WHICH dataset generated the tests and nothing
+    # else. Setting this restricts eval to the 456 problems present in both, so
+    # eval/correct and eval/cco_correct score the same problems.
+    #   python scripts/fetch_cco_eval.py
+    cco_eval_path: data/codecontests/cco_eval.jsonl
     relaxed_extraction: true   # accept a ```python fence truncated at the cap
     seed: 0
     # Bounds a runaway program, not honest work: the reward suite is <=10 small
