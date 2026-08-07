@@ -261,6 +261,41 @@ codecontests_rlvr_olmo_easy1000_seed2_50:
   training:
     rl_seed: 2
 
+# Larger task batch on the same viable 7B slice. Group size remains eight, so
+# this doubles independent problems and total rollouts per optimizer update
+# (16x8 = 128) without changing the per-problem GRPO baseline. At the observed
+# ~79% non-zero-advantage rate, this would cross the default micro_batch=64.
+# Use 128 so VERL computes one global token denominator for the whole kept
+# update; its internal max_token_len_per_gpu packing still bounds activations.
+codecontests_rlvr_olmo_easy1000_b16_seed0_50:
+  _extends: codecontests_rlvr_olmo_easy1000_seed0_50
+  training:
+    batch_size: 16
+    micro_batch: 128
+
+codecontests_rlvr_olmo_easy1000_b16_seed1_50:
+  _extends: codecontests_rlvr_olmo_easy1000_seed1_50
+  training:
+    batch_size: 16
+    micro_batch: 128
+
+codecontests_rlvr_olmo_easy1000_b16_seed2_50:
+  _extends: codecontests_rlvr_olmo_easy1000_seed2_50
+  training:
+    batch_size: 16
+    micro_batch: 128
+
+# One paid-compute boundary check before the three full runs: verifies that
+# 128 rollouts and the wider logical microbatch fit, and that gradient norm
+# and memory do not jump pathologically relative to the completed 8x8 runs.
+codecontests_rlvr_olmo_easy1000_b16_smoke1:
+  _extends: codecontests_rlvr_olmo_easy1000_b16_seed0_50
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+    log_transcripts: false
+
 # 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
 # worth reading: the 7B smoke showed the plumbing works but the model is too
 # weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
@@ -342,6 +377,23 @@ codecontests_rlvr_olmo31_32b_cap2048:
 # and mid-run eval points are not something we act on.
 codecontests_rlvr_olmo31_32b_cap2048_long:
   _extends: codecontests_rlvr_olmo31_32b_cap2048
+  training:
+    steps: 100
+    eval_every: 10
+    eval_n: 256
+    save_every: 25
+
+# The 1024 arm at the same length as cap2048_long, so the two are overlayable.
+# The 10-step version looked dead — eval pinned at 1/32 for its whole run — but
+# that run had no chance to show anything: KL to reference was 0.0035 at the end,
+# i.e. the policy had not moved, and n=32 could not have resolved a change
+# anyway. Whether a 1024 cap is trainable is genuinely open until it gets the
+# same 100 steps and the same n=256 eval the 2048 arm got.
+#
+# Everything except run length is inherited from cap1024, so the pair differs
+# only in the cap itself.
+codecontests_rlvr_olmo31_32b_cap1024_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024
   training:
     steps: 100
     eval_every: 10
