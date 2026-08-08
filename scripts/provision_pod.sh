@@ -43,6 +43,54 @@ timeout -k 30s 120 mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" 
 
 log() { echo -e "\n=== [provision] $* ==="; }
 
+# ---------------------------------------------------------------- shared-volume
+# $VOL is shared: other people's pods run out of this same env while this script
+# is capable of rewriting it. `uv pip install` into a live env swaps packages
+# under a running trainer -- best case an ImportError mid-run, worst case a
+# partially-swapped package that imports and misbehaves (flash_attn_2_cuda
+# against a different torch is exactly that shape). So the env is WRITE-ONCE.
+STAMP="$ENV_DIR/.provisioned"
+LOCK="$VOL/locks/provision.lock"
+LOCK_TTL_SECONDS="${LOCK_TTL_SECONDS:-7200}"
+
+if [ -f "$STAMP" ] && [ -z "${FORCE_PROVISION:-}" ]; then
+  log "env already provisioned — nothing to do"
+  cat "$STAMP"
+  echo "Set FORCE_PROVISION=1 to rebuild, but ONLY when no other pod is running"
+  echo "out of $ENV_DIR: rebuilding mutates an env other runs are executing."
+  exit 0
+fi
+
+# mkdir, not a lock FILE: on NFS-backed storage mkdir is atomic where
+# open(O_EXCL) is not reliably so. The lease has a TTL because a pod that dies
+# mid-provision would otherwise wedge the volume for everyone, forever.
+timeout -k 10s 60 mkdir -p "$VOL/locks" || {
+  echo "FATAL: cannot create $VOL/locks" >&2; exit 1; }
+if ! mkdir "$LOCK" 2>/dev/null; then
+  HELD_AT=$(cat "$LOCK/acquired_at" 2>/dev/null || echo 0)
+  AGE=$(( $(date +%s) - HELD_AT ))
+  if [ "$HELD_AT" != "0" ] && [ "$AGE" -lt "$LOCK_TTL_SECONDS" ]; then
+    echo "FATAL: another pod is provisioning (lock held ${AGE}s by $(cat "$LOCK/owner" 2>/dev/null))." >&2
+    echo "  Wait for it, or if that pod is gone, remove $LOCK by hand." >&2
+    exit 1
+  fi
+  echo "WARNING: breaking stale provision lock (age ${AGE}s > TTL ${LOCK_TTL_SECONDS}s)" >&2
+fi
+date +%s > "$LOCK/acquired_at"
+echo "${RUNPOD_POD_ID:-unknown-pod} pid $$" > "$LOCK/owner"
+# Released on ANY exit: a lock that outlives its holder is the failure this
+# whole mechanism is supposed to prevent.
+trap 'rm -rf "$LOCK"' EXIT
+
+# Free space is shared fate: when the volume fills, every concurrent run fails
+# on its next write, not just whoever tipped it over. Checkpoints are ~3 GB a
+# save, so a few parallel runs move this fast.
+FREE_PCT=$(df -P "$VOL" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print 100-$5}')
+if [ -n "$FREE_PCT" ] && [ "$FREE_PCT" -lt 20 ]; then
+  echo "WARNING: only ${FREE_PCT}% free on $VOL — grow the volume before running." >&2
+  echo "         A full volume fails EVERY concurrent run, not just this one." >&2
+fi
+
 log "GPU / driver"
 # nvidia-smi blocks forever on a wedged driver / ECC-recovering GPU.
 timeout -k 30s 60 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || {
@@ -267,4 +315,16 @@ print("torch", torch.__version__, "| vllm", vllm.__version__, "| verl", verl.__v
       "| flash_attn", flash_attn.__version__, "| ray", ray.__version__)
 print("TinkerActorRolloutRefWorker: ok")
 PY
+# Written ONLY after the sanity import passes, so the stamp means "this env
+# was proven to work", not merely "the script reached the end". A half-built env
+# with a stamp would be worse than none: every later pod would skip provisioning
+# and fail at import instead.
+cat > "$STAMP" <<STAMPEOF
+provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+by_pod=${RUNPOD_POD_ID:-unknown}
+vllm_pin=$VLLM_PIN
+verl_pin=$VERL_PIN
+flash_attn=${FLASH_ATTN_WHEEL:-built-from-source}
+STAMPEOF
+
 log "DONE — activate with: source $ENV_DIR/bin/activate"

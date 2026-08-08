@@ -199,6 +199,11 @@ export HF_HOME="${HF_HOME:-/workspace/hf}"
 # heterogeneous). The cgroup's own limit still governs; the transient peak
 # fits under it. Opt back in with RAY_memory_monitor_refresh_ms=250.
 export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+
+# The env on $VOL is shared with other people's pods. Importing anything writes
+# __pycache__/*.pyc back into it, so every run mutates a dependency others are
+# executing out of. Harmless in isolation; pointless risk on a shared volume.
+export PYTHONDONTWRITEBYTECODE=1
 cd /root/debate
 
 # Everything below assumes an otherwise-idle pod: the stale-vLLM sweep kills by
