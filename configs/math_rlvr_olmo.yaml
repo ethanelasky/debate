@@ -100,7 +100,12 @@ aime_rlvr_olmo32:
       n_gpus: 2
       strategy: fsdp2
       rollout_tp: 2                # one TP2 rollout replica; 32B weights split across both cards
-      gpu_memory_utilization: 0.50
+      # 0.42, not 0.50: at rollout boot ~100GB/GPU is already resident (FSDP
+      # actor+ref shards + torch reserved cache — evacuated H200 log
+      # 2026-08-08: 40.22/139.8 free at that moment), and vLLM refuses to
+      # start unless free >= util*total. 0.42*183GB(B200) = 77GB fits the
+      # ~83GB actually free; on 141GB cards this config does NOT fit.
+      gpu_memory_utilization: 0.42
       prompt_length: 4096          # problem + plan cue + up to 1000 plan tokens
       response_length: 1024        # covers the 1000-token plan and answer caps
       max_token_len_per_gpu: 16384
