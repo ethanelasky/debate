@@ -25,6 +25,7 @@ sleep so FSDP has the GPU. Both transitions are automatic.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -136,10 +137,26 @@ class VerlBackendConfig:
             # verl's hydra struct — the bare override is a ConfigCompositionException
             ["+actor_rollout_ref.actor.checkpoint.save_lora_only=True"] if self.lora_rank > 0 else []
         )
+        # verl's model config defaults attn_implementation to flash_attention_2
+        # and hard-errors at model load when the package is absent — it does
+        # not fall back (sm100 pods provision with flash-attn skipped: no
+        # cu130 wheel). find_spec, never an import: presence is all verl's
+        # default keys on, and importing flash_attn can be slow or itself
+        # broken. '+' because override_config is an open dict, not a declared
+        # struct key. Stands down if the caller pinned any attn_implementation
+        # via extra_overrides.
+        attn_impl_override: list[str] = []
+        if importlib.util.find_spec("flash_attn") is None and not any(
+            "attn_implementation" in o for o in self.extra_overrides
+        ):
+            attn_impl_override = [
+                "+actor_rollout_ref.model.override_config.attn_implementation=sdpa"
+            ]
         return [
             *self._strategy_overrides(),
             *mode_override,
             *lora_ckpt_override,
+            *attn_impl_override,
             f"actor_rollout_ref.model.path={self.model_path}",
             f"actor_rollout_ref.model.use_remove_padding={self.use_remove_padding}",
             "actor_rollout_ref.actor.use_dynamic_bsz=True",

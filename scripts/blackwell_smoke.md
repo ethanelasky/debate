@@ -28,6 +28,18 @@ storage bills separately and survives the pod.
 - A 1x smoke CANNOT validate TP2/NVLink; the TP2 arm needs an actual 2xB200
   allocation (NV18 in `nvidia-smi topo -m`).
 
+## Validated 2026-08-08
+
+- Attention backend on the skip path: **FLASHINFER** selected (step 3 grep).
+- TP2 **serve**: PASS on 2xB200, NV18 links in `nvidia-smi topo -m`.
+- 1-GPU **training** (step 5 smoke): PASS — kl k1 0.0005 at step 0 (canary
+  clean), ~16s/step warm vs ~125s on the H100 at the same batch 2 × group 4.
+- TP2 **training**: still UNPROVEN — only the serve arm got a 2-GPU allocation.
+- Logs: `/workspace/b200-validate-logs/` (on the volume, survives the pod).
+- cutlass-dsl: the `nvidia-cutlass-dsl-libs-cu13` wheel can land corrupted
+  (affects GDN models only); repair with
+  `pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13`.
+
 ## 0. Rent + restore (10 min box)
 
 ```bash
@@ -47,6 +59,8 @@ GPU_TYPE="NVIDIA B200" bash scripts/pod_create.sh b200-smoke
   # on the pod
   runpodctl config --apiKey <key>
   export RUNPOD_POD_ID=<id>
+  # from local — wandb dies at init without /root/.netrc (stop wiped that too)
+  scp -P <ssh-port> ~/.netrc root@<pod-ip>:/root/.netrc
   ```
   Without both, `pod_run.sh` refuses to launch (exit 6, watchdog auth guard).
   Do NOT export the pod-scoped `RUNPOD_API_KEY` from `/proc/1/environ` — it
@@ -75,7 +89,7 @@ built on a previous sm100 pod — never an sm90 one).
 Provision already ran this; re-run standalone only if you need it isolated:
 
 ```bash
-/workspace/envs/verl-main/bin/python - <<'PY'
+/workspace/envs/verl-b200/bin/python - <<'PY'
 import torch
 print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
 print(torch.cuda.get_arch_list())
@@ -97,7 +111,7 @@ Same launch shape as `pod_run.sh`'s judge server, same real-completion probe
 
 ```bash
 export HF_HOME=/workspace/hf   # volume-less pod: use /root/hf and expect a cold ~8GB pull
-/workspace/envs/verl-main/bin/python -m vllm.entrypoints.openai.api_server \
+/workspace/envs/verl-b200/bin/python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen3.5-4B --port 8100 \
   --gpu-memory-utilization 0.18 --max-model-len 16384 \
   --max-num-seqs 32 --enable-prefix-caching > /root/vllm_smoke.log 2>&1 &
@@ -130,7 +144,11 @@ same probe. This is the arm that exercises NCCL on sm100; a hang at
 ## 5. (d) repo smoke arm (20 min box)
 
 ```bash
-cd /root/debate && /workspace/envs/verl-main/bin/python -m pip install -q -e . --no-deps
+cd /root/debate && /workspace/envs/verl-b200/bin/python -m pip install -q -e . --no-deps
+# rerun hygiene: check_fresh_run_over_existing_checkpoints refuses a fresh
+# start over a previous attempt's step-*/final dirs — move them aside first
+[ -d /workspace/checkpoints/math_rlvr_olmo_smoke ] && \
+  mv /workspace/checkpoints/math_rlvr_olmo_smoke{,.old.$(date +%s)}
 bash scripts/pod_run.sh rlvr math_rlvr_olmo_smoke     # 1 GPU, configs/math_rlvr_olmo.yaml
 ```
 

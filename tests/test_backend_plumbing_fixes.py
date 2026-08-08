@@ -252,3 +252,33 @@ def test_loss_means_weight_each_key_over_the_batches_that_report_it():
 
 def test_loss_means_empty_input():
     assert _token_weighted_loss_means([]) == {}
+
+
+# --------------------------------------- sdpa fallback when flash-attn absent
+
+import importlib.util  # noqa: E402  (appended section; stdlib, test-only)
+
+_SDPA = "+actor_rollout_ref.model.override_config.attn_implementation=sdpa"
+
+
+def test_missing_flash_attn_emits_sdpa_override(monkeypatch):
+    # verl's model config defaults attn_implementation to flash_attention_2
+    # and hard-errors at model load when the package is absent; the config
+    # must steer transformers to sdpa instead.
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: None)
+    assert _SDPA in VerlBackendConfig(model_path="m").hydra_overrides()
+
+
+def test_present_flash_attn_emits_no_attn_override(monkeypatch):
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object())
+    overrides = VerlBackendConfig(model_path="m").hydra_overrides()
+    assert not any("attn_implementation" in o for o in overrides)
+
+
+def test_user_pinned_attn_implementation_is_not_duplicated(monkeypatch):
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: None)
+    user = "+actor_rollout_ref.model.override_config.attn_implementation=eager"
+    overrides = VerlBackendConfig(
+        model_path="m", extra_overrides=(user,)
+    ).hydra_overrides()
+    assert [o for o in overrides if "attn_implementation" in o] == [user]
