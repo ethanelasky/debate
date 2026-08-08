@@ -29,6 +29,14 @@ class Config:
     chat_template_kwargs: dict | None = None
     norm_adv_by_std: bool = True
     adv_length_norm: str = "none"   # none|datum|trajectory|count — see grpo_pack
+    # DAPO-style dynamic sampling. With group-normalized advantages, a group
+    # whose trajectories all earn the same reward has zero variance and is
+    # dropped whole by grpo_pack (pack/n_datums_dropped_zero_advantage) — at
+    # high-agreement stages most of the batch is wasted compute. When > 0,
+    # degenerate groups are re-rolled on FRESH tasks for up to this many retry
+    # rounds so the batch carries full gradient signal; the cap keeps a
+    # saturated pool from looping forever. 0 = off, loop identical to before.
+    dynamic_sampling_retries: int = 0
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
@@ -109,6 +117,49 @@ def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
     return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
 
 
+def _is_degenerate(group: list[Trajectory]) -> bool:
+    """No gradient signal under group normalization: fewer than 2 trajectories,
+    or every trajectory carrying exactly the same reward — zero std, which is
+    the condition under which grpo_pack drops the whole group. Judged on the
+    shared outcome reward only; per-slot datum_rewards variance does not rescue
+    a group here."""
+    return len(group) < 2 or all(t.reward == group[0].reward for t in group)
+
+
+def _resample_degenerate(
+    env: Env,
+    policy: Policy,
+    group_size: int,
+    groups: list[list[Trajectory]],
+    retries: int,
+) -> dict[str, float]:
+    """DAPO dynamic sampling: replace degenerate groups in-place with rollouts
+    on fresh tasks, up to `retries` rounds. A replacement that is itself
+    degenerate stays in the pool for the next round; whatever is still
+    degenerate at the cap stays in the batch, where grpo_pack drops it exactly
+    as it would without the toggle — no behavior cliff."""
+    degenerate = [i for i, g in enumerate(groups) if _is_degenerate(g)]
+    n_resampled = 0
+    for _ in range(retries):
+        if not degenerate:
+            break
+        fresh = env.rollout(env.tasks(len(degenerate), "train"), policy, group_size)
+        # env.tasks may return fewer than asked (exhausted pool); unpaired
+        # slots stay degenerate rather than dropping out of the accounting.
+        still = list(degenerate[len(fresh):])
+        for slot, group in zip(degenerate, fresh):
+            if _is_degenerate(group):
+                still.append(slot)
+            else:
+                groups[slot] = group
+                n_resampled += 1
+        degenerate = still
+    return {
+        "train/resampled_groups": float(n_resampled),
+        "train/degenerate_after_resample": float(len(degenerate)),
+    }
+
+
 class _Phases:
     """Wall-clock per phase of a step.
 
@@ -149,6 +200,17 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             backend.sync_sampler()
         with ph("rollout"):
             groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
+            ds_metrics: dict[str, float] = {}
+            if cfg.dynamic_sampling_retries > 0:
+                ds_metrics = _resample_degenerate(
+                    env, policy, cfg.group_size, groups, cfg.dynamic_sampling_retries
+                )
+        # on_rollout/_log_transcripts fire exactly once, after the final
+        # resample round: env's last-rollout state (last_rollout_records /
+        # last_states / last_rollout_info) reflects only the FINAL rollout, so
+        # with dynamic sampling transcript capture sees just that round's
+        # records. Acceptable; merging capture states across rounds is out of
+        # scope.
         if cfg.on_rollout is not None:
             try:
                 cfg.on_rollout(step, env)
@@ -156,6 +218,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 print(f"[on_rollout] {type(e).__name__}: {e}")
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
+        metrics.update(ds_metrics)  # keys only when the toggle is on; 0.0 otherwise
         _log_transcripts(cfg, step, env, "train")
 
         with ph("pack"):

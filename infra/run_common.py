@@ -41,6 +41,7 @@ TRAINING_KEYS = {
     "wandb_entity",
     "log_transcripts",
     "norm_adv_by_std",
+    "dynamic_sampling_retries",
     "rl_seed",
 }
 
@@ -78,6 +79,9 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("save_every", int),
     ("log_transcripts", _strict_bool),
     ("norm_adv_by_std", _strict_bool),
+    # DAPO dynamic sampling: retry rounds for re-rolling zero-variance groups
+    # on fresh tasks (see Config.dynamic_sampling_retries). 0/absent = off.
+    ("dynamic_sampling_retries", int),
     ("rl_seed", int),
 )
 
