@@ -79,7 +79,13 @@ math_rlvr_olmo_l5_plan_nocot:
 # (container-disk HF cache: the 65GB download does not fit the shared
 # volume's free space, and the volume must stay clear for checkpoints).
 aime_rlvr_olmo32:
-  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  # allenai/Olmo-3.1-32B-Instruct-DPO @ fc84a4f, pre-converted to bf16 on the
+  # volume. The HF repo ships fp32 (121GB/29 shards); loading THAT under TP2
+  # silently OOM-killed the rollout workers twice (the worker-death monitor
+  # surfaces it only as "RuntimeError: cancelled" — vLLM v0.24 has no init
+  # timeout at all, so a dead worker is the only way to that error). bf16
+  # (61GB) boots clean. Converter: one-shot shard-streaming cast, 2026-08-08.
+  model: /workspace/models/olmo32-bf16
   # 1000, matching the MB scratchpad arm's budgets (Ethan 2026-08-07): plan
   # 1000 + answer 1000. The answer prompt asks for concise-but-rigorous
   # justification, not the old step-by-step derivation; watch eval/has_boxed
