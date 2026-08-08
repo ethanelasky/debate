@@ -192,6 +192,13 @@ export PATH="$(dirname "$PY"):$CUDA_HOME/bin:$PATH"
 # time every pull lands on the container disk and is re-downloaded after each
 # pod stop/start (RunPod wipes /root, only /workspace survives).
 export HF_HOME="${HF_HOME:-/workspace/hf}"
+# Ray's memory monitor pre-emptively kills workers at 95% of the CONTAINER
+# limit; verl's weight-sync transiently spikes each FSDP worker to ~157GB RSS
+# (32B, 2026-08-08: 447GB peak tripped the monitor on a 503GB pod while a
+# 566GB pod ran the identical sync for hours — RunPod RAM allocations are
+# heterogeneous). The cgroup's own limit still governs; the transient peak
+# fits under it. Opt back in with RAY_memory_monitor_refresh_ms=250.
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
 cd /root/debate
 
 # Everything below assumes an otherwise-idle pod: the stale-vLLM sweep kills by
