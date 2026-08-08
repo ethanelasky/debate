@@ -140,12 +140,20 @@ def test_importance_sampling_emits_effectively_unclipped_ratios():
     assert "actor_rollout_ref.actor.clip_ratio_high=1000.0" in overrides
 
 
-@pytest.mark.parametrize("kind", ["cispo", "reinforce"])
+@pytest.mark.parametrize("kind", ["reinforce"])
 def test_non_consuming_loss_kinds_omit_clip_ratios(kind):
-    # These kinds do not read actor.clip_ratio_* on this path; emitting the
-    # keys would advertise a clip range the loss never applies.
+    # gpg does not read actor.clip_ratio_* on this path; emitting the keys
+    # would advertise a clip range the loss never applies.
     overrides = _overrides(kind)
     assert not any("clip_ratio" in o for o in overrides)
+
+
+def test_cispo_emits_clip_epsilons():
+    # verl's cispo clamps the IS weight to [1-eps_low, 1+eps_high]; omitting
+    # the keys would hand it the generic clip_ratio default silently.
+    overrides = _overrides("cispo", clip_low=0.8, clip_high=1.28)
+    assert "actor_rollout_ref.actor.clip_ratio_low=0.2" in overrides
+    assert "actor_rollout_ref.actor.clip_ratio_high=0.28" in overrides
 
 
 def test_gspo_emits_paper_scale_epsilons():

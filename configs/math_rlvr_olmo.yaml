@@ -187,3 +187,38 @@ math_rlvr_olmo_smoke:
     group_size: 4
     eval_every: 0
     save_every: 0
+
+# ---- "Make LoRA work on AIME" recipe arms (Ethan, 2026-08-08) ----
+# The field's AIME-RLVR successes ride response-length growth; ours capped it
+# at 1000 for MB parity. These arms give the LENGTH lever to the PRIVATE
+# scratchpad (answer stays 1000, parseable and MB-shaped) and reuse rollouts.
+
+# DAPO translation (paper 2503.14476; Codex consult 2026-08-08): clip-higher
+# 0.8/1.28, no KL, dynamic sampling (retry cap 5 is an engineering choice —
+# the paper oversamples unboundedly). Overlong reward shaping omitted (needs
+# a length-shaping reward channel we don't have; noted, not silently skipped).
+aime_rlvr_olmo32_dapo:
+  _extends: aime_rlvr_olmo32
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.0
+    dynamic_sampling_retries: 5
+
+# 8k private scratchpad + 2 GRPO epochs, PPO loss.
+aime_rlvr_olmo32_plan8k:
+  _extends: aime_rlvr_olmo32
+  plan_tokens: 8192
+  training:
+    ppo_epochs: 2
+    verl:
+      prompt_length: 12288       # problem + plan cue + up to 8192 plan tokens
+      response_length: 8192      # the plan turn generates up to plan_tokens
+      max_token_len_per_gpu: 24576
+
+# Same, CISPO loss (IS-weight clamp with stop-grad keeps gradient from every
+# token — MiniMax-M1's fix for clipped-token gradient starvation, plausibly
+# what LoRA's thin pipe needs). Asymmetric DAPO-style bounds.
+aime_rlvr_olmo32_plan8k_cispo:
+  _extends: aime_rlvr_olmo32_plan8k
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}

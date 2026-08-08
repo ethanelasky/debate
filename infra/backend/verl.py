@@ -109,7 +109,9 @@ class VerlBackendConfig:
         # the generic clip_ratio default (PPO-scale ~0.2) when absent. GSPO's
         # sequence ratios concentrate near 1, so a PPO-scale clip is
         # effectively no clip: gspo therefore REQUIRES explicit paper-scale
-        # bounds and gets its epsilons emitted; cispo/gpg do not consume them.
+        # bounds and gets its epsilons emitted. cispo reads them too (verl
+        # clamps the IS weight to [1-eps_low, 1+eps_high] with stop-grad);
+        # gpg alone ignores them.
         clip_overrides: list[str] = []
         if self.loss.kind == "gspo" and self.loss.clip_low < 0.99:
             raise ValueError(
@@ -117,7 +119,7 @@ class VerlBackendConfig:
                 f"clip_high 1.0004); got clip_low={self.loss.clip_low} — PPO-scale bounds "
                 "leave sequence ratios effectively unclipped"
             )
-        if self.loss.kind in ("ppo", "importance_sampling", "gspo"):
+        if self.loss.kind in ("ppo", "importance_sampling", "gspo", "cispo"):
             eps_low = round(1.0 - self.loss.clip_low, 6)
             eps_high = round(self.loss.clip_high - 1.0, 6)
             if self.loss.kind == "importance_sampling":
