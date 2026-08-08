@@ -137,6 +137,21 @@ aime_rlvr_olmo32:
     eval_max_tokens: 1000
     save_every: 25
 
+# Peak-decay probes (Ethan, 2026-08-08): the L5 RLVR runs and (tentatively)
+# the AIME baseline show quick gains that partially give back at lr 1e-4 /
+# kl 0.02. Two single-factor arms against aime_rlvr_olmo32 isolate the
+# mechanism: is the KL leash reeling the policy back once all-correct groups
+# stop contributing gradient, or is the lr overshooting?
+aime_rlvr_olmo32_lowkl:
+  _extends: aime_rlvr_olmo32
+  training:
+    kl_coef: 0.001
+
+aime_rlvr_olmo32_lowlr:
+  _extends: aime_rlvr_olmo32
+  training:
+    lr: 3.0e-5
+
 # Rollout-reuse arms (Ethan, 2026-08-08): B200 gradient steps are cheap
 # relative to rollouts, so reusing each rollout batch for 2 PPO epochs is the
 # cost lever — and multi-epoch is off-policy, which is where GSPO's
