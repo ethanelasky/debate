@@ -213,6 +213,33 @@ mb_rlvr_qwen36:
 # roughly 2x the tokens per rollout of the no-scratchpad arms (accepted, Ethan
 # 2026-08-06). The lr1e-3 arm of the no-scratchpad sweep collapsed to
 # all-attack by step ~70; only 1e-4 and 1e-5 are carried over here.
+# RESULTS (2026-08-07, eval split, scripts/mb_evalsplit.py, greedy): base
+# 0.816 -> lr1e-4 step-75 0.832 / final 0.840 (n=250; attack recall
+# .648/.744/.712, honest .984/.920/.968). Paired McNemar final-vs-base: 16
+# gained / 10 lost, p=0.33 — direction positive, NOT confirmed. Checkpoint
+# choice moves the aggregate <1pp but 34/250 rows flip between step-75 and
+# final: late training oscillates along the attack-vs-honest tradeoff (most
+# groups are all-agree — watch pack/n_datums_dropped_zero_advantage, 64-112
+# of 128 per step — so the reward has little gradient left at this base
+# accuracy). lr1e-5 was flat on dev and, per protocol, never touched the eval
+# split. Per-row outcomes (ids/labels/correct only): local
+# outputs/mb_evalsplit_20260807/ (outputs/ is gitignored); regenerate with
+# three mb_evalsplit.py passes if lost.
+#
+# CUE PROVENANCE — these numbers are bound to the "answer directly" blind cue
+# that landed as 04f5dd6, which is also what the relaunch pair
+# (ol1vuv8y/fpdddy8n) trained under. The 2026-08-07 launches went out with
+# UNCOMMITTED prompt edits, so the runs' recorded wandb commits do not
+# describe what they trained on — verify cue wording against transcript
+# samples, never the commit. Cue history: the first launch pair (dev means
+# ~.78) used the older verbose cue (scrutiny hints + "reason through
+# carefully"); dropping it was worth ~+8pp at step 0. A third
+# justification-then-answer variant exists in the launching checkout (for the
+# OLMo policy-swap sweep) but has NOT landed here — if an arm trains under
+# it, its baseline needs a re-eval under that cue: one edit of
+# infra/prompts/tasks/monitoringbench.yaml and two mb_evalsplit.py passes.
+# Checkpoints: lr1e-4 = tinker run
+# 088d4a8e-1d80-5a98-848e-7861ac422c37:train:0, lr1e-5 = cd749edb-....
 mb_rlvr_qwen36_scratchpad_on:
   _extends: mb_rlvr_qwen36
   plan_tokens: 1000   # = the answer budget, and math's plan slot cap
