@@ -104,11 +104,20 @@ class VerlBackendConfig:
         return overrides
 
     def hydra_overrides(self) -> list[str]:
-        # actor.clip_ratio_low/high feed only the vanilla (ppo) loss on this
-        # path; gspo/cispo/gpg do not consume them, so emitting values there
-        # would advertise a clip range the loss never applies.
+        # actor.clip_ratio_low/high feed the vanilla (ppo) loss AND gspo —
+        # verl's compute_policy_loss_gspo reads them as 1±eps, falling back to
+        # the generic clip_ratio default (PPO-scale ~0.2) when absent. GSPO's
+        # sequence ratios concentrate near 1, so a PPO-scale clip is
+        # effectively no clip: gspo therefore REQUIRES explicit paper-scale
+        # bounds and gets its epsilons emitted; cispo/gpg do not consume them.
         clip_overrides: list[str] = []
-        if self.loss.kind in ("ppo", "importance_sampling"):
+        if self.loss.kind == "gspo" and self.loss.clip_low < 0.99:
+            raise ValueError(
+                f"gspo on verl needs paper-scale clip bounds (e.g. clip_low 0.9997 / "
+                f"clip_high 1.0004); got clip_low={self.loss.clip_low} — PPO-scale bounds "
+                "leave sequence ratios effectively unclipped"
+            )
+        if self.loss.kind in ("ppo", "importance_sampling", "gspo"):
             eps_low = round(1.0 - self.loss.clip_low, 6)
             eps_high = round(self.loss.clip_high - 1.0, 6)
             if self.loss.kind == "importance_sampling":

@@ -137,6 +137,22 @@ aime_rlvr_olmo32:
     eval_max_tokens: 1000
     save_every: 25
 
+# Rollout-reuse arms (Ethan, 2026-08-08): B200 gradient steps are cheap
+# relative to rollouts, so reusing each rollout batch for 2 PPO epochs is the
+# cost lever — and multi-epoch is off-policy, which is where GSPO's
+# sequence-level ratio earns its keep. Paired: same budget, epochs 2, PPO vs
+# GSPO (paper-scale clips; verl reads them as 1±eps — see backend guard).
+aime_rlvr_olmo32_2epoch:
+  _extends: aime_rlvr_olmo32
+  training:
+    ppo_epochs: 2
+
+aime_rlvr_olmo32_gspo:
+  _extends: aime_rlvr_olmo32
+  training:
+    ppo_epochs: 2
+    loss: {kind: gspo, clip_low: 0.9997, clip_high: 1.0004}
+
 # tiny live-verification arm for the 32B AIME arm
 aime_rlvr_olmo32_smoke:
   _extends: aime_rlvr_olmo32

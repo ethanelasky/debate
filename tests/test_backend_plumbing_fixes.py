@@ -140,7 +140,7 @@ def test_importance_sampling_emits_effectively_unclipped_ratios():
     assert "actor_rollout_ref.actor.clip_ratio_high=1000.0" in overrides
 
 
-@pytest.mark.parametrize("kind", ["gspo", "cispo", "reinforce"])
+@pytest.mark.parametrize("kind", ["cispo", "reinforce"])
 def test_non_consuming_loss_kinds_omit_clip_ratios(kind):
     # These kinds do not read actor.clip_ratio_* on this path; emitting the
     # keys would advertise a clip range the loss never applies.
@@ -148,8 +148,25 @@ def test_non_consuming_loss_kinds_omit_clip_ratios(kind):
     assert not any("clip_ratio" in o for o in overrides)
 
 
-def test_gspo_still_selects_its_loss_mode():
-    assert "actor_rollout_ref.actor.policy_loss.loss_mode=gspo" in _overrides("gspo")
+def test_gspo_emits_paper_scale_epsilons():
+    # verl's gspo reads clip_ratio_low/high as 1±eps and would otherwise fall
+    # back to the PPO-scale default — effectively unclipped for seq ratios.
+    overrides = _overrides("gspo", clip_low=0.9997, clip_high=1.0004)
+    assert "actor_rollout_ref.actor.clip_ratio_low=0.0003" in overrides
+    assert "actor_rollout_ref.actor.clip_ratio_high=0.0004" in overrides
+    assert "actor_rollout_ref.actor.policy_loss.loss_mode=gspo" in overrides
+
+
+def test_gspo_rejects_ppo_scale_bounds():
+    with pytest.raises(ValueError, match="paper-scale"):
+        _overrides("gspo", clip_low=0.8, clip_high=1.2)
+
+
+def test_gspo_rejects_lossspec_defaults():
+    # LossSpec defaults are PPO bounds; a gspo config that forgets to set
+    # clips must fail at build, not train unclipped.
+    with pytest.raises(ValueError, match="paper-scale"):
+        _overrides("gspo")
 
 
 # ------------------------------------------------------- prompt-length guard
