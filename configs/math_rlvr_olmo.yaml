@@ -110,6 +110,16 @@ aime_rlvr_olmo32:
       response_length: 1024        # covers the 1000-token plan and answer caps
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
+      # Instrumented diagnosis 2026-08-08 (evacuation/manual-1786167529):
+      # under verl's --enable_sleep_mode (CuMemAllocator + expandable
+      # segments), vLLM's custom all-reduce hard-exits the TP workers from
+      # C++ at custom_all_reduce.cuh:455 ('invalid argument') during graph
+      # capture — no traceback, looks exactly like a silent SIGKILL. NCCL
+      # allreduce over NVLink instead; negligible rollout cost. This may
+      # also explain the first "fp32" crash (same cascade) — bf16 remains
+      # right for load time and CPU headroom regardless.
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
     wandb_entity: palaestra-research   # the TEAM (see the base entry's note)
     wandb_project: debate-math
     lora_rank: 32
