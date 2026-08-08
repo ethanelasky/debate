@@ -218,7 +218,14 @@ aime_rlvr_olmo32_plan8k:
 # Same, CISPO loss (IS-weight clamp with stop-grad keeps gradient from every
 # token — MiniMax-M1's fix for clipped-token gradient starvation, plausibly
 # what LoRA's thin pipe needs). Asymmetric DAPO-style bounds.
+# THE LONG BET (Ethan 2026-08-08): 200 steps, eval every 20 (plan8k evals
+# generate ~9k tokens/problem — at every-5 they would eat ~25% of wall-clock,
+# at every-20 ~3%). If still climbing at 200, continue to 400 via
+# --load .../step-00200 --wandb-resume <run-id> on the same curve.
 aime_rlvr_olmo32_plan8k_cispo:
   _extends: aime_rlvr_olmo32_plan8k
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    steps: 200
+    eval_every: 20
+    save_every: 25
