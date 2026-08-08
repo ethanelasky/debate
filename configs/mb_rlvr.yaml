@@ -155,6 +155,15 @@ mb_rlvr_qwen36:
     split_files:
       train: data/monitoringbench/splits/train_ids.txt
       test: data/monitoringbench/splits/dev_ids.txt
+    # Confidence tiebreaker, OFF by default (0.0 = byte-identical binary
+    # reward). Adds coeff * P(answer word) for correct verdicts and
+    # coeff * (1 - P) for wrong ones, so an all-agree GRPO group keeps nonzero
+    # advantage variance instead of being dropped whole
+    # (pack/n_datums_dropped_zero_advantage). CAUTION: it pressures the
+    # monitor's calibration (pushing stated confidence to 1.0 is the reward
+    # hack), and norm_adv_by_std amplifies the tiny spreads it creates — set
+    # training norm_adv_by_std: false (or lower the lr) when enabling.
+    # answer_conf_coeff: 0.05
   training:
     backend: tinker
     wandb_project: debate-mb

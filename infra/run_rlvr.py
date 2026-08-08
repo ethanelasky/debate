@@ -109,6 +109,7 @@ def main() -> None:
     family = get_family(ds.pop("type", None))
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
     env = family.source(ds)
+    source_env = env  # the task-source env keeps ownership of reward_sample
     # plan_tokens: two-turn plan-then-answer rollouts (train AND eval — one
     # env, one rollout path), matching the debate arm's pre-solution scratchpad
     # slot. See infra/envs/planned.py.
@@ -136,6 +137,14 @@ def main() -> None:
     )
     if args.load:
         backend.load(args.load)
+
+    # Tokenizer injection, attribute convention: envs have no tokenizer of
+    # their own; a logprob-reading reward (MB's dataset.answer_conf_coeff)
+    # needs one to map completion tokens to char offsets. Set on the SOURCE
+    # env — the object whose reward_sample reads it — not the PlannedEnv
+    # wrapper, so no attribute forwarding is involved (least-magic option).
+    # Envs that never read `tokenizer` simply carry an unused attribute.
+    source_env.tokenizer = backend.tokenizer
 
     max_tokens = exp.get("max_completion_tokens")
     if max_tokens is None:

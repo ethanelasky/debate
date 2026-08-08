@@ -146,7 +146,11 @@ class PlannedEnv(Env):
             if not a.fidelity_ok():
                 n_dropped += 1
                 continue
-            reward, info = self.inner.reward(tasks[ti], a.text)
+            # Scored via the inner env's SAMPLE-level seam with the ANSWER
+            # sample, so a logprob-reading grader (MB's confidence tiebreaker)
+            # sees the same Sample here as in the single-turn arm. The plan
+            # turn stays unrewarded — only `a` is ever scored.
+            reward, info = self.inner.reward_sample(tasks[ti], a)
             groups[ti].append(
                 Trajectory(
                     datums=[datum_from_sample(plan_s), datum_from_sample(a)],

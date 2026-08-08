@@ -166,6 +166,16 @@ class SingleTurnEnv(Env):
         Every info key should be present on EVERY branch, so eval-time averages
         are means over all samples rather than over whichever branch set it."""
 
+    def reward_sample(self, task: Task, sample: Sample) -> tuple[float, dict[str, Any]]:
+        """Sample-level scoring seam: rollout() routes every kept sample
+        through here — the inline AND the grade_workers pool branch — so a
+        grader that needs more than the text (e.g. MB's confidence tiebreaker,
+        which reads the sampler's per-token logprobs) can override this
+        without forking the rollout shape. The base implementation is EXACTLY
+        `self.reward(task, sample.text)`: subclasses that only implement
+        reward() see no behavior change."""
+        return self.reward(task, sample.text)
+
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
         # Split generation from scoring: they are the two halves of a rollout and
         # have completely different cost drivers (GPU token throughput vs CPU
@@ -187,10 +197,10 @@ class SingleTurnEnv(Env):
         workers = max(1, self.grade_workers)
         if workers > 1 and kept:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(self.reward, tasks[gi], s.text) for gi, s in kept]
+                futures = [pool.submit(self.reward_sample, tasks[gi], s) for gi, s in kept]
                 scored = [f.result() for f in futures]
         else:
-            scored = [self.reward(tasks[gi], s.text) for gi, s in kept]
+            scored = [self.reward_sample(tasks[gi], s) for gi, s in kept]
 
         self.last_phase_seconds = {"generate": _t_generate, "reward": time.monotonic() - _t1}
 
