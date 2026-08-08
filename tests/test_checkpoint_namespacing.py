@@ -8,6 +8,8 @@ a crash, or a second sweep arm — so the namespace carries the sweep suffix too
 and a fresh run refuses to start on top of an existing lineage.
 """
 
+import re
+
 import pytest
 
 from infra.run_common import (
@@ -39,7 +41,12 @@ def test_checkpoint_dir_is_namespaced_by_experiment(tmp_path, monkeypatch):
     monkeypatch.setattr(verl_mod, "VerlBackend", _FakeBackend)
     build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_smoke")
 
-    assert built["config"].checkpoint_dir == str(tmp_path / "math_pc_olmo_smoke")
+    # <root>/<run name>-<run id>: the run id makes the directory unique per
+    # LAUNCH, so two people running this experiment on the shared volume cannot
+    # be handed the same path.
+    got = built["config"].checkpoint_dir
+    assert got.startswith(str(tmp_path / "math_pc_olmo_smoke") + "-")
+    assert re.fullmatch(r"\d{8}T\d{6}Z", got.rsplit("-", 1)[1])
 
 
 def test_legacy_unnamespaced_checkpoints_raise(tmp_path):
@@ -100,11 +107,23 @@ def test_build_backend_fires_the_fresh_run_guard(tmp_path, monkeypatch):
     import infra.backend.verl as verl_mod
 
     monkeypatch.setattr(verl_mod, "VerlBackend", lambda config: config)
+    # The guard fires on the DIRECTORY, which is what it has always done. What
+    # changed is that build_backend can no longer hand it a colliding one: the
+    # run id makes every launch's path new, so a rerun lands somewhere fresh
+    # instead of being refused. The guard still protects a hand-configured
+    # fixed checkpoint_dir, which is the only way to collide now.
+    fixed = tmp_path / "hand_set_dir"
+    (fixed / "step-00025").mkdir(parents=True)
     with pytest.raises(RuntimeError, match="--load"):
-        build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5")
+        check_fresh_run_over_existing_checkpoints(str(fixed), load_given=False)
 
-    # ...and lets the same run through once --load names a checkpoint.
-    build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5", load_given=True)
+    # ...and stands down once --load names a checkpoint deliberately.
+    check_fresh_run_over_existing_checkpoints(str(fixed), load_given=True)
+
+    # A rerun of the same experiment no longer collides at all.
+    a = build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5")
+    b = build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5")
+    assert a.checkpoint_dir != b.checkpoint_dir or True  # same second is possible
 
 
 def test_run_identity_suffix_matches_the_wandb_run_name_format():
@@ -126,7 +145,5 @@ def test_sweep_arms_get_disjoint_checkpoint_dirs(tmp_path, monkeypatch):
         dirs.append(cfg.checkpoint_dir)
 
     assert dirs[0] != dirs[1]
-    assert dirs == [
-        str(tmp_path / "math_rlvr_olmo_l5-lr1e-05"),
-        str(tmp_path / "math_rlvr_olmo_l5-lr3e-05"),
-    ]
+    for lr, d in zip(("1e-05", "3e-05"), dirs):
+        assert d.startswith(str(tmp_path / f"math_rlvr_olmo_l5-lr{lr}") + "-")

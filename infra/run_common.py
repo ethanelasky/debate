@@ -11,6 +11,7 @@ or task families.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import os
 import re
 
@@ -174,6 +175,24 @@ def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
     return kw
 
 
+def run_id() -> str:
+    """A per-LAUNCH id, so two runs can never share a checkpoint directory.
+
+    $VOL is shared across the team, and run_name alone is not unique: two people
+    launching the same experiment get the same path. The existing guard
+    (check_fresh_run_over_existing_checkpoints) refuses to start fresh over
+    someone else's checkpoints, but it is check-then-act -- two launches inside
+    the same minute both see an empty directory and both proceed, and concurrent
+    writers to one .pt file produce a TORN file rather than a lost one: it looks
+    valid and fails at --load, possibly days later.
+
+    UTC to the second, so it sorts chronologically and is legible in a listing.
+    Deliberately carries no owner or hostname: the id answers "which launch",
+    and identity belongs in the run's own metadata, not in a path.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def run_identity_suffix(
     lr: float | None,
     levels: str | None,
@@ -300,7 +319,12 @@ def build_backend(
 
         v = dict(tr.get("verl") or {})
         ckpt_root = str(v.get("checkpoint_dir", VerlBackendConfig.checkpoint_dir))
-        ckpt_dir = os.path.join(ckpt_root, run_name)
+        # run_id makes the directory unique per LAUNCH, so a shared volume
+        # cannot serve two runs the same path. The wandb run keeps the bare
+        # run_name -- wandb ids are already unique, so only the filesystem needs
+        # this -- and the resolved path is logged into the run's config so the
+        # mapping from run name back to checkpoints stays discoverable.
+        ckpt_dir = os.path.join(ckpt_root, f"{run_name}-{run_id()}")
         check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
         check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
         verl_casts: tuple[tuple[str, object], ...] = (

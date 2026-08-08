@@ -49,6 +49,10 @@ class Config:
     # team cannot see. Set it explicitly in the experiment config.
     wandb_entity: str | None = None
     log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
+    # Where this run's checkpoints actually landed. Recorded because the
+    # directory carries a per-launch run_id that the wandb run name does not, so
+    # without it the mapping from a run back to its checkpoints is guesswork.
+    checkpoint_dir: str | None = None
     run_name: str | None = None
     # Continuation plumbing: start_step makes the loop run [start_step, steps)
     # so step indices, save names, and eval cadence continue the original

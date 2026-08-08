@@ -255,6 +255,7 @@ def main() -> None:
 
     profile = resolved_sampling_profile(lead, "train")
     cfg = Config(
+        checkpoint_dir=getattr(getattr(backend, "config", None), "checkpoint_dir", None),
         base_model=lead.model_file_path,
         sampling=SamplingParams(
             # no ceiling here: budgets are the protocol's per-slot caps, and

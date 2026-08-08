@@ -238,6 +238,7 @@ def main() -> None:
         _check_thinking_toggle(backend.tokenizer, bool(enable_thinking))
 
     cfg = Config(
+        checkpoint_dir=getattr(getattr(backend, "config", None), "checkpoint_dir", None),
         base_model=model_path,
         # total_budget, not max_completion_tokens: with think_tokens set the
         # one generation carries think AND answer, and Policy.predict treats
