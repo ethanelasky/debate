@@ -297,17 +297,46 @@ aime_rlvr_olmo32think:
     # think_tokens + max_completion_tokens.
     save_every: 25
 
-# Truncation control (overnight 2026-08-08): no scratchpad, single turn,
-# 3000-token answer under the commit-directly prompt — isolates "the plateau
-# was budget truncation + the re-derivation prompt" from everything else.
-# ~50% of eval answers truncated unboxed at 1000 across all prior arms.
-aime_rlvr_olmo32_ans3k:
-  _extends: aime_rlvr_olmo32
-  plan_tokens: null
-  max_completion_tokens: 3000
+# CISPO recipe on a smaller, stronger-floored policy (Ethan, 2026-08-08):
+# Qwen3.5-9B (AIME floor 43% think-off — the best sub-32B instruct we
+# measured) under the fixed 8k scratchpad + commit-directly prompt. Decouples
+# "does the recipe work" from "is OLMo-32B/LoRA the problem": a 9B trains
+# ~4x faster and the LoRA pipe covers a larger fraction of the model.
+# Hybrid-thinking model: enable_thinking false is a real setting, verified
+# against the template at launch.
+aime_rlvr_qwen9b_plan8k_cispo:
+  model: Qwen/Qwen3.5-9B
+  enable_thinking: false
+  max_completion_tokens: 1000
+  plan_tokens: 8192
+  dataset: {type: aime, seed: 0}
   training:
-    dynamic_sampling_retries: 5
+    backend: verl
     verl:
-      prompt_length: 2048
-      response_length: 3072
-    eval_max_tokens: 3000
+      n_gpus: 2
+      strategy: fsdp2
+      rollout_tp: 1                # 17GB bf16: one replica PER GPU — 2x rollout throughput
+      gpu_memory_utilization: 0.42
+      prompt_length: 12288
+      response_length: 8192
+      max_token_len_per_gpu: 24576
+      checkpoint_dir: /workspace/checkpoints
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+    wandb_entity: palaestra-research
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    ppo_epochs: 2
+    adv_length_norm: count
+    steps: 200
+    batch_size: 8
+    group_size: 8
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 20
+    eval_n: 93
+    eval_max_tokens: 1000
+    save_every: 25
+    dynamic_sampling_retries: 5
