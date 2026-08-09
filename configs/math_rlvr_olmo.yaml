@@ -229,3 +229,85 @@ aime_rlvr_olmo32_plan8k_cispo:
     steps: 200
     eval_every: 20
     save_every: 25
+    dynamic_sampling_retries: 5
+
+# Think-DPO ablation arm (Ethan, 2026-08-08): the THINKING model on AIME,
+# using its native private <think> channel instead of the PlannedEnv
+# scratchpad turn — single-turn generation, thinking ON, think phase
+# HARD-CAPPED at 8192 tokens (budget-forced sampling injects </think> at the
+# cap, masked from training, and the visible answer continues under
+# max_completion_tokens). Answer format rewards unchanged (MathEnv.reward).
+# Standalone entry, not _extends aime_rlvr_olmo32: _extends cannot REMOVE the
+# base's plan_tokens, and plan_tokens + think_tokens is rejected at launch.
+aime_rlvr_olmo32think:
+  # bf16 on HF (64.5GB, same Olmo3ForCausalLM arch) — no fp32->bf16
+  # conversion step this time. Download: HF_HOME=/workspace/hf so the ~64GB
+  # cache lands on the network volume (~100G free) and survives pod stops
+  # (the container disk is wiped on stop).
+  model: allenai/Olmo-3-32B-Think-DPO
+  enable_thinking: true
+  # Think content is PRIVATE compute for the reward, on two layers
+  # (answer_parsing.py): strip_think_blocks deletes complete
+  # <think>...</think> blocks before any boxed extraction, and when the chat
+  # template pre-opens <think> (completion carries only the close, so the
+  # block survives stripping) extraction still takes the LAST boxed — a boxed
+  # guess inside the think phase can never beat a boxed final answer, and is
+  # graded only if the visible answer never boxes at all. One caveat, stated
+  # exactly: the 0.1 format bonus keys on a raw '\boxed{' substring
+  # (MathEnv.reward has_boxed), so a think-phase box does earn that shaping
+  # term even when the answer has none.
+  think_tokens: 8192
+  max_completion_tokens: 1000
+  # think_overshoot_penalty: 0.1 off the reward whenever the think phase was
+  # force-closed at the 8192 cap instead of closing itself; the
+  # think_overshoot info key (0/1 per sample) tracks the rate.
+  dataset: {type: aime, seed: 0, think_overshoot_penalty: 0.1}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 2
+      strategy: fsdp2
+      rollout_tp: 2                # 32B weights split across both cards (see aime_rlvr_olmo32)
+      gpu_memory_utilization: 0.42 # same rollout-boot headroom math as aime_rlvr_olmo32
+      prompt_length: 2048          # single turn: system card + one AIME problem
+      response_length: 10240       # 8192 think + 1000 answer + margin, ONE request
+      max_token_len_per_gpu: 16384
+      checkpoint_dir: /workspace/checkpoints
+      # NCCL allreduce instead of vLLM's custom kernel — same sleep-mode
+      # crash as aime_rlvr_olmo32 (see that entry's note).
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+    wandb_entity: palaestra-research   # the TEAM (see the base entry's note)
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 1
+    adv_length_norm: count
+    steps: 100
+    batch_size: 8
+    group_size: 8
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 5
+    eval_n: 93         # the whole AIME held-out split
+    # no eval_max_tokens: eval rollouts run under the SAME think/total
+    # SlotLimits as training (9192 total); a 1000-token eval ceiling would
+    # silently shrink the think cap, and run_rlvr rejects any value below
+    # think_tokens + max_completion_tokens.
+    save_every: 25
+
+# Truncation control (overnight 2026-08-08): no scratchpad, single turn,
+# 3000-token answer under the commit-directly prompt — isolates "the plateau
+# was budget truncation + the re-derivation prompt" from everything else.
+# ~50% of eval answers truncated unboxed at 1000 across all prior arms.
+aime_rlvr_olmo32_ans3k:
+  _extends: aime_rlvr_olmo32
+  plan_tokens: null
+  max_completion_tokens: 3000
+  training:
+    dynamic_sampling_retries: 5
+    verl:
+      prompt_length: 2048
+      response_length: 3072
+    eval_max_tokens: 3000

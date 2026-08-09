@@ -67,6 +67,7 @@ class MathEnv(SingleTurnEnv):
         format_reward: float = 0.1,
         relaxed_correct_bonus: float = 0.1,
         shaped_reward: float = 0.0,
+        think_overshoot_penalty: float = 0.0,
         prompt_file: str | None = None,
     ):
         self.rng = random.Random(seed)
@@ -75,6 +76,16 @@ class MathEnv(SingleTurnEnv):
         self.format_reward = format_reward
         self.relaxed_correct_bonus = relaxed_correct_bonus
         self.shaped_reward = shaped_reward
+        # Think-overshoot penalty (dataset.think_overshoot_penalty): priced in
+        # reward_sample, not reward() — the overshoot fact lives on the
+        # Sample's regions, which reward() (text-only) never sees. Validated
+        # BEFORE the dataset download so a bad config fails in milliseconds.
+        self.think_overshoot_penalty = float(think_overshoot_penalty)
+        if self.think_overshoot_penalty < 0:
+            raise ValueError(
+                f"math: think_overshoot_penalty must be >= 0 (it is SUBTRACTED "
+                f"from the reward on overshoot), got {think_overshoot_penalty}"
+            )
 
         ds = _load()
         level_set = set(levels)
@@ -129,6 +140,26 @@ class MathEnv(SingleTurnEnv):
         }
         return reward, info
 
+    def reward_sample(self, task: Task, sample) -> tuple[float, dict[str, Any]]:
+        """reward() plus the think-overshoot penalty: a flat coefficient off
+        the reward when the sample's think phase was FORCE-CLOSED at its cap —
+        i.e. the Sample carries a "forced_close" region, which only
+        budget_forced_sample (the think_tokens arms) ever writes, so the knob
+        is inert on single-phase rollouts. 0.0 (the default) short-circuits to
+        the plain reward() path: byte-identical rewards AND info. When active,
+        think_overshoot (0.0/1.0) is present on EVERY branch (reward()'s
+        every-branch rule), so eval-time means are over all samples."""
+        reward, info = self.reward(task, sample.text)
+        coeff = self.think_overshoot_penalty
+        if coeff == 0.0:
+            return reward, info
+        overshoot = any(
+            r.kind == "forced_close" for r in (getattr(sample, "regions", None) or ())
+        )
+        if overshoot:
+            reward -= coeff
+        return reward, {**info, "think_overshoot": float(overshoot)}
+
 
 def strict_extract(text: str) -> Optional[float]:
     return extract_number_from_boxed_answer(text)
@@ -155,11 +186,16 @@ def _parse_levels(spec) -> tuple[int, ...]:
 
 class MathFamily(TaskFamily):
     def source(self, ds: dict) -> Env:
-        reject_unknown_keys(ds, {"levels", "seed", "eval_subset_size", "prompt_file"}, "math")
+        reject_unknown_keys(
+            ds,
+            {"levels", "seed", "eval_subset_size", "prompt_file", "think_overshoot_penalty"},
+            "math",
+        )
         return MathEnv(
             seed=int(ds.get("seed", 0)),
             levels=_parse_levels(ds.get("levels", 5)),
             eval_subset_size=int(ds.get("eval_subset_size", 512)),
+            think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
         )
 

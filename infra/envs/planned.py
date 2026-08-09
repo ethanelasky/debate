@@ -49,7 +49,7 @@ class PlannedEnv(Env):
     carries the problem text as meta["question"] and whose plan template
     binds it via <PROBLEM> (math, codecontests)."""
 
-    def __init__(self, inner: SingleTurnEnv, plan_max_tokens: int):
+    def __init__(self, inner: SingleTurnEnv, plan_max_tokens: int, answer_max_tokens: int | None = None):
         prompts = getattr(inner, "prompts", None)
         named = prompts.supplied_templates() if prompts is not None else {}
         # The turn-1/turn-2 split is positional (everything but the last
@@ -76,6 +76,10 @@ class PlannedEnv(Env):
         self.inner = inner
         self.plan_template = named[PLAN_TEMPLATE_NAME]
         self.plan_max_tokens = int(plan_max_tokens)
+        # The answer turn's own cap. Without it the answer inherits the
+        # sampler ceiling, which run_rlvr must raise to fit the PLAN turn —
+        # min()-clamping is how the plan silently shrank to 1000 before.
+        self.answer_max_tokens = int(answer_max_tokens) if answer_max_tokens is not None else None
         self.last_rollout_records: list[dict[str, Any]] = []
 
     def tasks(self, n: int, split: str = "train") -> list[Task]:
@@ -135,8 +139,13 @@ class PlannedEnv(Env):
                     continue
                 convo = plan_convos[ti] + [{"role": "assistant", "content": s.text.strip()}] + body
                 pending.append((ti, s, convo))
+        answer_limits = (
+            SlotLimits(max_total_tokens=self.answer_max_tokens)
+            if self.answer_max_tokens is not None
+            else None
+        )
         answer_results = (
-            policy.predict([c for _, _, c in pending], n=1) if pending else []
+            policy.predict([c for _, _, c in pending], n=1, limits=answer_limits) if pending else []
         )
 
         groups: list[list[Trajectory]] = [[] for _ in tasks]

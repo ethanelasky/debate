@@ -21,6 +21,16 @@ than trusted, because a template that ignores the kwarg drops it in silence —
 the same latent failure the OpenRouter seats hit (MB_DEBATE_PLAN 2026-08-02).
 Omit the key for models without a thinking mode.
 
+`think_tokens` (optional; requires enable_thinking: true, mutually exclusive
+with plan_tokens) is the thinking-model twin of plan_tokens: instead of a
+scratchpad TURN, the model's native private <think> phase is the sequential
+compute. Generation stays single-turn but runs through budget-forced sampling
+(infra/envs/base.py): the think phase is HARD-CAPPED at think_tokens —
+</think> force-injected at the cap, masked from training — and the visible
+answer continues under max_completion_tokens. One SlotLimits on the source env
+covers train AND eval rollouts. dataset.think_overshoot_penalty (math/aime)
+prices a force-closed think phase in the reward.
+
 MB blind choice (dataset.type: monitoringbench) needs nothing extra: the task
 source renders its RLVR prompt from the family's answer-generation config
 (infra/prompts/tasks/monitoringbench.yaml, dataset.prompt_file to override) —
@@ -50,6 +60,7 @@ EXPERIMENT_KEYS = {
     "enable_thinking",
     "max_completion_tokens",
     "plan_tokens",
+    "think_tokens",
     "dataset",
     "training",
 }
@@ -96,6 +107,35 @@ def validate_experiment(exp: dict) -> None:
     reject_unknown_keys(tr, TRAINING_KEYS, "training")
     reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
 
+    think_tokens = exp.get("think_tokens")
+    if think_tokens is not None:
+        if exp.get("plan_tokens") is not None:
+            raise ValueError(
+                "think_tokens and plan_tokens are mutually exclusive: the native "
+                "<think> phase IS the private scratchpad, so a plan turn on top "
+                "would double the sequential compute the arms exist to compare. "
+                "Drop one."
+            )
+        if int(think_tokens) <= 0:
+            raise ValueError(f"think_tokens must be a positive token budget, got {think_tokens!r}")
+        if exp.get("enable_thinking") is not True:
+            raise ValueError(
+                "think_tokens hard-caps the model's native think phase, which the "
+                "chat template only opens with enable_thinking: true — set the key "
+                "explicitly, or the cap would police a channel that never opens."
+            )
+        emt = tr.get("eval_max_tokens")
+        mct = exp.get("max_completion_tokens")
+        if emt is not None and mct is not None and int(emt) < int(think_tokens) + int(mct):
+            raise ValueError(
+                f"training.eval_max_tokens={emt} is below think_tokens + "
+                f"max_completion_tokens = {int(think_tokens) + int(mct)}: eval "
+                "rollouts run under the same think/total SlotLimits as training, "
+                "and a smaller eval ceiling silently SHRINKS the think cap "
+                "(budget-forced sampling takes the min). Raise it, or drop the "
+                "key so eval samples under the training budget."
+            )
+
 
 def main() -> None:
     args = runner_parser(__doc__).parse_args()
@@ -114,26 +154,60 @@ def main() -> None:
     # env, one rollout path), matching the debate arm's pre-solution scratchpad
     # slot. See infra/envs/planned.py.
     plan_tokens = exp.get("plan_tokens")
-    if plan_tokens is not None:
-        from infra.envs.planned import PlannedEnv
-
-        env = PlannedEnv(env, int(plan_tokens))
 
     tr = exp.get("training") or {}
     model_path = str(exp["model"])
     run_name = args.experiment + run_identity_suffix(
         args.lr, args.levels, args.group_size, args.batch_size
     )
+
+    max_tokens = exp.get("max_completion_tokens")
+    if max_tokens is None:
+        raise ValueError("set max_completion_tokens (per-generation budget) in the experiment")
+
+    # think_tokens: native-<think> single-turn rollouts (validated against
+    # plan_tokens/enable_thinking in validate_experiment). One SlotLimits on
+    # the SOURCE env covers train AND eval — both run through
+    # SingleTurnEnv.rollout — and routes generation through
+    # budget_forced_sample. The per-request total is think + answer: that sum
+    # is what the sampler ceiling must allow (Policy.predict clamps to
+    # min(params.max_tokens, max_total_tokens) — a bare max_completion_tokens
+    # ceiling would silently shrink the think cap) and what the rollout
+    # engine must fit in one request (gen_budgets vs verl.response_length).
+    think_tokens = exp.get("think_tokens")
+    total_budget = int(max_tokens)
+    # plan_tokens: the PLAN turn is the largest single generation, so the
+    # sampler ceiling must be raised to it — Policy.predict min()-clamps slot
+    # limits against params.max_tokens, which is exactly how the 8k plan
+    # silently shrank to max_completion_tokens (1000) in every pre-fix plan
+    # arm (2026-08-08). The answer turn keeps its own explicit cap instead.
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        env = PlannedEnv(env, int(plan_tokens), answer_max_tokens=int(max_tokens))
+        total_budget = max(int(max_tokens), int(plan_tokens))
+    gen_budgets = {
+        "max_completion_tokens": max_tokens,
+        "training.eval_max_tokens": tr.get("eval_max_tokens"),
+    }
+    if plan_tokens is not None:
+        gen_budgets["plan_tokens"] = int(plan_tokens)
+    if think_tokens is not None:
+        from infra.envs.base import SlotLimits
+
+        total_budget = int(think_tokens) + int(max_tokens)
+        source_env.slot_limits = SlotLimits(
+            max_think_tokens=int(think_tokens), max_total_tokens=total_budget
+        )
+        gen_budgets["think_tokens + max_completion_tokens"] = total_budget
+
     backend = build_backend(
         tr,
         model_path,
         run_name,
         lr_override=args.lr,
         load_given=bool(args.load),
-        gen_budgets={
-            "max_completion_tokens": exp.get("max_completion_tokens"),
-            "training.eval_max_tokens": tr.get("eval_max_tokens"),
-        },
+        gen_budgets=gen_budgets,
     )
     if args.load:
         backend.load(args.load)
@@ -146,17 +220,16 @@ def main() -> None:
     # Envs that never read `tokenizer` simply carry an unused attribute.
     source_env.tokenizer = backend.tokenizer
 
-    max_tokens = exp.get("max_completion_tokens")
-    if max_tokens is None:
-        raise ValueError("set max_completion_tokens (per-generation budget) in the experiment")
-
     enable_thinking = exp.get("enable_thinking")
     if enable_thinking is not None:
         _check_thinking_toggle(backend.tokenizer, bool(enable_thinking))
 
     cfg = Config(
         base_model=model_path,
-        sampling=SamplingParams(max_tokens=int(max_tokens), temperature=1.0, top_p=1.0),
+        # total_budget, not max_completion_tokens: with think_tokens set the
+        # one generation carries think AND answer, and Policy.predict treats
+        # this as the ceiling over the SlotLimits total.
+        sampling=SamplingParams(max_tokens=total_budget, temperature=1.0, top_p=1.0),
         chat_template_kwargs=(
             None if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
         ),

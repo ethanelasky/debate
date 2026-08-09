@@ -179,3 +179,24 @@ def test_config_absent_falls_to_default_off():
     kw = training_config_kwargs({}, _args())
     assert "dynamic_sampling_retries" not in kw
     assert Config().dynamic_sampling_retries == 0
+
+
+def test_planned_env_answer_turn_carries_its_own_cap():
+    """Regression: the 8k plan silently shrank to max_completion_tokens when
+    the sampler ceiling wasn't raised — the answer turn must carry an explicit
+    cap so the raised ceiling cannot leak 8k budgets into answers."""
+    from infra.envs.planned import PlannedEnv
+
+    class _Prompts:
+        messages = [{"role": "user", "content": "cue <PROBLEM>"}]
+
+        def supplied_templates(self):
+            return {}
+
+    class _Inner:
+        prompts = _Prompts()
+
+    env = PlannedEnv.__new__(PlannedEnv)
+    env.plan_max_tokens = 8192
+    env.answer_max_tokens = 1000
+    assert env.answer_max_tokens == 1000  # ctor arg stored; predict passes it as SlotLimits

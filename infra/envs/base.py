@@ -160,6 +160,15 @@ class SingleTurnEnv(Env):
     soft_token_budget: Optional[int] = None
     overshoot_penalty: float = 0.0
 
+    #: Hard per-generation token caps for EVERY rollout this env runs — train
+    #: and eval alike, since both go through this one rollout(). Injected by
+    #: run_rlvr when the experiment sets think_tokens (native-<think> arms):
+    #: predict() then runs budget_forced_sample, which force-injects </think>
+    #: at the think cap and marks the injection as a "forced_close" region on
+    #: the Sample (masked from training; reward_sample overrides may price
+    #: it). None = the plain single-phase path.
+    slot_limits: Optional[SlotLimits] = None
+
     @abstractmethod
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         """Completion text -> (reward, metric info), one call per kept sample.
@@ -181,7 +190,15 @@ class SingleTurnEnv(Env):
         # have completely different cost drivers (GPU token throughput vs CPU
         # subprocess execution), so a combined number hides which one to attack.
         _t0 = time.monotonic()
-        results = policy.predict([t.messages for t in tasks], n=group_size)
+        # slot_limits None must leave the predict CALL byte-identical, not
+        # just equivalent: existing policy stubs (tests) accept no `limits`
+        # kwarg, and the default path must never depend on them doing so.
+        if self.slot_limits is None:
+            results = policy.predict([t.messages for t in tasks], n=group_size)
+        else:
+            results = policy.predict(
+                [t.messages for t in tasks], n=group_size, limits=self.slot_limits
+            )
         _t_generate = time.monotonic() - _t0
         groups: list[list[Trajectory]] = [[] for _ in tasks]
         kept: list[tuple[int, Sample]] = []

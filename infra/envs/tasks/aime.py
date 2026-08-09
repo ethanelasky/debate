@@ -45,6 +45,7 @@ class AimeEnv(SingleTurnEnv):
         correct_reward: float = 1.0,
         format_reward: float = 0.1,
         relaxed_correct_bonus: float = 0.1,
+        think_overshoot_penalty: float = 0.0,
         prompt_file: str | None = None,
     ):
         self.rng = random.Random(seed)
@@ -53,6 +54,15 @@ class AimeEnv(SingleTurnEnv):
         self.format_reward = format_reward
         self.relaxed_correct_bonus = relaxed_correct_bonus
         self.shaped_reward = 0.0
+        # Same knob, validation placement (before the dataset download), and
+        # reward_sample as MathEnv — the methods are shared by assignment
+        # below, and the overshoot fact rides the Sample's regions.
+        self.think_overshoot_penalty = float(think_overshoot_penalty)
+        if self.think_overshoot_penalty < 0:
+            raise ValueError(
+                f"aime: think_overshoot_penalty must be >= 0 (it is SUBTRACTED "
+                f"from the reward on overshoot), got {think_overshoot_penalty}"
+            )
 
         rows = _rows(load_dataset(DATASET_ID)["train"])
         rng = random.Random(seed + 22222)
@@ -73,14 +83,18 @@ class AimeEnv(SingleTurnEnv):
 
     tasks = MathEnv.tasks
     reward = MathEnv.reward
+    reward_sample = MathEnv.reward_sample
 
 
 class AimeFamily(TaskFamily):
     def source(self, ds: dict) -> Env:
-        reject_unknown_keys(ds, {"seed", "eval_subset_size", "prompt_file"}, "aime")
+        reject_unknown_keys(
+            ds, {"seed", "eval_subset_size", "prompt_file", "think_overshoot_penalty"}, "aime"
+        )
         return AimeEnv(
             seed=int(ds.get("seed", 0)),
             eval_subset_size=int(ds.get("eval_subset_size", 512)),
+            think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
         )
 
