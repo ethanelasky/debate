@@ -87,18 +87,16 @@ def test_math_source_rejects_unknown_key_before_loading():
 # a stray edit to the YAML (reflow, smart quote, lost backslash) silently
 # changes the experiment.
 
-MATH_SYSTEM = "You are an expert mathematician. Solve rigorously and end with one boxed answer."
+MATH_SYSTEM = "You are an expert mathematician."
 
 MATH_USER = (
     "Solve this mathematics problem.\n"
     "\n"
     "<problem>What is $1 + 1$?</problem>\n"
     "\n"
-    "Requirements:\n"
-    "- Justify your answer in a concise but rigorous way.\n"
-    "- End with your final answer as EXACTLY one \\boxed{...} on the last line.\n"
-    "\n"
-    "Provide your solution:"
+    "Give your answer directly, with a concise but rigorous justification, as "
+    "EXACTLY one \\boxed{...} on the last line. The boxed answer must be the "
+    "very last thing you output, with nothing after it."
 )
 
 

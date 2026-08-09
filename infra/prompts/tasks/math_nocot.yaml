@@ -26,10 +26,7 @@ messages:
 
       <problem><PROBLEM></problem>
 
-      Requirements:
-      - End with your final answer as EXACTLY one \boxed{...} on the last line.
-
-      Provide your solution:
+      Give your answer directly, as EXACTLY one \boxed{...} on the last line. The boxed answer must be the very last thing you output, with nothing after it.
 
 # Neutral plan cue, derived from math.yaml's `plan` by DELETION ONLY: the
 # "work the problem / do the key computations" coaching is removed — this arm's

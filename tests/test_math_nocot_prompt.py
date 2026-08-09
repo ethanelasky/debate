@@ -42,11 +42,14 @@ def test_lines_are_a_subset_of_math_yaml():
     leading fragment of one (deletion of a trailing clause within a line)."""
     base = load_generation_prompts(resolve_prompt_file("infra/prompts/tasks/math.yaml", "unused"))
     base_lines = (_system(base) + "\n" + _user(base)).splitlines()
+    # Mid-line clause deletions count as deletions: compare against each base
+    # line with the reasoning-coaching clause stripped as well as verbatim.
+    stripped = [b.replace(", with a concise but rigorous justification,", ",") for b in base_lines]
     p = _prompts()
     for line in (_system(p) + "\n" + _user(p)).splitlines():
         if line.strip():
             assert any(
-                b == line or b.startswith(line.rstrip()) for b in base_lines
+                b == line or b.startswith(line.rstrip()) for b in base_lines + stripped
             ), f"authored (not deleted) line: {line!r}"
 
 

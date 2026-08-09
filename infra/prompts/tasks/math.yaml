@@ -32,7 +32,7 @@
 messages:
   - role: system
     content: |-
-      You are an expert mathematician. Solve rigorously and end with one boxed answer.
+      You are an expert mathematician.
   - role: user
     name: ANSWER_GEN_USER
     content: |-
@@ -40,11 +40,7 @@ messages:
 
       <problem><PROBLEM></problem>
 
-      Requirements:
-      - Justify your answer in a concise but rigorous way.
-      - End with your final answer as EXACTLY one \boxed{...} on the last line.
-
-      Provide your solution:
+      Give your answer directly, with a concise but rigorous justification, as EXACTLY one \boxed{...} on the last line. The boxed answer must be the very last thing you output, with nothing after it.
 
 # The plan-turn cue (splice name PLAN_USER; see infra/envs/task_prompts.py).
 # NOT part of the solo messages above: plain single-turn arms keep rendering
