@@ -57,3 +57,33 @@ def test_enable_thinking_is_an_accepted_experiment_key():
             "training": {"steps": 2, "lr": 1e-5},
         }
     )
+
+
+class _AlwaysThinkTokenizer:
+    """Olmo Think line: no toggle exists, the generation prompt always opens
+    <think>. Identical renders + <think> present must pass when the config
+    asked for thinking."""
+
+    def apply_chat_template(self, msgs, add_generation_prompt=True, tokenize=True, **kw):
+        text = "<|user|>probe<|assistant|><think>"
+        return [1, 2, 3] if tokenize else text
+
+
+class _NoThinkTokenizer:
+    def apply_chat_template(self, msgs, add_generation_prompt=True, tokenize=True, **kw):
+        return [1, 2, 3] if tokenize else "<|user|>probe<|assistant|>"
+
+
+def test_always_thinking_template_passes_when_thinking_requested():
+    from infra.run_rlvr import _check_thinking_toggle
+
+    _check_thinking_toggle(_AlwaysThinkTokenizer(), True)  # no raise
+
+
+def test_toggle_less_non_think_template_still_rejected():
+    import pytest
+
+    from infra.run_rlvr import _check_thinking_toggle
+
+    with pytest.raises(ValueError, match="renders identically"):
+        _check_thinking_toggle(_NoThinkTokenizer(), True)

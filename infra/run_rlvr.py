@@ -86,11 +86,24 @@ def _check_thinking_toggle(tokenizer, enable_thinking: bool) -> None:
         return out[0] if out and isinstance(out[0], list) else out
 
     if render(True) == render(False):
+        # An identical render has two meanings. An ALWAYS-thinking model
+        # (Olmo Think line: the template opens <think> unconditionally, no
+        # toggle exists) is fine when the config asked for thinking — the
+        # behavior matches intent even though the knob is inert. A template
+        # with no think mode at all is the silent-drop hazard this guard
+        # exists for. The rendered generation prompt separates them.
+        rendered_text = tokenizer.apply_chat_template(
+            probe, add_generation_prompt=True, tokenize=False, enable_thinking=True
+        )
+        if enable_thinking and "<think>" in rendered_text:
+            return
         raise ValueError(
             f"enable_thinking: {str(enable_thinking).lower()} was set, but this model's chat "
             "template renders identically with enable_thinking True and False — the setting "
             "would be silently dropped. Remove the key (models without a thinking mode need "
-            "no toggle) or point the arm at a hybrid-thinking model."
+            "no toggle) or point the arm at a hybrid-thinking model. (Always-thinking "
+            "templates whose generation prompt opens <think> pass this check when "
+            "enable_thinking is true.)"
         )
 
 
