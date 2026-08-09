@@ -340,3 +340,19 @@ aime_rlvr_qwen9b_plan8k_cispo:
     eval_max_tokens: 1000
     save_every: 25
     dynamic_sampling_retries: 5
+
+# Think-track flagship (Ethan, 2026-08-09: "no debate until RLVR works"):
+# CISPO on the pre-RL think checkpoint, native 8k <think> (hard-capped,
+# overshoot penalized), judged against the SAME LINE's RL-final —
+# Olmo-3-32B-Think measured as the attainable-RL yardstick. 60 steps from
+# the start (real 8-9k generations run ~30min/step on 2xB200; the 200-step
+# version of this costs ~$1.4k — continue via --load/--wandb-resume if the
+# curve is alive at 60).
+aime_rlvr_olmo32think_cispo:
+  _extends: aime_rlvr_olmo32think
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    ppo_epochs: 2
+    steps: 60
+    eval_every: 20
+    dynamic_sampling_retries: 5
