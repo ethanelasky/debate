@@ -269,7 +269,11 @@ aime_rlvr_olmo32think:
       strategy: fsdp2
       rollout_tp: 2                # 32B weights split across both cards (see aime_rlvr_olmo32)
       gpu_memory_utilization: 0.42 # same rollout-boot headroom math as aime_rlvr_olmo32
-      prompt_length: 2048          # single turn: system card + one AIME problem
+      # NOT 2048: budget-forced sampling closes an overlong think phase by
+      # resubmitting prompt + <think> content + forced </think> as a SECOND
+      # request, so the engine sees prompts up to base + think_tokens (~8.4k
+      # observed; killed attempt 4b at 2048 via the truncation guard).
+      prompt_length: 12288
       response_length: 10240       # 8192 think + 1000 answer + margin, ONE request
       max_token_len_per_gpu: 16384
       checkpoint_dir: /workspace/checkpoints
