@@ -372,7 +372,9 @@ aime_rlvr_olmo32think_cispo:
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     ppo_epochs: 2
-    steps: 60
+    # 100, not 60 (Ethan, 2026-08-09): every arm runs to >=100 steps before
+    # any verdict — shorter curves have bounced and recovered before.
+    steps: 100
     eval_every: 20
     save_every: 20     # multiple of eval_every — see the plan8k_cispo note
     dynamic_sampling_retries: 5
