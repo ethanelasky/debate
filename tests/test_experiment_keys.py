@@ -104,6 +104,8 @@ def test_rlvr_rejects_prompt_config_and_protocol():
 
 def _shipped_experiments():
     for path in sorted(CONFIG_DIR.glob("*.yaml")):
+        if path.name == "topologies.yaml":  # hardware table, not experiments
+            continue                        # (validated by test_topology.py)
         resolved = resolve_experiments_from_file(path)
         for name in runnable_experiments(resolved):
             yield pytest.param(resolved[name], id=f"{path.name}::{name}")

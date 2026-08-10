@@ -111,6 +111,79 @@ VERL_KEYS = {
 }
 
 
+TOPOLOGY_FILE = "configs/topologies.yaml"
+
+
+def _short_gpu_name(raw: str) -> str:
+    """'NVIDIA H100 80GB HBM3' -> 'H100'; 'NVIDIA B200' -> 'B200'."""
+    words = [w for w in raw.split() if w.upper() not in ("NVIDIA", "GEFORCE", "TESLA")]
+    return words[0].upper() if words else "UNKNOWN"
+
+
+def detect_topology_key() -> str | None:
+    """'<count>x<model>' from nvidia-smi, or None on a GPU-less machine."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    names = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    if out.returncode != 0 or not names:
+        return None
+    return f"{len(names)}x{_short_gpu_name(names[0])}"
+
+
+def resolve_topology(path: str = TOPOLOGY_FILE) -> dict:
+    """Hardware plumbing defaults for the machine we are on, auto-detected.
+
+    No CLI override on purpose: the yaml file is the single control surface.
+    Detected GPUs whose key is missing from the file are a HARD error: a
+    topology nobody smoke-tested must not launch on defaults tuned for
+    different silicon (the H200 util-0.50 VRAM boot failure). GPU-less
+    machines (local tests) resolve to {} — arms that carry a full verl block
+    keep working unchanged.
+    """
+    key = detect_topology_key()
+    if key is None:
+        return {}
+    import yaml
+
+    with open(path) as fh:
+        table = yaml.safe_load(fh) or {}
+    if key not in table:
+        raise RuntimeError(
+            f"topology {key!r} is not in {path} (known: {sorted(table)}). Add an "
+            "entry for this hardware and validate it with one smoke run before "
+            "the first paid launch."
+        )
+    entry = dict(table[key] or {})
+    unknown = set(entry) - VERL_KEYS
+    if unknown:
+        raise RuntimeError(
+            f"topology {key!r} in {path} carries keys outside training.verl's "
+            f"contract: {sorted(unknown)} (allowed: {sorted(VERL_KEYS)})"
+        )
+    os.environ["DEBATE_TOPOLOGY"] = key  # provenance: read by train._env_identity
+    return entry
+
+
+def apply_topology(verl_cfg: dict, topology: dict) -> dict:
+    """Topology supplies defaults; the arm's own keys win. extra_overrides is
+    the one list-valued key, and 'arm wins' would silently DROP the topology's
+    engine flags (e.g. disable_custom_all_reduce) the moment an arm adds one
+    of its own — so that key concatenates (topology first, deduped) instead."""
+    merged = dict(topology) | {k: v for k, v in verl_cfg.items() if k != "extra_overrides"}
+    extras = list(topology.get("extra_overrides") or [])
+    extras += [e for e in (verl_cfg.get("extra_overrides") or []) if e not in extras]
+    if extras:
+        merged["extra_overrides"] = extras
+    return merged
+
+
 def runner_parser(description: str | None) -> argparse.ArgumentParser:
     """The CLI both train runners share: experiment selection plus sweep
     overrides. Runner-specific flags are added by the caller."""
@@ -281,6 +354,7 @@ def build_backend(
     lr_override: float | None = None,
     load_given: bool = False,
     gen_budgets: dict | None = None,
+    topology: dict | None = None,
 ):
     """training block -> Backend. Shared by the debate and RLVR runners.
 
@@ -321,7 +395,7 @@ def build_backend(
     if backend_kind == "verl":
         from infra.backend.verl import VerlBackend, VerlBackendConfig
 
-        v = dict(tr.get("verl") or {})
+        v = apply_topology(dict(tr.get("verl") or {}), topology or {})
         ckpt_root = str(v.get("checkpoint_dir", VerlBackendConfig.checkpoint_dir))
         # run_id makes the directory unique per LAUNCH, so a shared volume
         # cannot serve two runs the same path. The wandb run keeps the bare

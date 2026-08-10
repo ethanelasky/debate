@@ -346,7 +346,11 @@ def _env_identity() -> dict[str, str]:
     degrades to 'unknown' rather than failing — provenance must never block
     training."""
     ident: dict[str, str] = {}
-    for key, var in (("env/pod_id", "RUNPOD_POD_ID"), ("env/image", "RUNPOD_IMAGE_NAME")):
+    for key, var in (
+        ("env/pod_id", "RUNPOD_POD_ID"),
+        ("env/image", "RUNPOD_IMAGE_NAME"),
+        ("env/topology", "DEBATE_TOPOLOGY"),  # set by run_common.resolve_topology
+    ):
         ident[key] = os.environ.get(var, "unknown")
     for key, mod in (("env/torch", "torch"), ("env/vllm", "vllm")):
         try:

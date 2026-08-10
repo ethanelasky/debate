@@ -1,0 +1,35 @@
+# Hardware topology -> training.verl plumbing defaults (Ethan, 2026-08-10).
+# Key = "<count>x<GPU>" as auto-detected from nvidia-smi at launch
+# (infra/run_common.resolve_topology). Arm-level verl keys WIN over these;
+# extra_overrides concatenates (topology first) instead — see apply_topology.
+#
+# Contract: every entry here has survived at least one smoke run on that
+# silicon. A detected topology with no entry is a launch error on purpose —
+# add the entry AND smoke it before the first paid run. Science knobs
+# (prompt_length, response_length) stay in the arms.
+
+# Validated: the whole AIME 32B campaign (2026-08-08..10).
+2xB200:
+  n_gpus: 2
+  rollout_tp: 2
+  gpu_memory_utilization: 0.42
+  extra_overrides:
+    - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+
+# UNVALIDATED — planned scale-up (2 TP2 engine replicas, FSDP over 4).
+# Smoke before first paid use; per-GPU numbers copied from 2xB200.
+4xB200:
+  n_gpus: 4
+  rollout_tp: 2
+  gpu_memory_utilization: 0.42
+  extra_overrides:
+    - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+
+# Validated for the 32B TP2 arms (util 0.42 sized against the 141GB card —
+# the 0.50 attempt died at rollout boot, 2026-08-08).
+2xH200:
+  n_gpus: 2
+  rollout_tp: 2
+  gpu_memory_utilization: 0.42
+  extra_overrides:
+    - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"

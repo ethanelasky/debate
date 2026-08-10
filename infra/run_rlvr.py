@@ -49,6 +49,7 @@ from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
     build_backend,
+    resolve_topology,
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
@@ -221,6 +222,7 @@ def main() -> None:
         lr_override=args.lr,
         load_given=bool(args.load),
         gen_budgets=gen_budgets,
+        topology=resolve_topology(),
     )
     if args.load:
         backend.load(args.load)
