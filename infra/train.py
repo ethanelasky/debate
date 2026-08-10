@@ -37,6 +37,13 @@ class Config:
     # rounds so the batch carries full gradient signal; the cap keeps a
     # saturated pool from looping forever. 0 = off, loop identical to before.
     dynamic_sampling_retries: int = 0
+    # DAPO dynamic sampling, upfront variant: draw batch_size * factor groups
+    # in the ONE initial rollout and keep the first batch_size non-degenerate
+    # ones (draw order). Trades tokens for wall-clock: no serial retry rounds,
+    # so a step pays one generation latency instead of 1 + retries. Mutually
+    # exclusive with dynamic_sampling_retries (both police the same waste).
+    # 1.0 = off, loop identical to before.
+    oversample_factor: float = 1.0
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
@@ -164,6 +171,26 @@ def _resample_degenerate(
     }
 
 
+def _select_oversampled(
+    drawn: list[list[Trajectory]], batch_size: int
+) -> tuple[list[list[Trajectory]], dict[str, float]]:
+    """DAPO dynamic sampling, upfront variant (Config.oversample_factor):
+    keep the FIRST batch_size non-degenerate groups in draw order. When the
+    draw has too few, degenerate groups fill the open slots, where grpo_pack
+    drops them exactly as it would without the toggle — no behavior cliff.
+    Draw order (not reward or variance) decides survival, so the kept batch
+    has the same per-problem distribution a serial retry chain converges to."""
+    keep = [g for g in drawn if not _is_degenerate(g)][:batch_size]
+    if len(keep) < batch_size:
+        keep.extend(g for g in drawn if _is_degenerate(g))
+        keep = keep[:batch_size]
+    return keep, {
+        "train/oversample_drawn": float(len(drawn)),
+        "train/oversample_degenerate": float(sum(1 for g in drawn if _is_degenerate(g))),
+        "train/degenerate_kept": float(sum(1 for g in keep if _is_degenerate(g))),
+    }
+
+
 class _Phases:
     """Wall-clock per phase of a step.
 
@@ -193,6 +220,16 @@ class _Phases:
 def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
     """eval_env: evaluate on a DIFFERENT env than training (e.g. debate
     training with plain-RLVR MathEnv evals). None = eval on `env`."""
+    if cfg.oversample_factor < 1.0:
+        raise ValueError(
+            f"oversample_factor must be >= 1.0 (1.0 = off), got {cfg.oversample_factor}"
+        )
+    if cfg.oversample_factor > 1.0 and cfg.dynamic_sampling_retries > 0:
+        raise ValueError(
+            "oversample_factor and dynamic_sampling_retries are mutually "
+            "exclusive: both replace degenerate groups, one upfront and one "
+            "serially — set exactly one, or the step would pay for both."
+        )
     logger = _make_logger(cfg)
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     optim = cfg.optim or OptimParams(lr=cfg.lr)
@@ -203,12 +240,22 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         with ph("sync_sampler"):
             backend.sync_sampler()
         with ph("rollout"):
-            groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
             ds_metrics: dict[str, float] = {}
-            if cfg.dynamic_sampling_retries > 0:
-                ds_metrics = _resample_degenerate(
-                    env, policy, cfg.group_size, groups, cfg.dynamic_sampling_retries
-                )
+            if cfg.oversample_factor > 1.0:
+                # One oversized generation round instead of serial retries.
+                # env.tasks may return fewer than asked (exhausted pool);
+                # selection keeps whatever arrived. last_rollout_records /
+                # transcripts then cover ALL drawn groups, kept or not —
+                # same single-final-rollout stance as the retry path below.
+                n_draw = int(round(cfg.batch_size * cfg.oversample_factor))
+                drawn = env.rollout(env.tasks(n_draw, "train"), policy, cfg.group_size)
+                groups, ds_metrics = _select_oversampled(drawn, cfg.batch_size)
+            else:
+                groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
+                if cfg.dynamic_sampling_retries > 0:
+                    ds_metrics = _resample_degenerate(
+                        env, policy, cfg.group_size, groups, cfg.dynamic_sampling_retries
+                    )
         # on_rollout/_log_transcripts fire exactly once, after the final
         # resample round: env's last-rollout state (last_rollout_records /
         # last_states / last_rollout_info) reflects only the FINAL rollout, so

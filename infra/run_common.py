@@ -43,6 +43,7 @@ TRAINING_KEYS = {
     "log_transcripts",
     "norm_adv_by_std",
     "dynamic_sampling_retries",
+    "oversample_factor",
     "rl_seed",
 }
 
@@ -83,6 +84,9 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     # DAPO dynamic sampling: retry rounds for re-rolling zero-variance groups
     # on fresh tasks (see Config.dynamic_sampling_retries). 0/absent = off.
     ("dynamic_sampling_retries", int),
+    # Upfront variant: one oversized draw, keep first batch_size healthy
+    # groups (see Config.oversample_factor). 1.0/absent = off.
+    ("oversample_factor", float),
     ("rl_seed", int),
 )
 

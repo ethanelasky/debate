@@ -231,6 +231,17 @@ aime_rlvr_olmo32_plan8k_cispo:
     save_every: 25
     dynamic_sampling_retries: 5
 
+# Oversample-upfront twin (Ethan, 2026-08-09): one 3x-sized generation round
+# replaces the serial retry chain — same degenerate-group policing, one
+# generation latency per step instead of 1 + retries. ~3x rollout tokens/step;
+# on B200 the step is latency-bound, not throughput-bound, so this is the
+# faster trade. For the continuation / next launch, NOT a mid-flight change.
+aime_rlvr_olmo32_plan8k_cispo_os3:
+  _extends: aime_rlvr_olmo32_plan8k_cispo
+  training:
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
+
 # Think-DPO ablation arm (Ethan, 2026-08-08): the THINKING model on AIME,
 # using its native private <think> channel instead of the PlannedEnv
 # scratchpad turn — single-turn generation, thinking ON, think phase
@@ -360,3 +371,10 @@ aime_rlvr_olmo32think_cispo:
     steps: 60
     eval_every: 20
     dynamic_sampling_retries: 5
+
+# Oversample-upfront twin of the think arm (see the plan8k _os3 note).
+aime_rlvr_olmo32think_cispo_os3:
+  _extends: aime_rlvr_olmo32think_cispo
+  training:
+    dynamic_sampling_retries: 0
+    oversample_factor: 3

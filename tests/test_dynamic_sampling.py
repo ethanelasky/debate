@@ -200,3 +200,83 @@ def test_planned_env_answer_turn_carries_its_own_cap():
     env.plan_max_tokens = 8192
     env.answer_max_tokens = 1000
     assert env.answer_max_tokens == 1000  # ctor arg stored; predict passes it as SlotLimits
+
+
+# ---- oversample_factor (upfront variant) ----
+
+
+def _run_oversampled(scripted_batch, *, batch_size: int, factor: float, steps: int = 1):
+    env = ScriptEnv([[_group(*rewards) for rewards in batch] for batch in scripted_batch])
+    backend = FakeBackend()
+    cfg = Config(
+        steps=steps,
+        batch_size=batch_size,
+        group_size=2,
+        oversample_factor=factor,
+        eval_every=0,
+        save_every=0,
+    )
+    logged: list[dict] = []
+    with mock.patch.object(
+        train_mod, "_make_logger", lambda cfg: lambda step, m: logged.append(m)
+    ):
+        train(env, backend, cfg)
+    return env, backend, logged
+
+
+def test_oversample_single_draw_keeps_first_healthy_in_order():
+    # factor 2, batch 2: draw 4, keep the FIRST 2 healthy groups by draw order.
+    env, backend, logged = _run_oversampled(
+        [[DEGEN, HEALTHY, HEALTHY, HEALTHY]], batch_size=2, factor=2.0
+    )
+    assert env.rollout_calls == [4]     # exactly one generation round
+    assert env.task_calls == [4]
+    metrics = logged[0]
+    assert metrics["train/oversample_drawn"] == 4.0
+    assert metrics["train/oversample_degenerate"] == 1.0
+    assert metrics["train/degenerate_kept"] == 0.0
+    assert metrics["train/n"] == 4.0    # 2 kept groups x group_size 2
+    assert metrics["pack/n_datums_dropped_zero_advantage"] == 0.0
+
+
+def test_oversample_pads_with_degenerate_when_draw_is_short_on_healthy():
+    env, backend, logged = _run_oversampled(
+        [[DEGEN, HEALTHY, DEGEN, DEGEN]], batch_size=2, factor=2.0
+    )
+    metrics = logged[0]
+    assert metrics["train/degenerate_kept"] == 1.0
+    # The padded degen group rides along and grpo_pack drops it, as ever.
+    assert metrics["pack/n_datums_dropped_zero_advantage"] == 2.0
+    assert metrics["train/n"] == 4.0
+
+
+def test_oversample_and_retries_are_mutually_exclusive():
+    env = ScriptEnv([])
+    cfg = Config(steps=1, batch_size=2, group_size=2,
+                 oversample_factor=3.0, dynamic_sampling_retries=5)
+    try:
+        train(env, FakeBackend(), cfg)
+    except ValueError as e:
+        assert "mutually" in str(e)
+    else:
+        raise AssertionError("expected ValueError for both toggles set")
+
+
+def test_oversample_below_one_rejected():
+    cfg = Config(steps=1, batch_size=2, group_size=2, oversample_factor=0.5)
+    try:
+        train(ScriptEnv([]), FakeBackend(), cfg)
+    except ValueError as e:
+        assert "oversample_factor" in str(e)
+    else:
+        raise AssertionError("expected ValueError for factor < 1")
+
+
+def test_oversample_config_plumbing_reaches_config():
+    assert "oversample_factor" in TRAINING_KEYS
+    kw = training_config_kwargs({"oversample_factor": 3}, _args())
+    assert kw["oversample_factor"] == 3.0
+    assert Config(**kw).oversample_factor == 3.0
+    kw_absent = training_config_kwargs({}, _args())
+    assert "oversample_factor" not in kw_absent
+    assert Config().oversample_factor == 1.0
