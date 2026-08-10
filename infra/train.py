@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -337,6 +339,61 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
     backend.save("final")
 
 
+def _env_identity() -> dict[str, str]:
+    """Execution-environment provenance for the wandb config (Ethan,
+    2026-08-10): which image/env produced a run must be readable off the run
+    itself once pods are DC-independent and envs ship as tarballs. Every field
+    degrades to 'unknown' rather than failing — provenance must never block
+    training."""
+    ident: dict[str, str] = {}
+    for key, var in (("env/pod_id", "RUNPOD_POD_ID"), ("env/image", "RUNPOD_IMAGE_NAME")):
+        ident[key] = os.environ.get(var, "unknown")
+    for key, mod in (("env/torch", "torch"), ("env/vllm", "vllm")):
+        try:
+            ident[key] = __import__(mod).__version__
+        except Exception:
+            ident[key] = "unknown"
+    ident["env/python_prefix"] = sys.prefix  # which venv (verl-b200 vs verl-main)
+    ver_file = os.path.join(sys.prefix, "ENV_VERSION")
+    if os.path.exists(ver_file):  # stamped into portable env tarballs
+        with open(ver_file) as fh:
+            ident["env/tarball_version"] = fh.read().strip()
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=10
+        )
+        ident["env/git_commit"] = out.stdout.strip() or "unknown"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, timeout=10
+        )
+        ident["env/git_dirty"] = "yes" if dirty.stdout.strip() else "no"
+    except Exception:
+        ident["env/git_commit"] = "unknown"
+    return ident
+
+
+def _save_dirty_patch(run) -> None:
+    """Monkey-patched runs carry their own patch (Ethan, 2026-08-10: research
+    needs low-friction uncommitted launches; provenance comes from RECORDING
+    the delta, not forbidding it). Saved as a file on the wandb run. Never
+    blocks training."""
+    try:
+        import subprocess
+
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"], capture_output=True, text=True, timeout=30
+        ).stdout
+        if diff.strip():
+            path = os.path.join(run.dir, "uncommitted.patch")
+            with open(path, "w") as fh:
+                fh.write(diff)
+            run.save(path, policy="now")
+    except Exception as e:
+        print(f"[wandb] dirty-patch capture skipped: {type(e).__name__}: {e}")
+
+
 def _make_logger(cfg: Config):
     run = None
     if cfg.wandb_project:
@@ -349,15 +406,17 @@ def _make_logger(cfg: Config):
             # steps must not keep advertising the original run's values.
             run = wandb.init(
                 project=cfg.wandb_project, entity=cfg.wandb_entity, id=cfg.wandb_run_id,
-                resume="must", config=vars(cfg), allow_val_change=True,
+                resume="must", config=vars(cfg) | _env_identity(), allow_val_change=True,
             )
         else:
             run = wandb.init(
                 project=cfg.wandb_project,
                 entity=cfg.wandb_entity,   # None -> wandb's default entity
                 name=cfg.run_name,
-                config=vars(cfg),
+                config=vars(cfg) | _env_identity(),
             )
+        if run is not None and dict(run.config).get("env/git_dirty") == "yes":
+            _save_dirty_patch(run)
 
     def log(step: int, metrics: dict[str, Any]) -> None:
         if run is not None:
