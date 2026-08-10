@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision a self-contained verl-main env for the debate VerlBackend.
+# Provision a self-contained verl-sm90 env for the debate VerlBackend.
 # Modeled on the prior repo's run-verified provision.sh: the pod image only
 # supplies the NVIDIA driver + nvcc; python/torch/vllm live in a uv-managed
 # env (persistent iff $VOL is a network volume; otherwise pod-lifetime).
@@ -27,7 +27,7 @@ VERL_PIN="${VERL_PIN:-e9618406de5bad40041d7612554e465ec2003ec1}"
 VLLM_PIN="${VLLM_PIN:-vllm==0.24.*}"
 MAX_JOBS="${MAX_JOBS:-2}"
 VOL="${VOL:-/workspace}"
-ENV_DIR="$VOL/envs/verl-main"
+ENV_DIR="$VOL/envs/verl-sm90"
 export HF_HOME="${HF_HOME:-$VOL/hf}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$VOL/uv/cache}"
 export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$VOL/uv/python}"

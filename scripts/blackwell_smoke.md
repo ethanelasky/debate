@@ -19,7 +19,7 @@ storage bills separately and survives the pod.
 
 - Host driver must be >= 580 (`nvidia-smi | head -3`) — CUDA 13 floor; a lower
   driver fails at first kernel, not at install.
-- The venv is `/workspace/envs/verl-b200` (NOT verl-main — that one carries an
+- The venv is `/workspace/envs/verl-b200` (NOT verl-sm90 — that one carries an
   sm90 flash-attn). Launches: `PY=/workspace/envs/verl-b200/bin/python bash
   scripts/pod_run.sh ...`.
 - flash-attn is skipped by default; expected attention backends in vllm logs:

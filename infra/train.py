@@ -353,7 +353,7 @@ def _env_identity() -> dict[str, str]:
             ident[key] = __import__(mod).__version__
         except Exception:
             ident[key] = "unknown"
-    ident["env/python_prefix"] = sys.prefix  # which venv (verl-b200 vs verl-main)
+    ident["env/python_prefix"] = sys.prefix  # which venv (verl-b200 vs verl-sm90)
     ver_file = os.path.join(sys.prefix, "ENV_VERSION")
     if os.path.exists(ver_file):  # stamped into portable env tarballs
         with open(ver_file) as fh:

@@ -9,7 +9,7 @@ shift-by-one match -> extraction offset.
 
 Run on the pod:
   cd /root/debate && PYTHONPATH=. HF_HOME=/workspace/hf \
-    /workspace/envs/verl-main/bin/python scripts/diag_logprob.py
+    /workspace/envs/verl-sm90/bin/python scripts/diag_logprob.py
 """
 
 import statistics

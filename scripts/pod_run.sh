@@ -2,7 +2,7 @@
 # All-on-pod training launcher for both run modes:
 #   bash scripts/pod_run.sh debate <experiment> [runner args...]  # starts judge vLLM
 #   bash scripts/pod_run.sh rlvr   <experiment> [runner args...]  # no judge
-# Prereqs: provision_pod.sh has built $VOL/envs/verl-main; repo synced to /root/debate.
+# Prereqs: provision_pod.sh has built $VOL/envs/verl-sm90; repo synced to /root/debate.
 #
 # Exit codes (a SEPARATE namespace from pod_up.sh's — same numbers, different
 # meanings; read them against this script only):
@@ -155,7 +155,7 @@ if [ -f /root/pod_idle_stop.stopping ]; then
   exit 5
 fi
 
-PY="${PY:-/workspace/envs/verl-main/bin/python}"
+PY="${PY:-/workspace/envs/verl-sm90/bin/python}"
 # Resolved BEFORE the cd: an invocation by relative path would otherwise leave
 # the sibling-script lookup below pointing at the wrong directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

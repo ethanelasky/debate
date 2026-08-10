@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision the provision_pod.sh env on an sm100 (Blackwell / B200) machine.
-# SAME venv contents and layout ($VOL/envs/verl-main) so pod_run.sh, the
+# SAME venv contents and layout ($VOL/envs/verl-sm90) so pod_run.sh, the
 # configs, and infra/backend/verl.py need no changes. Diverges from
 # provision_pod.sh ONLY where an sm90-era choice stops holding on sm100:
 #  * flash-attn: the sm90 script's wheel/source pair assumes FA2's Hopper
@@ -34,7 +34,7 @@ VLLM_PIN="${VLLM_PIN:-vllm==0.24.*}"
 # confirms ~16GB per job, and only for the flash-attn attempt.
 MAX_JOBS="${MAX_JOBS:-2}"
 VOL="${VOL:-/workspace}"
-# verl-b200, NOT verl-main: the volume is shared with sm90 pods and verl-main
+# verl-b200, NOT verl-sm90: the volume is shared with sm90 pods and verl-sm90
 # holds an sm90-built flash-attn that backend autodetection could pick up.
 # pod_run.sh finds this env via PY=/workspace/envs/verl-b200/bin/python.
 ENV_DIR="$VOL/envs/${VENV_NAME:-verl-b200}"
@@ -135,7 +135,7 @@ printf 'transformers>=5.13,<6\n' > "$OVERRIDE"
 # the in-place source patches below write THROUGH those links: a patched
 # olmo2.py lands in /workspace/uv and surfaces pre-patched — with whatever
 # comment wording THIS revision wrote — in every env that later installs the
-# same wheel, verl-main included. --link-mode=copy on every install in this
+# same wheel, verl-sm90 included. --link-mode=copy on every install in this
 # script keeps this env's patches out of the cache; the semantic
 # already-patched checks below tolerate files that leaked from envs
 # provisioned before this guard existed.
