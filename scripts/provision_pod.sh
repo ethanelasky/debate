@@ -53,9 +53,15 @@ STAMP="$ENV_DIR/.provisioned"
 LOCK="$VOL/locks/provision.lock"
 LOCK_TTL_SECONDS="${LOCK_TTL_SECONDS:-7200}"
 
-if [ -f "$STAMP" ] && [ -z "${FORCE_PROVISION:-}" ]; then
-  log "env already provisioned — nothing to do"
-  cat "$STAMP"
+# The test is the INTERPRETER, not the stamp. An env built before this stamp
+# existed has none and is still a live dependency -- the shared team volume is
+# exactly that, with four jobs importing out of it right now. Keying the guard
+# on the stamp alone would rebuild it and swap packages under all four, which is
+# the precise failure this guard exists to prevent. Stamp absence means
+# UNVERSIONED, never UNBUILT.
+if [ -x "$ENV_DIR/bin/python" ] && [ -z "${FORCE_PROVISION:-}" ]; then
+  log "env already present at $ENV_DIR — nothing to do"
+  [ -f "$STAMP" ] && cat "$STAMP" || echo "(no stamp: predates stamping; provenance unknown)"
   echo "Set FORCE_PROVISION=1 to rebuild, but ONLY when no other pod is running"
   echo "out of $ENV_DIR: rebuilding mutates an env other runs are executing."
   exit 0
