@@ -299,6 +299,19 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         if datums:
             from infra.rl.kl import apply_kl_penalty, entropy_proxy
 
+            if cfg.sampling.temperature != 1.0 and hasattr(backend, "forward"):
+                # Tempered sampling breaks the ratio anchor: vLLM's returned
+                # logprobs come from RAW logits while the training engine
+                # recomputes at logits/T, so epoch-1 ratios sit off 1.0 and
+                # clipping fires on exploratory tokens before any update
+                # (diff-sample audit, 2026-08-11: ~3.7% outside the clip at
+                # T=0.8, step 0). Re-anchor on the training engine's own
+                # forward — same pass the loss uses — restoring ratio == 1 in
+                # epoch 1. One extra forward per step, only when tempered.
+                with ph("anchor_logprobs"):
+                    for datum, lp in zip(datums, backend.forward(datums)):
+                        datum.sampler_logprobs = lp
+
             metrics["train/policy_token_entropy"] = entropy_proxy(datums)
             if cfg.kl_coef > 0:
                 # ref_logprobs is a FULL forward pass over every datum on the

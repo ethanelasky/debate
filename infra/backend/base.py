@@ -31,6 +31,10 @@ class SamplingParams:
     # None = no ceiling here; the per-slot protocol caps must then bound every
     # generation (Policy raises if a generation ends up with no budget at all).
     max_tokens: int | None = None
+    # Floor on generated tokens (vLLM min_tokens): suppresses EOS for the
+    # first N positions. The hw4-parity arms use 8; None = no floor, and an
+    # immediate-EOS sample then fails fidelity_ok and is dropped untrained.
+    min_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 1.0
     stop: list[str] | None = None

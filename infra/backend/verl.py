@@ -346,6 +346,8 @@ class VerlBackend(Backend):
         }
         if params.stop:
             sampling_params["stop"] = list(params.stop)
+        if params.min_tokens:
+            sampling_params["min_tokens"] = int(params.min_tokens)
         # Defensive EOS pin (run-verified in the prior repo): stops a natural
         # completion at EOS instead of padding out to max_tokens.
         if self.tokenizer.eos_token_id is not None:

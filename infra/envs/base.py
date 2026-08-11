@@ -115,7 +115,13 @@ class Policy:
         return results
 
     def greedy(self) -> "Policy":
-        return Policy(self.backend, replace(self.params, temperature=0.0), self.chat_template_kwargs)
+        # top_p reset too: vLLM ignores top_p at temperature 0 today, but the
+        # eval contract is "greedy, full distribution" — say so explicitly.
+        return Policy(
+            self.backend,
+            replace(self.params, temperature=0.0, top_p=1.0),
+            self.chat_template_kwargs,
+        )
 
 
 class Env(ABC):

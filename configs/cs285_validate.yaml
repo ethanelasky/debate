@@ -26,13 +26,20 @@ cs285_mathhard_grpo:
   temperature: 0.8
   top_p: 0.95
   max_completion_tokens: 512
+  min_completion_tokens: 8     # hw4 run script's --min_new_tokens 8
   dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_hw4.yaml}
   training:
     backend: verl
     verl:
       # n_gpus / rollout_tp / gpu_memory_utilization come from the 1xB200
       # topology entry (configs/topologies.yaml).
-      prompt_length: 768         # their 512-token prompt cap + template margin
+      # NOT 768: the level-5 pools carry a 1397-token max rendered prompt
+      # (31 train rows / 3 eval rows above 512). hw4 left-truncates in
+      # training and applies NO cap at eval; our guard hard-errors instead,
+      # so 768 dies deterministically at the step-0 eval. 1536 covers the
+      # longest row — eval matches hw4 exactly; the 31 truncated-by-them
+      # train rows we keep whole (diff-sample audit, 2026-08-11).
+      prompt_length: 1536
       response_length: 512
       max_token_len_per_gpu: 8192
       checkpoint_dir: /workspace/checkpoints

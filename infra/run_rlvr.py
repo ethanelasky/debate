@@ -66,11 +66,14 @@ EXPERIMENT_KEYS = {
     "training",
     # Rollout sampling profile (CS285-hw4 validation arms sample at 0.8/0.95
     # like the reference implementation). Default 1.0/1.0 — the debate arms'
-    # unbiased-ratio anchor — when omitted. The backend recomputes logprobs at
-    # the sampling temperature (VerlBackend._last_temperature), so a tempered
-    # profile is ratio-safe.
+    # unbiased-ratio anchor — when omitted. Tempered profiles are re-anchored
+    # in the train loop (backend.forward overwrite; see infra/train.py), since
+    # vLLM's sampler logprobs come from raw logits and would sit off the
+    # training engine's tempered recompute.
     "temperature",
     "top_p",
+    # Floor on generated tokens (vLLM min_tokens; hw4 parity uses 8).
+    "min_completion_tokens",
 }
 
 
@@ -254,6 +257,11 @@ def main() -> None:
         # this as the ceiling over the SlotLimits total.
         sampling=SamplingParams(
             max_tokens=total_budget,
+            min_tokens=(
+                int(exp["min_completion_tokens"])
+                if exp.get("min_completion_tokens") is not None
+                else None
+            ),
             temperature=float(exp.get("temperature", 1.0)),
             top_p=float(exp.get("top_p", 1.0)),
         ),
