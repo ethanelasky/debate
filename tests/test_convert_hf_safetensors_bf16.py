@@ -179,6 +179,27 @@ def test_resume_validates_and_skips_complete_output_shards(
     assert {path.name: path.stat().st_mtime_ns for path in output_shards} == mtimes
 
 
+def test_marker_owned_staging_accepts_multiple_pinned_shards(tmp_path: Path):
+    source_path = tmp_path / "source"
+    shard_keys = _build_source(source_path)
+    source = converter.LocalModelSource(source_path)
+    plan, _ = converter._discover_plan(source, REPO, REVISION)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / converter.STAGING_MARKER_NAME).write_text(json.dumps(plan))
+    for shard in shard_keys:
+        shutil.copyfile(source_path / shard, staging / shard)
+
+    result = _convert(tmp_path)
+
+    assert result.shards == len(shard_keys)
+    assert {
+        path.relative_to(staging).as_posix()
+        for path in staging.rglob("*")
+        if path.is_file()
+    } == {converter.STAGING_MARKER_NAME}
+
+
 def test_hard_kill_partials_are_cleaned_only_in_marker_owned_directories(tmp_path: Path):
     _convert(tmp_path)
     source = tmp_path / "source"

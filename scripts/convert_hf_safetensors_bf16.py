@@ -586,8 +586,11 @@ def _validate_directory_contents(
         raise ConversionError(
             f"unexpected files in owned staging directory: {', '.join(unexpected_staging[:5])}"
         )
-    if len(staging_files) > 1:
-        raise ConversionError("staging directory contains more than one weight shard")
+    # A normal remote conversion stages only one shard at a time.  Also admit
+    # multiple expected shards in an already marker-owned staging directory so
+    # operators can prefetch a pinned model efficiently.  Each file is still
+    # checked against the immutable source size/SHA-256 immediately before it
+    # is converted, and unexpected names continue to fail closed above.
 
 
 @contextlib.contextmanager
