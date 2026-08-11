@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from infra.backend.base import Backend, LossSpec, OptimParams, SamplingParams
@@ -47,6 +47,12 @@ class Config:
     # 1.0 = off, loop identical to before.
     oversample_factor: float = 1.0
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
+    # Linear lr warmup over the first N steps (0 = off, constant lr). Applied
+    # in the loop by rescaling OptimParams.lr per step: verl's own scheduler
+    # never advances on our tinker-worker path (optimizer_step only), and the
+    # backend rewrites lr into the param groups every step anyway — so the
+    # loop is the one place a schedule can actually take effect.
+    warmup_steps: int = 0
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
     eval_n: int = 128
@@ -234,9 +240,16 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         )
     logger = _make_logger(cfg)
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
-    optim = cfg.optim or OptimParams(lr=cfg.lr)
+    base_optim = cfg.optim or OptimParams(lr=cfg.lr)
 
     for step in range(cfg.start_step, cfg.steps):
+        # Linear warmup, hw4-style (0 -> lr over warmup_steps, then constant).
+        # Indexed by the ABSOLUTE step so continuations keep the lineage's
+        # schedule position instead of re-warming from zero.
+        if cfg.warmup_steps > 0:
+            optim = replace(base_optim, lr=base_optim.lr * min(1.0, (step + 1) / cfg.warmup_steps))
+        else:
+            optim = base_optim
         t0 = time.monotonic()
         ph = _Phases()
         with ph("sync_sampler"):

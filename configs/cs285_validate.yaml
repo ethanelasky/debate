@@ -37,15 +37,31 @@ cs285_mathhard_grpo:
       max_token_len_per_gpu: 8192
       checkpoint_dir: /workspace/checkpoints
       extra_overrides:
-        - "++actor_rollout_ref.actor.grad_clip=0.5"
+        # clip_grad, not actor.grad_clip: the FSDP engine clips with
+        # optimizer_config.clip_grad; actor.grad_clip is a dead key on this
+        # path (diff-algo audit, 2026-08-11). appended last -> wins over the
+        # backend's emitted clip_grad=1.0.
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
         - "++actor_rollout_ref.actor.optim.weight_decay=0.0"
-        - "++actor_rollout_ref.actor.optim.lr_warmup_steps=100"
+        # hw4 averages per completion then across the batch. seq-mean-token-mean
+        # + adv_length_norm none reproduces that exactly (global_batch_size=64);
+        # our default token-mean + datum matched the gradient DIRECTION but ran
+        # ~350x smaller, which grad clipping does not survive.
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
     wandb_entity: palaestra-research
     wandb_project: debate-math
-    lora_rank: 0                 # full fine-tune, as in the reference
+    # LoRA r=16 / alpha=32, dropout aside, matching hw4's
+    # load_lora_policy_model_and_tokenizer (train.py:530, config.py:43-47) —
+    # NOT full FT (earlier comment here was wrong). lr 3e-5 is an adapter
+    # rate; full-FT at that lr would collapse. Our backend emits
+    # lora_alpha = 2*rank = 32, matching. Also: kl_coef > 0 REQUIRES LoRA on
+    # our verl path (ref_logprobs raises without it).
+    lora_rank: 16
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 2
-    adv_length_norm: datum
+    micro_batch: 64              # pin: one optim step per ppo epoch, as hw4
+    warmup_steps: 100            # linear 0->lr over 100 steps (hw4 default)
+    adv_length_norm: none        # length weighting now lives in loss_agg_mode
     steps: 501
     batch_size: 8
     group_size: 8

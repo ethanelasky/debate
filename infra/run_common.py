@@ -44,6 +44,7 @@ TRAINING_KEYS = {
     "norm_adv_by_std",
     "dynamic_sampling_retries",
     "oversample_factor",
+    "warmup_steps",
     "rl_seed",
 }
 
@@ -87,6 +88,8 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     # Upfront variant: one oversized draw, keep first batch_size healthy
     # groups (see Config.oversample_factor). 1.0/absent = off.
     ("oversample_factor", float),
+    # Linear lr warmup steps (see Config.warmup_steps). 0/absent = off.
+    ("warmup_steps", int),
     ("rl_seed", int),
 )
 
