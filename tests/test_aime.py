@@ -13,10 +13,14 @@ def env():
 
 
 def test_pool_loads_and_splits(env):
-    assert len(env.train_rows) + len(env.test_rows) > 900
+    # three-way since 2026-08-11: dev is carved from the train side
+    assert len(env.train_rows) + len(env.dev_rows) + len(env.test_rows) > 900
     assert len(env.test_rows) >= 64
+    assert len(env.dev_rows) >= 64
     train_ids = {r["id"] for r in env.train_rows}
-    assert not train_ids & {r["id"] for r in env.test_rows}
+    dev_ids = {r["id"] for r in env.dev_rows}
+    test_ids = {r["id"] for r in env.test_rows}
+    assert not train_ids & test_ids and not train_ids & dev_ids and not dev_ids & test_ids
 
 
 def test_answers_are_aime_integers(env):
