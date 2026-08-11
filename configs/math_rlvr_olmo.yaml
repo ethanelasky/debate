@@ -239,6 +239,31 @@ aime_rlvr_olmo32_plan8k_cispo:
     lr_schedule: cosine
     min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
+    # Validated-recipe port (Ethan, 2026-08-11, from the CS285 exercise):
+    # kl_coef becomes a REAL in-loss k3 pull toward the ref (the old
+    # advantage-space centered k1 had zero net pull — the campaign
+    # effectively trained KL-free); seq-mean weighting via loss_agg_mode
+    # (adv_length_norm none, or it double-normalizes); grad clip 0.5
+    # consciously chosen (was the backend's 1.0 default); degenerate rows
+    # stay in the denominator instead of inflating effective lr.
+    kl_mechanism: loss
+    adv_length_norm: none
+    drop_zero_advantage: false
+    verl:
+      # _extends REPLACES lists, so restate the base arm's all-reduce flag
+      # (the 2xB200 topology also carries it — belt and braces).
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
+
+# GRPO twin of the validated-recipe arm (Ethan, 2026-08-11): only the loss
+# differs — the production-scale algorithm comparison, mirroring the CS285
+# GRPO-vs-CISPO pair.
+aime_rlvr_olmo32_plan8k_grpo:
+  _extends: aime_rlvr_olmo32_plan8k_cispo
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
 
 # Oversample-upfront twin (Ethan, 2026-08-09): one 3x-sized generation round
 # replaces the serial retry chain — same degenerate-group policing, one
@@ -380,13 +405,28 @@ aime_rlvr_olmo32think_cispo:
     # 100, not 60 (Ethan, 2026-08-09): every arm runs to >=100 steps before
     # any verdict — shorter curves have bounced and recovered before.
     steps: 100
-    # eval/save every 10 + warmup/cosine — see the plan8k_cispo notes.
+    # eval/save every 10 + warmup/cosine + validated-recipe port — see the
+    # plan8k_cispo notes.
     eval_every: 10
     save_every: 10
     warmup_steps: 10
     lr_schedule: cosine
     min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
+    kl_mechanism: loss
+    adv_length_norm: none
+    drop_zero_advantage: false
+    verl:
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
+
+# GRPO twin of the think arm (see the plan8k _grpo note).
+aime_rlvr_olmo32think_grpo:
+  _extends: aime_rlvr_olmo32think_cispo
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
 
 # Oversample-upfront twin of the think arm (see the plan8k _os3 note).
 aime_rlvr_olmo32think_cispo_os3:
