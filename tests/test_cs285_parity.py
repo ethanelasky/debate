@@ -166,16 +166,34 @@ def test_min_completion_tokens_reaches_sampling_and_greedy_strips_it():
 
     exp = load_experiment("configs/cs285_validate.yaml", "cs285_mathhard_grpo")
     params = _sampling_params(exp, int(exp["max_completion_tokens"]))
+    assert params.max_tokens == 512  # the ceiling hop shipped the plan-clamp bug once
     assert params.min_tokens == 8 and params.temperature == 0.8 and params.top_p == 0.95
     greedy = Policy(RecordingBackend(), params, None).greedy().params
     assert greedy.temperature == 0.0 and greedy.top_p == 1.0 and greedy.min_tokens is None
 
 
 def test_sampling_params_default_profile_when_keys_absent():
+    # 1.0/1.0 is the debate arms' unbiased-ratio anchor, not an hw4 knob —
+    # this pins the default, the only test that does.
     from infra.run_rlvr import _sampling_params
 
-    params = _sampling_params({"max_completion_tokens": 100}, 100)
+    params = _sampling_params({}, 100)
     assert params.temperature == 1.0 and params.top_p == 1.0 and params.min_tokens is None
+    assert params.max_tokens == 100
+
+
+def test_sampling_ceiling_covers_think_budget():
+    """The sampler ceiling must be think_tokens + max_completion_tokens for
+    think arms — Policy.predict min()-clamps SlotLimits against it, which is
+    exactly how the 8k plan silently shrank to 1k on 2026-08-08. Pin the
+    budget arithmetic main() feeds _sampling_params."""
+    from infra.config import load_experiment
+    from infra.run_rlvr import _sampling_params
+
+    exp = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_cispo")
+    total = int(exp["think_tokens"]) + int(exp["max_completion_tokens"])
+    params = _sampling_params(exp, total)
+    assert params.max_tokens == 8192 + 1000
 
 
 def test_kl_mechanism_loss_rejects_non_verl_backend():
