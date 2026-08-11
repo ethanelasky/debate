@@ -70,6 +70,10 @@ class AimeEnv(SingleTurnEnv):
         n_test = max(64, len(rows) // 10)
         self.test_rows, self.train_rows = rows[:n_test], rows[n_test:]
         self.test_rows = self.test_rows[:eval_subset_size]
+        # Eager dev carve, same rationale and shape as MathEnv's: test rows
+        # stay byte-identical to the campaign's historical eval split.
+        k = min(len(self.test_rows), max(1, len(self.train_rows) // 10))
+        self.dev_rows, self.train_rows = self.train_rows[:k], self.train_rows[k:]
         if len(self.train_rows) < 2 or not self.test_rows:
             raise RuntimeError(
                 f"aime env: too few rows (train={len(self.train_rows)}, test={len(self.test_rows)})"

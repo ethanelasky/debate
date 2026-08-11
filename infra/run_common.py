@@ -37,6 +37,8 @@ TRAINING_KEYS = {
     "eval_every",
     "eval_max_tokens",
     "eval_n",
+    "eval_split",
+    "final_test_eval",
     "save_every",
     "wandb_project",
     "wandb_entity",
@@ -84,6 +86,10 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("eval_every", int),
     ("eval_max_tokens", int),
     ("eval_n", int),
+    # 3-way split: eval_split "dev" logs dev/*; final_test_eval runs the one
+    # test/ pass after the last step (see Config).
+    ("eval_split", str),
+    ("final_test_eval", _strict_bool),
     ("save_every", int),
     ("log_transcripts", _strict_bool),
     ("norm_adv_by_std", _strict_bool),

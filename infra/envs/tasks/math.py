@@ -100,6 +100,13 @@ class MathEnv(SingleTurnEnv):
             n_test = max(64, len(rows) // 10)
             self.test_rows, self.train_rows = rows[:n_test], rows[n_test:]
         self.test_rows = self.test_rows[:eval_subset_size]
+        # Dev split (Ethan, 2026-08-11): carved EAGERLY from the train side —
+        # test_rows stay byte-identical to every historical eval, and no
+        # training step can ever sample a dev row (a lazy carve would leak
+        # dev rows into the steps before the first dev eval). dev/ steers
+        # decisions during training; test/ is touched once at the end.
+        k = min(len(self.test_rows), max(1, len(self.train_rows) // 10))
+        self.dev_rows, self.train_rows = self.train_rows[:k], self.train_rows[k:]
         if len(self.train_rows) < 2 or not self.test_rows:
             raise RuntimeError(
                 f"math env: too few rows after filtering (train={len(self.train_rows)}, test={len(self.test_rows)})"
@@ -114,6 +121,8 @@ class MathEnv(SingleTurnEnv):
     def tasks(self, n: int, split: str = "train") -> list[Task]:
         if split == "train":
             return [self._task(self.rng.choice(self.train_rows), split) for _ in range(n)]
+        if split == "dev":
+            return [self._task(row, split) for row in self.dev_rows[:n]]
         return [self._task(row, split) for row in self.test_rows[:n]]
 
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:

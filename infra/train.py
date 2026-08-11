@@ -80,6 +80,13 @@ class Config:
     eval_every: int = 20
     eval_n: int = 128
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
+    # Which split the periodic eval reads, and its metric prefix: "test" ->
+    # eval/ (historical behavior, default); "dev" -> dev/ (the 3-way-split
+    # protocol, Ethan 2026-08-11: decisions read dev, test stays unread).
+    eval_split: str = "test"
+    # Run ONE test-split eval after the final step, logged under test/ — the
+    # single read of the held-out set under the 3-way protocol.
+    final_test_eval: bool = False
     save_every: int = 50
     wandb_project: str | None = None  # None = no wandb
     # wandb entity (team). None falls back to the API key's DEFAULT entity,
@@ -154,9 +161,9 @@ def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
         print(f"[transcripts] {type(e).__name__}: {e}")
 
 
-def evaluate(env: Env, policy: Policy, n: int) -> dict[str, float]:
-    groups = env.rollout(env.tasks(n, split="test"), policy.greedy(), group_size=1)
-    return _aggregate([t for g in groups for t in g], "eval") | _rollout_info_metrics(env, "eval")
+def evaluate(env: Env, policy: Policy, n: int, split: str = "test", prefix: str = "eval") -> dict[str, float]:
+    groups = env.rollout(env.tasks(n, split=split), policy.greedy(), group_size=1)
+    return _aggregate([t for g in groups for t in g], prefix) | _rollout_info_metrics(env, prefix)
 
 
 def _is_degenerate(group: list[Trajectory]) -> bool:
@@ -397,8 +404,11 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                     policy.chat_template_kwargs,
                 )
             with ph("evaluate"):
-                metrics.update(evaluate(eval_env or env, eval_policy, cfg.eval_n))
-                _log_transcripts(cfg, step, eval_env or env, "eval")
+                prefix = "dev" if cfg.eval_split == "dev" else "eval"
+                metrics.update(
+                    evaluate(eval_env or env, eval_policy, cfg.eval_n, cfg.eval_split, prefix)
+                )
+                _log_transcripts(cfg, step, eval_env or env, prefix)
         # `step > cfg.start_step`, not `> 0`: a continuation's first step index
         # can hit the save cadence (start 25, save_every 25) and would re-save
         # step-00025 — overwriting the very checkpoint it just loaded with a
@@ -415,6 +425,18 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             metrics[f"phase/rollout_{k}_s"] = float(v)
         metrics.update(ph.metrics(metrics["step_seconds"]))
         logger(step, metrics)
+
+    if cfg.final_test_eval:
+        # The 3-way protocol's single read of the held-out test split.
+        test_policy = policy
+        if cfg.eval_max_tokens is not None:
+            test_policy = Policy(
+                policy.backend,
+                replace(policy.params, max_tokens=cfg.eval_max_tokens),
+                policy.chat_template_kwargs,
+            )
+        backend.sync_sampler()
+        logger(cfg.steps, evaluate(env, test_policy, cfg.eval_n, "test", "test"))
 
     backend.save("final")
 

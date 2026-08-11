@@ -230,8 +230,12 @@ aime_rlvr_olmo32_plan8k_cispo:
     # eval/save every 10 (Ethan, 2026-08-11): more points to average against
     # the ±4.7pp eval noise, and every checkpoint lands on an evaluated step
     # (save_every must stay a MULTIPLE of eval_every — 2026-08-09 rule).
+    # 3-way split: dev/ steers decisions; test/ (the historical 93-row eval
+    # set, rows unchanged) is read once after the final step.
     eval_every: 10
     save_every: 10
+    eval_split: dev
+    final_test_eval: true
     # Warmup then cosine to 0.2x peak (1e-4 -> 2e-5 by the final step): the
     # constant-lr flagship found its peak by step 20 and then orbited it —
     # full-size steps forever never settle (Ethan, 2026-08-11).
@@ -406,9 +410,11 @@ aime_rlvr_olmo32think_cispo:
     # any verdict — shorter curves have bounced and recovered before.
     steps: 100
     # eval/save every 10 + warmup/cosine + validated-recipe port — see the
-    # plan8k_cispo notes.
+    # plan8k_cispo notes. 3-way split: dev/ steers, test/ read once at the end.
     eval_every: 10
     save_every: 10
+    eval_split: dev
+    final_test_eval: true
     warmup_steps: 10
     lr_schedule: cosine
     min_lr_ratio: 0.2
