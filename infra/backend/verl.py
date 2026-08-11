@@ -491,8 +491,10 @@ class VerlBackend(Backend):
 
     def _pad_to_world_size(self, data: list[Datum]) -> list[Datum]:
         """nd dispatch chunks into world_size pieces with no auto-padding; pad
-        with zero-mask copies of the last datum (zero loss, zero tokens in the
-        loss normalization — exact no-op for the gradient)."""
+        with zero-mask copies of the last datum. No-op for the gradient
+        DIRECTION (every loss term masks the row to zero); under seq-mean
+        aggregation the padded row still counts in the stamped
+        global_batch_size denominator, a uniform scale Adam absorbs."""
         ws = self.wg.world_size
         pad = (-len(data)) % ws
         if pad:

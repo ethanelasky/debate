@@ -158,23 +158,24 @@ def test_parity_knobs_flow_through_training_config():
 
 
 def test_min_completion_tokens_reaches_sampling_and_greedy_strips_it():
-    # Through the REAL seam: the resolved cs285 arm carries the key, and
-    # run_rlvr's SamplingParams construction (replicated by expression here
-    # would be a mirror — so exercise the shipped config + the greedy strip
-    # on the resulting params instead).
+    # The REAL seam this time: _sampling_params is the function main() calls,
+    # so deleting the min_tokens hop in run_rlvr fails here (round-4 audit
+    # mutation-proved the previous hand-built version pinned nothing).
     from infra.config import load_experiment
+    from infra.run_rlvr import _sampling_params
 
     exp = load_experiment("configs/cs285_validate.yaml", "cs285_mathhard_grpo")
-    assert exp["min_completion_tokens"] == 8
-    params = SamplingParams(
-        max_tokens=int(exp["max_completion_tokens"]),
-        min_tokens=int(exp["min_completion_tokens"]),
-        temperature=float(exp["temperature"]),
-        top_p=float(exp["top_p"]),
-    )
-    assert params.min_tokens == 8 and params.temperature == 0.8
+    params = _sampling_params(exp, int(exp["max_completion_tokens"]))
+    assert params.min_tokens == 8 and params.temperature == 0.8 and params.top_p == 0.95
     greedy = Policy(RecordingBackend(), params, None).greedy().params
     assert greedy.temperature == 0.0 and greedy.top_p == 1.0 and greedy.min_tokens is None
+
+
+def test_sampling_params_default_profile_when_keys_absent():
+    from infra.run_rlvr import _sampling_params
+
+    params = _sampling_params({"max_completion_tokens": 100}, 100)
+    assert params.temperature == 1.0 and params.top_p == 1.0 and params.min_tokens is None
 
 
 def test_kl_mechanism_loss_rejects_non_verl_backend():

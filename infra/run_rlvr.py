@@ -77,6 +77,22 @@ EXPERIMENT_KEYS = {
 }
 
 
+def _sampling_params(exp: dict, total_budget: int) -> SamplingParams:
+    """The run's rollout sampling profile — extracted so tests can pin the
+    experiment-key -> SamplingParams hop through the same function main()
+    uses (a hand-built mirror in the test pinned nothing; round-4 audit)."""
+    return SamplingParams(
+        max_tokens=total_budget,
+        min_tokens=(
+            int(exp["min_completion_tokens"])
+            if exp.get("min_completion_tokens") is not None
+            else None
+        ),
+        temperature=float(exp.get("temperature", 1.0)),
+        top_p=float(exp.get("top_p", 1.0)),
+    )
+
+
 def _check_thinking_toggle(tokenizer, enable_thinking: bool) -> None:
     """Fail unless the policy's chat template actually reads enable_thinking.
 
@@ -255,16 +271,7 @@ def main() -> None:
         # total_budget, not max_completion_tokens: with think_tokens set the
         # one generation carries think AND answer, and Policy.predict treats
         # this as the ceiling over the SlotLimits total.
-        sampling=SamplingParams(
-            max_tokens=total_budget,
-            min_tokens=(
-                int(exp["min_completion_tokens"])
-                if exp.get("min_completion_tokens") is not None
-                else None
-            ),
-            temperature=float(exp.get("temperature", 1.0)),
-            top_p=float(exp.get("top_p", 1.0)),
-        ),
+        sampling=_sampling_params(exp, total_budget),
         chat_template_kwargs=(
             None if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
         ),

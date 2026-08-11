@@ -15,11 +15,12 @@
 #   rewards          1.0 correct + 0.1 boxed + 0.1 relaxed (MathEnv defaults)
 #   sampling         temperature 0.8, top_p 0.95 (exp-level keys)
 #   loss             GRPO = ppo clip 0.2 symmetric; 2 ppo epochs; kl 0.05
-#   optimizer        AdamW; weight_decay 0; linear warmup 100 steps; grad clip
-#                    0.5 — via extra_overrides (verl optim/actor knobs)
+#   optimizer        AdamW; weight_decay 0 and grad clip 0.5 via
+#                    extra_overrides; linear warmup 100 steps via the
+#                    warmup_steps training key (loop-level)
 #   adv_length_norm  none — per-completion averaging lives in
 #                    loss_agg_mode=seq-mean-token-mean
-# Known deviations (accepted, verify-fixes round-2 audit 2026-08-11):
+# Known deviations (accepted; audit rounds 2-4, 2026-08-11):
 #   - hardware B200 not H100 (speed only)
 #   - prompt_length 1536 no-truncate vs their train-side 512 left-truncate
 #     (eval side matches exactly: hw4 evals uncapped)
