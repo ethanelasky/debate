@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
+import json
 import os
+from pathlib import Path, PurePosixPath
 import re
 
 from infra.backend.base import LossSpec
@@ -130,6 +133,259 @@ VERL_KEYS = {
     "checkpoint_dir",
     "extra_overrides",
 }
+
+
+CANONICAL_OLMO32_MODEL = "/workspace/models/olmo32-bf16"
+CANONICAL_OLMO32_REPO = "allenai/Olmo-3.1-32B-Instruct-DPO"
+CANONICAL_OLMO32_REVISION = "fc84a4f699916fcf585aa54371f47897fa934d5c"
+CANONICAL_BF16_CONVERTER = "hf-safetensors-floating-to-bfloat16-v1"
+CANONICAL_BF16_MARKER = ".bf16-conversion.json"
+
+
+def _artifact_json(path: Path, label: str) -> dict:
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"{label} is missing, not a regular file, or is a symlink: {path}")
+    try:
+        value = json.loads(path.read_text())
+    except Exception as exc:
+        raise ValueError(f"cannot parse {label} {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} {path} must contain a JSON object")
+    return value
+
+
+def _artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_child(root: Path, name: object, label: str) -> Path:
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{label} contains an invalid empty filename")
+    pure = PurePosixPath(name)
+    if (
+        pure.is_absolute()
+        or pure.as_posix() != name
+        or "\\" in name
+        or any(part in ("", ".", "..") for part in pure.parts)
+    ):
+        raise ValueError(f"{label} contains unsafe filename {name!r}")
+    return root.joinpath(*pure.parts)
+
+
+def validate_local_policy_artifact(
+    model: str,
+    *,
+    canonical_olmo32_path: str = CANONICAL_OLMO32_MODEL,
+    canonical_size_range: tuple[int, int] = (55_000_000_000, 75_000_000_000),
+) -> str:
+    """Fail closed on incomplete local model artifacts before backend startup.
+
+    Generic local checkpoints retain the historical config + indexed/unindexed
+    weight check.  The canonical OLMo-32B path is stronger: it is produced by
+    ``convert_hf_safetensors_bf16.py``, so its final marker is the commit point.
+    Requiring and checking that marker prevents a hard-killed conversion from
+    looking launchable merely because all weight shards and config exist.
+    """
+
+    if not os.path.isabs(model):
+        return model
+    root = Path(os.path.abspath(model))
+    canonical_root = Path(os.path.abspath(canonical_olmo32_path))
+    root_resolved = root.resolve(strict=False)
+    canonical_resolved = canonical_root.resolve(strict=False)
+    targets_canonical = root == canonical_root or root_resolved == canonical_resolved
+    if targets_canonical and (
+        root != canonical_root
+        or root_resolved != canonical_resolved
+        or root_resolved != root
+        or canonical_resolved != canonical_root
+    ):
+        raise ValueError(
+            f"canonical OLMo artifact {model!r} must use the exact non-symlink path "
+            f"{canonical_olmo32_path!r}; aliases and symlink components are refused"
+        )
+    config_path = root / "config.json"
+    if not root.is_dir() or not config_path.is_file():
+        raise ValueError(
+            f"local policy artifact {model!r} is missing its directory or config.json; "
+            "attach the volume containing the pinned model rather than falling back to HF"
+        )
+    model_config = _artifact_json(config_path, "local policy config")
+
+    if not targets_canonical:
+        indices = [
+            path
+            for path in (
+                root / "model.safetensors.index.json",
+                root / "pytorch_model.bin.index.json",
+            )
+            if path.is_file()
+        ]
+        if indices:
+            referenced: set[str] = set()
+            for index_path in indices:
+                body = _artifact_json(index_path, "local policy index")
+                weight_map = body.get("weight_map")
+                if isinstance(weight_map, dict):
+                    referenced.update(
+                        name for name in weight_map.values() if isinstance(name, str)
+                    )
+            missing = sorted(
+                name
+                for name in referenced
+                if not (root / name).is_file() or (root / name).stat().st_size == 0
+            )
+            if not referenced or missing:
+                detail = ", ".join(missing[:5]) if missing else "index has no weight_map entries"
+                raise ValueError(f"local policy artifact {model!r} is incomplete: {detail}")
+        else:
+            weights = [*root.glob("*.safetensors"), *root.glob("pytorch_model*.bin")]
+            if not any(path.is_file() and path.stat().st_size > 0 for path in weights):
+                raise ValueError(f"local policy artifact {model!r} has no non-empty weight files")
+        return model
+
+    if root.is_symlink():
+        raise ValueError(f"canonical OLMo artifact {model!r} may not be a symlink")
+    index_path = root / "model.safetensors.index.json"
+    marker_path = root / CANONICAL_BF16_MARKER
+    index = _artifact_json(index_path, "canonical OLMo safetensors index")
+    marker = _artifact_json(marker_path, "canonical OLMo conversion marker")
+
+    architecture = model_config.get("architectures") or []
+    if "Olmo3ForCausalLM" not in architecture:
+        raise ValueError(
+            f"canonical OLMo artifact {model!r} has unexpected architectures={architecture!r}"
+        )
+    if model_config.get("torch_dtype") != "bfloat16" or (
+        "dtype" in model_config and model_config.get("dtype") != "bfloat16"
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} does not declare bfloat16")
+
+    source = marker.get("source")
+    if (
+        marker.get("complete") is not True
+        or marker.get("schema_version") != 1
+        or marker.get("converter") != CANONICAL_BF16_CONVERTER
+        or not isinstance(source, dict)
+        or source.get("repo") != CANONICAL_OLMO32_REPO
+        or source.get("revision") != CANONICAL_OLMO32_REVISION
+    ):
+        raise ValueError(
+            f"canonical OLMo artifact {model!r} has no complete conversion marker "
+            "for the pinned converter/repository/revision"
+        )
+    source_index_sha256 = source.get("index_sha256")
+    output_index_sha256 = marker.get("output_index_sha256")
+    if (
+        not isinstance(source_index_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_index_sha256) is None
+        or not isinstance(output_index_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", output_index_sha256) is None
+        or output_index_sha256 != _artifact_sha256(index_path)
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} index integrity is invalid")
+
+    support_names = marker.get("support_files")
+    source_support_hashes = source.get("support_sha256")
+    output_support_hashes = marker.get("output_support_sha256")
+    if (
+        not isinstance(support_names, list)
+        or not isinstance(source_support_hashes, dict)
+        or not isinstance(output_support_hashes, dict)
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} has invalid support-file provenance")
+    if (
+        set(support_names) != set(source_support_hashes)
+        or set(support_names) != set(output_support_hashes)
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} support-file marker is inconsistent")
+    for name in support_names:
+        path = _artifact_child(root, name, "canonical support marker")
+        source_hash = source_support_hashes.get(name)
+        output_hash = output_support_hashes.get(name)
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or not isinstance(source_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_hash) is None
+            or not isinstance(output_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", output_hash) is None
+            or _artifact_sha256(path) != output_hash
+        ):
+            raise ValueError(f"canonical OLMo support file failed integrity check: {name!r}")
+
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"canonical OLMo index {index_path} has no non-empty weight_map")
+    referenced = {_artifact_child(root, name, "canonical weight index") for name in weight_map.values()}
+    referenced_names = {path.relative_to(root).as_posix() for path in referenced}
+    marker_weight_names = marker.get("weight_shards")
+    marker_source_identities = marker.get("weight_shard_identity")
+    marker_records = marker.get("shards")
+    if (
+        not isinstance(marker_weight_names, list)
+        or set(marker_weight_names) != referenced_names
+        or not isinstance(marker_source_identities, dict)
+        or set(marker_source_identities) != referenced_names
+        or not isinstance(marker_records, dict)
+        or set(marker_records) != referenced_names
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} marker/index shard sets differ")
+
+    weight_file_bytes = 0
+    tensor_bytes = 0
+    for path in sorted(referenced):
+        name = path.relative_to(root).as_posix()
+        if not path.is_file() or path.is_symlink() or path.stat().st_size == 0:
+            raise ValueError(f"canonical OLMo artifact {model!r} has missing/unsafe shard {name!r}")
+        record = marker_records[name]
+        source_identity = marker_source_identities[name]
+        if not isinstance(record, dict) or not isinstance(source_identity, dict):
+            raise ValueError(f"canonical OLMo artifact {model!r} has invalid record for {name!r}")
+        file_bytes = record.get("file_bytes")
+        shard_tensor_bytes = record.get("tensor_bytes")
+        output_sha256 = record.get("sha256")
+        source_size = source_identity.get("size")
+        source_sha256 = source_identity.get("sha256")
+        if (
+            not isinstance(file_bytes, int)
+            or isinstance(file_bytes, bool)
+            or file_bytes != path.stat().st_size
+            or not isinstance(shard_tensor_bytes, int)
+            or isinstance(shard_tensor_bytes, bool)
+            or shard_tensor_bytes <= 0
+            or not isinstance(output_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", output_sha256) is None
+            or _artifact_sha256(path) != output_sha256
+            or not isinstance(source_size, int)
+            or isinstance(source_size, bool)
+            or source_size <= 0
+            or not isinstance(source_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+        ):
+            raise ValueError(f"canonical OLMo shard failed integrity check: {name!r}")
+        weight_file_bytes += file_bytes
+        tensor_bytes += shard_tensor_bytes
+
+    minimum, maximum = canonical_size_range
+    if minimum < 0 or maximum < minimum or not minimum <= weight_file_bytes <= maximum:
+        raise ValueError(
+            f"canonical OLMo artifact {model!r} has {weight_file_bytes} weight bytes; "
+            f"expected the bf16 conversion ({minimum}-{maximum} byte guard)"
+        )
+    index_metadata = index.get("metadata")
+    if (
+        marker.get("weight_file_bytes") != weight_file_bytes
+        or marker.get("tensor_bytes") != tensor_bytes
+        or not isinstance(index_metadata, dict)
+        or index_metadata.get("total_size") != tensor_bytes
+    ):
+        raise ValueError(f"canonical OLMo artifact {model!r} aggregate sizes are inconsistent")
+    return model
 
 
 TOPOLOGY_FILE = "configs/topologies.yaml"
@@ -396,6 +652,9 @@ def build_backend(
     Same only-if-present rule as training_config_kwargs: knobs the YAML omits
     fall to the backend config's own dataclass defaults.
     """
+    # pod_run.sh validates early for operator feedback, but the invariant also
+    # belongs here so direct module/console-script launches cannot bypass it.
+    validate_local_policy_artifact(model_path)
     backend_kind = str(tr.get("backend", "tinker"))
     if str(tr.get("kl_mechanism", "advantage")) == "loss" and backend_kind != "verl":
         # Tinker HAS ref_logprobs, so the train loop's capability check would

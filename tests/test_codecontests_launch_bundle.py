@@ -15,10 +15,20 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from safetensors.torch import save_file
+import torch
 import yaml
 
 from infra.config import load_experiment
-from infra.run_common import apply_topology
+from infra.run_common import (
+    CANONICAL_BF16_CONVERTER,
+    CANONICAL_BF16_MARKER,
+    CANONICAL_OLMO32_REPO,
+    CANONICAL_OLMO32_REVISION,
+    apply_topology,
+    validate_local_policy_artifact,
+)
+from scripts.convert_hf_safetensors_bf16 import convert_repository
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "codecontests_rlvr_olmo.yaml"
@@ -104,6 +114,214 @@ def test_four_gpu_hopper_topology_gates(topology_table: dict):
     assert topology_table["4xH100"]["n_gpus"] == 4
     assert topology_table["4xH100"]["rollout_tp"] == 4
     assert topology_table["4xH100"]["gpu_memory_utilization"] == pytest.approx(0.40)
+
+
+def test_pod_sync_uses_macos_compatible_rsync_progress_flag():
+    script = (ROOT / "scripts" / "pod_sync.sh").read_text()
+    assert "rsync -a --info=progress2" not in script
+    assert "rsync -a --progress" in script
+
+
+def _write_tiny_complete_canonical_model(root: Path) -> dict:
+    root.mkdir()
+    support = {
+        "config.json": json.dumps(
+            {
+                "architectures": ["Olmo3ForCausalLM"],
+                "torch_dtype": "bfloat16",
+                "dtype": "bfloat16",
+            }
+        ).encode(),
+        "tokenizer_config.json": b'{"model_max_length":4096}\n',
+        "tokenizer.json": b'{"version":"1.0"}\n',
+    }
+    for name, payload in support.items():
+        (root / name).write_bytes(payload)
+
+    shard_payloads = {
+        "model-00001-of-00002.safetensors": b"tiny-bf16-shard-one",
+        "model-00002-of-00002.safetensors": b"tiny-bf16-shard-two",
+    }
+    tensor_sizes = {
+        "model-00001-of-00002.safetensors": 12,
+        "model-00002-of-00002.safetensors": 14,
+    }
+    for name, payload in shard_payloads.items():
+        (root / name).write_bytes(payload)
+    weight_map = {
+        "model.embed.weight": "model-00001-of-00002.safetensors",
+        "lm_head.weight": "model-00002-of-00002.safetensors",
+    }
+    index = {
+        "metadata": {"total_size": sum(tensor_sizes.values())},
+        "weight_map": weight_map,
+    }
+    index_path = root / "model.safetensors.index.json"
+    index_path.write_text(json.dumps(index))
+
+    records = {
+        name: {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "file_bytes": len(payload),
+            "tensor_bytes": tensor_sizes[name],
+        }
+        for name, payload in shard_payloads.items()
+    }
+    marker = {
+        "schema_version": 1,
+        "converter": CANONICAL_BF16_CONVERTER,
+        "complete": True,
+        "source": {
+            "repo": CANONICAL_OLMO32_REPO,
+            "revision": CANONICAL_OLMO32_REVISION,
+            "index_sha256": hashlib.sha256(b"pinned-fp32-source-index").hexdigest(),
+            "support_sha256": {
+                name: hashlib.sha256(b"source-" + payload).hexdigest()
+                for name, payload in support.items()
+            },
+        },
+        "support_files": list(support),
+        "weight_shards": list(shard_payloads),
+        "weight_shard_identity": {
+            name: {
+                "size": len(payload) * 2,
+                "sha256": hashlib.sha256(b"source-" + payload).hexdigest(),
+            }
+            for name, payload in shard_payloads.items()
+        },
+        "shards": records,
+        "weight_file_bytes": sum(len(payload) for payload in shard_payloads.values()),
+        "tensor_bytes": sum(tensor_sizes.values()),
+        "output_index_sha256": _sha256(index_path),
+        "output_support_sha256": {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in support.items()
+        },
+    }
+    (root / CANONICAL_BF16_MARKER).write_text(json.dumps(marker))
+    return marker
+
+
+def _validate_tiny_canonical(root: Path) -> str:
+    return validate_local_policy_artifact(
+        str(root),
+        canonical_olmo32_path=str(root),
+        canonical_size_range=(1, 1_000_000),
+    )
+
+
+def test_canonical_model_preflight_requires_complete_converter_commit(tmp_path: Path):
+    root = tmp_path / "olmo32-bf16"
+    _write_tiny_complete_canonical_model(root)
+    assert _validate_tiny_canonical(root) == str(root)
+
+    (root / "model.safetensors.index.json").unlink()
+    with pytest.raises(ValueError, match="safetensors index"):
+        _validate_tiny_canonical(root)
+
+    for spelling in (f"{root}/", f"{root.parent}/./{root.name}"):
+        with pytest.raises(ValueError, match="safetensors index"):
+            validate_local_policy_artifact(
+                spelling,
+                canonical_olmo32_path=str(root),
+                canonical_size_range=(1, 1_000_000),
+            )
+
+
+def test_canonical_model_preflight_rejects_symlink_alias(tmp_path: Path):
+    root = tmp_path / "olmo32-bf16"
+    _write_tiny_complete_canonical_model(root)
+    alias = tmp_path / "model-alias"
+    alias.symlink_to(root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="aliases and symlink components"):
+        validate_local_policy_artifact(
+            str(alias),
+            canonical_olmo32_path=str(root),
+            canonical_size_range=(1, 1_000_000),
+        )
+
+
+def test_canonical_preflight_accepts_real_converter_output(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    shard_name = "model-00001-of-00001.safetensors"
+    save_file(
+        {"model.weight": torch.arange(8, dtype=torch.float32)},
+        source / shard_name,
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 32},
+                "weight_map": {"model.weight": shard_name},
+            }
+        )
+    )
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Olmo3ForCausalLM"],
+                "torch_dtype": "float32",
+                "dtype": "float32",
+            }
+        )
+    )
+    (source / "tokenizer_config.json").write_text('{"model_max_length":4096}\n')
+    (source / "tokenizer.json").write_text('{"version":"1.0"}\n')
+    output = tmp_path / "converted"
+    convert_repository(
+        repo=CANONICAL_OLMO32_REPO,
+        revision=CANONICAL_OLMO32_REVISION,
+        source_dir=source,
+        output_dir=output,
+        staging_dir=tmp_path / "staging",
+        expected_size_bytes=(1, 1_000_000),
+        progress=lambda _message: None,
+    )
+
+    assert validate_local_policy_artifact(
+        str(output),
+        canonical_olmo32_path=str(output),
+        canonical_size_range=(1, 1_000_000),
+    ) == str(output)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("complete", False),
+        ("converter", "wrong-converter"),
+        ("schema_version", 0),
+    ],
+)
+def test_canonical_model_preflight_rejects_nonfinal_marker(
+    tmp_path: Path, field: str, value: object
+):
+    root = tmp_path / "olmo32-bf16"
+    marker = _write_tiny_complete_canonical_model(root)
+    marker[field] = value
+    (root / CANONICAL_BF16_MARKER).write_text(json.dumps(marker))
+
+    with pytest.raises(ValueError, match="no complete conversion marker"):
+        _validate_tiny_canonical(root)
+
+
+def test_canonical_model_preflight_rejects_changed_shard_bytes(tmp_path: Path):
+    root = tmp_path / "olmo32-bf16"
+    _write_tiny_complete_canonical_model(root)
+    shard = root / "model-00001-of-00002.safetensors"
+    original = shard.read_bytes()
+    shard.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+
+    with pytest.raises(ValueError, match="shard failed integrity check"):
+        _validate_tiny_canonical(root)
+
+
+def test_pod_run_delegates_local_model_preflight_to_validated_helper():
+    script = (ROOT / "scripts" / "pod_run.sh").read_text()
+    assert "validate_local_policy_artifact(model)" in script
+    assert "if indices" not in script
 
 
 @pytest.mark.parametrize("cap", sorted(CAP_ARMS))

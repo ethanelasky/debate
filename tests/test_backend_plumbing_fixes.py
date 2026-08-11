@@ -74,6 +74,24 @@ def test_verl_block_with_verl_backend_passes(tmp_path, fake_verl_backend):
     build_backend(_verl_training(str(tmp_path)), "some/model", "run")
 
 
+def test_build_backend_cannot_bypass_local_artifact_validation(monkeypatch):
+    import infra.run_common as run_common
+
+    class ArtifactRejected(RuntimeError):
+        pass
+
+    def reject(model_path: str):
+        raise ArtifactRejected(model_path)
+
+    monkeypatch.setattr(run_common, "validate_local_policy_artifact", reject)
+    with pytest.raises(ArtifactRejected, match="olmo32-bf16"):
+        run_common.build_backend(
+            {"backend": "tinker"},
+            "/workspace/models/olmo32-bf16",
+            "direct-runner-launch",
+        )
+
+
 # ------------------------------------------------- generation budget checks
 
 

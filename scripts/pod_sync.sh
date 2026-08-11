@@ -178,7 +178,10 @@ diff <(local_sums "$REPO_ROOT") <(remote_sums /root/debate) \
 if [ "$WITH_DATA" = "--with-data" ]; then
   echo "== datasets -> $REMOTE:/root/debate/data/codecontests"
   $SSH "$REMOTE" "mkdir -p /root/debate/data/codecontests"
-  rsync -a --info=progress2 -e "$RSH" \
+  # macOS ships openrsync/rsync 2.6.9, which has --progress but not the newer
+  # aggregate-info progress flag. Keep this operator path portable: verification
+  # below is the correctness boundary, not the progress display mode.
+  rsync -a --progress -e "$RSH" \
     "$REPO_ROOT/data/codecontests/" "$REMOTE:/root/debate/data/codecontests/"
 
   echo "== verifying datasets"

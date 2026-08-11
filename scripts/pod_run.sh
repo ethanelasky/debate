@@ -312,16 +312,17 @@ fi
 # incomplete. In particular, the OLMo-3.1-32B upstream repo stores 121GB fp32
 # weights while the run-validated /workspace artifact is a 61GB bf16 conversion;
 # silently falling back to the repo changes both memory math and provenance.
-# This proves structure/size, not exact content identity: capture the mounted
-# artifact's checksum/provenance separately with the run evidence.
+# The canonical OLMo converter marker is the commit point: its exact source,
+# index, support files, shard records, hashes, and complete=true state are
+# verified before trainer startup. This rejects the hard-kill window where all
+# shards + config exist but the index/final marker does not.
 if [ "$MODE" = rlvr ]; then
   POLICY_MODEL="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
-import json
 import os
 import sys
-from pathlib import Path
 
 from infra.config import load_experiment
+from infra.run_common import validate_local_policy_artifact
 
 exp = load_experiment(sys.argv[1], sys.argv[2])
 model = str(exp.get("model") or "")
@@ -329,63 +330,10 @@ if not model:
     raise SystemExit(f"experiment {sys.argv[2]!r} in {sys.argv[1]} has no model")
 
 if os.path.isabs(model):
-    root = Path(model)
-    config = root / "config.json"
-    if not root.is_dir() or not config.is_file():
-        raise SystemExit(
-            f"local policy artifact {model!r} is missing its directory or config.json; "
-            "attach the volume containing the pinned model rather than falling back to HF"
-        )
-
     try:
-        model_config = json.loads(config.read_text())
+        validate_local_policy_artifact(model)
     except Exception as exc:
-        raise SystemExit(f"cannot parse local policy config {config}: {exc}") from exc
-
-    indices = [
-        path for path in (
-            root / "model.safetensors.index.json",
-            root / "pytorch_model.bin.index.json",
-        )
-        if path.is_file()
-    ]
-    if indices:
-        referenced = set()
-        for index in indices:
-            try:
-                body = json.loads(index.read_text())
-            except Exception as exc:
-                raise SystemExit(f"cannot parse local policy index {index}: {exc}") from exc
-            referenced.update((body.get("weight_map") or {}).values())
-        missing = sorted(
-            name for name in referenced
-            if not (root / name).is_file() or (root / name).stat().st_size == 0
-        )
-        if not referenced or missing:
-            detail = ", ".join(missing[:5]) if missing else "index has no weight_map entries"
-            raise SystemExit(f"local policy artifact {model!r} is incomplete: {detail}")
-    else:
-        weights = [*root.glob("*.safetensors"), *root.glob("pytorch_model*.bin")]
-        if not any(path.is_file() and path.stat().st_size > 0 for path in weights):
-            raise SystemExit(f"local policy artifact {model!r} has no non-empty weight files")
-
-    if model == "/workspace/models/olmo32-bf16":
-        architecture = model_config.get("architectures") or []
-        if "Olmo3ForCausalLM" not in architecture:
-            raise SystemExit(
-                f"canonical OLMo artifact {model!r} has unexpected architectures={architecture!r}"
-            )
-        shard_files = (
-            {(root / name) for name in referenced}
-            if indices
-            else {path for path in weights if path.is_file()}
-        )
-        shard_bytes = sum(path.stat().st_size for path in shard_files)
-        if not 55_000_000_000 <= shard_bytes <= 75_000_000_000:
-            raise SystemExit(
-                f"canonical OLMo artifact {model!r} has {shard_bytes} weight bytes; "
-                "expected the 61GB bf16 conversion (55-75GB guard), not the 121GB fp32 repo"
-            )
+        raise SystemExit(str(exc)) from exc
 
 print(model)
 PYEOF
