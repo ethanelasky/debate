@@ -310,6 +310,9 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(_rollout_info_metrics(env, "train"))
         metrics.update(ds_metrics)  # keys only when the toggle is on; 0.0 otherwise
+        # The lr actually applied this step — the only visible trace of the
+        # warmup schedule (verl's loss/optim metrics don't carry it).
+        metrics["train/lr"] = optim.lr
         _log_transcripts(cfg, step, env, "train")
 
         with ph("pack"):

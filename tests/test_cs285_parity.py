@@ -74,14 +74,21 @@ def _run(cfg_kwargs, steps=3):
     env = OneStepEnv()
     backend = RecordingBackend()
     cfg = Config(steps=steps, batch_size=2, group_size=2, eval_every=0, save_every=0, **cfg_kwargs)
-    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None):
+    logged: list[dict] = []
+    with mock.patch.object(
+        train_mod, "_make_logger", lambda cfg: lambda step, m: logged.append(m)
+    ):
         train(env, backend, cfg)
+    backend.logged = logged
     return backend
 
 
 def test_warmup_scales_lr_linearly_then_holds():
     backend = _run({"lr": 1e-4, "warmup_steps": 2}, steps=3)
     assert backend.optim_lrs == pytest.approx([5e-5, 1e-4, 1e-4])
+    # The applied lr is visible per step in wandb (train/lr) — the schedule
+    # graph Ethan asked for (2026-08-11).
+    assert [m["train/lr"] for m in backend.logged] == pytest.approx([5e-5, 1e-4, 1e-4])
 
 
 def test_no_warmup_is_constant_lr():
