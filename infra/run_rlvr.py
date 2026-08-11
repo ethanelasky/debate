@@ -64,6 +64,13 @@ EXPERIMENT_KEYS = {
     "think_tokens",
     "dataset",
     "training",
+    # Rollout sampling profile (CS285-hw4 validation arms sample at 0.8/0.95
+    # like the reference implementation). Default 1.0/1.0 — the debate arms'
+    # unbiased-ratio anchor — when omitted. The backend recomputes logprobs at
+    # the sampling temperature (VerlBackend._last_temperature), so a tempered
+    # profile is ratio-safe.
+    "temperature",
+    "top_p",
 }
 
 
@@ -245,7 +252,11 @@ def main() -> None:
         # total_budget, not max_completion_tokens: with think_tokens set the
         # one generation carries think AND answer, and Policy.predict treats
         # this as the ceiling over the SlotLimits total.
-        sampling=SamplingParams(max_tokens=total_budget, temperature=1.0, top_p=1.0),
+        sampling=SamplingParams(
+            max_tokens=total_budget,
+            temperature=float(exp.get("temperature", 1.0)),
+            top_p=float(exp.get("top_p", 1.0)),
+        ),
         chat_template_kwargs=(
             None if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
         ),

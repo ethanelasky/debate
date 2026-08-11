@@ -1,0 +1,66 @@
+# Infra-validation arms (Ethan, 2026-08-11): reproduce Berkeley CS185/285
+# HW4's KNOWN-WORKING math_hard + GRPO run inside OUR stack, hyperparameters
+# verbatim from the assignment's Required Run 4 (hw4.pdf §7.4) and the local
+# reference implementation (~/code/cs285_sp26/hw4). If our GRPO matches the
+# published trajectory (baseline eval ~0.26; final train reward >0.55, final
+# eval >0.37 at 501 steps; debug floor 0.35), the training loop, rewards,
+# advantages, and eval plumbing are validated end to end. The CISPO twin
+# changes ONLY the loss, so any separation is the algorithm, not the infra.
+#
+# Reference alignment:
+#   model            Qwen/Qwen2.5-Math-1.5B-Instruct, FULL fine-tune (lora 0)
+#   task             hendrycks MATH level-5 train, deterministic 512-row eval
+#   prompt           math_hw4.yaml (starter's _build_messages, verbatim)
+#   rewards          1.0 correct + 0.1 boxed + 0.1 relaxed (MathEnv defaults)
+#   sampling         temperature 0.8, top_p 0.95 (exp-level keys)
+#   loss             GRPO = ppo clip 0.2 symmetric; 2 ppo epochs; kl 0.05
+#   optimizer        AdamW; weight_decay 0; linear warmup 100 steps; grad clip
+#                    0.5 — via extra_overrides (verl optim/actor knobs)
+#   adv_length_norm  datum (hw4 averages token logprobs per completion)
+# Known deviations (accepted): no min_new_tokens equivalent (theirs: 8);
+# hardware B200 not H100 (speed only); verl minibatching vs their
+# minibatch 8 x grad_accum 8 (both = one optimizer step per rollout batch
+# per epoch).
+cs285_mathhard_grpo:
+  model: Qwen/Qwen2.5-Math-1.5B-Instruct
+  temperature: 0.8
+  top_p: 0.95
+  max_completion_tokens: 512
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: math_hw4.yaml}
+  training:
+    backend: verl
+    verl:
+      # n_gpus / rollout_tp / gpu_memory_utilization come from the 1xB200
+      # topology entry (configs/topologies.yaml).
+      prompt_length: 768         # their 512-token prompt cap + template margin
+      response_length: 512
+      max_token_len_per_gpu: 8192
+      checkpoint_dir: /workspace/checkpoints
+      extra_overrides:
+        - "++actor_rollout_ref.actor.grad_clip=0.5"
+        - "++actor_rollout_ref.actor.optim.weight_decay=0.0"
+        - "++actor_rollout_ref.actor.optim.lr_warmup_steps=100"
+    wandb_entity: palaestra-research
+    wandb_project: debate-math
+    lora_rank: 0                 # full fine-tune, as in the reference
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 2
+    adv_length_norm: datum
+    steps: 501
+    batch_size: 8
+    group_size: 8
+    lr: 3.0e-5
+    kl_coef: 0.05
+    kl_discount_factor: 0.0
+    eval_every: 100
+    eval_n: 512
+    eval_max_tokens: 512
+    save_every: 100
+
+# Same run, CISPO loss (asymmetric DAPO-style bounds, our campaign setting).
+# Everything else identical — the controlled algorithm comparison Ethan asked
+# for ("see if our choice of algorithm also works").
+cs285_mathhard_cispo:
+  _extends: cs285_mathhard_grpo
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}

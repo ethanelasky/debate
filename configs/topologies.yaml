@@ -8,6 +8,13 @@
 # add the entry AND smoke it before the first paid run. Science knobs
 # (prompt_length, response_length) stay in the arms.
 
+# UNVALIDATED until the cs285_validate arms boot on it (their launch IS the
+# smoke: a 1.5B full-FT single-GPU run, minutes to first signal).
+1xB200:
+  n_gpus: 1
+  rollout_tp: 1
+  gpu_memory_utilization: 0.42
+
 # Validated: the whole AIME 32B campaign (2026-08-08..10).
 2xB200:
   n_gpus: 2

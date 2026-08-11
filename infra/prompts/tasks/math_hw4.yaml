@@ -1,0 +1,19 @@
+# CS185/285 HW4 `math_hard` prompt, VERBATIM from the starter task
+# (~/code/cs285_sp26/hw4/hw4/tasks/math_hard.py::_build_messages) — the
+# infra-validation arms (configs/cs285_validate.yaml) must render exactly what
+# the known-working reference implementation renders, so drift in OUR stack is
+# the only variable. This is the old boxed-only prompt style our math.yaml
+# deliberately dropped; it lives here for validation only.
+messages:
+  - role: system
+    content: |-
+      Solve the competition-level math problem.
+      Return the final answer in this exact format: \boxed{NUMBER}
+      Do not output XML, ####, or extra prose.
+      Output only the boxed final answer.
+  - role: user
+    name: ANSWER_GEN_USER
+    content: |-
+      <PROBLEM>
+
+      Return only: \boxed{NUMBER}
