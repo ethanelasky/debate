@@ -17,10 +17,16 @@
 #   optimizer        AdamW; weight_decay 0; linear warmup 100 steps; grad clip
 #                    0.5 — via extra_overrides (verl optim/actor knobs)
 #   adv_length_norm  datum (hw4 averages token logprobs per completion)
-# Known deviations (accepted): no min_new_tokens equivalent (theirs: 8);
-# hardware B200 not H100 (speed only); verl minibatching vs their
-# minibatch 8 x grad_accum 8 (both = one optimizer step per rollout batch
-# per epoch).
+# Known deviations (accepted, verify-fixes round-2 audit 2026-08-11):
+#   - hardware B200 not H100 (speed only)
+#   - prompt_length 1536 no-truncate vs their train-side 512 left-truncate
+#     (eval side matches exactly: hw4 evals uncapped)
+#   - LoRA dropout 0 vs their 0.05 (verl's LoRA path exposes no dropout)
+#   - hw4 samples under model.eval() so its epoch-1 ratios are not exactly 1;
+#     ours are exactly 1 by construction (tempered re-anchor)
+#   - verl tempers the training-side logprobs (logits/T), so epoch-2 ratios
+#     run ~1.25x theirs for the same weight change (clip fires a bit earlier)
+#   - our eval points land one update after hw4's same-labeled points
 cs285_mathhard_grpo:
   model: Qwen/Qwen2.5-Math-1.5B-Instruct
   temperature: 0.8
@@ -66,9 +72,20 @@ cs285_mathhard_grpo:
     lora_rank: 16
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 2
-    micro_batch: 64              # pin: one optim step per ppo epoch, as hw4
+    # micro_batch is load-bearing beyond step count: _pack stamps
+    # global_batch_size per forward_backward CALL, so a smaller micro_batch
+    # would normalize each call over its own rows and multiply the
+    # effective lr by 64/micro_batch.
+    micro_batch: 64
     warmup_steps: 100            # linear 0->lr over 100 steps (hw4 default)
     adv_length_norm: none        # length weighting now lives in loss_agg_mode
+    adv_population_std: true     # hw4 std(unbiased=False); default is verl parity
+    drop_zero_advantage: false   # hw4 keeps all 64 rows in the seq-mean denominator
+    # hw4's KL is a DIFFERENTIABLE in-loss k3 vs the frozen ref, recomputed
+    # each minibatch — not our advantage-space centered k1 (which has zero
+    # net pull). kl_mechanism loss routes kl_coef into verl's native
+    # use_kl_loss/kl_loss_coef/low_var_kl.
+    kl_mechanism: loss
     steps: 501
     batch_size: 8
     group_size: 8

@@ -45,6 +45,9 @@ TRAINING_KEYS = {
     "dynamic_sampling_retries",
     "oversample_factor",
     "warmup_steps",
+    "adv_population_std",
+    "drop_zero_advantage",
+    "kl_mechanism",
     "rl_seed",
 }
 
@@ -90,6 +93,10 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("oversample_factor", float),
     # Linear lr warmup steps (see Config.warmup_steps). 0/absent = off.
     ("warmup_steps", int),
+    # hw4/DeepSeekMath parity knobs (see Config for semantics).
+    ("adv_population_std", _strict_bool),
+    ("drop_zero_advantage", _strict_bool),
+    ("kl_mechanism", str),
     ("rl_seed", int),
 )
 
@@ -431,6 +438,15 @@ def build_backend(
             )
         if tr.get("lora_rank") is not None:
             vkw["lora_rank"] = int(tr["lora_rank"])
+        if str(tr.get("kl_mechanism", "advantage")) == "loss":
+            # In-loss KL: the coefficient rides training.kl_coef; the backend
+            # needs it at construction (use_kl_loss is a worker-config knob).
+            if tr.get("kl_coef") is None or float(tr["kl_coef"]) <= 0:
+                raise RuntimeError(
+                    "training.kl_mechanism 'loss' needs training.kl_coef > 0 "
+                    "— the coefficient feeds verl's kl_loss_coef."
+                )
+            vkw["kl_loss_coef"] = float(tr["kl_coef"])
         if lr_override is not None:
             vkw["lr"] = float(lr_override)
         elif tr.get("lr") is not None:

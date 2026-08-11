@@ -52,6 +52,12 @@ class VerlBackendConfig:
     strategy: str = "fsdp2"  # "fsdp" | "fsdp2" | "megatron"
     max_token_len_per_gpu: int = 16384
     lora_rank: int = 32  # matches the Tinker backend; 0 = full finetune
+    # verl's native differentiable in-loss KL vs the frozen ref (k3 /
+    # low_var_kl, per minibatch). 0 = off (the campaign default; advantage-
+    # space KL lives in infra/rl/kl.py). Set from training.kl_coef by
+    # build_backend when training.kl_mechanism is "loss"; the train loop then
+    # stamps datum.ref_logprobs and _pack forwards them as ref_log_prob.
+    kl_loss_coef: float = 0.0
     lr: float = 1e-5  # initial; overridden per optim_step call
     grad_clip: float = 1.0
     checkpoint_dir: str = "checkpoints/verl"
@@ -174,7 +180,15 @@ class VerlBackendConfig:
             f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={self.max_token_len_per_gpu}",
             *clip_overrides,
             "actor_rollout_ref.actor.loss_agg_mode=token-mean",
-            "actor_rollout_ref.actor.use_kl_loss=False",
+            *(
+                [
+                    "actor_rollout_ref.actor.use_kl_loss=True",
+                    f"actor_rollout_ref.actor.kl_loss_coef={self.kl_loss_coef}",
+                    "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
+                ]
+                if self.kl_loss_coef > 0
+                else ["actor_rollout_ref.actor.use_kl_loss=False"]
+            ),
             "actor_rollout_ref.actor.entropy_coeff=0",
             f"actor_rollout_ref.actor.optim.lr={self.lr}",
             f"actor_rollout_ref.actor.optim.clip_grad={self.grad_clip}",
@@ -442,6 +456,20 @@ class VerlBackend(Backend):
         if for_update:
             tensors["old_log_probs"] = old_log_probs
             tensors["advantages"] = advantages
+            if any(d.ref_logprobs is not None for d in data):
+                # In-loss KL (kl_mechanism "loss"): every datum must carry the
+                # frozen-ref logprobs or none — a partial batch would pair
+                # zeros against real logprobs inside verl's kl_loss term.
+                if not all(d.ref_logprobs is not None for d in data):
+                    raise ValueError(
+                        "ref_logprobs set on some datums but not all; the "
+                        "train loop stamps every datum or none"
+                    )
+                ref_lp = torch.zeros((B, max_r), dtype=torch.float32)
+                for i, d in enumerate(data):
+                    r = len(d.tokens) - d.prompt_len
+                    ref_lp[i, :r] = torch.tensor(d.ref_logprobs, dtype=torch.float32)
+                tensors["ref_log_prob"] = ref_lp
 
         meta = {
             "temperature": self._last_temperature,
@@ -470,12 +498,17 @@ class VerlBackend(Backend):
         if pad:
             d = data[-1]
             n = len(d.tokens) - d.prompt_len
+            # ONE unmasked token, advantage 0 — not an all-zero mask: under
+            # seq-mean-token-mean aggregation an all-zero mask row divides
+            # 0/0 into NaN (verify-fixes audit, 2026-08-11). A single live
+            # token with zero advantage contributes exactly 0 either way.
             filler = Datum(
                 tokens=d.tokens,
                 prompt_len=d.prompt_len,
                 sampler_logprobs=d.sampler_logprobs,
                 advantages=[0.0] * n,
-                mask=[0.0] * n,
+                mask=([1.0] + [0.0] * (n - 1)) if n > 0 else [],
+                ref_logprobs=d.ref_logprobs,
             )
             data = data + [filler] * pad
         return data

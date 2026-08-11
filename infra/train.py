@@ -30,7 +30,15 @@ class Config:
     sampling: SamplingParams = field(default_factory=lambda: SamplingParams(max_tokens=512))
     chat_template_kwargs: dict | None = None
     norm_adv_by_std: bool = True
+    # Population (/n) vs sample (/(n-1)) std in group normalization. Sample is
+    # verl parity (the campaign default); population matches hw4/DeepSeekMath.
+    adv_population_std: bool = False
     adv_length_norm: str = "none"   # none|datum|trajectory|count — see grpo_pack
+    # Keep zero-advantage datums in the batch (False) instead of dropping them
+    # (True, default). Under seq-mean loss aggregation the denominator is the
+    # ROW count, so dropping inflates the effective lr by batch/kept — hw4
+    # keeps all rows.
+    drop_zero_advantage: bool = True
     # DAPO-style dynamic sampling. With group-normalized advantages, a group
     # whose trajectories all earn the same reward has zero variance and is
     # dropped whole by grpo_pack (pack/n_datums_dropped_zero_advantage) — at
@@ -47,6 +55,14 @@ class Config:
     # 1.0 = off, loop identical to before.
     oversample_factor: float = 1.0
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
+    # Where kl_coef acts. "advantage" (default): centered k1 penalty added to
+    # advantages once per step from the behavior logprobs — reshapes credit
+    # within the batch, zero net pull toward ref (the campaign mechanism).
+    # "loss": verl's native differentiable in-loss KL (k3/low_var_kl vs the
+    # frozen ref, recomputed each minibatch) — hw4/DeepSeekMath semantics; the
+    # loop stamps datum.ref_logprobs once per step and the backend forwards
+    # them. Requires a backend exposing ref_logprobs (verl + LoRA).
+    kl_mechanism: str = "advantage"
     # Linear lr warmup over the first N steps (0 = off, constant lr). Applied
     # in the loop by rescaling OptimParams.lr per step: verl's own scheduler
     # never advances on our tinker-worker path (optimizer_step only), and the
@@ -238,6 +254,15 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             "exclusive: both replace degenerate groups, one upfront and one "
             "serially — set exactly one, or the step would pay for both."
         )
+    if cfg.kl_mechanism not in ("advantage", "loss"):
+        raise ValueError(
+            f"kl_mechanism must be 'advantage' or 'loss', got {cfg.kl_mechanism!r}"
+        )
+    if cfg.kl_coef > 0 and cfg.kl_mechanism == "loss" and not hasattr(backend, "ref_logprobs"):
+        raise ValueError(
+            "kl_mechanism 'loss' needs a backend exposing ref_logprobs "
+            "(verl + LoRA); this backend does not."
+        )
     logger = _make_logger(cfg)
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     base_optim = cfg.optim or OptimParams(lr=cfg.lr)
@@ -291,6 +316,8 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             datums, pack_stats = grpo_pack(
                 groups,
                 norm_by_std=cfg.norm_adv_by_std,
+                population_std=cfg.adv_population_std,
+                drop_zero_advantage=cfg.drop_zero_advantage,
                 length_normalize=cfg.adv_length_norm,
                 shuffle_seed=cfg.seed + step,
             )
@@ -313,7 +340,15 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                         datum.sampler_logprobs = lp
 
             metrics["train/policy_token_entropy"] = entropy_proxy(datums)
-            if cfg.kl_coef > 0:
+            if cfg.kl_coef > 0 and cfg.kl_mechanism == "loss":
+                # In-loss KL: stamp the frozen-ref logprobs once per step; the
+                # backend forwards them and verl's kl_loss term (k3, per
+                # minibatch vs the CURRENT policy) does the differentiable
+                # pull. hw4/DeepSeekMath semantics.
+                with ph("kl_ref_logprobs"):
+                    for datum, lp in zip(datums, backend.ref_logprobs(datums)):
+                        datum.ref_logprobs = lp
+            elif cfg.kl_coef > 0:
                 # ref_logprobs is a FULL forward pass over every datum on the
                 # frozen base — the cost of kl_coef, and worth seeing separately.
                 with ph("kl_ref_logprobs"):

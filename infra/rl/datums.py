@@ -13,6 +13,7 @@ def grpo_pack(
     groups: list[list[Trajectory]],
     *,
     norm_by_std: bool = True,
+    population_std: bool = False,
     drop_zero_advantage: bool = True,
     length_normalize: str = "none",  # "none" | "datum" | "trajectory" | "count"
     shuffle_seed: int | None = None,
@@ -63,7 +64,8 @@ def grpo_pack(
         return [], {"pack/n_trajectories": float(n_trajs), "pack/n_datums": 0.0}
 
     advantages = compute_grpo_advantages(
-        [r for _, r, _, _ in rows], [g for _, _, g, _ in rows], norm_by_std=norm_by_std
+        [r for _, r, _, _ in rows], [g for _, _, g, _ in rows],
+        norm_by_std=norm_by_std, population_std=population_std
     )
 
     datums: list[Datum] = []

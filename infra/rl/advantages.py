@@ -23,6 +23,7 @@ def compute_grpo_advantages(
     *,
     epsilon: float = GRPO_ADVANTAGE_EPSILON,
     norm_by_std: bool = True,
+    population_std: bool = False,
 ) -> list[float]:
     if len(rewards) != len(group_ids):
         raise ValueError(f"rewards ({len(rewards)}) and group_ids ({len(group_ids)}) must align")
@@ -43,7 +44,13 @@ def compute_grpo_advantages(
             for idx, r in group:
                 advantages[idx] = r - mean_r
             continue
-        std_r = (sum((r - mean_r) ** 2 for r in rs) / (n - 1)) ** 0.5
+        # population_std (/n) matches hw4's torch.std(unbiased=False); the
+        # default sample std (/(n-1)) is torch.std(unbiased=True) = verl
+        # parity. At n=8 the two differ by a uniform 1.069x on every
+        # advantage — an effective-lr constant, but a wrong one when the
+        # point is reproducing a reference curve.
+        denom = n if population_std else (n - 1)
+        std_r = (sum((r - mean_r) ** 2 for r in rs) / denom) ** 0.5
         if std_r < epsilon:
             continue  # no gradient signal; leave at 0.0
         for idx, r in group:

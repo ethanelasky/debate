@@ -55,9 +55,16 @@ class Sample:
     """One sampled completion.
 
     logprobs are the SAMPLER'S own per-token logprobs — these are
-    old_log_probs for the PPO ratio. Never recompute the behavior anchor with
-    the trainer: under LoRA the trainer-side recompute is a different policy
-    than the one that sampled, and biases the ratio.
+    old_log_probs for the PPO ratio at temperature 1.0. Do not recompute the
+    behavior anchor with the trainer casually: on backends where the trainer
+    is a different policy than the sampler, that biases the ratio. The ONE
+    sanctioned exception is the tempered-sampling re-anchor in train.py
+    (temperature != 1.0): there sync_sampler has already pushed the current
+    weights, no optimizer step intervenes, and the engine's recompute is the
+    only anchor on the same logit scaling as the training-side ratio — vLLM's
+    returned logprobs come from RAW logits and would sit off by the
+    temperature. Removing that re-anchor reintroduces pre-update clipping on
+    every tempered arm.
 
     stop_reason contract: exactly "stop" (natural/EOS/stop-string) or
     "length" (hit max_tokens). Backends normalize their engine's values.
@@ -94,6 +101,10 @@ class Datum:
     sampler_logprobs: list[float]
     advantages: list[float]
     mask: list[float] | None = None
+    # Frozen-reference logprobs over the completion region, stamped by the
+    # train loop under kl_mechanism "loss" (verl consumes them as the batch's
+    # ref_log_prob for its differentiable in-loss KL). None = no in-loss KL.
+    ref_logprobs: list[float] | None = None
 
     def __post_init__(self) -> None:
         n = len(self.tokens) - self.prompt_len

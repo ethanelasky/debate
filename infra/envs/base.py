@@ -115,11 +115,14 @@ class Policy:
         return results
 
     def greedy(self) -> "Policy":
-        # top_p reset too: vLLM ignores top_p at temperature 0 today, but the
-        # eval contract is "greedy, full distribution" — say so explicitly.
+        # Full reset of the sampling profile, not just temperature: the eval
+        # contract is "greedy, full distribution, no length floor". top_p is
+        # a no-op at temp 0 today but say so explicitly; min_tokens is a
+        # TRAINING-sampler knob (exploration floor) and must not leak into
+        # eval decoding (hw4's eval has no min_new_tokens).
         return Policy(
             self.backend,
-            replace(self.params, temperature=0.0, top_p=1.0),
+            replace(self.params, temperature=0.0, top_p=1.0, min_tokens=None),
             self.chat_template_kwargs,
         )
 
