@@ -45,6 +45,8 @@ TRAINING_KEYS = {
     "dynamic_sampling_retries",
     "oversample_factor",
     "warmup_steps",
+    "lr_schedule",
+    "min_lr_ratio",
     "adv_population_std",
     "drop_zero_advantage",
     "kl_mechanism",
@@ -93,6 +95,9 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("oversample_factor", float),
     # Linear lr warmup steps (see Config.warmup_steps). 0/absent = off.
     ("warmup_steps", int),
+    # Post-warmup shape: constant (default) or cosine to lr*min_lr_ratio.
+    ("lr_schedule", str),
+    ("min_lr_ratio", float),
     # hw4/DeepSeekMath parity knobs (see Config for semantics).
     ("adv_population_std", _strict_bool),
     ("drop_zero_advantage", _strict_bool),

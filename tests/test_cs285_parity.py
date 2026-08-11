@@ -96,6 +96,25 @@ def test_no_warmup_is_constant_lr():
     assert backend.optim_lrs == pytest.approx([1e-4, 1e-4])
 
 
+def test_cosine_schedule_decays_from_peak_to_floor():
+    backend = _run(
+        {"lr": 1e-4, "warmup_steps": 2, "lr_schedule": "cosine", "min_lr_ratio": 0.2},
+        steps=6,
+    )
+    lrs = backend.optim_lrs
+    assert lrs[0] == pytest.approx(5e-5)          # warmup step 1
+    assert lrs[2] == pytest.approx(1e-4)          # cosine start = peak
+    assert lrs[-1] > 2e-5                          # floor reached only AT cfg.steps
+    assert all(a >= b for a, b in zip(lrs[2:], lrs[3:]))  # monotone decay
+    # closed-form check at the midpoint of the decay span (step 4 of [2,6)):
+    assert lrs[4] == pytest.approx(1e-4 * (0.2 + 0.8 * 0.5), rel=1e-6)
+
+
+def test_lr_schedule_rejects_unknown_value():
+    with pytest.raises(ValueError, match="lr_schedule"):
+        _run({"lr_schedule": "linear"}, steps=1)
+
+
 def test_population_std_scales_advantages_by_known_ratio():
     sample = compute_grpo_advantages([0.0, 1.0], ["g", "g"])
     population = compute_grpo_advantages([0.0, 1.0], ["g", "g"], population_std=True)

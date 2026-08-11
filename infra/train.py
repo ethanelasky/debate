@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -69,6 +70,12 @@ class Config:
     # backend rewrites lr into the param groups every step anyway — so the
     # loop is the one place a schedule can actually take effect.
     warmup_steps: int = 0
+    # After warmup: "constant" holds peak lr; "cosine" decays it to
+    # lr * min_lr_ratio by the final step. A constant full-size step forever
+    # is how the instruct flagship orbited its peak instead of settling
+    # (Ethan, 2026-08-11: "we should have lr decay").
+    lr_schedule: str = "constant"
+    min_lr_ratio: float = 0.1
     kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
     eval_n: int = 128
@@ -254,6 +261,10 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             "exclusive: both replace degenerate groups, one upfront and one "
             "serially — set exactly one, or the step would pay for both."
         )
+    if cfg.lr_schedule not in ("constant", "cosine"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {cfg.lr_schedule!r}")
+    if not (0.0 <= cfg.min_lr_ratio <= 1.0):
+        raise ValueError(f"min_lr_ratio must be in [0, 1], got {cfg.min_lr_ratio}")
     if cfg.kl_mechanism not in ("advantage", "loss"):
         raise ValueError(
             f"kl_mechanism must be 'advantage' or 'loss', got {cfg.kl_mechanism!r}"
@@ -268,13 +279,18 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
     base_optim = cfg.optim or OptimParams(lr=cfg.lr)
 
     for step in range(cfg.start_step, cfg.steps):
-        # Linear warmup, hw4-style (0 -> lr over warmup_steps, then constant).
-        # Indexed by the ABSOLUTE step so continuations keep the lineage's
-        # schedule position instead of re-warming from zero.
+        # Schedule, indexed by the ABSOLUTE step so continuations keep the
+        # lineage's position: linear warmup (0 -> lr over warmup_steps), then
+        # constant or cosine decay to lr * min_lr_ratio at the final step.
+        scale = 1.0
         if cfg.warmup_steps > 0:
-            optim = replace(base_optim, lr=base_optim.lr * min(1.0, (step + 1) / cfg.warmup_steps))
-        else:
-            optim = base_optim
+            scale = min(1.0, (step + 1) / cfg.warmup_steps)
+        if cfg.lr_schedule == "cosine" and step >= cfg.warmup_steps:
+            span = max(1, cfg.steps - cfg.warmup_steps)
+            progress = (step - cfg.warmup_steps) / span
+            floor = cfg.min_lr_ratio
+            scale = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        optim = base_optim if scale == 1.0 else replace(base_optim, lr=base_optim.lr * scale)
         t0 = time.monotonic()
         ph = _Phases()
         with ph("sync_sampler"):

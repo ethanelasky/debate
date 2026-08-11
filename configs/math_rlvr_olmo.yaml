@@ -227,12 +227,17 @@ aime_rlvr_olmo32_plan8k_cispo:
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     steps: 200
-    eval_every: 20
-    # save_every must be a MULTIPLE of eval_every (Ethan, 2026-08-09): every
-    # checkpoint then lands on a step with a known eval, so a continuation
-    # never resumes from a blind point (the step-25 ckpt / step-20 peak
-    # mismatch of the first flagship run).
-    save_every: 20
+    # eval/save every 10 (Ethan, 2026-08-11): more points to average against
+    # the ±4.7pp eval noise, and every checkpoint lands on an evaluated step
+    # (save_every must stay a MULTIPLE of eval_every — 2026-08-09 rule).
+    eval_every: 10
+    save_every: 10
+    # Warmup then cosine to 0.2x peak (1e-4 -> 2e-5 by the final step): the
+    # constant-lr flagship found its peak by step 20 and then orbited it —
+    # full-size steps forever never settle (Ethan, 2026-08-11).
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
 
 # Oversample-upfront twin (Ethan, 2026-08-09): one 3x-sized generation round
@@ -375,8 +380,12 @@ aime_rlvr_olmo32think_cispo:
     # 100, not 60 (Ethan, 2026-08-09): every arm runs to >=100 steps before
     # any verdict — shorter curves have bounced and recovered before.
     steps: 100
-    eval_every: 20
-    save_every: 20     # multiple of eval_every — see the plan8k_cispo note
+    # eval/save every 10 + warmup/cosine — see the plan8k_cispo notes.
+    eval_every: 10
+    save_every: 10
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
 
 # Oversample-upfront twin of the think arm (see the plan8k _os3 note).
