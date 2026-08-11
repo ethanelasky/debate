@@ -386,6 +386,16 @@ def build_backend(
     fall to the backend config's own dataclass defaults.
     """
     backend_kind = str(tr.get("backend", "tinker"))
+    if str(tr.get("kl_mechanism", "advantage")) == "loss" and backend_kind != "verl":
+        # Tinker HAS ref_logprobs, so the train loop's capability check would
+        # pass, stamp the datums, skip the advantage penalty — and tinker's
+        # forward_backward would ignore the field: kl_coef silently becomes a
+        # no-op (round-3 audit). Only verl consumes ref_log_prob in-loss.
+        raise RuntimeError(
+            f"training.kl_mechanism 'loss' requires backend 'verl' (got "
+            f"{backend_kind!r}); on other backends the stamped ref_logprobs "
+            "are ignored and the KL vanishes without a trace."
+        )
     if "verl" in tr and backend_kind != "verl":
         # A verl block under any other backend is dead config: every knob in
         # it (response_length, n_gpus, checkpoint_dir, ...) would be ignored

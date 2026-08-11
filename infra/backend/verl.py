@@ -498,16 +498,21 @@ class VerlBackend(Backend):
         if pad:
             d = data[-1]
             n = len(d.tokens) - d.prompt_len
-            # ONE unmasked token, advantage 0 — not an all-zero mask: under
-            # seq-mean-token-mean aggregation an all-zero mask row divides
-            # 0/0 into NaN (verify-fixes audit, 2026-08-11). A single live
-            # token with zero advantage contributes exactly 0 either way.
+            # All-zero mask IS safe at the pin: agg_loss's seq-mean branch
+            # divides by (seq_mask + 1e-8), so a fully-masked row yields 0,
+            # not NaN, and contributes nothing to ANY loss term — including
+            # kl_loss, whose kld is masked by the same response_mask. (A
+            # round-2 audit briefly swapped in one live token here; round 3
+            # showed that token would carry a real KL gradient under
+            # kl_mechanism 'loss' while the NaN it guarded against cannot
+            # occur. Reverted.) ref_logprobs copied so the all-or-none check
+            # in _pack stays consistent.
             filler = Datum(
                 tokens=d.tokens,
                 prompt_len=d.prompt_len,
                 sampler_logprobs=d.sampler_logprobs,
                 advantages=[0.0] * n,
-                mask=([1.0] + [0.0] * (n - 1)) if n > 0 else [],
+                mask=[0.0] * n,
                 ref_logprobs=d.ref_logprobs,
             )
             data = data + [filler] * pad
@@ -542,6 +547,16 @@ class VerlBackend(Backend):
             "verl bakes the loss into the worker at init; construct VerlBackend "
             f"with loss={loss.kind!r} (got {self.config.loss.kind!r})"
         )
+        if data and (self.config.kl_loss_coef > 0) != (data[0].ref_logprobs is not None):
+            # The loud direction (coef set, no ref) would KeyError inside verl;
+            # THIS direction — ref stamped but coef 0 — would silently train
+            # with no KL at all (round-3 audit). Both are config skew.
+            raise RuntimeError(
+                f"in-loss KL config skew: kl_loss_coef={self.config.kl_loss_coef} "
+                f"but datums {'carry' if data[0].ref_logprobs is not None else 'lack'} "
+                "ref_logprobs — kl_mechanism 'loss' needs both sides wired "
+                "(build_backend does this from training.kl_mechanism)."
+            )
         self._sleep_rollout()
         padded = self._pad_to_world_size(data)
         td, _ = self._pack(padded, for_update=True)

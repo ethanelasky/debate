@@ -34,7 +34,11 @@ class OneStepEnv(Env):
         return [Task(messages=[{"role": "user", "content": f"t{i}"}]) for i in range(n)]
 
     def rollout(self, tasks, policy, group_size):
-        return [[_traj(0.0), _traj(1.0)] for _ in tasks]
+        # `last` records the ACTUAL trajectories the loop saw — assertions on
+        # aliasing must use these, not a separately-constructed batch (a
+        # fresh batch made the mutation assertion vacuous; round-3 audit).
+        self.last = [[_traj(0.0), _traj(1.0)] for _ in tasks]
+        return self.last
 
 
 class RecordingBackend:
@@ -106,8 +110,6 @@ def test_drop_zero_advantage_false_keeps_degenerate_rows():
 def test_tempered_reanchor_rebinds_not_mutates():
     env = OneStepEnv()
     backend = RecordingBackend()
-    trajs = env.rollout(env.tasks(1), None, 2)
-    original_lists = [t.datums[0].sampler_logprobs for t in trajs[0]]
     cfg = Config(
         steps=1, batch_size=2, group_size=2, eval_every=0, save_every=0,
         sampling=SamplingParams(max_tokens=8, temperature=0.8),
@@ -118,9 +120,13 @@ def test_tempered_reanchor_rebinds_not_mutates():
     assert backend.fb_datums and all(
         lp == -0.25 for d in backend.fb_datums[0] for lp in d.sampler_logprobs
     )
-    # ...by REBINDING the attribute; the trajectory's own lists (transcripts,
-    # docent) must keep the sampler's original values.
-    assert all(lst == [-0.1, -0.1] for lst in original_lists)
+    # ...by REBINDING the attribute on the pack-produced Datum: the rollout's
+    # own trajectory lists (read by transcripts/docent) keep the sampler's
+    # values. env.last is the exact object graph the loop consumed, so a
+    # slice-assign mutation (sampler_logprobs[:] = lp) fails here.
+    for group in env.last:
+        for t in group:
+            assert t.datums[0].sampler_logprobs == [-0.1, -0.1]
 
 
 def test_kl_mechanism_loss_stamps_ref_and_skips_advantage_penalty():
@@ -142,7 +148,7 @@ def test_kl_mechanism_rejects_unknown_value():
         _run({"kl_mechanism": "reward"}, steps=1)
 
 
-def test_min_tokens_reaches_sampling_params_and_greedy_strips_it():
+def test_parity_knobs_flow_through_training_config():
     parser = runner_parser(None)
     args = parser.parse_args(["--experiment-file", "f.yaml", "--experiment", "e"])
     for key in ("adv_population_std", "drop_zero_advantage", "kl_mechanism"):
@@ -150,6 +156,29 @@ def test_min_tokens_reaches_sampling_params_and_greedy_strips_it():
     kw = training_config_kwargs({"adv_population_std": True, "drop_zero_advantage": False}, args)
     assert kw["adv_population_std"] is True and kw["drop_zero_advantage"] is False
 
-    params = SamplingParams(max_tokens=512, min_tokens=8, temperature=0.8, top_p=0.95)
+
+def test_min_completion_tokens_reaches_sampling_and_greedy_strips_it():
+    # Through the REAL seam: the resolved cs285 arm carries the key, and
+    # run_rlvr's SamplingParams construction (replicated by expression here
+    # would be a mirror — so exercise the shipped config + the greedy strip
+    # on the resulting params instead).
+    from infra.config import load_experiment
+
+    exp = load_experiment("configs/cs285_validate.yaml", "cs285_mathhard_grpo")
+    assert exp["min_completion_tokens"] == 8
+    params = SamplingParams(
+        max_tokens=int(exp["max_completion_tokens"]),
+        min_tokens=int(exp["min_completion_tokens"]),
+        temperature=float(exp["temperature"]),
+        top_p=float(exp["top_p"]),
+    )
+    assert params.min_tokens == 8 and params.temperature == 0.8
     greedy = Policy(RecordingBackend(), params, None).greedy().params
     assert greedy.temperature == 0.0 and greedy.top_p == 1.0 and greedy.min_tokens is None
+
+
+def test_kl_mechanism_loss_rejects_non_verl_backend():
+    from infra.run_common import build_backend
+
+    with pytest.raises(RuntimeError, match="requires backend 'verl'"):
+        build_backend({"backend": "tinker", "kl_mechanism": "loss", "kl_coef": 0.05}, "m", "r")

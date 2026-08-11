@@ -8,7 +8,8 @@
 # changes ONLY the loss, so any separation is the algorithm, not the infra.
 #
 # Reference alignment:
-#   model            Qwen/Qwen2.5-Math-1.5B-Instruct, FULL fine-tune (lora 0)
+#   model            Qwen/Qwen2.5-Math-1.5B-Instruct, LoRA r16/alpha32 (hw4
+#                    trains an adapter, not full FT)
 #   task             hendrycks MATH level-5 train, deterministic 512-row eval
 #   prompt           math_hw4.yaml (starter's _build_messages, verbatim)
 #   rewards          1.0 correct + 0.1 boxed + 0.1 relaxed (MathEnv defaults)
@@ -16,7 +17,8 @@
 #   loss             GRPO = ppo clip 0.2 symmetric; 2 ppo epochs; kl 0.05
 #   optimizer        AdamW; weight_decay 0; linear warmup 100 steps; grad clip
 #                    0.5 — via extra_overrides (verl optim/actor knobs)
-#   adv_length_norm  datum (hw4 averages token logprobs per completion)
+#   adv_length_norm  none — per-completion averaging lives in
+#                    loss_agg_mode=seq-mean-token-mean
 # Known deviations (accepted, verify-fixes round-2 audit 2026-08-11):
 #   - hardware B200 not H100 (speed only)
 #   - prompt_length 1536 no-truncate vs their train-side 512 left-truncate
@@ -27,6 +29,13 @@
 #   - verl tempers the training-side logprobs (logits/T), so epoch-2 ratios
 #     run ~1.25x theirs for the same weight change (clip fires a bit earlier)
 #   - our eval points land one update after hw4's same-labeled points
+#   - the in-loss KL runs between TEMPERED logprob pairs (logits/T both
+#     sides), so its effective strength is ~1/T^2 = 1.56x hw4's raw-logit
+#     k3 at T=0.8; verl also aggregates the KL with loss_agg_mode (row-
+#     weighted) where hw4 uses a global token-mean, and clamps kld to
+#     [-10, 10] (gradient zeroed past delta ~2.6). Compound effect ~1.3-1.9x
+#     their pull — watch loss/kl_loss; drop kl_coef toward 0.032 only if it
+#     runs hot vs the reference curve.
 cs285_mathhard_grpo:
   model: Qwen/Qwen2.5-Math-1.5B-Instruct
   temperature: 0.8
