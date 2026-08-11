@@ -3,8 +3,9 @@ running the candidate program against stdin/stdout test cases.
 
 Ported from the old repo (ai_debate/data_loader/codecontests_loader.py and
 ai_debate/experiments/verifiers/codecontests_verifier.py), slimmed: rows are
-held in memory (no lazy-JSONL dict) and there is no container sandbox — the
-runner is a plain subprocess.
+held in memory (no lazy-JSONL dict). Candidate programs execute in a separate
+process; production Linux additionally requires a bubblewrap + seccomp
+sandbox and fails closed when that boundary cannot be established.
 
 ===========================================================================
 HOW THE TWO ARMS USE THIS FILE
@@ -54,9 +55,9 @@ runtime never joins a sidecar.
 
 No suite is ever rendered into a prompt. Models see the problem
 statement only. _task() puts test cases in Task.meta and the prompt renderer
-binds only meta["question"]. Raw single-turn transcript records retain task
-metadata for reproducibility, including these lists, so artifact sizing must
-account for them; that metadata is never sent to the model.
+binds only meta["question"]. The suites stay in memory for grading but the
+environment marks all eight fields artifact-private, so raw, Planned, Docent,
+and wandb records cannot persist them.
 
 One thing that looks like a leak and is not: some rlvr_tests cases DO appear
 verbatim in the problem statement (~16% of non-trivial cases across the test
@@ -96,18 +97,19 @@ suites use the same <=10-case, 500 KB/case, 2 MB/problem caps.
 HOW THE VERIFIER WORKS
 ===========================================================================
 
-run_stdin_tests() writes the program, the cases, and a runner script to a
-tempdir and spawns `python runner.py` in its OWN PROCESS GROUP so a timeout
-kills grandchildren too. The runner compiles the program once and exec()s it
-per case with stdin/stdout swapped to StringIO — one interpreter start per
-solution, not per test.
+run_stdin_tests() keeps expected outputs and verdict state in the trusted
+parent only. Each case launches a fresh candidate interpreter and connects
+only that case's stdin plus bounded stdout/stderr files. Candidate code never
+shares an interpreter, stack, globals, argv, or writable result file with the
+verifier, so introspection and monkeypatching cannot forge a verdict.
 
-The verdict is read from a FILE the runner writes, never from stdout: the
-untrusted program shares the runner's stdout and could otherwise print a
-forged {"passed": true} from an atexit hook after the StringIO swap unwinds.
-The runner also blanks sys.argv so the program cannot find and forge that
-file. Limits: RLIMIT_AS 4GB, RLIMIT_NPROC 256, RLIMIT_FSIZE 64MB (the last
-two are best-effort; macOS skips them).
+On Linux the child is fail-closed behind bubblewrap: private user/PID/network/
+mount namespaces, uid/gid 65534, no capabilities, a read-only Python runtime,
+and no host working tree. A required libseccomp filter independently rejects
+child processes, cross-process signals, network syscalls, and filesystem
+mutation while permitting one same-process worker thread. macOS keeps the
+separate-process, empty-environment, rlimit path for local tests but is not a
+production security boundary.
 
 Comparison is whitespace-normalized with floats collapsed via %g, so
 "3.0000000000" and "3" match. Problems whose statements admit multiple valid
@@ -158,11 +160,15 @@ eval scale. The design trains on the cheap suite and measures with both.
 
 from __future__ import annotations
 
+import concurrent.futures
+import functools
+import importlib.util
 import json
 import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -170,11 +176,13 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
+from infra.envs.tasks.codecontests_sandbox import OUTPUT_LIMIT_BYTES
 
 PROMPT_FILE = "codecontests.yaml"
 
@@ -297,7 +305,363 @@ def has_closed_fence(text: str) -> bool:
     )
 
 
+def normalize_output(value: str) -> str:
+    """Apply the historical whitespace/case/float CodeContests comparison."""
+    normalized = []
+    for line in value.split("\n"):
+        line = line.rstrip()
+
+        def normalize_float(match: re.Match) -> str:
+            try:
+                return f"{float(match.group(0)):g}"
+            except (ValueError, OverflowError):
+                return match.group(0)
+
+        line = re.sub(
+            r"-?\d+\.\d+(?:[eE][+-]?\d+)?", normalize_float, line
+        )
+        normalized.append(line)
+    while normalized and not normalized[-1]:
+        normalized.pop()
+    return "\n".join(normalized).lower()
+
+
 # ------------------------------------------------------------------ verifier
+
+
+class VerifierInfrastructureError(RuntimeError):
+    """Trusted verifier setup/state failed; the rollout is scientifically invalid."""
+
+
+class SandboxUnavailable(VerifierInfrastructureError):
+    """The production Linux execution boundary could not be established."""
+
+
+_SANDBOX_BOOTSTRAP_PATH = os.path.join(
+    os.path.dirname(__file__), "codecontests_sandbox.py"
+)
+_sandbox_probe_lock = threading.Lock()
+_verified_bubblewrap_path: Optional[str] = None
+_SANDBOX_READY_PREFIX = "CODECONTESTS_SANDBOX_READY:"
+_CANDIDATE_ENV = {
+    "HOME": "/nonexistent",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/bin:/bin",
+    # Candidate Python uses -s -P rather than -I: this is a trusted, fixed
+    # search root in the cleared environment and exposes only curated contest
+    # dependencies. The bootstrap itself still starts under -I -S.
+    "PYTHONPATH": "/packages",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONIOENCODING": "utf-8",
+}
+_SANDBOX_PROBE = r'''import os
+import socket
+import sys
+import threading
+
+import mpmath
+import sympy
+
+if os.geteuid() == 0:
+    raise SystemExit("still privileged")
+
+try:
+    with open("/tmp/codecontests-write-probe", "w") as f:
+        f.write("mutation escaped")
+except OSError:
+    pass
+else:
+    raise SystemExit("filesystem mutation was allowed")
+
+try:
+    child = os.fork()
+except OSError:
+    pass
+else:
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    raise SystemExit("process creation was allowed")
+
+# Exactly one same-process worker is the competitive-programming recursion
+# idiom. A second concurrent worker must hit RLIMIT_NPROC=3 (the private PID
+# namespace also has bubblewrap's init/reaper process).
+release = threading.Event()
+started = threading.Event()
+worker = threading.Thread(target=lambda: (started.set(), release.wait()))
+worker.start()
+if not started.wait(2):
+    raise SystemExit("single worker thread did not start")
+try:
+    extra = threading.Thread(target=lambda: None)
+    extra.start()
+except RuntimeError:
+    pass
+else:
+    extra.join()
+    raise SystemExit("second concurrent worker thread was allowed")
+release.set()
+worker.join()
+
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError:
+    pass
+else:
+    raise SystemExit("network socket creation was allowed")
+
+try:
+    os.kill(1, 0)
+except OSError:
+    pass
+else:
+    raise SystemExit("process signalling was allowed")
+
+if os.path.exists("/root") or os.path.exists("/workspace"):
+    raise SystemExit("host-private filesystem paths are visible")
+if "/packages" not in sys.path:
+    raise SystemExit("curated package root is absent from sys.path")
+if not (os.statvfs("/packages").f_flag & os.ST_RDONLY):
+    raise SystemExit("curated package root is writable")
+
+symbol = sympy.Symbol("x")
+if str(sympy.factor(symbol**2 - 1)) != "(x - 1)*(x + 1)":
+    raise SystemExit("curated sympy dependency is not functional")
+if mpmath.sqrt(4) != 2:
+    raise SystemExit("curated mpmath dependency is not functional")
+
+print("CODECONTESTS_SANDBOX_OK")
+'''
+
+
+def _python_runtime_mount() -> tuple[str, str]:
+    """Return the base runtime tree and interpreter path inside the sandbox."""
+    base_prefix = os.path.realpath(sys.base_prefix)
+    base_executable = os.path.realpath(
+        getattr(sys, "_base_executable", None) or sys.executable
+    )
+    try:
+        if os.path.commonpath((base_prefix, base_executable)) != base_prefix:
+            raise ValueError
+        relative_executable = os.path.relpath(base_executable, base_prefix)
+    except ValueError as exc:
+        raise SandboxUnavailable(
+            f"Python base executable {base_executable!r} is outside base prefix "
+            f"{base_prefix!r}"
+        ) from exc
+    return base_prefix, "/runtime/" + relative_executable
+
+
+@functools.lru_cache(maxsize=1)
+def _curated_package_mounts() -> tuple[tuple[str, str], ...]:
+    """Expose only historical contest dependencies, never the whole venv."""
+    mounts: list[tuple[str, str]] = []
+    for package in ("sympy", "mpmath"):
+        spec = importlib.util.find_spec(package)
+        locations = list(spec.submodule_search_locations or []) if spec else []
+        if len(locations) != 1 or not os.path.isdir(locations[0]):
+            raise SandboxUnavailable(
+                f"curated CodeContests dependency {package!r} is missing from the training venv"
+            )
+        source = os.path.realpath(locations[0])
+        mounts.append((source, f"/packages/{package}"))
+
+        # Preserve importlib.metadata behavior without exposing unrelated
+        # venv packages. Distribution metadata is read-only and tiny.
+        parent = Path(source).parent
+        for metadata in sorted(parent.glob(f"{package.replace('_', '-')}-*.dist-info")):
+            mounts.append((str(metadata.resolve()), f"/packages/{metadata.name}"))
+    return tuple(mounts)
+
+
+def _bubblewrap_command(
+    bubblewrap: str,
+    solution_path: str,
+    ready_token: str,
+    bootstrap_path: str = _SANDBOX_BOOTSTRAP_PATH,
+) -> list[str]:
+    runtime_source, runtime_executable = _python_runtime_mount()
+    command = [
+        bubblewrap,
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--uid", "65534",
+        "--gid", "65534",
+        "--cap-drop", "ALL",
+        "--clearenv",
+    ]
+    for key, value in _CANDIDATE_ENV.items():
+        command.extend(("--setenv", key, value))
+
+    # The OS runtime and UV-managed Python runtime are the only host trees
+    # visible (plus the read-only dynamic-linker cache below). /root,
+    # /workspace, the repo, datasets, credentials, and verifier tempdir never
+    # enter the namespace.
+    for source in ("/usr", "/bin", "/lib", "/lib64"):
+        if not os.path.lexists(source):
+            continue
+        if os.path.islink(source):
+            command.extend(("--symlink", os.readlink(source), source))
+        else:
+            command.extend(("--ro-bind", source, source))
+    command.extend(("--dir", "/etc"))
+    if os.path.isfile("/etc/ld.so.cache"):
+        command.extend(
+            ("--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache")
+        )
+    command.extend(
+        (
+            "--ro-bind", runtime_source, "/runtime",
+            # Keep venv-only dependencies out of the runtime tree. A separate
+            # staging root lets bwrap create child bind targets without
+            # writing into the read-only /runtime parent.
+            "--tmpfs", "/packages",
+        )
+    )
+    # Curated dependency binds must follow creation of their independent
+    # /packages tmpfs. Bubblewrap creates each package mountpoint inside the
+    # namespace and exposes only these two venv packages, then the whole
+    # search root is remounted read-only.
+    for source, destination in _curated_package_mounts():
+        command.extend(("--ro-bind", source, destination))
+    command.extend(
+        (
+            "--remount-ro", "/packages",
+            "--ro-bind", bootstrap_path, "/sandbox_bootstrap.py",
+            "--ro-bind", solution_path, "/solution.py",
+            "--dev", "/dev",
+            "--dir", "/tmp",
+            "--chdir", "/tmp",
+            "--",
+            runtime_executable, "-I", "-S",
+            "/sandbox_bootstrap.py", "/solution.py", ready_token,
+        )
+    )
+    return command
+
+
+def _verified_bubblewrap() -> str:
+    """Return a proven bubblewrap binary or raise before candidate execution."""
+    global _verified_bubblewrap_path
+    if _verified_bubblewrap_path is not None:
+        return _verified_bubblewrap_path
+    # functools.lru_cache is thread-safe but may execute a first cache miss
+    # more than once concurrently. The first rollout grades up to 32 samples
+    # in parallel, so use a double-checked lock and run exactly one probe.
+    with _sandbox_probe_lock:
+        if _verified_bubblewrap_path is not None:
+            return _verified_bubblewrap_path
+        _verified_bubblewrap_path = _probe_bubblewrap()
+        return _verified_bubblewrap_path
+
+
+def _probe_bubblewrap() -> str:
+    bubblewrap = shutil.which("bwrap")
+    if not bubblewrap:
+        raise SandboxUnavailable(
+            "bwrap is required for CodeContests execution on Linux"
+        )
+    if not os.path.isfile(_SANDBOX_BOOTSTRAP_PATH):
+        raise SandboxUnavailable(
+            f"sandbox bootstrap is missing: {_SANDBOX_BOOTSTRAP_PATH}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="codecontests_sandbox_probe_") as tmpdir:
+        probe_path = os.path.join(tmpdir, "probe.py")
+        with open(probe_path, "w") as f:
+            f.write(_SANDBOX_PROBE)
+        ready_token = secrets.token_hex(16)
+        command = _bubblewrap_command(bubblewrap, probe_path, ready_token)
+        try:
+            probe = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_CANDIDATE_ENV,
+                text=True,
+                timeout=15,
+                start_new_session=True,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxUnavailable(f"bubblewrap feasibility probe failed: {exc}") from exc
+    ready_marker = f"{_SANDBOX_READY_PREFIX}{ready_token}"
+    if (
+        probe.returncode != 0
+        or probe.stdout.strip() != "CODECONTESTS_SANDBOX_OK"
+        or ready_marker not in probe.stderr.splitlines()
+    ):
+        detail = (probe.stderr or probe.stdout or "no diagnostic").strip()[:1000]
+        raise SandboxUnavailable(
+            f"bubblewrap/libseccomp feasibility probe failed (rc={probe.returncode}): {detail}"
+        )
+    return bubblewrap
+
+
+def _reset_sandbox_probe_for_tests() -> None:
+    global _verified_bubblewrap_path
+    with _sandbox_probe_lock:
+        _verified_bubblewrap_path = None
+        _curated_package_mounts.cache_clear()
+
+
+def verify_code_execution_sandbox() -> None:
+    """Cheap launch preflight; Linux never falls back to unsandboxed code."""
+    if sys.platform == "linux":
+        _verified_bubblewrap()
+
+
+def _candidate_command(solution_path: str) -> tuple[list[str], str]:
+    ready_token = secrets.token_hex(16)
+    if sys.platform == "linux":
+        command = _bubblewrap_command(
+            _verified_bubblewrap(), solution_path, ready_token
+        )
+        return command, ready_token
+    # Local macOS test path: still a fresh interpreter with a blank environment
+    # and irreversible rlimits, but without Linux namespace/seccomp claims.
+    return (
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            _SANDBOX_BOOTSTRAP_PATH,
+            solution_path,
+            ready_token,
+        ],
+        ready_token,
+    )
+
+
+def _read_bounded_output(path: str) -> tuple[str, bool]:
+    try:
+        with open(path, "rb") as file_obj:
+            raw = file_obj.read(OUTPUT_LIMIT_BYTES + 1)
+    finally:
+        # Captures are transport scratch, not run artifacts. Remove each one
+        # as soon as its bounded contents have entered trusted memory rather
+        # than retaining up to 4 MiB/case until the whole suite finishes.
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    text = raw[:OUTPUT_LIMIT_BYTES].decode("utf-8", errors="replace")
+    # RLIMIT_FSIZE stops the regular capture file at exactly this size, so
+    # equality is the observable saturation signal.
+    return text, len(raw) >= OUTPUT_LIMIT_BYTES
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 def run_stdin_tests(
@@ -306,79 +670,182 @@ def run_stdin_tests(
     outputs: list[str],
     timeout: int = 90,
 ) -> dict[str, Any]:
-    """Run every stdin/stdout case in one subprocess (the runner execs the
-    solution once per case in-process, so we pay one interpreter start per
-    solution rather than one per test)."""
+    """Run cases externally; expected outputs never cross the trust boundary."""
     t0 = time.perf_counter()
-    tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
+    if len(inputs) != len(outputs):
+        raise VerifierInfrastructureError(
+            "trusted CodeContests suite is ragged: "
+            f"{len(inputs)} inputs != {len(outputs)} outputs"
+        )
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
+    except OSError as exc:
+        raise VerifierInfrastructureError(
+            f"could not create verifier temporary directory: {exc}"
+        ) from exc
 
     _verifier_semaphore.acquire()
     try:
         solution_path = os.path.join(tmpdir, "solution.py")
-        with open(solution_path, "w") as f:
-            f.write(solution_code)
-
-        test_cases_path = os.path.join(tmpdir, "test_cases.json")
-        with open(test_cases_path, "w") as f:
-            json.dump({"inputs": inputs, "outputs": outputs}, f)
-
-        runner_path = os.path.join(tmpdir, "runner.py")
-        with open(runner_path, "w") as f:
-            f.write(_TEST_RUNNER_SCRIPT)
-
-        # The runner writes its verdict to this file, never to stdout: the
-        # untrusted solution shares the runner's stdout (e.g. via atexit after
-        # the StringIO swap is undone) and could forge a result JSON line
-        # there. stdout/stderr are captured for diagnostics only.
-        result_path = os.path.join(tmpdir, "result.json")
-
         try:
-            proc = subprocess.Popen(
-                [sys.executable, runner_path, solution_path, test_cases_path, result_path],
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,  # own process group, so timeout kills grandchildren too
-            )
-        except Exception as exc:  # noqa: BLE001
-            return _failure_result("error", len(inputs), repr(exc), t0)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.communicate()  # reap
-            return _failure_result("timeout", len(inputs), "Total execution timed out.", t0, timeout=True)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            proc.communicate()
-            return _failure_result("error", len(inputs), repr(exc), t0)
-
-        elapsed = time.perf_counter() - t0
-        try:  # verdict comes ONLY from the runner-written result file
-            with open(result_path) as f:
-                result = json.load(f)
-            result["execution_time_seconds"] = elapsed
-            return result
-        except (OSError, json.JSONDecodeError, ValueError):
+            compile(solution_code, solution_path, "exec")
+        except SyntaxError as exc:
             return _failure_result(
-                "error", len(inputs), (stderr or stdout or "")[:1000], t0
+                "error", 0, f"SyntaxError: {exc}", t0,
+                candidate_error=True,
             )
+        try:
+            with open(solution_path, "w") as f:
+                f.write(solution_code)
+        except OSError as exc:
+            raise VerifierInfrastructureError(
+                f"could not stage candidate source: {exc}"
+            ) from exc
+
+        try:
+            command, ready_token = _candidate_command(solution_path)
+        except VerifierInfrastructureError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise VerifierInfrastructureError(
+                f"could not construct candidate sandbox command: {exc}"
+            ) from exc
+
+        # The one-time namespace/seccomp feasibility probe is infrastructure
+        # preflight, not candidate execution time. Start the historical total
+        # per-solution timeout only after the sandbox command is ready.
+        deadline = time.perf_counter() + timeout
+        tests_passed = 0
+        first_failure = None
+        candidate_error = False
+        for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return _failure_result(
+                    "timeout", len(inputs), "Total execution timed out.",
+                    t0, timeout=True,
+                )
+            try:
+                # Regular temporary files plus RLIMIT_FSIZE keep adversarial
+                # stdout/stderr bounded. PIPE + communicate would buffer until
+                # exhaustion before the parent got a chance to intervene. The
+                # child gets write-only, append-only descriptors: it cannot
+                # read or overwrite bootstrap's authenticated ready marker.
+                stdout_path = os.path.join(tmpdir, f"stdout_{i}.capture")
+                stderr_path = os.path.join(tmpdir, f"stderr_{i}.capture")
+                stdout_fd = os.open(
+                    stdout_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND,
+                    0o600,
+                )
+                try:
+                    stderr_fd = os.open(
+                        stderr_path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND,
+                        0o600,
+                    )
+                except Exception:
+                    os.close(stdout_fd)
+                    raise
+                with (
+                    os.fdopen(stdout_fd, "wb") as stdout_file,
+                    os.fdopen(stderr_fd, "wb") as stderr_file,
+                ):
+                    proc = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        env=_CANDIDATE_ENV,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                    try:
+                        proc.communicate(
+                            input=test_input.encode("utf-8"), timeout=remaining
+                        )
+                    except subprocess.TimeoutExpired:
+                        _kill_process_group(proc)
+                        proc.communicate()
+                        return _failure_result(
+                            "timeout", len(inputs), "Total execution timed out.",
+                            t0, timeout=True,
+                        )
+                actual, stdout_truncated = _read_bounded_output(stdout_path)
+                stderr, stderr_truncated = _read_bounded_output(stderr_path)
+            except VerifierInfrastructureError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                proc_obj = locals().get("proc")
+                if isinstance(proc_obj, subprocess.Popen) and proc_obj.poll() is None:
+                    _kill_process_group(proc_obj)
+                    proc_obj.wait()
+                raise VerifierInfrastructureError(
+                    f"candidate transport failed on case {i}: {exc!r}"
+                ) from exc
+
+            # The readiness token is generated in the trusted parent, passed
+            # only to bootstrap, and erased from argv by exec. Candidate text
+            # therefore cannot masquerade as a sandbox failure or suppress a
+            # real one by printing a familiar-looking traceback.
+            ready_marker = f"{_SANDBOX_READY_PREFIX}{ready_token}\n"
+            if ready_marker not in stderr:
+                raise VerifierInfrastructureError(
+                    "candidate sandbox/bootstrap did not emit its authenticated "
+                    f"readiness marker on case {i}: {stderr[:1000]}"
+                )
+            stderr = stderr.replace(ready_marker, "", 1)
+            candidate_error = candidate_error or proc.returncode != 0
+            candidate_error = candidate_error or stdout_truncated or stderr_truncated
+
+            normalized_actual = normalize_output(actual)
+            normalized_expected = normalize_output(expected_output)
+            if not stdout_truncated and normalized_actual == normalized_expected:
+                tests_passed += 1
+                continue
+
+            if first_failure is None:
+                diagnostic = stderr[:500]
+                if stdout_truncated:
+                    diagnostic = "stdout exceeded the 2 MiB limit. " + diagnostic
+                if stderr_truncated:
+                    diagnostic = diagnostic[:450] + " [stderr truncated]"
+                first_failure = {
+                    "test_idx": i,
+                    "expected": normalized_expected[:500],
+                    "actual": normalized_actual[:500],
+                    "stderr": diagnostic,
+                }
+
+        passed = tests_passed == len(inputs)
+        return {
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "tests_passed": tests_passed,
+            "tests_total": len(inputs),
+            "timeout": False,
+            "candidate_error": candidate_error,
+            "first_failure": first_failure,
+            "execution_time_seconds": time.perf_counter() - t0,
+        }
+    except VerifierInfrastructureError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        return _failure_result("error", len(inputs), repr(exc), t0)
+        raise VerifierInfrastructureError(
+            f"trusted CodeContests verifier failed: {exc!r}"
+        ) from exc
     finally:
         _verifier_semaphore.release()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _failure_result(
-    status: str, tests_total: int, stderr: str, t0: float, timeout: bool = False
+    status: str,
+    tests_total: int,
+    stderr: str,
+    t0: float,
+    timeout: bool = False,
+    candidate_error: bool = False,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -386,146 +853,10 @@ def _failure_result(
         "tests_passed": 0,
         "tests_total": tests_total,
         "timeout": timeout,
+        "candidate_error": candidate_error,
         "first_failure": {"test_idx": 0, "expected": "", "actual": "", "stderr": stderr},
         "execution_time_seconds": time.perf_counter() - t0,
     }
-
-
-# Runner script: execs the solution against each case with stdin/stdout
-# swapped to StringIO, then writes one JSON result to the file given as
-# argv[3] (atomically, via os.replace) — never to stdout, which the solution
-# code shares and could forge.
-_TEST_RUNNER_SCRIPT = r'''
-import json
-import os
-import sys
-import io
-import re
-import resource
-import traceback
-
-# Cap memory at 4GB to prevent OOM when many solutions run concurrently
-try:
-    mem_limit = 4 * 1024 * 1024 * 1024  # 4 GB
-    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
-except (ValueError, resource.error):
-    pass  # Not available on all platforms
-try:
-    resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
-except (ValueError, resource.error):
-    pass  # best-effort (macOS)
-try:
-    fsize_limit = 64 * 1024**2
-    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
-except (ValueError, resource.error):
-    pass  # best-effort (macOS)
-
-def normalize_output(s):
-    lines = s.split("\n")
-    normalized = []
-    for line in lines:
-        line = line.rstrip()
-        def normalize_float(match):
-            try:
-                return f"{float(match.group(0)):g}"
-            except (ValueError, OverflowError):
-                return match.group(0)
-        line = re.sub(r"-?\d+\.\d+(?:[eE][+-]?\d+)?", normalize_float, line)
-        normalized.append(line)
-    while normalized and not normalized[-1]:
-        normalized.pop()
-    return "\n".join(normalized).lower()
-
-def main():
-    solution_path = sys.argv[1]
-    test_cases_path = sys.argv[2]
-    result_path = sys.argv[3]
-
-    def write_result(obj):
-        # temp name + os.replace: the parent never sees a half-written file
-        tmp_path = result_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(obj, f)
-        os.replace(tmp_path, result_path)
-
-    # Hide the result path from the solution (it runs in-process and could
-    # read sys.argv, then forge the verdict file from an atexit hook).
-    sys.argv = [solution_path]
-
-    with open(solution_path) as f:
-        solution_code = f.read()
-
-    # Compile once, run many times
-    try:
-        compiled = compile(solution_code, solution_path, "exec")
-    except SyntaxError as e:
-        write_result({
-            "status": "error", "passed": False,
-            "tests_passed": 0, "tests_total": 0, "timeout": False,
-            "first_failure": {"test_idx": 0, "expected": "", "actual": "",
-                              "stderr": f"SyntaxError: {e}"},
-        })
-        return
-
-    with open(test_cases_path) as f:
-        cases = json.load(f)
-
-    inputs = cases["inputs"]
-    outputs = cases["outputs"]
-    tests_passed = 0
-    tests_total = len(inputs)
-    first_failure = None
-
-    for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
-        old_stdin = sys.stdin
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        captured_stdout = io.StringIO()
-        captured_stderr = io.StringIO()
-
-        try:
-            sys.stdin = io.StringIO(test_input)
-            sys.stdout = captured_stdout
-            sys.stderr = captured_stderr
-            # Each exec gets a fresh namespace so globals don't leak.
-            # __name__ must be "__main__" so if __name__ == "__main__" guards work.
-            exec(compiled, {"__builtins__": __builtins__, "__name__": "__main__"})
-        except SystemExit:
-            pass  # Some solutions call exit()
-        except Exception:
-            captured_stderr.write(traceback.format_exc())
-        finally:
-            sys.stdin = old_stdin
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-
-        actual = captured_stdout.getvalue()
-        stderr = captured_stderr.getvalue()
-
-        if normalize_output(actual) == normalize_output(expected_output):
-            tests_passed += 1
-        else:
-            if first_failure is None:
-                first_failure = {
-                    "test_idx": i,
-                    "expected": normalize_output(expected_output)[:500],
-                    "actual": normalize_output(actual)[:500],
-                    "stderr": stderr[:500],
-                }
-
-    passed = tests_passed == tests_total
-    write_result({
-        "status": "passed" if passed else "failed",
-        "passed": passed,
-        "tests_passed": tests_passed,
-        "tests_total": tests_total,
-        "timeout": False,
-        "first_failure": first_failure,
-    })
-
-if __name__ == "__main__":
-    main()
-'''
 
 
 # ----------------------------------------------------------------------- env
@@ -660,6 +991,16 @@ def _filter_cf_rating(
 class CodeContestsEnv(SingleTurnEnv):
     # Grading shells out to a subprocess per sample, so threads overlap.
     grade_workers = max(1, _MAX_CONCURRENT_VERIFIERS)
+    # Suites must stay live on Task.meta for reward()/grade(), but may never
+    # enter generic RLVR transcript, wandb, raw-fallback, or Docent records.
+    artifact_private_meta_keys = SingleTurnEnv.artifact_private_meta_keys | frozenset(
+        {
+            "rlvr_inputs", "rlvr_outputs",
+            "truth_inputs", "truth_outputs",
+            "gdm_inputs", "gdm_outputs",
+            "cco_inputs", "cco_outputs",
+        }
+    )
 
     def __init__(
         self,
@@ -756,8 +1097,8 @@ class CodeContestsEnv(SingleTurnEnv):
         # problem statement, and the ONLY field that reaches a prompt.
         #
         # Suites ride in meta for the graders to read. They are verifier inputs,
-        # not public examples: nothing renders them. `name` stays scalar while
-        # docent_export drops the list-valued suites from exported transcripts.
+        # not public examples: nothing renders them, and the environment's
+        # artifact-private key set redacts them from every transcript exporter.
         return Task(
             messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={
@@ -806,6 +1147,8 @@ class CodeContestsEnv(SingleTurnEnv):
         if has_cco:
             info["cco_correct"] = 0.0
             info["cco_tests_passed_frac"] = 0.0
+            info["cco_exec_timeout"] = 0.0
+            info["cco_exec_error"] = 0.0
         if code is None:
             return 0.0, info
         if is_cpp_code(code):
@@ -822,6 +1165,8 @@ class CodeContestsEnv(SingleTurnEnv):
             info["cco_tests_passed_frac"] = (
                 cco.get("tests_passed", 0) / cco_total if cco_total else 0.0
             )
+            info["cco_exec_timeout"] = float(bool(cco.get("timeout")))
+            info["cco_exec_error"] = float(bool(cco.get("candidate_error")))
 
         gdm_inputs = task.meta.get("gdm_inputs") or task.meta["rlvr_inputs"]
         gdm_outputs = task.meta.get("gdm_outputs") or task.meta["rlvr_outputs"]
@@ -834,9 +1179,10 @@ class CodeContestsEnv(SingleTurnEnv):
         gdm_passed_frac = result.get("tests_passed", 0) / total if total else 0.0
         info["gdm_correct"] = info["correct"] = gdm_correct
         info["gdm_tests_passed_frac"] = info["tests_passed_frac"] = gdm_passed_frac
-        # verifier breakage must be distinguishable from wrong answers
+        # Infrastructure failures raise and invalidate the rollout. These
+        # metrics therefore describe only candidate behavior.
         info["exec_timeout"] = float(bool(result.get("timeout")))
-        info["exec_error"] = float(result.get("status") == "error")
+        info["exec_error"] = float(bool(result.get("candidate_error")))
         return self.format_reward + self.correct_reward * info["correct"], info
 
 
@@ -927,6 +1273,41 @@ class CodeContestsFamily(TaskFamily):
         if is_cpp_code(solution):
             return False
         return bool(run_stdin_tests(solution, inputs, outputs, timeout=self.timeout_seconds).get("passed"))
+
+    def grade_batch(
+        self, items: list[tuple[dict[str, Any], Any]]
+    ) -> list[Optional[bool]]:
+        """Grade concurrently while keeping infrastructure failures fatal.
+
+        The generic family contract intentionally turns arbitrary per-item
+        grader exceptions into ``None``. A missing/broken code-execution
+        boundary is different: continuing would publish an unlabeled debate
+        as if it were a valid evaluation, so this family propagates that
+        specific exception and retains the generic behavior for other bugs.
+        """
+        self.last_grade_errors = 0
+        if not items:
+            return []
+
+        def _one(
+            item: tuple[dict[str, Any], Any]
+        ) -> tuple[Optional[bool], bool]:
+            try:
+                return self.grade(*item), False
+            except VerifierInfrastructureError:
+                raise
+            except Exception:  # noqa: BLE001
+                return None, True
+
+        if len(items) == 1 or self.grade_workers <= 1:
+            scored = [_one(item) for item in items]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.grade_workers
+            ) as pool:
+                scored = list(pool.map(_one, items))
+        self.last_grade_errors = sum(error for _, error in scored)
+        return [grade for grade, _ in scored]
 
     def format_flags(self, text: str) -> dict[str, float]:
         # strict flag: a properly CLOSED fence, independent of the (possibly

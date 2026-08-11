@@ -8,7 +8,7 @@
 # meanings; read them against this script only):
 #   1  a required argument is missing — bash's own exit status for the
 #      ${var:?message} expansions below, not a code this script chooses
-#   2  unknown mode, unresolvable judge config, or legacy checkpoint layout
+#   2  unknown mode, unresolvable config/model artifact, or legacy checkpoint layout
 #   3  judge vLLM failed to start, serve, or free its port
 #   4  editable pip install failed or timed out
 #   5  a trainer is already running, another pod_run.sh holds the launch lock,
@@ -256,6 +256,147 @@ case "$MODE" in
   *) echo "unknown mode $MODE (debate|rlvr)" >&2; exit 2 ;;
 esac
 [ -f "$CONFIG" ] || { echo "FATAL: config $CONFIG not found (cwd $(pwd))" >&2; exit 2; }
+
+# CodeContests executes model-authored Python, so its Linux sandbox is a hard
+# launch dependency rather than something to discover after model boot. The
+# RunPod PyTorch images are Ubuntu and run this launcher as root; install the
+# distro's bubblewrap + libseccomp runtime into the ephemeral pod when absent,
+# then exercise the real user/mount/PID/network namespace, uid drop, rlimits,
+# and seccomp policy. Container runtimes sometimes deny user namespaces even
+# when bwrap is installed, so a version check is not a sufficient preflight.
+DATASET_TYPE="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
+import sys
+from infra.config import load_experiment
+
+exp = load_experiment(sys.argv[1], sys.argv[2])
+print(str((exp.get("dataset") or {}).get("type") or ""))
+PYEOF
+)" || {
+  echo "FATAL: could not resolve dataset type for $CONFIG:$EXP" >&2
+  exit 2
+}
+if [ "$DATASET_TYPE" = codecontests ]; then
+  SANDBOX_INSTALL=0
+  command -v bwrap >/dev/null 2>&1 || SANDBOX_INSTALL=1
+  "$PY" - <<'PYEOF' >/dev/null 2>&1 || SANDBOX_INSTALL=1
+import ctypes
+ctypes.CDLL("libseccomp.so.2")
+PYEOF
+  if [ "$SANDBOX_INSTALL" = 1 ]; then
+    if [ "$(id -u)" != 0 ] || ! command -v apt-get >/dev/null 2>&1; then
+      echo "FATAL: CodeContests requires bwrap + libseccomp.so.2; automatic apt install needs root on an apt-based image" >&2
+      exit 2
+    fi
+    echo "== installing CodeContests sandbox dependencies (bubblewrap, libseccomp2) =="
+    timeout -k 30s 300 apt-get update -qq &&
+      timeout -k 30s 300 env DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y -qq bubblewrap libseccomp2 || {
+          echo "FATAL: could not install CodeContests sandbox dependencies within 300s" >&2
+          exit 2
+        }
+  fi
+  if ! timeout -k 5s 30 "$PY" - <<'PYEOF'
+from infra.envs.tasks.codecontests import verify_code_execution_sandbox
+
+verify_code_execution_sandbox()
+print("== CodeContests Linux sandbox feasibility probe passed ==")
+PYEOF
+  then
+    echo "FATAL: CodeContests sandbox cannot establish its namespaces, unprivileged uid, or seccomp policy; candidate code was not run" >&2
+    exit 2
+  fi
+fi
+
+# A local policy path is an intentional artifact selection, not an HF repo
+# name. Fail before watchdog/judge startup if the mounted artifact is absent or
+# incomplete. In particular, the OLMo-3.1-32B upstream repo stores 121GB fp32
+# weights while the run-validated /workspace artifact is a 61GB bf16 conversion;
+# silently falling back to the repo changes both memory math and provenance.
+# This proves structure/size, not exact content identity: capture the mounted
+# artifact's checksum/provenance separately with the run evidence.
+if [ "$MODE" = rlvr ]; then
+  POLICY_MODEL="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
+import json
+import os
+import sys
+from pathlib import Path
+
+from infra.config import load_experiment
+
+exp = load_experiment(sys.argv[1], sys.argv[2])
+model = str(exp.get("model") or "")
+if not model:
+    raise SystemExit(f"experiment {sys.argv[2]!r} in {sys.argv[1]} has no model")
+
+if os.path.isabs(model):
+    root = Path(model)
+    config = root / "config.json"
+    if not root.is_dir() or not config.is_file():
+        raise SystemExit(
+            f"local policy artifact {model!r} is missing its directory or config.json; "
+            "attach the volume containing the pinned model rather than falling back to HF"
+        )
+
+    try:
+        model_config = json.loads(config.read_text())
+    except Exception as exc:
+        raise SystemExit(f"cannot parse local policy config {config}: {exc}") from exc
+
+    indices = [
+        path for path in (
+            root / "model.safetensors.index.json",
+            root / "pytorch_model.bin.index.json",
+        )
+        if path.is_file()
+    ]
+    if indices:
+        referenced = set()
+        for index in indices:
+            try:
+                body = json.loads(index.read_text())
+            except Exception as exc:
+                raise SystemExit(f"cannot parse local policy index {index}: {exc}") from exc
+            referenced.update((body.get("weight_map") or {}).values())
+        missing = sorted(
+            name for name in referenced
+            if not (root / name).is_file() or (root / name).stat().st_size == 0
+        )
+        if not referenced or missing:
+            detail = ", ".join(missing[:5]) if missing else "index has no weight_map entries"
+            raise SystemExit(f"local policy artifact {model!r} is incomplete: {detail}")
+    else:
+        weights = [*root.glob("*.safetensors"), *root.glob("pytorch_model*.bin")]
+        if not any(path.is_file() and path.stat().st_size > 0 for path in weights):
+            raise SystemExit(f"local policy artifact {model!r} has no non-empty weight files")
+
+    if model == "/workspace/models/olmo32-bf16":
+        architecture = model_config.get("architectures") or []
+        if "Olmo3ForCausalLM" not in architecture:
+            raise SystemExit(
+                f"canonical OLMo artifact {model!r} has unexpected architectures={architecture!r}"
+            )
+        shard_files = (
+            {(root / name) for name in referenced}
+            if indices
+            else {path for path in weights if path.is_file()}
+        )
+        shard_bytes = sum(path.stat().st_size for path in shard_files)
+        if not 55_000_000_000 <= shard_bytes <= 75_000_000_000:
+            raise SystemExit(
+                f"canonical OLMo artifact {model!r} has {shard_bytes} weight bytes; "
+                "expected the 61GB bf16 conversion (55-75GB guard), not the 121GB fp32 repo"
+            )
+
+print(model)
+PYEOF
+)" || {
+    echo "FATAL: policy-model preflight failed for $CONFIG:$EXP (see error above)" >&2
+    exit 2
+  }
+  case "$POLICY_MODEL" in
+    /*) echo "== local policy artifact verified: $POLICY_MODEL ==" ;;
+  esac
+fi
 
 # Idle watchdog: once the pod has been idle for IDLE_MINUTES (default 30) — no
 # trainer/eval processes, no active SSH, GPU idle — it kills leftover vLLM

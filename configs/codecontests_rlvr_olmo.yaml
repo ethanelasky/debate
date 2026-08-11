@@ -133,9 +133,9 @@ codecontests_rlvr_olmo_long:
 # (codecontests_olmo31_32b_canary_experiments.yaml): Olmo-3.1-32B-Instruct-DPO
 # on 8 GPUs, lora_rank 32, gpu_mem_util 0.45, max_new_tokens 8192.
 #
-# NOTE the model family: 3.1, not the 3-7B the MATH baselines in this repo use.
-# The arms above are 7B and exist to prove the code path cheaply; this is the
-# one whose numbers mean anything.
+# NOTE the model family: 3.1 Instruct-DPO (the no-think instruct model), not
+# the 3-7B the MATH baselines in this repo use. The arms above are 7B and exist
+# to prove the code path cheaply; this is the one whose numbers mean anything.
 #
 # Why 8 GPUs: 32B in bf16 is ~64 GB of weights, so vLLM's rollout copy plus
 # FSDP training state cannot share a single 80 GB card.
@@ -145,7 +145,13 @@ codecontests_rlvr_olmo_long:
 # completions came from, so the short budget's evidence does not apply here.
 codecontests_rlvr_olmo31_32b:
   _extends: codecontests_rlvr_olmo
-  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  # Same canonical, run-validated local artifact as the AIME 32B campaign:
+  # allenai/Olmo-3.1-32B-Instruct-DPO @ fc84a4f, shard-streaming converted
+  # from the upstream repo's 121GB fp32 weights to 61GB bf16. The bare HF repo
+  # silently OOM-killed TP2 rollout workers; pod_run.sh preflights this local
+  # directory, model family, bf16-sized shard set and every index reference
+  # before launch. That is a completeness/size check, not a content checksum.
+  model: /workspace/models/olmo32-bf16
   max_completion_tokens: 8192
   dataset:
     soft_token_budget: 4096
@@ -429,6 +435,24 @@ codecontests_rlvr_olmo31_32b_cap1024:
     verl:
       response_length: 1024
     eval_max_tokens: 1024
+
+# Paid-compute boundary checks for the two long arms. They retain the real
+# 8-problem x 8-sample rollout shape and every cap/reward/optimizer setting;
+# only the run length and periodic eval/save cadence are disabled. train()
+# still writes its normal final one-step adapter for post-smoke inspection.
+codecontests_rlvr_olmo31_32b_cap2048_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
+codecontests_rlvr_olmo31_32b_cap1024_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
 
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.

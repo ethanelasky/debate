@@ -33,6 +33,122 @@ SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o 
 RSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p $PORT"
 REMOTE="root@$IP"
 
+# Validate the complete reproducibility bundle BEFORE contacting the pod. The
+# trainer reads train.jsonl + paired_test.jsonl, while the source/eval files
+# and all three manifests are what prove how those runtime artifacts were
+# derived. Syncing only the JSONLs makes a run executable but not auditable.
+REQUIRED_CODECONTESTS_DATA=(
+  train.jsonl
+  test.jsonl
+  manifest.json
+  cco_eval.jsonl
+  cco_eval.manifest.json
+  paired_test.jsonl
+  paired_test.manifest.json
+)
+if [ "$WITH_DATA" = "--with-data" ]; then
+  for f in "${REQUIRED_CODECONTESTS_DATA[@]}"; do
+    [ -f "$REPO_ROOT/data/codecontests/$f" ] || {
+      echo "FATAL: data/codecontests/$f missing locally" >&2
+      exit 2
+    }
+  done
+  if ! python3 - "$REPO_ROOT/data/codecontests" <<'PYEOF'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+
+def load(name):
+    path = root / name
+    try:
+        body = json.loads(path.read_text())
+    except Exception as exc:
+        raise SystemExit(f"FATAL: cannot parse data/codecontests/{name}: {exc}") from exc
+    if not isinstance(body, dict):
+        raise SystemExit(f"FATAL: data/codecontests/{name} is not a JSON object")
+    return body
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify(name, metadata, size_key):
+    path = root / name
+    declared_name = metadata.get("file")
+    if declared_name is not None and declared_name != name:
+        raise SystemExit(
+            f"FATAL: data/codecontests/{name} manifest names {declared_name!r}"
+        )
+    try:
+        expected_size = int(metadata[size_key])
+        expected_sha = str(metadata["sha256"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"FATAL: data/codecontests/{name} manifest lacks valid {size_key}/sha256"
+        ) from exc
+    actual_size = path.stat().st_size
+    if actual_size != expected_size:
+        raise SystemExit(
+            f"FATAL: data/codecontests/{name} size mismatch: "
+            f"manifest={expected_size}, local={actual_size}"
+        )
+    actual_sha = sha256(path)
+    if actual_sha != expected_sha:
+        raise SystemExit(
+            f"FATAL: data/codecontests/{name} sha256 mismatch: "
+            f"manifest={expected_sha}, local={actual_sha}"
+        )
+    return actual_sha
+
+
+base = load("manifest.json")
+cco = load("cco_eval.manifest.json")
+paired = load("paired_test.manifest.json")
+try:
+    outputs = base["outputs"]
+    paired_output = paired["output"]
+except (KeyError, TypeError) as exc:
+    raise SystemExit("FATAL: CodeContests manifests lack outputs/output metadata") from exc
+
+train_sha = verify("train.jsonl", outputs["train"], "size_bytes")
+test_sha = verify("test.jsonl", outputs["test"], "size_bytes")
+cco_sha = verify("cco_eval.jsonl", cco, "bytes")
+paired_sha = verify("paired_test.jsonl", paired_output, "size_bytes")
+
+# The paired artifact records the exact two staging inputs it joined. Checking
+# those links catches a self-consistent but mismatched set of independently
+# valid files/manifests.
+try:
+    paired_gdm_sha = str(paired["sources"]["gdm"]["sha256"])
+    paired_cco_sha = str(paired["sources"]["cco"]["sha256"])
+except (KeyError, TypeError) as exc:
+    raise SystemExit("FATAL: paired_test manifest lacks source sha256 links") from exc
+if paired_gdm_sha != test_sha or paired_cco_sha != cco_sha:
+    raise SystemExit(
+        "FATAL: paired_test manifest source hashes do not match "
+        "test.jsonl + cco_eval.jsonl"
+    )
+
+print(
+    "== local dataset manifests verified: "
+    f"train={train_sha[:12]} test={test_sha[:12]} "
+    f"cco={cco_sha[:12]} paired={paired_sha[:12]} =="
+)
+PYEOF
+  then
+    exit 2
+  fi
+fi
+
 # GNU sha256sum (pod) and BSD shasum (mac) differ in path prefixes and default
 # sort order, so an aggregate hash of the two disagrees even when every file
 # matches -- that exact false alarm cost a round of panic. Compare per file.
@@ -60,9 +176,6 @@ diff <(local_sums "$REPO_ROOT") <(remote_sums /root/debate) \
     echo "FATAL: repo mismatch after sync -- first lines:" >&2; head -20 /tmp/pod_sync_repo.diff >&2; exit 3; }
 
 if [ "$WITH_DATA" = "--with-data" ]; then
-  for f in train.jsonl test.jsonl cco_eval.jsonl; do
-    [ -f "$REPO_ROOT/data/codecontests/$f" ] || { echo "FATAL: data/codecontests/$f missing locally" >&2; exit 2; }
-  done
   echo "== datasets -> $REMOTE:/root/debate/data/codecontests"
   $SSH "$REMOTE" "mkdir -p /root/debate/data/codecontests"
   rsync -a --info=progress2 -e "$RSH" \

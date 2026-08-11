@@ -170,7 +170,11 @@ class PlannedEnv(Env):
             records.append(
                 {
                     "task_index": ti,
-                    "meta": {k: v for k, v in tasks[ti].meta.items() if k != "bindings"},
+                    "meta": {
+                        k: v
+                        for k, v in tasks[ti].meta.items()
+                        if k not in self.inner.artifact_private_meta_keys
+                    },
                     "messages": convo,
                     "completion": a.text,
                     "stop_reason": a.stop_reason,

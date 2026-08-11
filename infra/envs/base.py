@@ -149,12 +149,17 @@ class SingleTurnEnv(Env):
     Each rollout() overwrites `last_rollout_records` — one dict per KEPT
     sample (prompt messages, completion, reward, info) — retained for
     transcript export (wandb; the single-turn twin of DebateEnv.last_states).
-    meta is copied without "bindings": its values (e.g. a 60k-token MB
-    trajectory) are already rendered into the messages.
+    meta is copied without keys in `artifact_private_meta_keys`: `bindings`
+    is already rendered into messages, while verifier-backed subclasses can
+    additionally retain private grading state in memory without exporting it.
     """
 
     grade_workers: int = 1
     last_rollout_records: list[dict[str, Any]] = []
+    # Subclasses can keep verifier-only Task.meta fields available to reward()
+    # while excluding them from generic transcript/Docent records. `bindings`
+    # is already-rendered prompt material and has always been omitted.
+    artifact_private_meta_keys: frozenset[str] = frozenset({"bindings"})
 
     #: Flat overshoot penalty. A sample longer than `soft_token_budget` loses
     #: `overshoot_penalty` from its reward — a constant, NOT scaled by how far
@@ -244,7 +249,11 @@ class SingleTurnEnv(Env):
             records.append(
                 {
                     "task_index": gi,
-                    "meta": {k: v for k, v in tasks[gi].meta.items() if k != "bindings"},
+                    "meta": {
+                        k: v
+                        for k, v in tasks[gi].meta.items()
+                        if k not in self.artifact_private_meta_keys
+                    },
                     "messages": tasks[gi].messages,
                     "completion": s.text,
                     "stop_reason": s.stop_reason,

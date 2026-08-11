@@ -6,12 +6,15 @@ from __future__ import annotations
 import json
 import logging
 import runpy
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from infra.config import resolve_experiments_from_file
 from infra.envs.tasks import get_family
+from infra.envs.tasks import codecontests as codecontests_module
 from infra.envs.tasks.codecontests import (
     CodeContestsEnv,
     CodeContestsFamily,
@@ -364,6 +367,16 @@ def test_correct_solution_passes_all_cases():
     assert r["passed"] and r["tests_passed"] == 2 and r["tests_total"] == 2
 
 
+def test_standard_exit_convenience_preserves_contest_python_semantics():
+    r = run_stdin_tests(
+        "print(input())\nexit()\nprint('unreachable')",
+        ["hello"],
+        ["hello"],
+        timeout=TIMEOUT,
+    )
+    assert r["passed"], r
+
+
 def test_wrong_solution_reports_first_failure():
     r = run_stdin_tests("print(0)", ["1 2", "3 4"], ["3", "7"], timeout=TIMEOUT)
     assert not r["passed"] and r["status"] == "failed"
@@ -374,6 +387,7 @@ def test_wrong_solution_reports_first_failure():
 def test_syntax_error_solution_is_an_error():
     r = run_stdin_tests("def (:", ["1 2"], ["3"], timeout=TIMEOUT)
     assert r["status"] == "error" and not r["passed"]
+    assert r["candidate_error"] is True
     assert "SyntaxError" in r["first_failure"]["stderr"]
 
 
@@ -385,7 +399,30 @@ def test_float_normalization():
 def test_runtime_error_is_a_failure_not_a_crash():
     r = run_stdin_tests("raise ValueError('boom')", ["x"], ["1"], timeout=TIMEOUT)
     assert not r["passed"]
+    assert r["candidate_error"] is True
     assert "ValueError" in r["first_failure"]["stderr"]
+
+
+def test_one_worker_thread_recursion_idiom_is_supported():
+    solution = (
+        "import sys, threading\n"
+        "sys.setrecursionlimit(1_000_000)\n"
+        "def main():\n"
+        "    print(input().strip())\n"
+        "threading.Thread(target=main).start()\n"
+    )
+    r = run_stdin_tests(solution, ["thread-ok"], ["thread-ok"], timeout=TIMEOUT)
+    assert r["passed"], r
+
+
+def test_capture_is_unlinked_as_soon_as_it_is_read(tmp_path):
+    capture = tmp_path / "case.capture"
+    capture.write_bytes(b"bounded output")
+    assert codecontests_module._read_bounded_output(str(capture)) == (
+        "bounded output",
+        False,
+    )
+    assert not capture.exists()
 
 
 # Forges a result JSON as the LAST line of the runner's real stdout (atexit
@@ -408,6 +445,193 @@ def test_forged_stdout_verdict_is_ignored():
     assert r["tests_passed"] == 0 and r["tests_total"] == 2
     fam = CodeContestsFamily(timeout_seconds=TIMEOUT)
     assert fam.grade({"truth_inputs": ["1 2"], "truth_outputs": ["3"]}, FORGED_STDOUT_SOLUTION) is False
+
+
+# This is the concrete in-process exploit that broke the former runner. The
+# solution found main()'s trusted write_result closure through inspect.stack()
+# and scheduled a forged all-passed verdict after the real result was written.
+# A separate candidate process has no verifier frame or result writer to find.
+STACK_INTROSPECTION_FORGER = r"""
+import atexit
+import inspect
+
+for frame_info in inspect.stack():
+    write_result = frame_info.frame.f_locals.get("write_result")
+    if callable(write_result):
+        atexit.register(lambda writer=write_result: writer({
+            "status": "passed",
+            "passed": True,
+            "tests_passed": 2,
+            "tests_total": 2,
+            "timeout": False,
+            "first_failure": None,
+        }))
+print(0)
+"""
+
+
+def test_stack_introspection_cannot_reach_or_forge_verifier_state():
+    r = run_stdin_tests(
+        STACK_INTROSPECTION_FORGER,
+        ["1 2", "3 4"],
+        ["3", "7"],
+        timeout=TIMEOUT,
+    )
+    assert r["status"] == "failed" and r["passed"] is False
+    assert r["tests_passed"] == 0 and r["first_failure"]["actual"] == "0"
+
+
+def test_candidate_cannot_forge_an_infrastructure_error_status():
+    solution = (
+        "import sys\n"
+        "sys.stderr.write('bwrap: fake failure\\n"
+        "Traceback in sandbox_bootstrap.py\\n"
+        "CODECONTESTS_SANDBOX_READY:guessed-token\\n')\n"
+        "print(0)\n"
+        "raise SystemExit(1)\n"
+    )
+    r = run_stdin_tests(solution, [""], ["1"], timeout=TIMEOUT)
+    assert r["status"] == "failed" and not r["passed"]
+    assert "fake failure" in r["first_failure"]["stderr"]
+
+
+def test_candidate_does_not_inherit_parent_environment_secrets(monkeypatch):
+    monkeypatch.setenv("CODECONTESTS_ADVERSARIAL_SECRET", "must-not-cross")
+    solution = (
+        "import os\n"
+        "print(os.environ.get('CODECONTESTS_ADVERSARIAL_SECRET', 'clean'))\n"
+    )
+    r = run_stdin_tests(solution, [""], ["clean"], timeout=TIMEOUT)
+    assert r["passed"], r
+
+
+def test_candidate_stdout_is_bounded():
+    solution = "import sys\nsys.stdout.write('x' * (3 * 1024 * 1024))\n"
+    r = run_stdin_tests(solution, [""], [""], timeout=TIMEOUT)
+    assert r["status"] == "failed" and not r["passed"]
+    assert "2 MiB limit" in r["first_failure"]["stderr"]
+
+
+def test_bubblewrap_mounts_runtime_before_curated_read_only_packages(monkeypatch):
+    monkeypatch.setattr(
+        codecontests_module,
+        "_python_runtime_mount",
+        lambda: ("/host/runtime", "/runtime/bin/python"),
+    )
+    monkeypatch.setattr(
+        codecontests_module,
+        "_curated_package_mounts",
+        lambda: (
+            ("/host/sympy", "/packages/sympy"),
+            ("/host/mpmath", "/packages/mpmath"),
+        ),
+    )
+    command = codecontests_module._bubblewrap_command(
+        "bwrap", "/host/solution.py", "token", "/host/bootstrap.py"
+    )
+
+    def operation_index(*operation):
+        width = len(operation)
+        return next(
+            i
+            for i in range(len(command) - width + 1)
+            if tuple(command[i : i + width]) == operation
+        )
+
+    runtime = operation_index("--ro-bind", "/host/runtime", "/runtime")
+    packages = operation_index("--tmpfs", "/packages")
+    sympy = operation_index("--ro-bind", "/host/sympy", "/packages/sympy")
+    mpmath = operation_index("--ro-bind", "/host/mpmath", "/packages/mpmath")
+    read_only = operation_index("--remount-ro", "/packages")
+    assert runtime < packages < sympy < read_only
+    assert runtime < packages < mpmath < read_only
+    assert codecontests_module._CANDIDATE_ENV["PYTHONPATH"] == "/packages"
+
+
+def test_linux_sandbox_is_enforced_or_fails_closed(tmp_path):
+    if sys.platform != "linux":
+        pytest.skip("Linux namespace/seccomp boundary; macOS exercises process isolation separately")
+
+    sentinel = tmp_path / "must-not-be-created"
+    solution = f"""
+import os
+import socket
+
+blocked = os.geteuid() != 0
+for action in (
+    lambda: open({str(sentinel)!r}, "w"),
+    lambda: os.fork(),
+    lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+    lambda: os.kill(1, 0),
+):
+    try:
+        action()
+    except OSError:
+        pass
+    else:
+        blocked = False
+print("blocked" if blocked else "escaped")
+"""
+    try:
+        r = run_stdin_tests(solution, [""], ["blocked"], timeout=TIMEOUT)
+    except codecontests_module.SandboxUnavailable:
+        # An image without bwrap/libseccomp or namespace permission is safe to
+        # reject; production pod_run.sh installs dependencies and runs the
+        # same feasibility probe before the model boots. It must invalidate
+        # the run rather than masquerade as a candidate wrong answer.
+        assert not sentinel.exists()
+    else:
+        assert r["passed"], r
+        assert not sentinel.exists()
+
+
+def test_concurrent_linux_candidates_have_private_uid_and_tmp_namespaces():
+    if sys.platform != "linux":
+        pytest.skip("Linux namespace concurrency boundary")
+    try:
+        codecontests_module.verify_code_execution_sandbox()
+    except codecontests_module.SandboxUnavailable as exc:
+        pytest.skip(f"host safely rejects the Linux sandbox: {exc}")
+
+    solution = (
+        "import os, threading, time\n"
+        "answer = []\n"
+        "worker = threading.Thread(target=lambda: (time.sleep(0.1), answer.append('thread-ok')))\n"
+        "worker.start()\n"
+        "worker.join()\n"
+        "print(os.geteuid(), len(os.listdir('/tmp')), answer[0])\n"
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _i: run_stdin_tests(
+                    solution, [""], ["65534 0 thread-ok"], timeout=TIMEOUT
+                ),
+                range(8),
+            )
+        )
+    assert all(result["passed"] for result in results), results
+
+
+def test_missing_linux_sandbox_never_executes_candidate(monkeypatch, tmp_path):
+    sentinel = tmp_path / "candidate-ran"
+    codecontests_module._reset_sandbox_probe_for_tests()
+    monkeypatch.setattr(codecontests_module.sys, "platform", "linux")
+    monkeypatch.setattr(codecontests_module.shutil, "which", lambda _name: None)
+    try:
+        with pytest.raises(
+            codecontests_module.SandboxUnavailable,
+            match="bwrap is required",
+        ):
+            run_stdin_tests(
+                f"open({str(sentinel)!r}, 'w').write('unsafe')",
+                [""],
+                [""],
+                timeout=TIMEOUT,
+            )
+    finally:
+        codecontests_module._reset_sandbox_probe_for_tests()
+    assert not sentinel.exists()
 
 
 def test_timeout_is_reported_and_graded_false():
@@ -450,6 +674,55 @@ def test_reward_cpp_code_gets_format_credit_only(env):
     assert info["correct"] == 0.0 and info["cpp_code"] == 1.0
 
 
+def test_reward_candidate_syntax_error_is_observable_not_infrastructure(env):
+    task = env.tasks(1, split="test")[0]
+    reward, info = env.reward(task, "```python\ndef (: \n```")
+    assert reward == pytest.approx(0.1)
+    assert info["correct"] == 0.0
+    assert info["exec_error"] == 1.0
+    assert info["exec_timeout"] == 0.0
+
+
+def test_verifier_infrastructure_failure_invalidates_reward_and_rollout(
+    env, monkeypatch
+):
+    from infra.backend.base import Sample
+
+    def unavailable(*_args, **_kwargs):
+        raise codecontests_module.SandboxUnavailable("sandbox preflight failed")
+
+    monkeypatch.setattr(codecontests_module, "run_stdin_tests", unavailable)
+    task = env.tasks(1, split="test")[0]
+    completion = f"```python\n{SUM_SOLUTION}\n```"
+    with pytest.raises(
+        codecontests_module.SandboxUnavailable,
+        match="sandbox preflight failed",
+    ):
+        env.reward(task, completion)
+
+    class FakePolicy:
+        def predict(self, messages, n):
+            return [
+                [
+                    Sample(
+                        tokens=[1],
+                        logprobs=[0.0],
+                        text=completion,
+                        stop_reason="stop",
+                        prompt_tokens=[0],
+                    )
+                    for _ in range(n)
+                ]
+                for _ in messages
+            ]
+
+    with pytest.raises(
+        codecontests_module.SandboxUnavailable,
+        match="sandbox preflight failed",
+    ):
+        env.rollout([task], FakePolicy(), group_size=1)
+
+
 # -------------------------------------------------------------------- family
 
 
@@ -480,6 +753,22 @@ def test_grade_without_test_cases(family):
 
 def test_grade_cpp_solution(family):
     assert family.grade(_meta(), "#include <iostream>\nint main(){ std::cout<<1; }") is False
+
+
+def test_grade_batch_propagates_verifier_infrastructure_failure(
+    family, monkeypatch
+):
+    def unavailable(*_args, **_kwargs):
+        raise codecontests_module.VerifierInfrastructureError(
+            "candidate transport failed"
+        )
+
+    monkeypatch.setattr(codecontests_module, "run_stdin_tests", unavailable)
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="candidate transport failed",
+    ):
+        family.grade_batch([(_meta(), SUM_SOLUTION)])
 
 
 def test_extractor_relaxed_knob(family):
@@ -605,6 +894,105 @@ def _paired_env(tmp_path, paired_rows=PAIRED_ROWS):
     )
 
 
+PRIVATE_SUITE_KEYS = (
+    "rlvr_inputs",
+    "rlvr_outputs",
+    "truth_inputs",
+    "truth_outputs",
+    "gdm_inputs",
+    "gdm_outputs",
+    "cco_inputs",
+    "cco_outputs",
+)
+
+
+def _install_private_suite_sentinels(task):
+    for suite in ("rlvr", "truth", "gdm", "cco"):
+        sentinel = f"PRIVATE_SUITE_{suite.upper()}"
+        task.meta[f"{suite}_inputs"] = [sentinel]
+        task.meta[f"{suite}_outputs"] = [sentinel]
+
+
+def _assert_private_suites_absent(records):
+    from infra.envs.singleturn_docent import agent_runs
+
+    raw = json.dumps(records)
+    docent = "\n".join(run.model_dump_json() for run in agent_runs(records))
+    for serialized in (raw, docent):
+        assert "PRIVATE_SUITE_" not in serialized
+        for key in PRIVATE_SUITE_KEYS:
+            assert key not in serialized
+    record = records[0]
+    assert {"question", "name", "cf_rating", "difficulty", "split"} <= set(
+        record["meta"]
+    )
+    assert record["messages"] and record["completion"]
+    assert "reward" in record and "info" in record
+
+
+class _ArtifactPolicy:
+    def __init__(self, texts):
+        self.texts = iter(texts)
+
+    def predict(self, messages, n, limits=None):
+        from infra.backend.base import Sample
+
+        text = next(self.texts)
+        return [
+            [
+                Sample(
+                    tokens=[1],
+                    logprobs=[0.0],
+                    text=text,
+                    stop_reason="stop",
+                    prompt_tokens=[0],
+                )
+                for _ in range(n)
+            ]
+            for _ in messages
+        ]
+
+
+def test_training_and_paired_rollouts_redact_suites_but_grade_in_memory(
+    env, tmp_path
+):
+    completion = f"```python\n{ECHO_SOLUTION}\n```"
+    train_task = env._task(env.train_rows[0], "train")
+    paired = _paired_env(tmp_path)
+    paired_task = paired.tasks(1, split="test")[0]
+
+    for source, task in ((env, train_task), (paired, paired_task)):
+        _install_private_suite_sentinels(task)
+        snapshot = {key: list(task.meta[key]) for key in PRIVATE_SUITE_KEYS}
+        groups = source.rollout(
+            [task], _ArtifactPolicy([completion]), group_size=1
+        )
+        assert groups[0][0].reward == pytest.approx(1.1)
+        assert {key: task.meta[key] for key in PRIVATE_SUITE_KEYS} == snapshot
+        _assert_private_suites_absent(source.last_rollout_records)
+
+    # Debate's truth label still consumes the same private in-memory state.
+    assert CodeContestsFamily(timeout_seconds=TIMEOUT).grade(
+        train_task.meta, ECHO_SOLUTION
+    ) is True
+
+
+def test_planned_rollout_also_redacts_private_suites(env):
+    from infra.envs.planned import PlannedEnv
+
+    task = env._task(env.train_rows[0], "train")
+    _install_private_suite_sentinels(task)
+    snapshot = {key: list(task.meta[key]) for key in PRIVATE_SUITE_KEYS}
+    planned = PlannedEnv(env, plan_max_tokens=32, answer_max_tokens=64)
+    planned.rollout(
+        [task],
+        _ArtifactPolicy(["private plan", f"```python\n{ECHO_SOLUTION}\n```"]),
+        group_size=1,
+    )
+    assert {key: task.meta[key] for key in PRIVATE_SUITE_KEYS} == snapshot
+    _assert_private_suites_absent(planned.last_rollout_records)
+
+
 def test_paired_artifact_defines_the_eval_pool(tmp_path):
     env = _paired_env(tmp_path)
     assert [r["name"] for r in env.test_rows] == ["sum", "echo"]
@@ -691,6 +1079,23 @@ def test_cco_verdict_does_not_change_the_gdm_reward(tmp_path):
     assert reward == pytest.approx(1.1)
     assert info["gdm_correct"] == info["correct"] == 1.0
     assert info["cco_correct"] == 0.0
+
+
+def test_paired_candidate_error_metrics_are_suite_specific(tmp_path):
+    env = _paired_env(tmp_path)
+    code = (
+        "a, b = map(int, input().split())\n"
+        "if a == 10:\n"
+        "    raise RuntimeError('cco-only failure')\n"
+        "print(a + b)\n"
+    )
+    _, info = env.reward(
+        env.tasks(1, split="test")[0], f"```python\n{code}\n```"
+    )
+    assert info["gdm_correct"] == 1.0
+    assert info["exec_error"] == 0.0
+    assert info["cco_correct"] == 0.0
+    assert info["cco_exec_error"] == 1.0
 
 
 def test_paired_loader_drops_rows_missing_either_suite(tmp_path):
