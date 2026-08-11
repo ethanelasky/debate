@@ -38,6 +38,17 @@ CAP_ARMS = {
     },
 }
 
+B200X2_ARMS = {
+    1024: {
+        "long": "codecontests_rlvr_olmo31_32b_cap1024_b200x2_long",
+        "smoke": "codecontests_rlvr_olmo31_32b_cap1024_b200x2_smoke1",
+    },
+    2048: {
+        "long": "codecontests_rlvr_olmo31_32b_cap2048_b200x2_long",
+        "smoke": "codecontests_rlvr_olmo31_32b_cap2048_b200x2_smoke1",
+    },
+}
+
 
 @pytest.fixture(scope="module")
 def topology_table() -> dict:
@@ -93,6 +104,45 @@ def test_four_gpu_hopper_topology_gates(topology_table: dict):
     assert topology_table["4xH100"]["n_gpus"] == 4
     assert topology_table["4xH100"]["rollout_tp"] == 4
     assert topology_table["4xH100"]["gpu_memory_utilization"] == pytest.approx(0.40)
+
+
+@pytest.mark.parametrize("cap", sorted(CAP_ARMS))
+def test_b200x2_capacity_fallback_changes_only_hardware(
+    cap: int, topology_table: dict
+):
+    primary = load_experiment(CONFIG, CAP_ARMS[cap]["long"])
+    fallback = load_experiment(CONFIG, B200X2_ARMS[cap]["long"])
+
+    expected = copy.deepcopy(primary)
+    expected["training"]["verl"].update(
+        {"n_gpus": 2, "rollout_tp": 2, "gpu_memory_utilization": 0.42}
+    )
+    assert fallback == expected
+
+    effective = apply_topology(
+        fallback["training"]["verl"], topology_table["2xB200"]
+    )
+    assert effective["n_gpus"] == 2
+    assert effective["rollout_tp"] == 2
+    assert effective["gpu_memory_utilization"] == pytest.approx(0.42)
+    assert any(
+        "disable_custom_all_reduce=true" in item
+        for item in effective["extra_overrides"]
+    )
+
+
+@pytest.mark.parametrize("cap", sorted(CAP_ARMS))
+def test_b200x2_smoke_changes_only_runtime_cadence(cap: int):
+    long = load_experiment(CONFIG, B200X2_ARMS[cap]["long"])
+    smoke = load_experiment(CONFIG, B200X2_ARMS[cap]["smoke"])
+
+    expected = copy.deepcopy(long)
+    expected["training"].update({"steps": 1, "eval_every": 0, "save_every": 0})
+    assert smoke == expected
+    assert (
+        smoke["training"]["batch_size"],
+        smoke["training"]["group_size"],
+    ) == (8, 8)
 
 
 REQUIRED_CODECONTESTS_DATA = (

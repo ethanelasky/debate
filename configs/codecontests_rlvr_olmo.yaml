@@ -454,6 +454,41 @@ codecontests_rlvr_olmo31_32b_cap1024_smoke1:
     eval_every: 0
     save_every: 0
 
+# Capacity fallback for the validated 2xB200 topology when no four-card Hopper
+# block is available. These variants change hardware sharding only: all data,
+# token caps, rollout shape, optimizer, cadence, and evaluation settings remain
+# identical to the corresponding primary long/smoke arms. 0.42/TP2 is the
+# repo's run-validated 32B B200 profile in topologies.yaml.
+codecontests_rlvr_olmo31_32b_cap2048_b200x2_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_long
+  training:
+    verl:
+      n_gpus: 2
+      rollout_tp: 2
+      gpu_memory_utilization: 0.42
+
+codecontests_rlvr_olmo31_32b_cap1024_b200x2_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_long
+  training:
+    verl:
+      n_gpus: 2
+      rollout_tp: 2
+      gpu_memory_utilization: 0.42
+
+codecontests_rlvr_olmo31_32b_cap2048_b200x2_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_b200x2_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
+codecontests_rlvr_olmo31_32b_cap1024_b200x2_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_b200x2_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
 codecontests_rlvr_olmo31_32b_smoke:
