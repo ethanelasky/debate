@@ -120,6 +120,7 @@ def test_pod_sync_uses_macos_compatible_rsync_progress_flag():
     script = (ROOT / "scripts" / "pod_sync.sh").read_text()
     assert "rsync -a --info=progress2" not in script
     assert "rsync -a --progress" in script
+    assert script.count("--no-owner --no-group") == 2
 
 
 def _write_tiny_complete_canonical_model(root: Path) -> dict:

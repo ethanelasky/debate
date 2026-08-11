@@ -165,7 +165,10 @@ remote_sums() { $SSH "$REMOTE" "cd $1 && find . -type f $PRUNE $CODE -exec sha25
 local_sums()  { (cd "$1" && eval "find . -type f $PRUNE $CODE -exec shasum -a 256 {} \;" | sed 's#  \./#  #' | LC_ALL=C sort -k2); }
 
 echo "== repo -> $REMOTE:/root/debate"
-rsync -a --delete -e "$RSH" \
+# The client commonly runs on macOS as uid 501 while the pod runs as root.
+# Because the SSH receiver is root, bare archive mode preserves that numeric
+# owner and makes the remote Git checkout fail its safe-directory check.
+rsync -a --no-owner --no-group --delete -e "$RSH" \
   --exclude '.git' --exclude '.claude' --exclude 'data' --exclude '.venv' --exclude '__pycache__' \
   --exclude 'outputs' --exclude 'docent' --exclude 'rollouts' --exclude 'wandb' \
   "$REPO_ROOT/" "$REMOTE:/root/debate/"
@@ -181,7 +184,7 @@ if [ "$WITH_DATA" = "--with-data" ]; then
   # macOS ships openrsync/rsync 2.6.9, which has --progress but not the newer
   # aggregate-info progress flag. Keep this operator path portable: verification
   # below is the correctness boundary, not the progress display mode.
-  rsync -a --progress -e "$RSH" \
+  rsync -a --progress --no-owner --no-group -e "$RSH" \
     "$REPO_ROOT/data/codecontests/" "$REMOTE:/root/debate/data/codecontests/"
 
   echo "== verifying datasets"
