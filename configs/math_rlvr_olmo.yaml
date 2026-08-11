@@ -434,6 +434,13 @@ aime_rlvr_olmo32think_grpo:
   training:
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
 
+# Oversample-upfront GRPO think arm (see the plan8k _os3 note).
+aime_rlvr_olmo32think_grpo_os3:
+  _extends: aime_rlvr_olmo32think_grpo
+  training:
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
+
 # Oversample-upfront twin of the think arm (see the plan8k _os3 note).
 aime_rlvr_olmo32think_cispo_os3:
   _extends: aime_rlvr_olmo32think_cispo
