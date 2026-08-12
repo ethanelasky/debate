@@ -261,6 +261,33 @@ aime_rlvr_olmo32_plan8k_cispo:
         - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
         - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
 
+# MB-parity instruct twins (Ethan, 2026-08-11): the instruct side of the
+# 2x2 (track x loss) — validated recipe, 1000-token private scratchpad +
+# 500-token answer, one 3x oversampled draw, dev-split evals. Engine sizes
+# shrink to the budgets (answer-turn prompt = base + plan text ~1.5k).
+aime_rlvr_olmo32_plan1k_grpo_os3:
+  _extends: aime_rlvr_olmo32_plan8k_cispo
+  plan_tokens: 1000
+  max_completion_tokens: 500
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    steps: 100
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
+    verl:
+      prompt_length: 4096
+      response_length: 2048
+      max_token_len_per_gpu: 8192
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
+
+aime_rlvr_olmo32_plan1k_cispo_os3:
+  _extends: aime_rlvr_olmo32_plan1k_grpo_os3
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+
 # GRPO twin of the validated-recipe arm (Ethan, 2026-08-11): only the loss
 # differs — the production-scale algorithm comparison, mirroring the CS285
 # GRPO-vs-CISPO pair.
