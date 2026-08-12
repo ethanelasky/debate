@@ -224,12 +224,15 @@ def test_eval_max_tokens_below_think_plus_answer_rejected():
 def test_shipped_think_arm_is_coherent():
     exp = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think")
     validate_rlvr(exp)
-    assert exp["think_tokens"] == 8192 and exp["max_completion_tokens"] == 1000
+    think, ans = int(exp["think_tokens"]), int(exp["max_completion_tokens"])
+    assert think > 0 and ans > 0
     assert exp["enable_thinking"] is True
     assert "plan_tokens" not in exp
     assert exp["dataset"]["think_overshoot_penalty"] == 0.1
-    # the engine serves think + answer as ONE request
-    assert exp["training"]["verl"]["response_length"] >= 8192 + 1000
+    # the engine serves think + answer as ONE request, and the forced-close
+    # continuation resubmits base + think as a PROMPT
+    assert exp["training"]["verl"]["response_length"] >= think + ans
+    assert exp["training"]["verl"]["prompt_length"] >= think + 512
     assert "eval_max_tokens" not in exp["training"]
 
 

@@ -219,7 +219,9 @@ def test_sampling_ceiling_covers_think_budget():
     exp = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_cispo")
     total = int(exp["think_tokens"]) + int(exp["max_completion_tokens"])
     params = _sampling_params(exp, total)
-    assert params.max_tokens == 8192 + 1000
+    # the RELATIONSHIP, not a literal: the ceiling must cover think + answer
+    # (Policy.predict min()-clamps SlotLimits against it — the plan-clamp bug)
+    assert params.max_tokens == total > int(exp["max_completion_tokens"])
 
 
 def test_kl_mechanism_loss_rejects_non_verl_backend():
@@ -227,3 +229,52 @@ def test_kl_mechanism_loss_rejects_non_verl_backend():
 
     with pytest.raises(RuntimeError, match="requires backend 'verl'"):
         build_backend({"backend": "tinker", "kl_mechanism": "loss", "kl_coef": 0.05}, "m", "r")
+
+
+def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
+    """The debate arm changes the environment, not the validated optimizer."""
+    from infra.config import load_experiment
+    from infra.run_debate import build_env, split_agents, validate_experiment
+
+    path = "configs/cs285_validate.yaml"
+    rlvr = load_experiment(path, "cs285_mathhard_cispo")
+    debate = load_experiment(path, "cs285_mathhard_debate_cispo")
+    validate_experiment(debate)
+
+    same_training = {
+        "lora_rank", "loss", "ppo_epochs", "micro_batch", "warmup_steps",
+        "adv_length_norm", "adv_population_std", "drop_zero_advantage",
+        "kl_mechanism", "steps", "batch_size", "group_size", "lr",
+        "kl_coef", "kl_discount_factor", "eval_every", "eval_n",
+        "eval_max_tokens", "save_every",
+    }
+    assert {k: debate["training"][k] for k in same_training} == {
+        k: rlvr["training"][k] for k in same_training
+    }
+
+    trained, frozen = split_agents(debate)
+    assert set(trained) == {"alice", "bob"}
+    assert set(frozen) == {"judge"}
+    assert {s.model_file_path for s in trained.values()} == {
+        "Qwen/Qwen2.5-Math-1.5B-Instruct"
+    }
+    assert all(
+        s.sampling.train.temperature == 1.0 and s.sampling.train.top_p == 1.0
+        for s in trained.values()
+    )
+
+    # Exercise the real prompt-splice/config constructor: math_hw4.yaml is
+    # answer-only and cannot satisfy the debate pack; the approved math prompt
+    # supplies the inspectable derivation and every required splice.
+    env = build_env(debate, trained, frozen)
+    trained_slots = [
+        (cs.speaker, cs.slot.name, cs.slot.max_total_tokens)
+        for cs in env.protocol.compile()
+        if cs.speaker in trained
+    ]
+    assert trained_slots == [
+        ("alice", "proposal", 512),
+        ("bob", "critique", 512),
+        ("alice", "defense", 512),
+        ("bob", "rebuttal", 512),
+    ]
