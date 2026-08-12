@@ -60,7 +60,7 @@ math_pc_olmo_l5:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
   training:
     backend: verl
@@ -166,7 +166,7 @@ math_pc_olmo_l5_g8:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
   training:
     backend: verl
@@ -217,23 +217,67 @@ math_pc_olmo_l5_g8_nocot:
 # 32B topology, and training recipe. gpu_memory_utilization stays at the
 # debate-safe 0.33 rather than the judge-free RLVR run's 0.42: the frozen 4B
 # judge reserves another 0.18 of GPU 0 on the same 183GB B200.
+# STANDALONE, not _extends (2026-08-12): this arm's protocol SHAPE differs
+# from the nocot parent's (think-native, no plan/scratchpad turns), and
+# protocol turn lists merge BY INDEX under _extends — the exact poison the
+# other standalone entries document. Everything except the protocol is a
+# verbatim copy of math_pc_olmo_l5_g8_nocot's semantics.
 math_pc_olmo32think_cispo_os3:
-  _extends: math_pc_olmo_l5_g8_nocot
+  # Think-native protocol (Ethan's spec, 2026-08-12): the model's PRIVATE
+  # <think> phase replaces every scratchpad/plan turn — 1k think + 500
+  # visible per debater slot, solution first (required by the solo-opening
+  # flag; a plan turn would double the private channel). Judge unchanged.
+  protocol:
+    turns:
+      - alice: [{name: proposal, kind: solution, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - bob:   [{name: critique, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - alice: [{name: defense, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - bob:   [{name: rebuttal, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math.yaml
+    entry: math_proposer_critic
+  fresh_positions: true
   # The proposer's opening is a SOLO solution — rendered without any debate
-  # context (Ethan, 2026-08-12): the opening must be the same distribution
-  # the RLVR twin trains on; debate-awareness enters only from the critic's
-  # first speech onward. Requires fresh_positions (inherited true).
+  # context (Ethan, 2026-08-12): the opening must share the RLVR twin's
+  # prompt distribution; debate-awareness enters with the critic's speech.
   first_speech_non_debate_aware: true
+  plan_tokens: 1000
   agents:
     alice:
+      trained: true
       model_settings:
+        model_type: local
         model_file_path: allenai/Olmo-3-32B-Think-DPO
+        alias: proposer-alice
         enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
     bob:
+      trained: true
       model_settings:
+        model_type: local
         model_file_path: allenai/Olmo-3-32B-Think-DPO
+        alias: critic-bob
         enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+  dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
   training:
+    backend: verl
+    eval_max_tokens: 2000
     wandb_entity: palaestra-research
     wandb_project: debate-math
     lora_rank: 32
