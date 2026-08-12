@@ -142,6 +142,14 @@ def _split_think(raw: str) -> tuple[Optional[str], str]:
     m = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
     if m:
         return m.group(1).strip(), raw[m.end() :].strip()
+    # Pre-opened template (Olmo-Think line): the chat template emits <think>
+    # in the GENERATION PROMPT, so the completion carries only the close —
+    # the pair regex can never match and the private reasoning would enter
+    # the public transcript verbatim (measured live: 27% of the 32B think
+    # debate arm's transcript views leaked ~1.4k tokens each, 2026-08-12).
+    j = raw.find("</think>")
+    if j >= 0:
+        return raw[:j].strip(), raw[j + len("</think>") :].strip()
     return None, raw.strip()
 
 
