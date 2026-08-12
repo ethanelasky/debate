@@ -134,8 +134,9 @@ cs285_mathhard_cispo:
 #     ratio (the RLVR runner has a recompute seam that DebateEnv forbids)
 #   - reward is continuous competitive judge confidence (+ the same 0.1
 #     strict-boxed proposal shaping), not MathEnv correctness
-#   - four trained 512-token speech slots per debate; prompt_length 6144
-#     covers the cumulative transcript without silent engine truncation
+#   - four trained 512-token speech slots per debate; the 3584-token prompt
+#     window plus 512-token response exactly respects Qwen2.5-Math's 4096-token
+#     context while covering the cumulative transcript without engine truncation
 # Everything under `training` otherwise mirrors the validated CISPO arm.
 # Run (1xB200):
 #   CONFIG=configs/cs285_validate.yaml bash scripts/pod_run.sh debate cs285_mathhard_debate_cispo
@@ -184,9 +185,9 @@ cs285_mathhard_debate_cispo:
   training:
     backend: verl
     verl:
-      prompt_length: 6144
+      prompt_length: 3584
       response_length: 512
-      max_token_len_per_gpu: 8192
+      max_token_len_per_gpu: 4096
       checkpoint_dir: /workspace/checkpoints
       extra_overrides:
         - "++actor_rollout_ref.actor.optim.clip_grad=0.5"

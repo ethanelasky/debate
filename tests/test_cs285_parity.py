@@ -262,6 +262,9 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
         s.sampling.train.temperature == 1.0 and s.sampling.train.top_p == 1.0
         for s in trained.values()
     )
+    verl = debate["training"]["verl"]
+    assert verl["prompt_length"] + verl["response_length"] == 4096
+    assert verl["max_token_len_per_gpu"] == 4096
 
     # Exercise the real prompt-splice/config constructor: math_hw4.yaml is
     # answer-only and cannot satisfy the debate pack; the approved math prompt
