@@ -109,6 +109,60 @@ class NullBackend:
         pass
 
 
+class VersionedBackend(NullBackend):
+    """Make policy versions observable without approximating loop indices."""
+
+    def __init__(self):
+        self.version = 0
+        self.rollout_awake = False
+        self.saves: list[tuple[str, int]] = []
+
+    def sync_sampler(self):
+        self.rollout_awake = True
+
+    def forward_backward(self, datums, loss):
+        # Mirrors VerlBackend: training work sleeps the colocated rollout
+        # engine before touching FSDP state.
+        self.rollout_awake = False
+
+    def optim_step(self, optim):
+        self.version += 1
+        return {}
+
+    def save(self, name):
+        # Mirrors VerlBackend.save(), whose lifecycle contract now quiesces
+        # rollout even after a zero-datum step skipped forward/backward.
+        self.rollout_awake = False
+        self.saves.append((name, self.version))
+
+
+class VersionRecordingEnv(SplitRecordingEnv):
+    def __init__(
+        self,
+        backend: VersionedBackend,
+        fail_final_eval: bool = False,
+        degenerate_train: bool = False,
+    ):
+        super().__init__()
+        self.backend = backend
+        self.fail_final_eval = fail_final_eval
+        self.degenerate_train = degenerate_train
+        self.eval_versions: list[int] = []
+
+    def rollout(self, tasks, policy, group_size):
+        split = tasks[0].messages[0]["content"].rstrip("0123456789")
+        if split != "train":
+            self.eval_versions.append(self.backend.version)
+            if self.fail_final_eval:
+                raise RuntimeError("synthetic verifier infrastructure failure")
+        groups = super().rollout(tasks, policy, group_size)
+        if split == "train" and self.degenerate_train:
+            for group in groups:
+                for trajectory in group:
+                    trajectory.reward = 0.0
+        return groups
+
+
 def _run_split(**cfg_kwargs):
     env = SplitRecordingEnv()
     logged: list[tuple[int, dict]] = []
@@ -139,3 +193,110 @@ def test_default_eval_behavior_gets_final_point_too():
     assert any(k.startswith("eval/") for _, m in logged for k in m)
     assert not any(k.startswith(("dev/", "test/")) for _, m in logged for k in m)
     assert env.eval_splits == ["test", "test", "test"]  # 2 in-loop + final
+
+
+def test_eval_and_checkpoint_labels_equal_rollout_steps_at_one_ppo_epoch():
+    backend = VersionedBackend()
+    env = VersionRecordingEnv(backend)
+    cfg = Config(
+        steps=2,
+        batch_size=1,
+        group_size=2,
+        eval_every=1,
+        eval_n=1,
+        save_every=1,
+    )
+    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None):
+        train(env, backend, cfg)
+
+    assert env.eval_versions == [0, 1, 2]
+    assert backend.saves == [("step-00001", 1), ("final", 2)]
+
+
+def test_rollout_step_labels_do_not_claim_optimizer_count_with_two_epochs():
+    backend = VersionedBackend()
+    env = VersionRecordingEnv(backend)
+    cfg = Config(
+        steps=2,
+        batch_size=1,
+        group_size=2,
+        ppo_epochs=2,
+        eval_every=1,
+        eval_n=1,
+        save_every=1,
+    )
+    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None):
+        train(env, backend, cfg)
+
+    # The x-axis is rollout-batch steps. Each batch gets two optimizer calls.
+    assert env.eval_versions == [0, 2, 4]
+    assert backend.saves == [("step-00001", 2), ("final", 4)]
+
+
+def test_final_adapter_survives_final_verifier_failure():
+    backend = VersionedBackend()
+    env = VersionRecordingEnv(backend, fail_final_eval=True)
+    cfg = Config(
+        steps=1,
+        batch_size=1,
+        group_size=2,
+        eval_every=0,
+        final_test_eval=True,
+        eval_n=1,
+        save_every=0,
+    )
+    with (
+        mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None),
+        pytest.raises(RuntimeError, match="verifier infrastructure failure"),
+    ):
+        train(env, backend, cfg)
+
+    assert backend.saves == [("final", 1)]
+
+
+def test_final_save_sleeps_rollout_after_zero_datum_step():
+    backend = VersionedBackend()
+    env = VersionRecordingEnv(backend, degenerate_train=True)
+    cfg = Config(
+        steps=1,
+        batch_size=1,
+        group_size=2,
+        eval_every=0,
+        save_every=0,
+    )
+    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None):
+        train(env, backend, cfg)
+
+    assert backend.version == 0
+    assert backend.saves == [("final", 0)]
+
+
+def test_final_eval_transcripts_are_captured_before_next_split():
+    env = SplitRecordingEnv()
+    captured: list[tuple[int, str, tuple[str, ...]]] = []
+    cfg = Config(
+        steps=1,
+        batch_size=1,
+        group_size=2,
+        eval_every=1,
+        eval_n=1,
+        eval_split="dev",
+        final_test_eval=True,
+        save_every=0,
+    )
+
+    def capture(_cfg, step, captured_env, split):
+        captured.append((step, split, tuple(captured_env.eval_splits)))
+
+    with (
+        mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None),
+        mock.patch.object(train_mod, "_log_transcripts", capture),
+    ):
+        train(env, NullBackend(), cfg)
+
+    assert captured == [
+        (0, "dev", ("dev",)),
+        (0, "train", ("dev",)),
+        (1, "dev", ("dev", "dev")),
+        (1, "test", ("dev", "dev", "test")),
+    ]

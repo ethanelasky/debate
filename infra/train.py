@@ -311,31 +311,33 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         optim = base_optim if scale == 1.0 else replace(base_optim, lr=base_optim.lr * scale)
         t0 = time.monotonic()
         ph = _Phases()
+        # Save the current policy before waking the colocated rollout engine.
+        # Verl deliberately time-multiplexes FSDP and vLLM memory; checkpoint
+        # serialization while vLLM is awake is both unnecessary and an OOM
+        # risk.  At the top of step N these are still exactly the weights after
+        # N completed rollout-batch steps. A step may contain zero optimizer
+        # calls (all groups degenerate) or several (ppo_epochs > 1).
+        top_metrics: dict[str, float] = {}
+        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
+            top_metrics["checkpoint_saved"] = 1.0
+            with ph("save"):
+                backend.save(f"step-{step:05d}")
         with ph("sync_sampler"):
             backend.sync_sampler()
-        # Eval and save at the TOP of the step (Ethan, 2026-08-12): label N
-        # means the policy after EXACTLY N updates — step 0 is a true
-        # pre-training baseline, checkpoints carry the same meaning as their
+        # Eval at the TOP of the step (Ethan, 2026-08-12): label N means the
+        # policy after EXACTLY N completed rollout batches — step 0 is a true
+        # pre-training baseline, and checkpoints carry the same meaning as their
         # matching eval points, and N/K intervals yield N/K + 1 evals with
         # the last one at x = steps (after the loop). The engine was just
         # synced, so the eval serves the current weights.
-        eval_metrics: dict[str, float] = {}
         if cfg.eval_every and step % cfg.eval_every == 0:
             eval_policy = _eval_policy(policy, cfg)
             with ph("evaluate"):
                 prefix = "dev" if cfg.eval_split == "dev" else "eval"
-                eval_metrics.update(
+                top_metrics.update(
                     evaluate(eval_env or env, eval_policy, cfg.eval_n, cfg.eval_split, prefix)
                 )
                 _log_transcripts(cfg, step, eval_env or env, prefix)
-        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
-        # can hit the save cadence (start 25, save_every 25) and would re-save
-        # step-00025 — overwriting the very checkpoint it just loaded with a
-        # one-step-newer lineage under the same name.
-        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
-            eval_metrics["checkpoint_saved"] = 1.0
-            with ph("save"):
-                backend.save(f"step-{step:05d}")
         with ph("rollout"):
             ds_metrics: dict[str, float] = {}
             if cfg.oversample_factor > 1.0:
@@ -427,7 +429,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 with ph("optim_step"):
                     metrics.update(backend.optim_step(optim))
 
-        metrics.update(eval_metrics)  # top-of-step eval/save, labeled this step
+        metrics.update(top_metrics)  # top-of-step eval/save, labeled this step
         metrics["step_seconds"] = time.monotonic() - t0
         # SingleTurnEnv splits its rollout into generate/reward; fold that in so
         # "rollout" is broken down rather than opaque.
@@ -436,21 +438,34 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         metrics.update(ph.metrics(metrics["step_seconds"]))
         logger(step, metrics)
 
+    # Persist the exact final policy before any final evaluation.  Evaluation
+    # can fail for reasons outside the optimizer (for example a verifier
+    # infrastructure failure); after an expensive run that must invalidate the
+    # score, not discard the trained adapter and fall back to the last periodic
+    # checkpoint.  The evaluation below still reads these same final weights.
+    backend.save("final")
     if cfg.eval_every or cfg.final_test_eval:
         backend.sync_sampler()
         final_policy = _eval_policy(policy, cfg)
     if cfg.eval_every:
         # Fencepost (Ethan, 2026-08-12): in-loop evals run at the TOP of each
-        # step (label N = after exactly N updates), so the final policy needs
-        # its own point — N/K intervals means N/K + 1 evals, the +1 at
-        # x = steps, paired with the `final` checkpoint below.
+        # step (label N = after exactly N rollout batches), so the final policy
+        # needs its own point — N/K intervals means N/K + 1 evals, the +1 at
+        # x = steps, paired with the `final` checkpoint written above.
         prefix = "dev" if cfg.eval_split == "dev" else "eval"
-        logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, cfg.eval_split, prefix))
+        final_eval_env = eval_env or env
+        logger(
+            cfg.steps,
+            evaluate(final_eval_env, final_policy, cfg.eval_n, cfg.eval_split, prefix),
+        )
+        # Capture before another split reuses the same env and overwrites its
+        # last-rollout records.  Aggregate metrics alone cannot support the
+        # paired per-problem analysis required by the evaluation protocol.
+        _log_transcripts(cfg, cfg.steps, final_eval_env, prefix)
     if cfg.final_test_eval:
         # The 3-way protocol's single read of the held-out test split.
         logger(cfg.steps, evaluate(env, final_policy, cfg.eval_n, "test", "test"))
-
-    backend.save("final")
+        _log_transcripts(cfg, cfg.steps, env, "test")
 
 
 def _env_identity() -> dict[str, str]:
