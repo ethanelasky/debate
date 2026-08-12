@@ -13,7 +13,7 @@
 # checkpoints are already durable.
 set -u
 CKPT_ROOT="${CKPT_ROOT:-/workspace/checkpoints}"
-RUN_NAME="${RUN_NAME:?set RUN_NAME (the run's checkpoint namespace)}"
+RUN_NAME="${RUN_NAME:?set RUN_NAME (the checkpoint namespace of the run)}"
 PYBIN="${PYBIN:-/workspace/envs/verl-b200/bin/python}"
 QUIESCENT_SECS=90   # a dir this old is a finished write, not a mid-save
 INTERVAL=120
