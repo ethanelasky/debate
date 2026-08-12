@@ -161,6 +161,17 @@ def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
         print(f"[transcripts] {type(e).__name__}: {e}")
 
 
+def _eval_policy(policy: Policy, cfg: "Config") -> Policy:
+    """The greedy-eval policy, with eval_max_tokens applied when set."""
+    if cfg.eval_max_tokens is None:
+        return policy
+    return Policy(
+        policy.backend,
+        replace(policy.params, max_tokens=cfg.eval_max_tokens),
+        policy.chat_template_kwargs,
+    )
+
+
 def evaluate(env: Env, policy: Policy, n: int, split: str = "test", prefix: str = "eval") -> dict[str, float]:
     groups = env.rollout(env.tasks(n, split=split), policy.greedy(), group_size=1)
     return _aggregate([t for g in groups for t in g], prefix) | _rollout_info_metrics(env, prefix)
@@ -302,6 +313,29 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         ph = _Phases()
         with ph("sync_sampler"):
             backend.sync_sampler()
+        # Eval and save at the TOP of the step (Ethan, 2026-08-12): label N
+        # means the policy after EXACTLY N updates — step 0 is a true
+        # pre-training baseline, checkpoints carry the same meaning as their
+        # matching eval points, and N/K intervals yield N/K + 1 evals with
+        # the last one at x = steps (after the loop). The engine was just
+        # synced, so the eval serves the current weights.
+        eval_metrics: dict[str, float] = {}
+        if cfg.eval_every and step % cfg.eval_every == 0:
+            eval_policy = _eval_policy(policy, cfg)
+            with ph("evaluate"):
+                prefix = "dev" if cfg.eval_split == "dev" else "eval"
+                eval_metrics.update(
+                    evaluate(eval_env or env, eval_policy, cfg.eval_n, cfg.eval_split, prefix)
+                )
+                _log_transcripts(cfg, step, eval_env or env, prefix)
+        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
+        # can hit the save cadence (start 25, save_every 25) and would re-save
+        # step-00025 — overwriting the very checkpoint it just loaded with a
+        # one-step-newer lineage under the same name.
+        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
+            eval_metrics["checkpoint_saved"] = 1.0
+            with ph("save"):
+                backend.save(f"step-{step:05d}")
         with ph("rollout"):
             ds_metrics: dict[str, float] = {}
             if cfg.oversample_factor > 1.0:
@@ -393,31 +427,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 with ph("optim_step"):
                     metrics.update(backend.optim_step(optim))
 
-        if cfg.eval_every and step % cfg.eval_every == 0:
-            eval_policy = policy
-            if cfg.eval_max_tokens is not None:
-                from dataclasses import replace as _replace
-
-                eval_policy = Policy(
-                    policy.backend,
-                    _replace(policy.params, max_tokens=cfg.eval_max_tokens),
-                    policy.chat_template_kwargs,
-                )
-            with ph("evaluate"):
-                prefix = "dev" if cfg.eval_split == "dev" else "eval"
-                metrics.update(
-                    evaluate(eval_env or env, eval_policy, cfg.eval_n, cfg.eval_split, prefix)
-                )
-                _log_transcripts(cfg, step, eval_env or env, prefix)
-        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
-        # can hit the save cadence (start 25, save_every 25) and would re-save
-        # step-00025 — overwriting the very checkpoint it just loaded with a
-        # one-step-newer lineage under the same name.
-        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
-            metrics["checkpoint_saved"] = 1.0
-            with ph("save"):
-                backend.save(f"step-{step:05d}")
-
+        metrics.update(eval_metrics)  # top-of-step eval/save, labeled this step
         metrics["step_seconds"] = time.monotonic() - t0
         # SingleTurnEnv splits its rollout into generate/reward; fold that in so
         # "rollout" is broken down rather than opaque.
@@ -426,17 +436,19 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         metrics.update(ph.metrics(metrics["step_seconds"]))
         logger(step, metrics)
 
+    if cfg.eval_every or cfg.final_test_eval:
+        backend.sync_sampler()
+        final_policy = _eval_policy(policy, cfg)
+    if cfg.eval_every:
+        # Fencepost (Ethan, 2026-08-12): in-loop evals run at the TOP of each
+        # step (label N = after exactly N updates), so the final policy needs
+        # its own point — N/K intervals means N/K + 1 evals, the +1 at
+        # x = steps, paired with the `final` checkpoint below.
+        prefix = "dev" if cfg.eval_split == "dev" else "eval"
+        logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, cfg.eval_split, prefix))
     if cfg.final_test_eval:
         # The 3-way protocol's single read of the held-out test split.
-        test_policy = policy
-        if cfg.eval_max_tokens is not None:
-            test_policy = Policy(
-                policy.backend,
-                replace(policy.params, max_tokens=cfg.eval_max_tokens),
-                policy.chat_template_kwargs,
-            )
-        backend.sync_sampler()
-        logger(cfg.steps, evaluate(env, test_policy, cfg.eval_n, "test", "test"))
+        logger(cfg.steps, evaluate(env, final_policy, cfg.eval_n, "test", "test"))
 
     backend.save("final")
 

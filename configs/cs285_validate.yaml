@@ -29,7 +29,8 @@
 #     ours are exactly 1 by construction (tempered re-anchor)
 #   - verl tempers the training-side logprobs (logits/T), so epoch-2 ratios
 #     run ~1.25x theirs for the same weight change (clip fires a bit earlier)
-#   - our eval points land one update after hw4's same-labeled points
+#   - (RESOLVED 2026-08-12: top-of-step evals — label N = after N updates,
+#     matching hw4's baseline + (step+1)%K convention exactly)
 #   - the in-loss KL runs between TEMPERED logprob pairs (logits/T both
 #     sides), so its effective strength is ~1/T^2 = 1.56x hw4's raw-logit
 #     k3 at T=0.8; verl also aggregates the KL with loss_agg_mode (row-

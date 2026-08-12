@@ -121,17 +121,21 @@ def _run_split(**cfg_kwargs):
     return env, logged
 
 
-def test_eval_split_dev_logs_dev_prefix_and_final_test_pass():
+def test_eval_split_dev_logs_dev_prefix_and_final_passes():
     env, logged = _run_split(eval_split="dev", final_test_eval=True)
     in_loop = [m for _, m in logged if any(k.startswith("dev/") for k in m)]
     assert in_loop and not any(k.startswith("eval/") for _, m in logged for k in m)
     final_step, final_metrics = logged[-1]
     assert final_step == 2 and any(k.startswith("test/") for k in final_metrics)
-    assert env.eval_splits == ["dev", "dev", "test"]
+    # Fencepost: N/K intervals -> N/K + 1 dev evals; the final policy gets a
+    # dev point at x = steps BEFORE the single test read.
+    assert env.eval_splits == ["dev", "dev", "dev", "test"]
+    dev_final_step, dev_final = logged[-2]
+    assert dev_final_step == 2 and any(k.startswith("dev/") for k in dev_final)
 
 
-def test_default_eval_behavior_unchanged():
+def test_default_eval_behavior_gets_final_point_too():
     env, logged = _run_split()
     assert any(k.startswith("eval/") for _, m in logged for k in m)
     assert not any(k.startswith(("dev/", "test/")) for _, m in logged for k in m)
-    assert env.eval_splits == ["test", "test"]
+    assert env.eval_splits == ["test", "test", "test"]  # 2 in-loop + final

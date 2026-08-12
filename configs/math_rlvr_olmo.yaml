@@ -271,7 +271,7 @@ aime_rlvr_olmo32_plan1k_grpo_os3:
   max_completion_tokens: 500
   training:
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
-    steps: 100
+    steps: 500      # long-horizon 2x2 (Ethan, 2026-08-12)
     dynamic_sampling_retries: 0
     oversample_factor: 3
     verl:
@@ -438,9 +438,9 @@ aime_rlvr_olmo32think_cispo:
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     ppo_epochs: 2
-    # 100, not 60 (Ethan, 2026-08-09): every arm runs to >=100 steps before
-    # any verdict — shorter curves have bounced and recovered before.
-    steps: 100
+    # 500 (Ethan, 2026-08-12): the long-horizon 2x2 — cosine spans the full
+    # 500 so restarts, not continuations, when this number changes.
+    steps: 500
     # eval/save every 10 + warmup/cosine + validated-recipe port — see the
     # plan8k_cispo notes. 3-way split: dev/ steers, test/ read once at the end.
     eval_every: 10
