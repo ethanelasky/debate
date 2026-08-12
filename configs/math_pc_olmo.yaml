@@ -203,3 +203,71 @@ math_pc_olmo_l5_g8:
 math_pc_olmo_l5_g8_nocot:
   _extends: math_pc_olmo_l5_g8
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+
+# OLMo-3-32B Think-DPO debate arm (Ethan, 2026-08-11). This is a controlled
+# splice of two completed/live runs, not a new debate recipe:
+#
+#   debate protocol/dataset/reward: math_pc_olmo_l5_g8_nocot
+#     W&B palaestra-research/debate-rebuild/bkih4xbk (latest completed debate)
+#   optimizer recipe: aime_rlvr_olmo32think_grpo_os3
+#     W&B palaestra-research/debate-math/zeaz96rn (live 32B run)
+#
+# _extends deliberately preserves the debate's five serial stages and every
+# per-slot cap. The overrides below change only the shared policy checkpoint,
+# 32B topology, and training recipe. gpu_memory_utilization stays at the
+# debate-safe 0.33 rather than the judge-free RLVR run's 0.42: the frozen 4B
+# judge reserves another 0.18 of GPU 0 on the same 183GB B200.
+math_pc_olmo32think_grpo_os3:
+  _extends: math_pc_olmo_l5_g8_nocot
+  # The proposer's opening is a SOLO solution — rendered without any debate
+  # context (Ethan, 2026-08-12): the opening must be the same distribution
+  # the RLVR twin trains on; debate-awareness enters only from the critic's
+  # first speech onward. Requires fresh_positions (inherited true).
+  first_speech_non_debate_aware: true
+  agents:
+    alice:
+      model_settings:
+        model_file_path: allenai/Olmo-3-32B-Think-DPO
+        enable_thinking: true
+    bob:
+      model_settings:
+        model_file_path: allenai/Olmo-3-32B-Think-DPO
+        enable_thinking: true
+  training:
+    wandb_entity: palaestra-research
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    ppo_epochs: 2
+    adv_length_norm: none
+    steps: 100
+    batch_size: 8
+    group_size: 8
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 10
+    eval_n: 93
+    save_every: 10
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
+    kl_mechanism: loss
+    drop_zero_advantage: false
+    eval_split: dev
+    final_test_eval: true
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
+    verl:
+      n_gpus: 2
+      strategy: fsdp2
+      rollout_tp: 2
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.33
+      prompt_length: 8192
+      response_length: 2048
+      max_token_len_per_gpu: 16384
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"

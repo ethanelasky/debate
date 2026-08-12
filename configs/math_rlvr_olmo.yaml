@@ -261,6 +261,33 @@ aime_rlvr_olmo32_plan8k_cispo:
         - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
         - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
 
+# MB-parity instruct twins (Ethan, 2026-08-11): the instruct side of the
+# 2x2 (track x loss) — validated recipe, 1000-token private scratchpad +
+# 500-token answer, one 3x oversampled draw, dev-split evals. Engine sizes
+# shrink to the budgets (answer-turn prompt = base + plan text ~1.5k).
+aime_rlvr_olmo32_plan1k_grpo_os3:
+  _extends: aime_rlvr_olmo32_plan8k_cispo
+  plan_tokens: 1000
+  max_completion_tokens: 500
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    steps: 500      # long-horizon 2x2 (Ethan, 2026-08-12)
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
+    verl:
+      prompt_length: 4096
+      response_length: 2048
+      max_token_len_per_gpu: 8192
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
+
+aime_rlvr_olmo32_plan1k_cispo_os3:
+  _extends: aime_rlvr_olmo32_plan1k_grpo_os3
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+
 # GRPO twin of the validated-recipe arm (Ethan, 2026-08-11): only the loss
 # differs — the production-scale algorithm comparison, mirroring the CS285
 # GRPO-vs-CISPO pair.
@@ -305,8 +332,13 @@ aime_rlvr_olmo32think:
   # exactly: the 0.1 format bonus keys on a raw '\boxed{' substring
   # (MathEnv.reward has_boxed), so a think-phase box does earn that shaping
   # term even when the answer has none.
-  think_tokens: 8192
-  max_completion_tokens: 1000
+  # 4000/500 (Ethan, 2026-08-11): the 1k cap proved below the model's
+  # compressibility floor — dev plateaued ~16% with overshoot pinned at 1.0
+  # (native think length ~7.7k; it learned truncated-state answering, not
+  # compression). 4k starts inside the 20-85 band while still pricing budget
+  # discipline.
+  think_tokens: 4000
+  max_completion_tokens: 500
   # think_overshoot_penalty: 0.1 off the reward whenever the think phase was
   # force-closed at the 8192 cap instead of closing itself; the
   # think_overshoot info key (0/1 per sample) tracks the rate.
@@ -318,13 +350,13 @@ aime_rlvr_olmo32think:
       strategy: fsdp2
       rollout_tp: 2                # 32B weights split across both cards (see aime_rlvr_olmo32)
       gpu_memory_utilization: 0.42 # same rollout-boot headroom math as aime_rlvr_olmo32
-      # NOT 2048: budget-forced sampling closes an overlong think phase by
-      # resubmitting prompt + <think> content + forced </think> as a SECOND
-      # request, so the engine sees prompts up to base + think_tokens (~8.4k
-      # observed; killed attempt 4b at 2048 via the truncation guard).
-      prompt_length: 12288
-      response_length: 10240       # 8192 think + 1000 answer + margin, ONE request
-      max_token_len_per_gpu: 16384
+      # Budget-forced sampling closes an overlong think phase by resubmitting
+      # prompt + <think> content + forced </think> as a SECOND request, so
+      # the engine sees prompts up to base (~300) + think_tokens (4000) +
+      # margin (the 8k-era run observed base+think+~200).
+      prompt_length: 6144
+      response_length: 5120        # 4000 think + 500 answer + margin, ONE request
+      max_token_len_per_gpu: 12288
       checkpoint_dir: /workspace/checkpoints
       # NCCL allreduce instead of vLLM's custom kernel — same sleep-mode
       # crash as aime_rlvr_olmo32 (see that entry's note).
@@ -406,9 +438,9 @@ aime_rlvr_olmo32think_cispo:
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     ppo_epochs: 2
-    # 100, not 60 (Ethan, 2026-08-09): every arm runs to >=100 steps before
-    # any verdict — shorter curves have bounced and recovered before.
-    steps: 100
+    # 500 (Ethan, 2026-08-12): the long-horizon 2x2 — cosine spans the full
+    # 500 so restarts, not continuations, when this number changes.
+    steps: 500
     # eval/save every 10 + warmup/cosine + validated-recipe port — see the
     # plan8k_cispo notes. 3-way split: dev/ steers, test/ read once at the end.
     eval_every: 10
@@ -433,6 +465,13 @@ aime_rlvr_olmo32think_grpo:
   _extends: aime_rlvr_olmo32think_cispo
   training:
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+
+# Oversample-upfront GRPO think arm (see the plan8k _os3 note).
+aime_rlvr_olmo32think_grpo_os3:
+  _extends: aime_rlvr_olmo32think_grpo
+  training:
+    dynamic_sampling_retries: 0
+    oversample_factor: 3
 
 # Oversample-upfront twin of the think arm (see the plan8k _os3 note).
 aime_rlvr_olmo32think_cispo_os3:
