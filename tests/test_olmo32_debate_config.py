@@ -5,8 +5,8 @@ from infra.run_debate import split_agents, validate_experiment, validate_trained
 
 def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
     debate = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo_l5_g8_nocot")
-    arm = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo32think_grpo_os3")
-    live = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_grpo_os3")
+    arm = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo32think_cispo_os3")
+    live = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_cispo_os3")
 
     validate_experiment(arm)
     trained, frozen = split_agents(arm)

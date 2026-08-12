@@ -209,7 +209,7 @@ math_pc_olmo_l5_g8_nocot:
 #
 #   debate protocol/dataset/reward: math_pc_olmo_l5_g8_nocot
 #     W&B palaestra-research/debate-rebuild/bkih4xbk (latest completed debate)
-#   optimizer recipe: aime_rlvr_olmo32think_grpo_os3
+#   optimizer recipe: aime_rlvr_olmo32think_cispo_os3
 #     W&B palaestra-research/debate-math/zeaz96rn (live 32B run)
 #
 # _extends deliberately preserves the debate's five serial stages and every
@@ -217,7 +217,7 @@ math_pc_olmo_l5_g8_nocot:
 # 32B topology, and training recipe. gpu_memory_utilization stays at the
 # debate-safe 0.33 rather than the judge-free RLVR run's 0.42: the frozen 4B
 # judge reserves another 0.18 of GPU 0 on the same 183GB B200.
-math_pc_olmo32think_grpo_os3:
+math_pc_olmo32think_cispo_os3:
   _extends: math_pc_olmo_l5_g8_nocot
   # The proposer's opening is a SOLO solution — rendered without any debate
   # context (Ethan, 2026-08-12): the opening must be the same distribution
@@ -237,7 +237,9 @@ math_pc_olmo32think_grpo_os3:
     wandb_entity: palaestra-research
     wandb_project: debate-math
     lora_rank: 32
-    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    # CISPO, not ppo: GRPO retired 2026-08-12 (validation twins 36.1 vs 33.8;
+    # Ethan: "never run it again").
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     ppo_epochs: 2
     adv_length_norm: none
     steps: 100
