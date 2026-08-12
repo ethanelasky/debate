@@ -44,7 +44,9 @@ def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
         "loss",
         "ppo_epochs",
         "adv_length_norm",
-        "steps",
+        # "steps" deliberately NOT pinned: horizon is a per-arm choice, not
+        # part of the optimizer recipe — the RLVR arms went to 500
+        # (2026-08-12) while a debate step costs ~10x an RLVR step.
         "batch_size",
         "group_size",
         "lr",
