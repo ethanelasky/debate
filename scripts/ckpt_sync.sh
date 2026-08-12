@@ -25,6 +25,8 @@ fi
 
 STATE=/root/.ckpt_synced
 touch "$STATE"
+echo $$ > /root/ckpt_sync.pid   # liveness = kill -0 $(cat pid), not pgrep
+echo "ckpt_sync: started pid $$ run=$RUN_NAME root=$CKPT_ROOT"
 
 while true; do
   now=$(date +%s)
