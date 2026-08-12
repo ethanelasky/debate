@@ -34,15 +34,27 @@ while true; do
     mtime=$(stat -c %Y "$dir")
     [ $(( now - mtime )) -lt $QUIESCENT_SECS ] && continue
     echo "[$(date -u +%H:%M:%S)] uploading $dir"
-    if HF_DIR="$dir" HF_RUN="$RUN_NAME" "$PYBIN" - <<'PYEOF'
-import os
-from huggingface_hub import HfApi
-api = HfApi(token=open("/root/.cache/huggingface/token").read().strip())
-repo = f"ethanelasky/ckpt-{os.environ['HF_RUN']}"[:96]
-api.create_repo(repo, repo_type="model", private=True, exist_ok=True)
-d = os.environ["HF_DIR"]
-api.upload_folder(folder_path=d, repo_id=repo, repo_type="model",
-                  path_in_repo=os.path.basename(d))
+    # S3-to-volume when credentials exist (the durable store Ethan named);
+    # HF private repo otherwise.
+    if [ -f /root/.runpod/s3.env ]; then set -a; . /root/.runpod/s3.env; set +a; fi
+    if SYNC_DIR="$dir" SYNC_RUN="$RUN_NAME" "$PYBIN" - <<'PYEOF'
+import os, pathlib
+d = pathlib.Path(os.environ["SYNC_DIR"]); run = os.environ["SYNC_RUN"]
+if os.environ.get("AWS_ACCESS_KEY_ID"):
+    import boto3
+    s3 = boto3.client("s3", region_name="us-ca-2",
+                      endpoint_url="https://s3api-us-ca-2.runpod.io")
+    for f in d.rglob("*"):
+        if f.is_file():
+            key = f"checkpoints/{run}/{d.name}/{f.relative_to(d)}"
+            s3.upload_file(str(f), "guppgnq1g0", key)
+else:
+    from huggingface_hub import HfApi
+    api = HfApi(token=open("/root/.cache/huggingface/token").read().strip())
+    repo = f"ethanelasky/ckpt-{run}"[:96]
+    api.create_repo(repo, repo_type="model", private=True, exist_ok=True)
+    api.upload_folder(folder_path=str(d), repo_id=repo, repo_type="model",
+                      path_in_repo=d.name)
 print("ok")
 PYEOF
     then
