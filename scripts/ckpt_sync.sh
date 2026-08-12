@@ -37,7 +37,8 @@ while true; do
     # S3-to-volume when credentials exist (the durable store Ethan named);
     # HF private repo otherwise.
     if [ -f /root/.runpod/s3.env ]; then set -a; . /root/.runpod/s3.env; set +a; fi
-    if SYNC_DIR="$dir" SYNC_RUN="$RUN_NAME" "$PYBIN" - <<'PYEOF'
+    upload_ok=0
+    SYNC_DIR="$dir" SYNC_RUN="$RUN_NAME" "$PYBIN" - <<'PYEOF' && upload_ok=1
 import os, pathlib
 d = pathlib.Path(os.environ["SYNC_DIR"]); run = os.environ["SYNC_RUN"]
 if os.environ.get("AWS_ACCESS_KEY_ID"):
@@ -57,7 +58,7 @@ else:
                       path_in_repo=d.name)
 print("ok")
 PYEOF
-    then
+    if [ "$upload_ok" = 1 ]; then
       echo "$dir" >> "$STATE"
     else
       echo "[$(date -u +%H:%M:%S)] upload FAILED for $dir; will retry"
