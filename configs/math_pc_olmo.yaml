@@ -219,6 +219,11 @@ math_pc_olmo_l5_g8_nocot:
 # judge reserves another 0.18 of GPU 0 on the same 183GB B200.
 math_pc_olmo32think_grpo_os3:
   _extends: math_pc_olmo_l5_g8_nocot
+  # The proposer's opening is a SOLO solution — rendered without any debate
+  # context (Ethan, 2026-08-12): the opening must be the same distribution
+  # the RLVR twin trains on; debate-awareness enters only from the critic's
+  # first speech onward. Requires fresh_positions (inherited true).
+  first_speech_non_debate_aware: true
   agents:
     alice:
       model_settings:
