@@ -111,6 +111,11 @@ def _recv_message(conn: Any) -> dict[str, Any]:
     return _decode_message(payload)
 
 
+def _connection_send_bytes(conn: Any, payload: bytes) -> None:
+    """Parent send seam used by deterministic timeout/race tests."""
+    conn.send_bytes(payload)
+
+
 def _expression_bytes(value: str, *, field: str) -> int:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string")
@@ -365,6 +370,7 @@ class MathVerifyWorker:
         self._conn: Any = None
         self._lock = threading.RLock()
         self._next_request_id = 1
+        self._send_bytes = _connection_send_bytes
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -412,8 +418,14 @@ class MathVerifyWorker:
             lock.release()
             self._adopt_current_process()
 
-    def _await_message(self, deadline_seconds: float) -> dict[str, Any]:
-        if self._conn is None or self._process is None:
+    def _await_message(
+        self,
+        deadline_seconds: float,
+        *,
+        conn: Any,
+        process: Any,
+    ) -> dict[str, Any]:
+        if conn is None or process is None:
             raise _RetryableInfrastructureError("worker is not running")
         deadline = time.monotonic() + deadline_seconds
         while True:
@@ -421,12 +433,12 @@ class MathVerifyWorker:
             if remaining <= 0:
                 raise _RetryableInfrastructureError("worker operation timed out")
             try:
-                ready = self._conn.poll(min(remaining, 0.05))
+                ready = conn.poll(min(remaining, 0.05))
             except (EOFError, OSError) as exc:
                 raise _RetryableInfrastructureError("worker pipe failed") from exc
             if ready:
-                return _recv_message(self._conn)
-            if not self._process.is_alive():
+                return _recv_message(conn)
+            if not process.is_alive():
                 raise _RetryableInfrastructureError("worker exited")
 
     def _start(self) -> None:
@@ -442,7 +454,11 @@ class MathVerifyWorker:
         try:
             process.start()
             child_conn.close()
-            hello = self._await_message(self._startup_timeout)
+            hello = self._await_message(
+                self._startup_timeout,
+                conn=parent_conn,
+                process=process,
+            )
             if hello.get("kind") == "startup_error":
                 error_type = hello.get("error_type")
                 raise _RetryableInfrastructureError(
@@ -509,13 +525,19 @@ class MathVerifyWorker:
         payload = _json_bytes(wire_request)
         try:
             assert self._conn is not None
+            assert self._process is not None
+            # Bind the whole request to one immutable worker generation.  A
+            # timed-out daemon sender may resume only after retry has installed
+            # a new self._conn; it must still touch solely this old endpoint.
+            conn = self._conn
+            process = self._process
+            send_bytes = self._send_bytes
             started = time.monotonic()
             failure: list[BaseException] = []
 
             def send() -> None:
                 try:
-                    assert self._conn is not None
-                    self._conn.send_bytes(payload)
+                    send_bytes(conn, payload)
                 except BaseException as exc:
                     failure.append(exc)
 
@@ -533,7 +555,11 @@ class MathVerifyWorker:
             remaining = self._parent_timeout - (time.monotonic() - started)
             if remaining <= 0:
                 raise _RetryableInfrastructureError("worker operation timed out")
-            response = self._await_message(remaining)
+            response = self._await_message(
+                remaining,
+                conn=conn,
+                process=process,
+            )
         except (BrokenPipeError, EOFError, OSError) as exc:
             raise _RetryableInfrastructureError("worker pipe failed") from exc
         if (

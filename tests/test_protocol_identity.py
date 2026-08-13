@@ -839,6 +839,86 @@ def test_resume_args_allow_valid_continuation_and_fresh_run():
     )
 
 
+@pytest.mark.parametrize("start_step", [-1, -20])
+def test_resume_args_reject_negative_start_step_even_without_wandb(start_step):
+    with pytest.raises(ValueError, match="must be >= 0"):
+        validate_resume_args(
+            SimpleNamespace(
+                wandb_resume=None,
+                no_wandb=True,
+                load=None,
+                start_step=start_step,
+            )
+        )
+
+
+def test_resume_args_reject_checkpoint_and_explicit_step_mismatch():
+    with pytest.raises(ValueError, match="does not match checkpoint basename"):
+        validate_resume_args(
+            SimpleNamespace(
+                wandb_resume="run-id",
+                no_wandb=False,
+                load="/checkpoints/step-00025/",
+                start_step=40,
+            )
+        )
+
+
+def test_resume_args_accept_matching_explicit_checkpoint_step():
+    validate_resume_args(
+        SimpleNamespace(
+            wandb_resume="run-id",
+            no_wandb=False,
+            load="/checkpoints/step-00025/",
+            start_step=25,
+        )
+    )
+
+
+@pytest.mark.parametrize("module_name", ["infra.run_rlvr", "infra.run_debate"])
+def test_runner_rejects_step_mismatch_before_wandb_init(monkeypatch, module_name):
+    module = __import__(module_name, fromlist=["main"])
+    wandb, _ = _install_fake_wandb(monkeypatch, {})
+    args = SimpleNamespace(
+        wandb_resume="run-id",
+        no_wandb=False,
+        load="/checkpoints/step-00025",
+        start_step=40,
+    )
+    monkeypatch.setattr(
+        module,
+        "runner_parser",
+        lambda description: SimpleNamespace(parse_args=lambda: args),
+    )
+
+    with pytest.raises(ValueError, match="does not match checkpoint basename"):
+        module.main()
+
+    assert wandb.init_calls == []
+
+
+@pytest.mark.parametrize(
+    ("start_step", "steps", "message"),
+    [(-1, 10, "must be >= 0"), (11, 10, "must be <= steps")],
+)
+def test_train_rejects_invalid_step_range_before_wandb_init(
+    monkeypatch, start_step, steps, message
+):
+    wandb, _ = _install_fake_wandb(monkeypatch, {})
+    cfg = Config(
+        start_step=start_step,
+        steps=steps,
+        eval_every=0,
+        save_every=0,
+        wandb_project="project",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        train_mod.train(object(), LifecycleBackend(), cfg)
+
+    assert wandb.init_calls == []
+
+
 @pytest.mark.parametrize("load", ["/checkpoints/final", "tinker://opaque-id"])
 def test_resume_requires_explicit_step_for_final_or_opaque_checkpoint(load):
     with pytest.raises(ValueError, match="requires an explicit --start-step"):

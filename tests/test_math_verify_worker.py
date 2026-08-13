@@ -224,6 +224,51 @@ def test_pipe_write_itself_is_covered_by_parent_deadline():
     worker.close()
 
 
+def test_timed_out_sender_cannot_resume_on_replacement_worker_pipe():
+    ctx = multiprocessing.get_context("spawn")
+    launches = ctx.Value("i", 0)
+    worker = _worker("echo", launches=launches, timeout=0.1)
+    first_entered = threading.Event()
+    first_resumed = threading.Event()
+    release_first = threading.Event()
+    calls = []
+    first_failure: list[BaseException] = []
+
+    def controlled_send(conn, payload):
+        calls.append(conn)
+        if len(calls) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=3)
+            try:
+                conn.send_bytes(payload)
+            except BaseException as exc:
+                first_failure.append(exc)
+            finally:
+                first_resumed.set()
+            return
+        if len(calls) == 2:
+            # This call can happen only after the first worker was discarded
+            # and a fresh process/pipe completed its handshake.
+            release_first.set()
+        conn.send_bytes(payload)
+
+    worker._send_bytes = controlled_send
+    assert worker.is_parseable("retry-on-fresh-pipe") is True
+    assert first_entered.is_set()
+    assert first_resumed.wait(timeout=1)
+    assert launches.value == 2
+    assert len(calls) == 2
+    assert calls[0] is not calls[1]
+    assert first_failure  # the retired endpoint was already closed
+
+    # The resumed stale sender did not inject its old request into the current
+    # pipe, so the following request remains aligned too.
+    assert worker.is_parseable("next-request") is True
+    assert len(calls) == 3
+    assert calls[2] is calls[1]
+    worker.close()
+
+
 def test_gold_protocol_error_is_fatal_without_transport_retry():
     ctx = multiprocessing.get_context("spawn")
     launches = ctx.Value("i", 0)

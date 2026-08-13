@@ -328,6 +328,13 @@ class _Phases:
 
 def _validate_train_config(backend: Backend, cfg: Config) -> None:
     """Validate before opening external logging state."""
+    if cfg.start_step < 0:
+        raise ValueError(f"start_step must be >= 0, got {cfg.start_step}")
+    if cfg.start_step > cfg.steps:
+        raise ValueError(
+            f"start_step must be <= steps, got start_step={cfg.start_step}, "
+            f"steps={cfg.steps}"
+        )
     if cfg.oversample_factor < 1.0:
         raise ValueError(
             f"oversample_factor must be >= 1.0 (1.0 = off), got {cfg.oversample_factor}"
@@ -479,7 +486,7 @@ def _train_with_logger(
         metrics.update(pack_stats)
 
         if datums:
-            from infra.rl.kl import apply_kl_penalty, entropy_proxy, ref_kl_metrics
+            from infra.rl.kl import apply_kl_penalty, entropy_proxy
 
             if cfg.sampling.temperature != 1.0 and hasattr(backend, "forward"):
                 # Tempered sampling breaks the ratio anchor: vLLM's returned
@@ -503,9 +510,6 @@ def _train_with_logger(
                 with ph("kl_ref_logprobs"):
                     for datum, lp in zip(datums, backend.ref_logprobs(datums)):
                         datum.ref_logprobs = lp
-                # Same k1/k2/k3 snapshot the advantage path logs; without it
-                # the loss mechanism has no KL value in wandb at all.
-                metrics.update(ref_kl_metrics(datums))
             elif cfg.kl_coef > 0:
                 # ref_logprobs is a FULL forward pass over every datum on the
                 # frozen base — the cost of kl_coef, and worth seeing separately.
@@ -726,20 +730,39 @@ def resolve_protocol_identity(dataset_type: str, family: Any) -> dict[str, str]:
 
 def validate_resume_args(args: Any) -> None:
     """Reject continuation flags that cannot identify a valid lineage."""
+    start_step = getattr(args, "start_step", None)
+    if start_step is not None and start_step < 0:
+        raise ValueError(f"--start-step must be >= 0, got {start_step}")
+
+    load = getattr(args, "load", None)
+    checkpoint_step = None
+    if load:
+        basename = str(load).rstrip("/").rsplit("/", 1)[-1]
+        match = re.fullmatch(r"step-(\d+)", basename)
+        if match is not None:
+            checkpoint_step = int(match.group(1))
+    if (
+        start_step is not None
+        and checkpoint_step is not None
+        and start_step != checkpoint_step
+    ):
+        raise ValueError(
+            f"--start-step {start_step} does not match checkpoint basename "
+            f"step-{checkpoint_step:05d}"
+        )
+
     if not getattr(args, "wandb_resume", None):
         return
     if getattr(args, "no_wandb", False):
         raise ValueError("--wandb-resume cannot be combined with --no-wandb")
-    if not getattr(args, "load", None):
+    if not load:
         raise ValueError("--wandb-resume requires --load <checkpoint>")
     # A step-N checkpoint is saved before update N and therefore carries its
     # absolute continuation step in the name. ``final`` and service-owned
     # opaque checkpoint URIs carry optimizer state but no portable step
     # metadata. Guessing zero would restart the W&B x-axis, LR schedule, and
     # step-seeded shuffles, so those require the operator to state the step.
-    if getattr(args, "start_step", None) is None and re.search(
-        r"(?:^|/)step-\d+/?$", str(args.load)
-    ) is None:
+    if start_step is None and checkpoint_step is None:
         raise ValueError(
             "--wandb-resume with a final or opaque checkpoint requires an "
             "explicit --start-step; only load paths ending in step-N encode "

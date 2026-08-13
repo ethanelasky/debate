@@ -384,6 +384,28 @@ def run_stdin_tests(
                 "codecontests verifier cases must be strings"
             )
 
+        # Compile the exact UTF-8 bytes the child will read. SyntaxError and
+        # its IndentationError/TabError subclasses are candidate failures,
+        # classified here by trusted Python state rather than by grepping a
+        # runtime traceback (which would misclassify ``raise SyntaxError``).
+        try:
+            compile(solution_code.encode("utf-8"), "solution.py", "exec")
+        except SyntaxError as exc:
+            return {
+                "status": "candidate_error",
+                "passed": False,
+                "tests_passed": 0,
+                "tests_total": len(inputs),
+                "timeout": False,
+                "first_failure": {
+                    "test_idx": 0,
+                    "expected": "",
+                    "actual": "",
+                    "stderr": f"{type(exc).__name__}: {exc}",
+                },
+                "execution_time_seconds": time.perf_counter() - t0,
+            }
+
         tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
         _verifier_semaphore.acquire()
         acquired = True
@@ -426,10 +448,10 @@ def run_stdin_tests(
             if case_ok:
                 tests_passed += 1
             else:
-                # Preserve the historical metric meaning: syntax/compile and
-                # output-limit failures are ``candidate_error``; ordinary
-                # runtime exceptions/signals are simply failed solutions.
-                if case["output_limited"] or "SyntaxError:" in case["stderr"]:
+                # Compile failures were classified before launch. Output-limit
+                # failures remain candidate errors; runtime exceptions and
+                # signals are simply failed solutions.
+                if case["output_limited"]:
                     saw_candidate_error = True
                 if first_failure is None:
                     stderr = case["stderr"]

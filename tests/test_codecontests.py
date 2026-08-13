@@ -506,10 +506,19 @@ def test_wrong_solution_reports_first_failure():
     assert r["first_failure"]["expected"] == "3" and r["first_failure"]["actual"] == "0"
 
 
-def test_syntax_error_solution_is_an_error():
-    r = run_stdin_tests("def (:", ["1 2"], ["3"], timeout=TIMEOUT)
+@pytest.mark.parametrize(
+    ("source", "error_name"),
+    [
+        ("def (:", "SyntaxError"),
+        ("if True:\nprint(1)", "IndentationError"),
+        ("if True:\n\tprint(1)\n        print(2)", "TabError"),
+    ],
+)
+def test_compile_error_subclasses_are_candidate_errors(source, error_name):
+    r = run_stdin_tests(source, ["1 2"], ["3"], timeout=TIMEOUT)
     assert r["status"] == "candidate_error" and not r["passed"]
-    assert "SyntaxError" in r["first_failure"]["stderr"]
+    assert error_name in r["first_failure"]["stderr"]
+    assert r["tests_passed"] == 0 and r["tests_total"] == 1
 
 
 def test_float_normalization():
@@ -529,6 +538,17 @@ def test_runtime_error_after_expected_output_still_fails():
     )
     assert r["status"] == "failed" and not r["passed"]
     assert "ValueError" in r["first_failure"]["stderr"]
+
+
+def test_runtime_syntaxerror_is_failed_not_compile_error():
+    r = run_stdin_tests(
+        "print(1)\nraise SyntaxError('raised at runtime')",
+        ["x"],
+        ["1"],
+        timeout=TIMEOUT,
+    )
+    assert r["status"] == "failed" and not r["passed"]
+    assert "SyntaxError: raised at runtime" in r["first_failure"]["stderr"]
 
 
 def test_worker_start_failure_is_fatal_in_direct_reward_and_debate_grade(
@@ -576,6 +596,33 @@ def test_candidate_compile_and_runtime_failures_grade_false(env, family):
             (_meta(), "raise ValueError('candidate bug')"),
         ]
     ) == [False, False]
+
+
+@pytest.mark.parametrize(
+    "compile_error",
+    [
+        "if True:\nprint(1)",
+        "if True:\n\tprint(1)\n        print(2)",
+    ],
+)
+def test_indentation_compile_errors_set_reward_exec_error(env, compile_error):
+    reward, info = env.reward(
+        env.tasks(1, split="test")[0],
+        f"```python\n{compile_error}\n```",
+    )
+    assert reward == pytest.approx(env.format_reward)
+    assert info["exec_error"] == 1.0
+    assert info["correct_relaxed"] == 0.0
+
+
+def test_runtime_syntaxerror_does_not_set_reward_exec_error(env):
+    reward, info = env.reward(
+        env.tasks(1, split="test")[0],
+        "```python\nraise SyntaxError('raised at runtime')\n```",
+    )
+    assert reward == pytest.approx(env.format_reward)
+    assert info["exec_error"] == 0.0
+    assert info["correct_relaxed"] == 0.0
 
 
 # Forges a result JSON as the LAST line of the runner's real stdout (atexit

@@ -329,8 +329,9 @@ aime_rlvr_olmo32think:
   # block survives stripping) extraction still takes the LAST boxed — a boxed
   # guess inside the think phase can never beat a boxed final answer, and is
   # graded only if the visible answer never boxes at all. One caveat, stated
-  # exactly: the 0.1 format bonus is controlled independently from correctness;
-  # watch answer_format_valid when changing the answer budget.
+  # exactly: the 0.1 format bonus keys on a raw '\boxed{' substring
+  # (MathEnv.reward has_boxed), so a think-phase box does earn that shaping
+  # term even when the answer has none.
   # 4000/500 (Ethan, 2026-08-11): the 1k cap proved below the model's
   # compressibility floor — dev plateaued ~16% with overshoot pinned at 1.0
   # (native think length ~7.7k; it learned truncated-state answering, not
