@@ -563,6 +563,178 @@ def test_owned_inventory_rejects_same_token_with_ancestry_session_drift(
         )
 
 
+def test_post_kill_inventory_waits_for_reparented_token_to_disappear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = {10: _ProcessIdentity(10, 1, 10, 10, 100)}
+    snapshots = iter(
+        (
+            {10: _ProcessIdentity(10, 2, 10, 10, 100)},
+            {},
+            {},
+        )
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_snapshot_process_identities",
+        classmethod(lambda cls: next(snapshots)),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_container_process_ids",
+        classmethod(lambda cls, measured, container_id: set()),
+    )
+
+    SandboxSupervisor._wait_for_owned_process_exit(
+        proc_pid=10,
+        container_id="cc-test",
+        initial_inventory=retained,
+        poll_seconds=0,
+    )
+
+
+def test_post_kill_inventory_rejects_persistent_reparented_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = {10: _ProcessIdentity(10, 1, 10, 10, 100)}
+    reparented = {10: _ProcessIdentity(10, 2, 10, 10, 100)}
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_snapshot_process_identities",
+        classmethod(lambda cls: dict(reparented)),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_container_process_ids",
+        classmethod(lambda cls, measured, container_id: set()),
+    )
+
+    with pytest.raises(
+        SupervisorConfigurationError,
+        match="helper remained",
+    ):
+        SandboxSupervisor._wait_for_owned_process_exit(
+            proc_pid=10,
+            container_id="cc-test",
+            initial_inventory=retained,
+            timeout_seconds=0.01,
+            poll_seconds=0,
+        )
+
+
+def test_post_kill_inventory_rejects_marker_group_and_descendant_residuals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = {
+        20: _ProcessIdentity(20, 1, 10, 10, 200),
+        21: _ProcessIdentity(21, 20, 21, 21, 201),
+        22: _ProcessIdentity(22, 1, 22, 22, 202),
+    }
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_snapshot_process_identities",
+        classmethod(lambda cls: dict(identities)),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_container_process_ids",
+        classmethod(lambda cls, measured, container_id: {22}),
+    )
+
+    residual = SandboxSupervisor._owned_exit_residual_inventory(
+        proc_pid=10,
+        container_id="cc-test",
+        initial_inventory={},
+    )
+
+    assert set(residual) == {20, 21, 22}
+
+
+def test_post_kill_inventory_ignores_reused_pid_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained = {10: _ProcessIdentity(10, 1, 10, 10, 100)}
+    reused = {10: _ProcessIdentity(10, 1, 99, 99, 200)}
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_snapshot_process_identities",
+        classmethod(lambda cls: dict(reused)),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_container_process_ids",
+        classmethod(lambda cls, measured, container_id: set()),
+    )
+
+    assert (
+        SandboxSupervisor._owned_exit_residual_inventory(
+            proc_pid=10,
+            container_id="cc-test",
+            initial_inventory=retained,
+        )
+        == {}
+    )
+
+
+def test_post_kill_inventory_requires_two_empty_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    residual = {10: _ProcessIdentity(10, 1, 10, 10, 100)}
+    scans = iter(({}, residual, {}, {}))
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_owned_exit_residual_inventory",
+        classmethod(lambda cls, **kwargs: next(scans)),
+    )
+
+    SandboxSupervisor._wait_for_owned_process_exit(
+        proc_pid=10,
+        container_id="cc-test",
+        initial_inventory={},
+        poll_seconds=0,
+    )
+
+
+def test_post_kill_inventory_retains_newly_attributed_token_across_detach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovered = _ProcessIdentity(20, 1, 10, 10, 200)
+    detached = _ProcessIdentity(20, 1, 20, 20, 200)
+    snapshots = iter(
+        (
+            {20: discovered},
+            {20: detached},
+            {},
+            {},
+        )
+    )
+    snapshot_calls = 0
+
+    def snapshot(cls):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_snapshot_process_identities",
+        classmethod(snapshot),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_container_process_ids",
+        classmethod(lambda cls, measured, container_id: set()),
+    )
+
+    SandboxSupervisor._wait_for_owned_process_exit(
+        proc_pid=10,
+        container_id="cc-test",
+        initial_inventory={},
+        poll_seconds=0,
+    )
+    assert snapshot_calls == 4
+
+
 def test_owned_inventory_union_retains_exited_process_tokens() -> None:
     gate = _ProcessIdentity(10, 1, 10, 10, 100)
     helper = _ProcessIdentity(11, 10, 10, 10, 101)
@@ -695,6 +867,112 @@ def test_cleanup_recursively_kills_without_thawing(
 
     assert calls == [("write", str(outer / "cgroup.kill"), "1")]
     assert not outer.exists()
+
+
+def test_cleanup_removes_empty_cgroup_before_reporting_residual_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer = tmp_path / "outer"
+    controller = outer / "controller"
+    candidate = outer / "candidate"
+    controller.mkdir(parents=True)
+    candidate.mkdir()
+    request_cgroup = _RequestCgroup(
+        outer=str(outer),
+        controller=str(controller),
+        candidate=str(candidate),
+        oci_path="requests/test/candidate",
+        memory_events_before={},
+        pids_events_before={},
+        outer_controllers=frozenset({"cpu", "memory", "pids"}),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_write_cgroup_control",
+        staticmethod(lambda path, value: None),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_keyed_cgroup_values",
+        classmethod(lambda cls, path: {"populated": 0}),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_wait_for_owned_process_exit",
+        classmethod(
+            lambda cls, **kwargs: (_ for _ in ()).throw(
+                SupervisorConfigurationError("persistent residual")
+            )
+        ),
+    )
+    supervisor = object.__new__(SandboxSupervisor)
+
+    with pytest.raises(SupervisorConfigurationError, match="persistent residual"):
+        supervisor._cleanup_request_cgroup(
+            request_cgroup,
+            proc_pid=10,
+            container_id="cc-test",
+            initial_inventory={},
+        )
+
+    assert not outer.exists()
+
+
+def test_cleanup_preserves_residual_error_when_cgroup_removal_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer = tmp_path / "outer"
+    controller = outer / "controller"
+    candidate = outer / "candidate"
+    controller.mkdir(parents=True)
+    candidate.mkdir()
+    request_cgroup = _RequestCgroup(
+        outer=str(outer),
+        controller=str(controller),
+        candidate=str(candidate),
+        oci_path="requests/test/candidate",
+        memory_events_before={},
+        pids_events_before={},
+        outer_controllers=frozenset({"cpu", "memory", "pids"}),
+    )
+    primary = SupervisorConfigurationError("persistent residual")
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_write_cgroup_control",
+        staticmethod(lambda path, value: None),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_keyed_cgroup_values",
+        classmethod(lambda cls, path: {"populated": 0}),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_wait_for_owned_process_exit",
+        classmethod(lambda cls, **kwargs: (_ for _ in ()).throw(primary)),
+    )
+    monkeypatch.setattr(
+        SandboxSupervisor,
+        "_subtree_pids",
+        staticmethod(lambda path: {99}),
+    )
+    supervisor = object.__new__(SandboxSupervisor)
+
+    with pytest.raises(SupervisorConfigurationError) as caught:
+        supervisor._cleanup_request_cgroup(
+            request_cgroup,
+            proc_pid=10,
+            container_id="cc-test",
+            initial_inventory={},
+        )
+
+    assert caught.value is primary
+    assert caught.value.__notes__ == [
+        "executor cgroup removal also failed: SupervisorConfigurationError"
+    ]
+    assert outer.exists()
 
 
 def test_attested_terminal_boundary_freezes_and_attests_before_signalling(

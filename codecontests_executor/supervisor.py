@@ -1224,6 +1224,113 @@ class SandboxSupervisor:
             )
         return measured[0]
 
+    @classmethod
+    def _owned_exit_residual_inventory(
+        cls,
+        *,
+        proc_pid: int,
+        container_id: str,
+        initial_inventory: dict[int, _ProcessIdentity],
+    ) -> dict[int, _ProcessIdentity]:
+        """Find host processes still attributable to a killed sandbox.
+
+        This is deliberately separate from ``_stable_owned_inventory``.  The
+        latter protects live READY and terminal trust boundaries and must bind
+        ancestry exactly.  After SIGKILL, however, a zombie can be reparented
+        before it disappears from procfs.  Its immutable PID/starttime token
+        still identifies it without treating that expected PPID change as an
+        escape.
+        """
+
+        identities = cls._snapshot_process_identities()
+        retained_tokens = {
+            pid
+            for pid, expected in initial_inventory.items()
+            if (observed := identities.get(pid)) is not None
+            and observed.starttime_ticks == expected.starttime_ticks
+        }
+        reused_tokens = {
+            pid
+            for pid, expected in initial_inventory.items()
+            if (observed := identities.get(pid)) is not None
+            and observed.starttime_ticks != expected.starttime_ticks
+        }
+        container_ids = cls._container_process_ids(identities, container_id)
+        process_group_ids = {
+            pid
+            for pid, identity in identities.items()
+            if identity.process_group == proc_pid and pid not in reused_tokens
+        }
+        session_ids = {
+            pid
+            for pid, identity in identities.items()
+            if identity.session == proc_pid and pid not in reused_tokens
+        }
+        roots = retained_tokens | container_ids | process_group_ids | session_ids
+        if not roots:
+            return {}
+        return cls._descendant_inventory(identities, roots)
+
+    @classmethod
+    def _wait_for_owned_process_exit(
+        cls,
+        *,
+        proc_pid: int,
+        container_id: str,
+        initial_inventory: dict[int, _ProcessIdentity],
+        timeout_seconds: float = 2.0,
+        poll_seconds: float = 0.01,
+    ) -> None:
+        """Require two consecutive empty post-kill process inventories."""
+
+        deadline = time.monotonic() + timeout_seconds
+        empty_scans = 0
+        last_scan_error: SupervisorConfigurationError | None = None
+        last_residual: dict[int, _ProcessIdentity] = {}
+        # Promote every attributed residual into the immutable teardown token
+        # set.  A helper first discovered by nonce/PGID/session evidence must
+        # not become invisible merely by later changing those mutable fields.
+        teardown_inventory = dict(initial_inventory)
+        while time.monotonic() < deadline:
+            try:
+                last_residual = cls._owned_exit_residual_inventory(
+                    proc_pid=proc_pid,
+                    container_id=container_id,
+                    initial_inventory=teardown_inventory,
+                )
+            except SupervisorConfigurationError as exc:
+                # Process exit/PID-reuse churn can invalidate one procfs scan.
+                # It is safe only if later scans become stably empty.
+                last_scan_error = exc
+                empty_scans = 0
+            else:
+                last_scan_error = None
+                if last_residual:
+                    for pid, identity in last_residual.items():
+                        previous = teardown_inventory.get(pid)
+                        if (
+                            previous is not None
+                            and previous.starttime_ticks != identity.starttime_ticks
+                        ):
+                            raise SupervisorConfigurationError(
+                                "teardown-owned PID/starttime identity was reused"
+                            )
+                        teardown_inventory[pid] = identity
+                    empty_scans = 0
+                else:
+                    empty_scans += 1
+                    if empty_scans == 2:
+                        return
+            time.sleep(poll_seconds)
+        if last_scan_error is not None:
+            raise SupervisorConfigurationError(
+                "post-kill process inventory did not stabilize"
+            ) from last_scan_error
+        raise SupervisorConfigurationError(
+            "owned/container helper remained after cgroup kill: "
+            f"count={len(last_residual)}"
+        )
+
     def _attest_runtime_cgroup(
         self,
         *,
@@ -1416,25 +1523,36 @@ class SandboxSupervisor:
             raise SupervisorConfigurationError(
                 "request cgroup remained populated during cleanup"
             )
+        residual_error: BaseException | None = None
         if proc_pid is not None and container_id is not None:
-            residual = self._stable_owned_inventory(
-                proc_pid=proc_pid,
-                container_id=container_id,
-                initial_inventory=initial_inventory,
-                root_required=False,
-            )
-            if residual:
-                raise SupervisorConfigurationError(
-                    "owned/container helper remained after cgroup cleanup"
+            try:
+                self._wait_for_owned_process_exit(
+                    proc_pid=proc_pid,
+                    container_id=container_id,
+                    initial_inventory=initial_inventory or {},
                 )
+            except BaseException as exc:  # noqa: BLE001 - preserve fail-closed audit
+                residual_error = exc
+        try:
             if self._subtree_pids(request_cgroup.outer):
                 raise SupervisorConfigurationError(
                     "request cgroup gained a process after cleanup"
                 )
-        for directory, subdirs, _files in os.walk(request_cgroup.outer, topdown=False):
-            for subdir in subdirs:
-                os.rmdir(os.path.join(directory, subdir))
-        os.rmdir(request_cgroup.outer)
+            for directory, subdirs, _files in os.walk(
+                request_cgroup.outer, topdown=False
+            ):
+                for subdir in subdirs:
+                    os.rmdir(os.path.join(directory, subdir))
+            os.rmdir(request_cgroup.outer)
+        except BaseException as exc:  # noqa: BLE001 - all-exit cleanup
+            if residual_error is None:
+                residual_error = exc
+            else:
+                residual_error.add_note(
+                    f"executor cgroup removal also failed: {type(exc).__name__}"
+                )
+        if residual_error is not None:
+            raise residual_error
 
     @staticmethod
     def _runsc_log_is_clean(path: str) -> bool:
