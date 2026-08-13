@@ -637,6 +637,156 @@ def test_monitor_failure_status_has_only_bounded_trusted_diagnostics() -> None:
     assert "candidate-controlled secret" not in repr(status)
 
 
+def test_candidate_ready_pipe_preserves_exact_trace_stop_for_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading READY must not reap the PTRACE_TRACEME child's SIGSTOP."""
+    class PollForbidden:
+        pid = 101
+
+        def poll(self) -> int | None:
+            pytest.fail("readiness must not poll the traced candidate")
+
+    proc = cast(Any, PollForbidden())
+    wait4_calls: list[tuple[int, int]] = []
+    ptrace_calls: list[tuple[int, int, Any]] = []
+    assert "poll" not in launcher._wait_ready.__code__.co_names
+    assert "waitpid" not in launcher._wait_ready.__code__.co_names
+
+    def exact_wait4(pid: int, options: int) -> tuple[int, int, Any]:
+        wait4_calls.append((pid, options))
+        return pid, _stopped(signal.SIGSTOP), SimpleNamespace()
+
+    monkeypatch.setattr(
+        launcher.os,
+        "waitpid",
+        lambda *_args: pytest.fail("readiness must not call waitpid"),
+    )
+    monkeypatch.setattr(launcher.os, "wait4", exact_wait4)
+    monkeypatch.setattr(launcher, "_candidate_proc_attested", lambda *_args: True)
+    monkeypatch.setattr(launcher, "_candidate_task_ids", lambda: {proc.pid})
+    monkeypatch.setattr(
+        launcher,
+        "_ptrace",
+        lambda request, pid, address=0, data=None: ptrace_calls.append(
+            (request, pid, data)
+        ),
+    )
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"R")
+        launcher._wait_ready(read_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    launcher._attest_initial_trace_stop(proc, (1024, 1, 4096, 16, 32))
+
+    assert wait4_calls == [
+        (proc.pid, os.WUNTRACED | launcher._WAIT_ALL),
+    ]
+    assert len(ptrace_calls) == 1
+    request, pid, options = ptrace_calls[0]
+    assert request == launcher._PTRACE_SETOPTIONS
+    assert pid == proc.pid
+    assert options == (
+        launcher._PTRACE_O_TRACESYSGOOD
+        | launcher._PTRACE_O_TRACEFORK
+        | launcher._PTRACE_O_TRACEVFORK
+        | launcher._PTRACE_O_TRACECLONE
+        | launcher._PTRACE_O_TRACEEXEC
+        | launcher._PTRACE_O_TRACEEXIT
+        | launcher._PTRACE_O_TRACESECCOMP
+        | launcher._PTRACE_O_EXITKILL
+    )
+
+
+def test_candidate_ready_eof_has_bounded_signed_diagnostic() -> None:
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    try:
+        with pytest.raises(launcher._CandidateReadyEOF) as caught:
+            launcher._wait_ready(read_fd)
+    finally:
+        os.close(read_fd)
+
+    status = launcher._monitor_failure_status(
+        launcher._MonitorStageError("setup_readiness", caught.value)
+    )
+
+    assert status["error"] == "_CandidateReadyEOF"
+    assert status["site"] == "setup_readiness"
+
+
+def test_candidate_ready_timeout_has_bounded_signed_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NeverReadySelector:
+        def register(self, _fd: int, _events: int) -> None:
+            pass
+
+        def select(self, _timeout: float) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            pass
+
+    times = iter((100.0, 106.0))
+    monkeypatch.setattr(launcher.selectors, "DefaultSelector", NeverReadySelector)
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: next(times))
+
+    with pytest.raises(launcher._CandidateReadyTimeout) as caught:
+        launcher._wait_ready(123)
+
+    status = launcher._monitor_failure_status(
+        launcher._MonitorStageError("setup_readiness", caught.value)
+    )
+    assert status["error"] == "_CandidateReadyTimeout"
+    assert status["site"] == "setup_readiness"
+
+
+def test_candidate_ready_rejects_noncanonical_marker() -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"RX")
+        with pytest.raises(launcher._CandidateReadyProtocolError):
+            launcher._wait_ready(read_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_pre_ready_failure_kills_candidate_without_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PollForbidden:
+        pid = 101
+        stdout = None
+        stderr = None
+
+        def poll(self) -> int | None:
+            pytest.fail("cleanup must not poll the ptraced candidate")
+
+    proc = cast(Any, PollForbidden())
+    killed: list[Any] = []
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+    monkeypatch.setattr(launcher, "_write_all", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher,
+        "_wait_ready",
+        lambda _fd: (_ for _ in ()).throw(launcher._CandidateReadyEOF()),
+    )
+    monkeypatch.setattr(launcher, "_kill_candidate_tree", killed.append)
+
+    with pytest.raises(launcher._MonitorStageError) as caught:
+        launcher._run_candidate(b"pass", (1024, 1, 4096, 16, 32))
+
+    assert caught.value.site == "setup_readiness"
+    assert caught.value.error_type == "_CandidateReadyEOF"
+    assert killed == [proc]
+
+
 def test_output_relay_records_evidence_and_never_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

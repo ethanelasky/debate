@@ -1862,18 +1862,34 @@ def _attest_initial_trace_stop(
     _ptrace(_PTRACE_SETOPTIONS, proc.pid, data=options)
 
 
-def _wait_ready(fd: int, proc: subprocess.Popen[bytes]) -> bool:
+class _CandidateReadyEOF(RuntimeError):
+    """The trusted candidate runner exited before its readiness marker."""
+
+
+class _CandidateReadyTimeout(RuntimeError):
+    """The trusted candidate runner did not become ready within its deadline."""
+
+
+class _CandidateReadyProtocolError(RuntimeError):
+    """The trusted candidate runner emitted an invalid readiness marker."""
+
+
+def _wait_ready(fd: int) -> None:
     selector = selectors.DefaultSelector()
     try:
         selector.register(fd, selectors.EVENT_READ)
         deadline = time.monotonic() + _CANDIDATE_READY_TIMEOUT_SECONDS
-        while proc.poll() is None:
+        while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                raise _CandidateReadyTimeout
             if selector.select(min(0.05, remaining)):
-                return os.read(fd, 2) == b"R"
-        return False
+                marker = os.read(fd, 2)
+                if marker == b"R":
+                    return
+                if not marker:
+                    raise _CandidateReadyEOF
+                raise _CandidateReadyProtocolError
     finally:
         selector.close()
 
@@ -2930,6 +2946,7 @@ def _run_candidate(
     gate_read = gate_write = -1
     address_space, cpu_seconds, file_size, process_count, open_files = limits
     proc: subprocess.Popen[bytes] | None = None
+    trace_completed = False
     failure_site = "pipe_setup"
     try:
         code_read, code_write = os.pipe()
@@ -2979,8 +2996,14 @@ def _run_candidate(
         os.close(code_write)
         code_write = -1
         failure_site = "setup_readiness"
-        if not _wait_ready(ready_read, proc):
-            raise RuntimeError("candidate setup readiness failed")
+        # The readiness pipe is the sole owner of this boundary.  In
+        # particular, do not call ``Popen.poll()`` here: this is a
+        # PTRACE_TRACEME child, so waitpid(WNOHANG) may consume its SIGSTOP as
+        # a trace stop and CPython will mis-record it as ``returncode=-19``.
+        # The child writes the one-byte trusted marker before raising SIGSTOP;
+        # EOF therefore also detects a genuine pre-ready exit without racing
+        # the later attestation's exact wait4 ownership.
+        _wait_ready(ready_read)
         failure_site = "initial_attestation"
         _attest_initial_trace_stop(proc, limits)
         os.close(ready_read)
@@ -3040,6 +3063,11 @@ def _run_candidate(
             file_size_limit=file_size,
             teardown_control=teardown_control,
         )
+        # `_trace_and_measure` has consumed the exact terminal wait for every
+        # traced task.  Before this point, no `Popen` wait helper may inspect
+        # the PTRACE_TRACEME child; on failure the only safe cleanup is an
+        # idempotent signal that leaves wait ownership unambiguous.
+        trace_completed = True
         failure_site = "relay_drain"
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
@@ -3096,7 +3124,7 @@ def _run_candidate(
                     os.close(fd)
                 except OSError:
                     pass
-        if proc is not None and proc.poll() is None:
+        if proc is not None and not trace_completed:
             _kill_candidate_tree(proc)
 
 

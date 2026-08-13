@@ -1171,6 +1171,70 @@ def test_remote_late_response_is_timeout_and_stops_later_cases(
     assert len(client.calls) == 1
 
 
+def test_remote_late_response_preserves_recovered_infrastructure_retry_count(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 0.0}
+    durations = iter([0.25, 10.0])
+
+    def advance():
+        clock["now"] += next(durations)
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _launch_attestation_unknown(),
+                _remote_execution(
+                    stdout=b"too late", attested_service_total_ns=10_000_000_000
+                ),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    result = run_stdin_tests("print('too late')", [""], ["too late"], timeout=10)
+
+    assert result["status"] == "timeout" and result["timeout"] is True
+    assert result["infrastructure_retries"] == 1
+    assert len(client.calls) == 2
+
+
+def test_remote_wall_limit_preserves_recovered_infrastructure_retry_count(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 0.0}
+    durations = iter([0.25, 9.9])
+
+    def advance():
+        clock["now"] += next(durations)
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _launch_attestation_unknown(),
+                _remote_execution(
+                    outcome="candidate_failure",
+                    category="WALL_LIMIT",
+                    attested_service_total_ns=9_900_000_000,
+                ),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    result = run_stdin_tests("while True: pass", [""], [""], timeout=10)
+
+    assert result["status"] == "timeout" and result["timeout"] is True
+    assert result["infrastructure_retries"] == 1
+    assert len(client.calls) == 2
+
+
 def test_remote_replay_outage_time_is_not_charged_to_candidate(
     install_remote_executor, monkeypatch
 ):

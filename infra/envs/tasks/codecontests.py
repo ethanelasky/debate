@@ -1031,6 +1031,7 @@ def _run_stdin_tests_remote(
                         "Total execution timed out.",
                         t0,
                         timeout=True,
+                        infrastructure_retries=infrastructure_retries,
                     )
 
                 # Preserve the one shared solution deadline across RPCs. The
@@ -1053,6 +1054,7 @@ def _run_stdin_tests_remote(
                         "Total execution timed out.",
                         t0,
                         timeout=True,
+                        infrastructure_retries=infrastructure_retries,
                     )
                 remaining_seconds, remaining_nanos = divmod(
                     remaining_ns, 1_000_000_000
@@ -1162,6 +1164,7 @@ def _run_stdin_tests_remote(
                     "Total execution timed out.",
                     t0,
                     timeout=True,
+                    infrastructure_retries=infrastructure_retries,
                 )
 
             if outcome == "candidate_failure":
@@ -1172,6 +1175,7 @@ def _run_stdin_tests_remote(
                         _remote_failure_diagnostic(execution),
                         t0,
                         timeout=True,
+                        infrastructure_retries=infrastructure_retries,
                     )
                 stdout_truncated, stderr_truncated = _remote_output_saturation(
                     execution
@@ -1433,6 +1437,7 @@ def _failure_result(
     t0: float,
     timeout: bool = False,
     candidate_error: bool = False,
+    infrastructure_retries: int = 0,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -1441,6 +1446,7 @@ def _failure_result(
         "tests_total": tests_total,
         "timeout": timeout,
         "candidate_error": candidate_error,
+        "infrastructure_retries": infrastructure_retries,
         "first_failure": {"test_idx": 0, "expected": "", "actual": "", "stderr": stderr},
         "execution_time_seconds": time.perf_counter() - t0,
     }
