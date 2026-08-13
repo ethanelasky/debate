@@ -15,6 +15,12 @@
   rollout_tp: 1
   gpu_memory_utilization: 0.42
 
+# Validated: qwen2.5 judge-probe, 3 debate steps + colocated judge (2026-08-13).
+1xH200:
+  n_gpus: 1
+  rollout_tp: 1
+  gpu_memory_utilization: 0.42
+
 # Validated: the whole AIME 32B campaign (2026-08-08..10).
 2xB200:
   n_gpus: 2

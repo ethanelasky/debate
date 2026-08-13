@@ -5,7 +5,13 @@ import math
 import pytest
 
 from infra.backend.base import Datum
-from infra.rl.kl import apply_kl_penalty, discounted_future_sum, entropy_proxy, k1_per_token
+from infra.rl.kl import (
+    apply_kl_penalty,
+    discounted_future_sum,
+    entropy_proxy,
+    k1_per_token,
+    ref_kl_metrics,
+)
 
 
 class FakeRefBackend:
@@ -55,6 +61,28 @@ def test_masked_tokens_untouched_and_excluded_from_mean():
     # only token 0 counts: avg = its own k1 -> centered penalty 0
     assert d.advantages[0] == pytest.approx(1.0)
     assert d.advantages[1] == 1.0  # masked: untouched
+
+
+def test_ref_kl_metrics_from_stamped_logprobs():
+    # k1 = [1.0, 0.0], same numbers as the apply_kl_penalty test above, but
+    # via PRE-STAMPED ref_logprobs (the loss-mechanism path) — no backend.
+    d = mk([-0.5, -1.0])
+    d.ref_logprobs = [-1.5, -1.0]
+    metrics = ref_kl_metrics([d])
+    assert metrics["kl/policy_vs_ref_k1"] == pytest.approx(0.5)
+    assert metrics["kl/policy_vs_ref_k2"] == pytest.approx(0.25)
+    assert metrics["kl/policy_vs_ref_k3"] == pytest.approx((math.exp(-1.0) + 1.0 - 1.0) / 2)
+    # advantages untouched: this is the logging-only path
+    assert d.advantages == [0.0, 0.0]
+
+
+def test_ref_kl_metrics_respects_mask_and_missing_refs():
+    stamped = mk([-0.5, -9.9], mask=[1.0, 0.0])
+    stamped.ref_logprobs = [-1.5, -1.5]
+    unstamped = mk([-3.0])  # ref never stamped: must not contribute
+    metrics = ref_kl_metrics([stamped, unstamped])
+    assert metrics["kl/policy_vs_ref_k1"] == pytest.approx(1.0)  # masked token excluded
+    assert ref_kl_metrics([unstamped]) == {}
 
 
 def test_discounted_future_sum():

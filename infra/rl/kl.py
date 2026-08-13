@@ -90,6 +90,33 @@ def apply_kl_penalty(
     }
 
 
+def ref_kl_metrics(datums: list[Datum]) -> dict[str, float]:
+    """Logging-only KL vs the frozen ref, from ref_logprobs ALREADY STAMPED on
+    the datums — the loss-mechanism path, where verl's in-loss kl_loss does the
+    pull but the pod engine never returns a KL value. Same estimators and keys
+    as apply_kl_penalty, zero extra forwards. Step-start snapshot: within-step
+    drift across ppo_epochs is not in it (hw4's per-minibatch k3 reads higher)."""
+    k1_sum = k2_sum = k3_sum = 0.0
+    n_tokens = 0
+    for d in datums:
+        if d.ref_logprobs is None:
+            continue
+        mask = d.mask if d.mask is not None else [1.0] * len(d.sampler_logprobs)
+        for k, m in zip(k1_per_token(d.sampler_logprobs, d.ref_logprobs), mask):
+            if m:
+                k1_sum += k
+                k2_sum += 0.5 * k * k
+                k3_sum += math.exp(-k) + k - 1.0
+                n_tokens += 1
+    if not n_tokens:
+        return {}
+    return {
+        "kl/policy_vs_ref_k1": k1_sum / n_tokens,
+        "kl/policy_vs_ref_k2": k2_sum / n_tokens,
+        "kl/policy_vs_ref_k3": k3_sum / n_tokens,
+    }
+
+
 def entropy_proxy(datums: list[Datum]) -> float:
     """HW4's logging-only entropy: −mean sampled-token logprob over unmasked
     completion tokens."""

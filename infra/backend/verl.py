@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -247,6 +248,31 @@ def _token_weighted_loss_means(per_micro: list[tuple[dict, int]]) -> dict[str, f
     return {k: v / weights[k] if weights[k] else 0.0 for k, v in sums.items()}
 
 
+def _effective_grad_clip(config) -> float:
+    """The emitted clip_grad can be overridden through extra_overrides, which
+    hydra appends last (last-wins), so the effective value must honor that
+    order rather than trusting config.grad_clip."""
+    for o in reversed(tuple(config.extra_overrides)):
+        key, sep, val = str(o).partition("=")
+        if sep and key.lstrip("+").endswith("actor.optim.clip_grad"):
+            return float(val)
+    return float(config.grad_clip)
+
+
+def _grad_norm_metrics(grad_norm: float, clip_norm: float) -> dict[str, float]:
+    """The engine reports the PRE-clip norm, and on a non-finite one it skips
+    the update entirely with only a worker-stdout WARN as a trace. clip_grad_
+    norm_ scales down to the threshold, so the post-clip norm is min(pre, clip);
+    when the norm is non-finite no update happened and there is no post-clip
+    value to report."""
+    if not math.isfinite(grad_norm):
+        return {"optim/nonfinite_grad_step": 1.0}
+    return {
+        "optim/nonfinite_grad_step": 0.0,
+        "optim/grad_norm_clipped": min(grad_norm, clip_norm),
+    }
+
+
 def _release_training_cache(*_args, **_kwargs):
     """Runs INSIDE the training worker (dispatched via execute_func_rank_zero;
     must stay module-level picklable). Returns MiB (allocated, reserved)
@@ -278,6 +304,7 @@ class VerlBackend(Backend):
         from verl.workers.rollout.llm_server import LLMServerManager
 
         self.config = config
+        self._grad_clip_norm = _effective_grad_clip(config)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
 
         config_dir = os.path.join(os.path.dirname(verl_config_pkg.__file__))
@@ -590,6 +617,8 @@ class VerlBackend(Backend):
         for m in step_metrics:
             for k, v in (m or {}).items():
                 metrics[f"optim/{k}"] = float(v)
+        if "optim/grad_norm" in metrics:
+            metrics.update(_grad_norm_metrics(metrics["optim/grad_norm"], self._grad_clip_norm))
         self._global_step += 1
         return metrics
 
