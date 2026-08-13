@@ -1,0 +1,29 @@
+{
+  "format": "palaestra.codecontests.tunnel-supervisor.v1",
+  "name": "codecontests-runpod-tunnel",
+  "ssh": {
+    "target": "root@RUNPOD_HOST",
+    "port": 22022,
+    "identity_file": "/ABSOLUTE/PATH/tunnel_ed25519",
+    "known_hosts_file": "/ABSOLUTE/PATH/known_hosts",
+    "config_file": null
+  },
+  "reverse": {
+    "remote_bind_host": "127.0.0.1",
+    "remote_port": 18081,
+    "local_host": "127.0.0.1",
+    "local_port": 18081
+  },
+  "attestation": {
+    "identity_file": "/ABSOLUTE/PATH/judge-client-bundle/identity.json",
+    "bearer_file": "/ABSOLUTE/PATH/judge-client-bundle/bearer",
+    "hmac_key_file": "/ABSOLUTE/PATH/judge-client-bundle/hmac-key"
+  },
+  "state_file": "/ABSOLUTE/PATH/tunnel-state.json",
+  "connect_timeout_seconds": 5,
+  "startup_timeout_seconds": 30,
+  "health_interval_seconds": 2,
+  "health_failure_limit": 2,
+  "backoff_initial_seconds": 1,
+  "backoff_max_seconds": 30
+}

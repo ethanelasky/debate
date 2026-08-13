@@ -291,12 +291,14 @@ is_busy() {
     done
   done
 
-  # (b) a human is on the pod over ssh. Two spellings of the per-session
-  # process exist: `sshd: user@pts/N` up to OpenSSH 9.7, and `sshd-session:
-  # user@pts/N` from 9.8 on, where the session was split out of sshd. Matching
-  # only the first spelling makes a live operator invisible on any modern
-  # image, so the pattern accepts both.
-  pids="$(pgrep -f 'sshd[^ ]*:.*@' 2>/dev/null || true)"
+  # (b) a human has an INTERACTIVE SSH pty on the pod. Two spellings of the
+  # per-session process exist: `sshd: user@pts/N` up to OpenSSH 9.7, and
+  # `sshd-session: user@pts/N` from 9.8 on. Deliberately require `@pts/N`:
+  # reverse tunnels and non-interactive commands appear as `user@notty`.
+  # Counting a durable verifier reverse tunnel as human activity pins an idle
+  # GPU pod forever and defeats this watchdog. A real trainer remains protected
+  # independently by the process checks above.
+  pids="$(pgrep -f 'sshd[^ ]*:.*@pts/[0-9]+' 2>/dev/null || true)"
   if [ -n "$pids" ]; then
     BUSY_REASON="active ssh session (pid $(echo "$pids" | tr '\n' ' '))"
     return 0

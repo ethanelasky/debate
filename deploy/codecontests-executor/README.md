@@ -199,3 +199,66 @@ the payload to the root-owned frozen identity file, then immediately re-fetch
 and require exact equality. Do not use `--print-identity` as the authoritative
 production capture: running outside the unit measures a different cgroup.
 That option is only an offline prestart diagnostic.
+
+## Durable reverse tunnels
+
+Do not launch a campaign reverse tunnel as a bare `ssh -fNT -R` process.  A
+network outage longer than its keepalive budget terminates that process, and
+OpenSSH does not restart itself.  Use `scripts/supervise_codecontests_tunnel.py`
+under a host lifecycle manager instead.
+
+The supervisor owns one foreground SSH child.  It starts the loopback-only
+reverse listener with `ExitOnForwardFailure=yes`, then opens an independent SSH
+connection to the compute host and fetches `/v1/identity` through that remote
+listener.  `ready` means the returned envelope had a valid HMAC and its payload
+was byte-semantically equal to the frozen identity.  A dead SSH child or a
+bounded number of failed end-to-end probes causes the child to be terminated
+and recreated; connection failures back off to a configured ceiling and retry
+indefinitely.  No bearer or HMAC value is written to the state or JSON log.
+
+Copy `tunnel-supervisor.example.json` into the run's root-owned control
+directory, substitute only that run's SSH endpoint and frozen client bundle,
+and restrict the resulting config before starting it:
+
+```sh
+chmod 600 /absolute/run-control/tunnel-supervisor.json
+python3 scripts/install_codecontests_tunnel_supervisor.py \
+  --mode launchd \
+  --label com.palaestra.codecontests-tunnel.RUN_ID \
+  --config /absolute/run-control/tunnel-supervisor.json \
+  --log-file /absolute/run-control/tunnel-supervisor.log
+```
+
+`launchd` is preferred on an interactive macOS login because `KeepAlive`
+restarts the supervisor itself.  A headless/background login may not expose a
+GUI launchd domain; in that case use `--mode nohup`.  The fallback double-forks
+into a new session as well as using `nohup`, so it is not a child of the shell
+or agent turn that installed it.  The installer refuses a second live
+supervisor for the same state file and does not replace a launchd plist unless
+`--replace` is explicit.
+
+Before starting training, require the configured state JSON to say `ready`,
+require both `supervisor_pid` and `tunnel_pid` to be live, and retain the state
+and log with the run artifacts.  `generation` increments on every SSH child;
+after a forced reconnect it must increase, the child PID must change, and a
+fresh signed client execution through the remote listener must succeed.  A
+TCP-listen check alone is insufficient because a stale or wrong service could
+own the port.
+
+Before deleting the compute host, stop the exact run-scoped supervisor and
+require a zero exit status:
+
+```sh
+python3 scripts/install_codecontests_tunnel_supervisor.py \
+  --remove \
+  --mode launchd \
+  --label com.palaestra.codecontests-tunnel.RUN_ID \
+  --config /absolute/run-control/tunnel-supervisor.json
+```
+
+For launchd this disables the exact label before booting it out, preventing a
+restart at the next login.  For the nohup fallback it validates that the live
+PID's command line names both this supervisor and the exact config before
+sending `SIGTERM`.  Removal waits for both supervisor and SSH child to be gone
+and for a clean `stopped` state.  It deliberately retains the config, plist,
+state, and log so they can be checksummed with the run artifacts.

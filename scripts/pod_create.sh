@@ -69,6 +69,10 @@ if not required.issubset(set(template.get("ports") or [])):
 # typo should not allocate an arbitrary expensive GPU fleet.
 case "$GPU_TYPE|$TEMPLATE_ID" in
   "NVIDIA H200|a9dk3g7cny") ;;
+  # Validated by the 32B AIME campaign and the CodeContests TP2 smokes; see
+  # configs/topologies.yaml. The template contract above independently pins
+  # the image and SSH exposure before this allowlist is consulted.
+  "NVIDIA B200|a9dk3g7cny") ;;
   *)
     [ "${ALLOW_UNTESTED:-0}" = 1 ] || {
       echo "FATAL: unproven GPU/template pair: $GPU_TYPE / $TEMPLATE_ID" >&2
