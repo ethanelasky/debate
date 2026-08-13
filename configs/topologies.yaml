@@ -45,6 +45,10 @@
   gpu_memory_utilization: 0.42
   extra_overrides:
     - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+    # Match the audited 32B TP2 B200 path: preloading the immutable base avoids
+    # gathering and CPU-staging the full model during the first sampler sync.
+    - "actor_rollout_ref.rollout.load_format=safetensors"
+    - "actor_rollout_ref.rollout.layered_summon=true"
 
 # Validated by the CodeContests OLMo-3.1-32B TP4 phase/cap runs
 # (2026-08-05..07). Those runs used 0.45 on 141GB cards; workload arms may

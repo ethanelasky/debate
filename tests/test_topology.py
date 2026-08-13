@@ -93,12 +93,13 @@ def test_apply_topology_concatenates_extra_overrides():
     assert apply_topology(arm, topo)["extra_overrides"] == ["++a=1", "++b=2"]
 
 
-def test_b200x2_preloads_base_and_syncs_only_layered_lora():
+@pytest.mark.parametrize("topology", ["2xB200", "2xH200"])
+def test_32b_tp2_topologies_preload_base_and_sync_only_layered_lora(topology):
     import yaml
 
     with open(rc.TOPOLOGY_FILE) as fh:
         table = yaml.safe_load(fh)
-    overrides = table["2xB200"]["extra_overrides"]
+    overrides = table[topology]["extra_overrides"]
     assert "actor_rollout_ref.rollout.load_format=safetensors" in overrides
     assert "actor_rollout_ref.rollout.layered_summon=true" in overrides
 
