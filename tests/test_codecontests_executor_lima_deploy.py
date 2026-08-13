@@ -45,6 +45,11 @@ def test_lima_deploy_shell_and_unit_policy_are_static() -> None:
     assert "CPUAffinity=0 1 2 3" in unit
     assert "MemoryMax=25769803776" in unit
     assert "MemorySwapMax=0" in unit
+    # Request replay/single-flight state is process-local.  An automatic
+    # service restart would forget completed request IDs and could execute a
+    # response-lost retry twice, so a crash must fail the run closed.
+    assert "Restart=no" in unit
+    assert "Restart=on-failure" not in unit
     assert "NoNewPrivileges=no" in unit
     assert "MemoryDenyWriteExecute=no" in unit
     assert "Delegate=cpu memory pids" in unit

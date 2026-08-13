@@ -31,6 +31,39 @@ GRACE_MINUTES="${GRACE_MINUTES:-10}"  # never tear down this soon after start (s
 ONCE=0
 if [ "${1:-}" = "--once" ]; then ONCE=1; fi
 
+# Two paid pods can share one network volume.  Keep every durable watchdog
+# write in a pod-specific namespace by default so their logs and evacuation
+# snapshots cannot append to or overwrite each other.  Explicit overrides are
+# accepted only as normalized absolute paths.
+validate_safe_absolute_path() {
+  local value="$1" label="$2"
+  case "$value" in
+    /*) ;;
+    *) echo "FATAL: $label must be an absolute path" >&2; exit 1 ;;
+  esac
+  case "$value" in
+    /|*//*|*/../*|*/..|*/./*|*/.|*$'\n'*|*$'\r'*)
+      echo "FATAL: $label must be normalized (not /, and no //, . or .. components/newlines)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+POD_LOG_NAMESPACE=""
+if [ -n "${RUNPOD_POD_ID:-}" ]; then
+  case "$RUNPOD_POD_ID" in
+    *[!A-Za-z0-9]*)
+      echo "FATAL: RUNPOD_POD_ID contains unsafe path characters" >&2
+      exit 1
+      ;;
+  esac
+  POD_LOG_NAMESPACE="/$RUNPOD_POD_ID"
+fi
+LOG="${POD_IDLE_LOG:-/workspace/logs${POD_LOG_NAMESPACE}/pod_idle_stop.log}"
+EVAC_ROOT="${POD_IDLE_EVAC_ROOT:-/workspace/logs/evacuation${POD_LOG_NAMESPACE}}"
+validate_safe_absolute_path "$LOG" POD_IDLE_LOG
+validate_safe_absolute_path "$EVAC_ROOT" POD_IDLE_EVAC_ROOT
+
 # Bounding comes FIRST, before anything else in this script touches /workspace:
 # the very first writes are the log-path setup below, and an unbounded mkdir or
 # touch against a sick NFS volume wedges the watchdog in uninterruptible sleep
@@ -56,10 +89,10 @@ run_bounded() {
 # a timeout is treated exactly like a permission failure and falls back to the
 # container disk, so a stalled volume costs us the durable log, never the
 # watchdog itself.
-LOG=/workspace/logs/pod_idle_stop.log
 LOG_FALLBACK=0
 LOG_WARN=""
-if ! run_bounded 15 mkdir -p /workspace/logs 2>/dev/null \
+LOG_DIR="${LOG%/*}"
+if ! run_bounded 15 mkdir -p "$LOG_DIR" 2>/dev/null \
    || ! run_bounded 15 touch "$LOG" 2>/dev/null; then
   LOG=/root/pod_idle_stop.log
   LOG_FALLBACK=1
@@ -252,6 +285,106 @@ is_busy() {
   BUSY_REASON=""
   local pids
 
+  # A reconnecting remote-job wrapper owns cold provisioning before pod_run.sh
+  # becomes one of the ordinary trainer process forms below.  Trust its marker
+  # only when the file and live Linux process have an exact, root-owned identity.
+  # A stale regular marker is removed by the same bounded helper after an inode
+  # recheck; unsafe symlinks/ownership/modes are ignored and never unlinked.
+  local remote_job_marker=""
+  remote_job_marker="$(run_bounded 10 python3 -B - <<'PY' 2>/dev/null || true
+import json
+import os
+import stat
+
+path = "/root/palaestra_remote_job_busy.json"
+try:
+    before = os.lstat(path)
+except FileNotFoundError:
+    raise SystemExit(0)
+except OSError:
+    print("UNSAFE")
+    raise SystemExit(0)
+
+safe_file = (
+    stat.S_ISREG(before.st_mode)
+    and not stat.S_ISLNK(before.st_mode)
+    and before.st_uid == 0
+    and stat.S_IMODE(before.st_mode) == 0o600
+)
+if not safe_file:
+    print("UNSAFE")
+    raise SystemExit(0)
+
+try:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            print("UNSAFE")
+            raise SystemExit(0)
+        raw = os.read(fd, 65537)
+        if len(raw) > 65536 or os.read(fd, 1):
+            raise ValueError("oversized")
+    finally:
+        os.close(fd)
+    def strict_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+    marker = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
+    if not isinstance(marker, dict) or set(marker) != {"format", "pid", "pgid", "start_ticks"}:
+        raise ValueError("shape")
+    if marker["format"] != "palaestra.runpod-remote-job-pid.v1":
+        raise ValueError("format")
+    if any(isinstance(marker[key], bool) or not isinstance(marker[key], int) for key in ("pid", "pgid", "start_ticks")):
+        raise ValueError("types")
+    pid = marker["pid"]
+    if pid <= 1 or marker["pgid"] != pid or marker["start_ticks"] < 0:
+        raise ValueError("identity")
+    with open("/proc/%d/stat" % pid, "rb") as handle:
+        proc = handle.read(65537).decode("utf-8")
+    close = proc.rfind(")")
+    fields = proc[close + 2:].split()
+    if close < 0 or len(fields) < 20:
+        raise ValueError("proc")
+    live = (
+        fields[0] != "Z"
+        and int(fields[2]) == pid
+        and int(fields[3]) == pid
+        and int(fields[19]) == marker["start_ticks"]
+    )
+except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, UnicodeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    live = False
+
+if live:
+    print("BUSY:%d" % pid)
+else:
+    try:
+        current = os.lstat(path)
+        if (
+            stat.S_ISREG(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and current.st_uid == 0
+            and stat.S_IMODE(current.st_mode) == 0o600
+            and (current.st_dev, current.st_ino) == (before.st_dev, before.st_ino)
+        ):
+            os.unlink(path)
+    except OSError:
+        pass
+    print("STALE")
+PY
+)"
+  case "$remote_job_marker" in
+    BUSY:*)
+      BUSY_REASON="exact remote-job wrapper identity (pid ${remote_job_marker#BUSY:})"
+      return 0
+      ;;
+  esac
+
   # (a) trainer / eval entrypoints in every form they are actually launched:
   #     the module form (`python -m infra.run_debate`), the DIRECT FILE PATH
   #     form (`$PY infra/run_debate.py`), which matches no module pattern and
@@ -430,7 +563,7 @@ evacuate() {
   # step files restart at step-00000.jsonl on every run, so a second evacuation
   # would silently overwrite the first run's transcripts file-for-file while the
   # log still reported success. Timestamped, nothing can clobber anything.
-  EVAC_DIR="/workspace/logs/evacuation/$(date -u +%Y%m%dT%H%M%SZ)"
+  EVAC_DIR="$EVAC_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
   log "evacuating /root artifacts to $EVAC_DIR (the stop wipes the container disk)"
   if ! run_bounded 15 mkdir -p "$EVAC_DIR" 2>/dev/null; then
     log "WARNING: could not create $EVAC_DIR within 15s (is /workspace mounted, writable and responding?); evacuation will fail"

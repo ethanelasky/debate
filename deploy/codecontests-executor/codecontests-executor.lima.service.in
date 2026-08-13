@@ -16,8 +16,11 @@ Environment=CODECONTESTS_EXECUTOR_HMAC_KEY_FILE=%d/hmac-key
 EnvironmentFile=@CONFIG_ROOT@/environment
 LoadCredential=bearer:@CONFIG_ROOT@/bearer
 LoadCredential=hmac-key:@CONFIG_ROOT@/hmac-key
-Restart=on-failure
-RestartSec=2
+# The signed request replay cache is intentionally process-local.  Restarting
+# this service would discard that cache and could execute a request again after
+# the client lost its first response.  Fail closed and require a fresh,
+# re-attested deployment instead.
+Restart=no
 TimeoutStartSec=600
 TimeoutStopSec=15
 KillMode=control-group

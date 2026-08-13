@@ -1565,6 +1565,51 @@ class SandboxSupervisor:
         except subprocess.TimeoutExpired:
             self._kill_process_group(proc, signal.SIGKILL)
 
+    def _finish_runtime_boundary(
+        self,
+        *,
+        proc: subprocess.Popen[bytes],
+        request_cgroup: _RequestCgroup | None,
+        cgroup_attested: bool,
+        container_id: str,
+        owned_inventory: dict[int, _ProcessIdentity],
+    ) -> dict[int, _ProcessIdentity]:
+        if request_cgroup is not None and cgroup_attested and owned_inventory:
+            # Freeze before delivering any signal.  Signalling runsc first can
+            # make a still-live helper reparent while retaining its exact
+            # PID/starttime token, which correctly looks like ancestry drift
+            # to the terminal inventory check even though the verifier itself
+            # induced the transition.
+            self._set_cgroup_frozen(request_cgroup.outer, frozen=True)
+            runtime_inventory = self._attest_later_runtime_cgroup(
+                proc_pid=proc.pid,
+                request_cgroup=request_cgroup,
+                container_id=container_id,
+                initial_inventory=owned_inventory,
+            )
+            owned_inventory = self._merge_owned_inventories(
+                owned_inventory,
+                runtime_inventory,
+            )
+            self._write_cgroup_control(
+                os.path.join(request_cgroup.outer, "cgroup.kill"), "1"
+            )
+        else:
+            # Before READY/frozen-cgroup attestation, retain the original
+            # process-group termination path; no trusted cgroup boundary is
+            # available to replace it.
+            self._terminate_process_group(proc)
+
+        # Belt-and-suspenders cleanup for failures before frozen cgroup
+        # attestation and for any helper still sharing the original group.
+        self._kill_process_group(proc, signal.SIGKILL)
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=self.config.termination_grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+        return owned_inventory
+
     @staticmethod
     def _read_capped(
         stream: Any,
@@ -1597,7 +1642,6 @@ class SandboxSupervisor:
                 if len(capture.data) > cap:
                     capture.exceeded = True
                     stop_event.set()
-                    SandboxSupervisor._kill_process_group(proc, signal.SIGTERM)
                     return
         except (OSError, SupervisorConfigurationError) as exc:
             capture.error = type(exc).__name__
@@ -2018,47 +2062,29 @@ class SandboxSupervisor:
                     ):
                         aggregate_cpu_expired = True
                         cpu_cross_usage_us = current_cpu_us
-                        self._terminate_process_group(proc)
                         break
                 current_time = time.monotonic()
                 if not cgroup_attested:
                     remaining = ready_deadline - current_time
                     if remaining <= 0:
                         ready_expired = True
-                        self._terminate_process_group(proc)
                         break
                 else:
                     assert candidate_deadline is not None
                     remaining = candidate_deadline - current_time
                 if remaining <= 0:
                     wall_expired = True
-                    self._terminate_process_group(proc)
                     break
                 if stop_event.wait(timeout=min(0.01, remaining)):
-                    self._terminate_process_group(proc)
                     break
 
-            # At the second boundary, freeze the exact host helper inventory
-            # again before teardown.  Killing the whole cgroup avoids relying
-            # on a process group that an unexpected helper could have left.
-            if request_cgroup is not None and cgroup_attested and owned_inventory:
-                self._set_cgroup_frozen(request_cgroup.outer, frozen=True)
-                runtime_inventory = self._attest_later_runtime_cgroup(
-                    proc_pid=proc.pid,
-                    request_cgroup=request_cgroup,
-                    container_id=container_id,
-                    initial_inventory=owned_inventory,
-                )
-                owned_inventory = self._merge_owned_inventories(
-                    owned_inventory,
-                    runtime_inventory,
-                )
-                self._write_cgroup_control(
-                    os.path.join(request_cgroup.outer, "cgroup.kill"), "1"
-                )
-            # Also kill the original process group as a belt-and-suspenders
-            # cleanup for failures before frozen cgroup attestation.
-            self._kill_process_group(proc, signal.SIGKILL)
+            owned_inventory = self._finish_runtime_boundary(
+                proc=proc,
+                request_cgroup=request_cgroup,
+                cgroup_attested=cgroup_attested,
+                container_id=container_id,
+                owned_inventory=owned_inventory,
+            )
             # A controller that exits before its private READY marker leaves
             # the input writer blocked on this gate.  Release it before the
             # bounded joins so that the writer can observe the closed pipe;

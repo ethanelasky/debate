@@ -95,6 +95,7 @@ def _config(
     tmp_path: Path,
     *,
     trainer: tuple[str, ...] = ("/usr/bin/true",),
+    trainer_cancel: tuple[str, ...] = ("/usr/bin/true",),
     transport_cleanup: tuple[str, ...] = ("/usr/bin/true",),
     evacuate: tuple[str, ...] | None = None,
     verify: tuple[str, ...] | None = None,
@@ -106,6 +107,7 @@ def _config(
     return supervisor.SupervisorConfig(
         pod_id=POD_ID,
         trainer=trainer,
+        trainer_cancel=trainer_cancel,
         transport_cleanup=transport_cleanup,
         evacuate=evacuate or default_evac,
         verify=verify or default_verify,
@@ -113,6 +115,7 @@ def _config(
         post_delete_reachability_probe=post_delete_probe,
         event_log=tmp_path / "lifecycle.jsonl",
         trainer_timeout_seconds=2,
+        trainer_cancel_timeout_seconds=2,
         transport_cleanup_timeout_seconds=2,
         evacuation_timeout_seconds=2,
         verification_timeout_seconds=2,
@@ -145,7 +148,8 @@ def test_success_evacuates_verifies_then_deletes_exact_owned_id(tmp_path: Path) 
     assert calls == [["audit"], ["delete", POD_ID], ["audit"]]
     events = _events(tmp_path)
     names = [event["event"] for event in events]
-    assert names.index("trainer_finished") < names.index("transport_cleanup_started")
+    assert names.index("trainer_finished") < names.index("trainer_cancel_started")
+    assert names.index("trainer_cancel_finished") < names.index("transport_cleanup_started")
     assert names.index("transport_cleanup_finished") < names.index("evacuation_started")
     assert names.index("evacuation_finished") < names.index(
         "artifact_verification_started"
@@ -157,6 +161,7 @@ def test_success_evacuates_verifies_then_deletes_exact_owned_id(tmp_path: Path) 
     assert events[-1]["pod_absent"] is True
     assert events[-1]["contradictory_reachability"] is False
     assert events[-1]["transport_cleaned"] is True
+    assert events[-1]["remote_cancelled"] is True
     assert "emergency_evacuation_started" not in names
 
 
@@ -193,6 +198,78 @@ def test_transport_cleanup_failure_is_recorded_but_never_pins_paid_compute(
     assert result == supervisor.EXIT_INTERNAL
     assert (tmp_path / "deleted").exists()
     assert _events(tmp_path)[-1]["transport_cleaned"] is False
+
+
+def test_cancel_failure_makes_artifacts_uncertain_but_still_deletes(
+    tmp_path: Path,
+) -> None:
+    fake_safe = _fake_safe(tmp_path)
+    config = _config(tmp_path, trainer_cancel=("/usr/bin/false",))
+
+    result = supervisor.supervise(config, safe_wrapper=fake_safe)
+
+    assert result == supervisor.EXIT_ARTIFACT_UNCERTAIN
+    assert (tmp_path / "deleted").exists()
+    events = _events(tmp_path)
+    names = [event["event"] for event in events]
+    assert names.index("trainer_cancel_finished") < names.index("evacuation_started")
+    assert names.index("evacuation_finished") < names.index("safe_delete_attempt")
+    assert events[-1]["remote_cancelled"] is False
+    assert events[-1]["pod_absent"] is True
+
+
+def test_cancel_timeout_still_evacuates_and_deletes(tmp_path: Path) -> None:
+    fake_safe = _fake_safe(tmp_path)
+    config = _config(tmp_path, trainer_cancel=("/bin/sleep", "10"))
+    config = supervisor.SupervisorConfig(
+        **{**config.__dict__, "trainer_cancel_timeout_seconds": 0.05}
+    )
+
+    result = supervisor.supervise(config, safe_wrapper=fake_safe)
+
+    assert result == supervisor.EXIT_ARTIFACT_UNCERTAIN
+    assert (tmp_path / "deleted").exists()
+    cancel = next(
+        event for event in _events(tmp_path) if event["event"] == "trainer_cancel_finished"
+    )
+    assert cancel["timed_out"] is True
+    assert _events(tmp_path)[-1]["remote_cancelled"] is False
+
+
+def test_trainer_timeout_runs_cancel_before_evacuation_and_returns_timeout(
+    tmp_path: Path,
+) -> None:
+    fake_safe = _fake_safe(tmp_path)
+    cancel_marker = tmp_path / "cancel-ran"
+    config = _config(
+        tmp_path,
+        trainer=("/bin/sleep", "10"),
+        trainer_cancel=("/usr/bin/touch", str(cancel_marker)),
+    )
+    config = supervisor.SupervisorConfig(
+        **{**config.__dict__, "trainer_timeout_seconds": 0.05}
+    )
+
+    result = supervisor.supervise(config, safe_wrapper=fake_safe)
+
+    assert result == 124
+    assert cancel_marker.exists()
+    assert (tmp_path / "deleted").exists()
+    names = [event["event"] for event in _events(tmp_path)]
+    assert names.index("trainer_finished") < names.index("trainer_cancel_started")
+    assert names.index("trainer_cancel_finished") < names.index("evacuation_started")
+
+
+def test_delete_unproven_takes_precedence_over_cancel_failure(tmp_path: Path) -> None:
+    fake_safe = _fake_safe(tmp_path, delete_fails=True)
+    config = _config(tmp_path, trainer_cancel=("/usr/bin/false",))
+
+    result = supervisor.supervise(config, safe_wrapper=fake_safe)
+
+    assert result == supervisor.EXIT_DELETE_UNPROVEN
+    final = _events(tmp_path)[-1]
+    assert final["remote_cancelled"] is False
+    assert final["pod_absent"] is False
 
 
 def test_timed_out_evacuation_is_killed_and_cannot_prevent_delete(
@@ -236,6 +313,9 @@ def test_signal_interrupts_trainer_but_cleanup_and_delete_still_run(
     final = _events(tmp_path)[-1]
     assert final["deferred_signals"] == [signal.SIGTERM]
     assert final["pod_absent"] is True
+    names = [event["event"] for event in _events(tmp_path)]
+    assert names.index("trainer_interrupted") < names.index("trainer_cancel_started")
+    assert names.index("trainer_cancel_finished") < names.index("evacuation_started")
 
 
 def test_failed_delete_is_retried_and_never_claimed_absent(tmp_path: Path) -> None:
@@ -299,7 +379,7 @@ def test_cleanup_budget_must_reserve_bounded_delete_and_probe_time(
     fake_safe = _fake_safe(tmp_path)
     config = _config(tmp_path)
     config = supervisor.SupervisorConfig(
-        **{**config.__dict__, "cleanup_deadline_seconds": 58}
+        **{**config.__dict__, "cleanup_deadline_seconds": 60}
     )
 
     with pytest.raises(supervisor.SupervisorError, match="positive evacuation time"):

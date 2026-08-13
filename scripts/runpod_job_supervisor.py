@@ -57,6 +57,7 @@ class CommandResult:
 class SupervisorConfig:
     pod_id: str
     trainer: tuple[str, ...]
+    trainer_cancel: tuple[str, ...]
     transport_cleanup: tuple[str, ...]
     evacuate: tuple[str, ...]
     verify: tuple[str, ...]
@@ -64,6 +65,7 @@ class SupervisorConfig:
     post_delete_reachability_probe: tuple[str, ...]
     event_log: Path
     trainer_timeout_seconds: float
+    trainer_cancel_timeout_seconds: float
     transport_cleanup_timeout_seconds: float
     evacuation_timeout_seconds: float
     verification_timeout_seconds: float
@@ -383,11 +385,13 @@ def supervise(config: SupervisorConfig, *, safe_wrapper: Path = SAFE_WRAPPER) ->
             * PROCESS_TERMINATION_GRACE_SECONDS
         )
     )
-    if config.cleanup_deadline_seconds <= delete_reserve_seconds:
+    if config.cleanup_deadline_seconds <= (
+        delete_reserve_seconds + config.trainer_cancel_timeout_seconds
+    ):
         raise SupervisorError(
             "cleanup deadline must leave positive evacuation time after reserving "
-            "all delete attempts, final audit, reachability probe, process shutdown, "
-            "and retry delays"
+            "trainer cancellation, all delete attempts, final audit, reachability "
+            "probe, process shutdown, and retry delays"
         )
 
     log = EventLog(config.event_log)
@@ -459,7 +463,22 @@ def supervise(config: SupervisorConfig, *, safe_wrapper: Path = SAFE_WRAPPER) ->
         cleanup_deadline = cleanup_started_at + config.cleanup_deadline_seconds
         predelete_deadline = cleanup_deadline - delete_reserve_seconds
         artifact_certain = False
+        remote_cancelled = False
         transport_cleaned = False
+        try:
+            trainer_cancel_result = _run_work_command(
+                config.trainer_cancel,
+                timeout_seconds=_remaining_timeout(
+                    predelete_deadline,
+                    config.trainer_cancel_timeout_seconds,
+                ),
+                pod_id=config.pod_id,
+                log=log,
+                phase="trainer_cancel",
+            )
+            remote_cancelled = trainer_cancel_result.returncode == 0
+        except subprocess.TimeoutExpired:
+            log.emit("trainer_cancel_skipped", reason="cleanup_deadline")
         try:
             transport_cleanup_result = _run_work_command(
                 config.transport_cleanup,
@@ -497,7 +516,9 @@ def supervise(config: SupervisorConfig, *, safe_wrapper: Path = SAFE_WRAPPER) ->
                     log=log,
                     phase="artifact_verification",
                 )
-                artifact_certain = verification_result.returncode == 0
+                artifact_certain = (
+                    remote_cancelled and verification_result.returncode == 0
+                )
         except subprocess.TimeoutExpired:
             log.emit("primary_artifact_path_skipped", reason="cleanup_deadline")
 
@@ -580,6 +601,7 @@ def supervise(config: SupervisorConfig, *, safe_wrapper: Path = SAFE_WRAPPER) ->
             pod_absent=absent,
             contradictory_reachability=contradictory_reachability,
             reachability_probe_conclusive=reachability_probe_conclusive,
+            remote_cancelled=remote_cancelled,
             transport_cleaned=transport_cleaned,
             deferred_signals=deferred_signals,
         )
@@ -621,6 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pod-id", required=True)
     parser.add_argument("--trainer-command-json", required=True)
+    parser.add_argument("--trainer-cancel-command-json", required=True)
     parser.add_argument("--transport-cleanup-command-json", required=True)
     parser.add_argument("--evacuate-command-json", required=True)
     parser.add_argument("--verify-command-json", required=True)
@@ -629,6 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--event-log", type=Path, required=True)
     parser.add_argument(
         "--trainer-timeout-seconds", type=_positive_float, required=True
+    )
+    parser.add_argument(
+        "--trainer-cancel-timeout-seconds", type=_positive_float, required=True
     )
     parser.add_argument(
         "--transport-cleanup-timeout-seconds", type=_positive_float, default=60
@@ -662,6 +688,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = SupervisorConfig(
             pod_id=args.pod_id,
             trainer=_parse_command(args.trainer_command_json, label="trainer command"),
+            trainer_cancel=_parse_command(
+                args.trainer_cancel_command_json,
+                label="trainer cancel command",
+            ),
             transport_cleanup=_parse_command(
                 args.transport_cleanup_command_json,
                 label="transport cleanup command",
@@ -680,6 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             event_log=args.event_log,
             trainer_timeout_seconds=args.trainer_timeout_seconds,
+            trainer_cancel_timeout_seconds=args.trainer_cancel_timeout_seconds,
             transport_cleanup_timeout_seconds=args.transport_cleanup_timeout_seconds,
             evacuation_timeout_seconds=args.evacuation_timeout_seconds,
             verification_timeout_seconds=args.verification_timeout_seconds,

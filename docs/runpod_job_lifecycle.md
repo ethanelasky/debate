@@ -5,11 +5,13 @@ training run. It accepts only an exact `runpod-safe`-owned Pod ID and performs:
 
 1. ownership audit;
 2. bounded trainer command;
-3. tunnel-supervisor shutdown;
-4. bounded evacuation and checksum verification (plus a bounded emergency
+3. explicit Pod-side trainer cancellation and proof that its exact private
+   process group has stopped;
+4. tunnel-supervisor shutdown;
+5. bounded evacuation and checksum verification (plus a bounded emergency
    evacuation attempt if either fails);
-5. `/opt/homebrew/bin/runpod-safe delete <exact-pod-id>` with bounded retries;
-6. final ownership audit and an independent, bounded endpoint-reachability
+6. `/opt/homebrew/bin/runpod-safe delete <exact-pod-id>` with bounded retries;
+7. final ownership audit and an independent, bounded endpoint-reachability
    probe.
 
 All command values are JSON argv arrays, not shell strings. Every executable
@@ -27,10 +29,13 @@ lease covers the full trainer timeout, the full cleanup deadline, and a
 30-second host/provider clock-skew margin. Missing, timezone-naive, malformed,
 expired, or undersized deadlines are launch blockers.
 
-The cleanup deadline reserves the worst-case configured time for every delete
-attempt, retry delay, final audit, reachability probe, and local process-group
-termination before allocating any time to evacuation. This keeps a hung copy or
-checksum command from consuming the deletion window.
+The cleanup deadline reserves the worst-case configured time for trainer
+cancellation, every delete attempt, retry delay, final audit, reachability
+probe, and local process-group termination before allocating any time to
+evacuation. This keeps a hung copy or checksum command from consuming the
+deletion window. If exact remote cancellation cannot be proven, evacuation is
+still attempted and the Pod is still deleted, but the artifacts are reported
+uncertain because they may have changed during the copy.
 
 For a launchd-managed verifier tunnel, the transport-cleanup argv is:
 
@@ -51,6 +56,75 @@ unverified artifacts after deletion, `72` when deletion is not independently
 proven, and `73` when transport cleanup fails. Otherwise the supervisor returns
 the trainer status (including `124` for a trainer timeout). Any nonzero status
 requires operator review of the JSONL event log.
+
+## Reconnecting remote trainer owner
+
+Do not use a raw SSH command as the lifecycle supervisor's trainer command. If
+the host network drops, SSH can return 255 while the Pod-side trainer remains
+healthy; interpreting that as trainer exit would evacuate and delete a live
+run. Use `scripts/runpod_remote_job.py` instead.
+
+Stage one foreground launch script on the Pod, compute its SHA-256 locally,
+and create a mode-0600 config like this (the state directory's parent must
+already exist on the Pod):
+
+```json
+{
+  "format": "palaestra.runpod-remote-job.v1",
+  "job_id": "cc-cap1024-RUN_ID",
+  "ssh_argv": [
+    "/usr/bin/ssh", "-T",
+    "-o", "BatchMode=yes",
+    "-o", "IdentitiesOnly=yes",
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", "UserKnownHostsFile=/ABSOLUTE/RUN/known_hosts",
+    "-o", "ConnectTimeout=8",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ControlMaster=no",
+    "-o", "ControlPath=none",
+    "-o", "RequestTTY=no",
+    "-i", "/ABSOLUTE/RUN/trainer_ed25519",
+    "-p", "RUNPOD_SSH_PORT",
+    "root@RUNPOD_HOST"
+  ],
+  "remote_state_dir": "/workspace/run-control/cc-cap1024-RUN_ID",
+  "remote_launch_script": "/root/run-control/cc-cap1024-RUN_ID/launch.sh",
+  "launch_script_sha256": "LOWERCASE_SHA256",
+  "poll_interval_seconds": 10,
+  "outage_timeout_seconds": 600,
+  "ssh_command_timeout_seconds": 30,
+  "initialization_timeout_seconds": 30,
+  "cancel_timeout_seconds": 10
+}
+```
+
+The normal lifecycle trainer argv is:
+
+```text
+["/usr/bin/python3","/absolute/repo/scripts/runpod_remote_job.py","--config","/absolute/run-control/remote-job.json","--mode","start-and-monitor"]
+```
+
+The lifecycle trainer-cancel argv uses the same config and `--mode cancel`.
+Configure the supervisor's `--trainer-cancel-timeout-seconds` longer than the
+remote config's `cancel_timeout_seconds` plus its bounded SSH-command timeout.
+
+The remote state directory is the atomic single-start marker. An uncertain
+start response is retried safely, but an existing marker is never launched a
+second time. The detached wrapper records its exact PID/start time, streams the
+launcher's output to `launch.log`, and atomically writes `rc`. Polling verifies
+the staged launch-script digest every time. A continuous SSH outage is tolerated
+up to `outage_timeout_seconds`; a dead wrapper without `rc` fails loudly. The
+supervisor then invokes exact cancellation, which inventories the recorded
+private session and uses Linux pidfds to stop surviving Bash/trainer descendants
+without signalling a reused numeric PID. Cancellation remains available if the
+staged script path was replaced or removed after launch.
+
+`--mode start-only` is available for a separately supervised setup phase, and
+`--mode monitor` never starts missing work. The latter can be used as the
+lifecycle trainer command only when the exact atomic state was already created
+and the server TTL still covers the lifecycle supervisor's full trainer and
+cleanup budgets. The launch script itself must remain foreground until training
+and its final artifact sync are complete.
 
 Set the trainer timeout and the server-side Pod TTL from the run estimate plus
 setup, evacuation, and debugging margin. Keep the cleanup deadline shorter than
@@ -79,7 +153,8 @@ paid training.
 ## Offline tests
 
 ```sh
-.venv/bin/python -m pytest -q tests/test_runpod_job_supervisor.py
+.venv/bin/python -m pytest -q \
+  tests/test_runpod_job_supervisor.py tests/test_runpod_remote_job.py
 ```
 
 The tests use fake commands and a fake safe wrapper. They create, stop, and

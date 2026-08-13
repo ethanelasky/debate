@@ -670,6 +670,134 @@ def test_cleanup_recursively_kills_without_thawing(
     assert not outer.exists()
 
 
+def test_attested_terminal_boundary_freezes_and_attests_before_signalling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer = tmp_path / "outer"
+    controller = outer / "controller"
+    candidate = outer / "candidate"
+    controller.mkdir(parents=True)
+    candidate.mkdir()
+    request_cgroup = _RequestCgroup(
+        outer=str(outer),
+        controller=str(controller),
+        candidate=str(candidate),
+        oci_path="requests/test/candidate",
+        memory_events_before={},
+        pids_events_before={},
+        outer_controllers=frozenset({"cpu", "memory", "pids"}),
+    )
+    identity = _ProcessIdentity(10, 1, 10, 10, 100)
+    events: list[tuple[object, ...]] = []
+
+    class FakeProcess:
+        pid = 10
+
+        @staticmethod
+        def poll() -> int:
+            return -signal.SIGKILL
+
+    supervisor = object.__new__(SandboxSupervisor)
+    supervisor.config = SandboxExecutorConfig(termination_grace_seconds=0.01)
+    monkeypatch.setattr(
+        supervisor,
+        "_set_cgroup_frozen",
+        lambda path, *, frozen: events.append(("freeze", path, frozen)),
+    )
+
+    def attest(**kwargs):  # type: ignore[no-untyped-def]
+        events.append(("attest", kwargs["proc_pid"], kwargs["container_id"]))
+        return {identity.pid: identity}
+
+    monkeypatch.setattr(supervisor, "_attest_later_runtime_cgroup", attest)
+    monkeypatch.setattr(
+        supervisor,
+        "_write_cgroup_control",
+        lambda path, value: events.append(("write", path, value)),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_process_group",
+        lambda _proc: pytest.fail("attested runtime was terminated before freeze"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_kill_process_group",
+        lambda _proc, sig: events.append(("signal", sig)),
+    )
+
+    retained = supervisor._finish_runtime_boundary(
+        proc=FakeProcess(),  # type: ignore[arg-type]
+        request_cgroup=request_cgroup,
+        cgroup_attested=True,
+        container_id="cc-test",
+        owned_inventory={identity.pid: identity},
+    )
+
+    assert retained == {identity.pid: identity}
+    assert events == [
+        ("freeze", str(outer), True),
+        ("attest", 10, "cc-test"),
+        ("write", str(outer / "cgroup.kill"), "1"),
+        ("signal", signal.SIGKILL),
+    ]
+
+
+def test_unattested_terminal_boundary_preserves_process_group_termination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    request_cgroup = _RequestCgroup(
+        outer="/test/outer",
+        controller="/test/outer/controller",
+        candidate="/test/outer/candidate",
+        oci_path="requests/test/candidate",
+        memory_events_before={},
+        pids_events_before={},
+        outer_controllers=frozenset({"cpu", "memory", "pids"}),
+    )
+
+    class FakeProcess:
+        pid = 10
+
+        @staticmethod
+        def poll() -> int:
+            return -signal.SIGTERM
+
+    supervisor = object.__new__(SandboxSupervisor)
+    supervisor.config = SandboxExecutorConfig(termination_grace_seconds=0.01)
+    monkeypatch.setattr(
+        supervisor,
+        "_terminate_process_group",
+        lambda _proc: events.append(("terminate", signal.SIGTERM)),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_set_cgroup_frozen",
+        lambda *_args, **_kwargs: pytest.fail("unattested runtime was frozen"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_kill_process_group",
+        lambda _proc, sig: events.append(("signal", sig)),
+    )
+
+    retained = supervisor._finish_runtime_boundary(
+        proc=FakeProcess(),  # type: ignore[arg-type]
+        request_cgroup=request_cgroup,
+        cgroup_attested=False,
+        container_id="cc-test",
+        owned_inventory={},
+    )
+
+    assert retained == {}
+    assert events == [
+        ("terminate", signal.SIGTERM),
+        ("signal", signal.SIGKILL),
+    ]
+
+
 def test_trusted_guest_cpu_status_must_cross_the_exact_budget():
     effective = _request()["task"]["limits"]["effective"]
     marker = b"ready\n"
