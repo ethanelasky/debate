@@ -415,7 +415,7 @@ def test_source_protocol_identity_and_task_meta_are_exact(monkeypatch):
     assert identity["math_verify_version"] == "0.9.0"
     assert identity["extraction_protocol"] == "math-symbolic-visible-answer-v2"
     assert identity["grading_protocol"] == "math-verify-latex-v2"
-    assert identity["worker_protocol"] == "math-verify-worker-v2"
+    assert identity["worker_protocol"] == "math-verify-worker-v3"
     assert identity["canonicalization_protocol"] == "math-symbolic-exact-canonicalization-v1"
     assert json.loads(identity["canonicalizations"]) == [
         [raw, canonical] for raw, canonical in EXACT_CANONICALIZATIONS

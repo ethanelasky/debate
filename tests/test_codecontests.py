@@ -965,7 +965,7 @@ def test_protocol_identity_is_stable_compact_and_resolved(tmp_path):
     identity = first.protocol_identity()
 
     assert identity == second.protocol_identity()
-    assert identity["grading_protocol"] == "codecontests_fresh_process_per_case_v2"
+    assert identity["grading_protocol"] == "codecontests_fresh_process_per_case_v3"
     assert identity["train_source_path"] == str(train.resolve())
     assert identity["eval_source_path"] == str(test.resolve())
     assert identity["train_manifest_path"] == str(manifest.resolve())

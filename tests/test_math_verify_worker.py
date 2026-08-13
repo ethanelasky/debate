@@ -392,7 +392,7 @@ def test_source_does_not_enable_free_form_expression_parsing():
 
 
 def test_public_protocol_constants_are_immutable_and_versioned():
-    assert MATH_VERIFY_WORKER_PROTOCOL == "math-verify-worker-v2"
+    assert MATH_VERIFY_WORKER_PROTOCOL == "math-verify-worker-v3"
     assert CANONICALIZATION_PROTOCOL == "math-symbolic-exact-canonicalization-v1"
     assert EXACT_CANONICALIZATIONS == (
         (r"\approx 8.24 \text{ mph}", "8.24"),

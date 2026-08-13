@@ -1210,7 +1210,7 @@ class CodeContestsFamily(TaskFamily):
         train_manifest = _manifest_for(train_path)
         eval_manifest = _manifest_for(eval_path)
         self._protocol_identity = {
-            "grading_protocol": "codecontests_fresh_process_per_case_v2",
+            "grading_protocol": "codecontests_fresh_process_per_case_v3",
             "train_source_path": str(train_path),
             "eval_source_path": str(eval_path),
             "eval_source_kind": eval_source_kind,

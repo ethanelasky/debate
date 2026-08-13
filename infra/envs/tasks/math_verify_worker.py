@@ -23,7 +23,7 @@ from infra.envs.tasks.base import GraderInfrastructureError
 
 
 _PROTOCOL_VERSION = 2
-MATH_VERIFY_WORKER_PROTOCOL = "math-verify-worker-v2"
+MATH_VERIFY_WORKER_PROTOCOL = "math-verify-worker-v3"
 CANONICALIZATION_PROTOCOL = "math-symbolic-exact-canonicalization-v1"
 _MAX_EXPRESSION_BYTES = 64 * 1024
 _MAX_MESSAGE_BYTES = 16 * 1024 * 1024
