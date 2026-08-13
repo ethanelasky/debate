@@ -5,31 +5,38 @@ from infra.run_debate import split_agents, validate_experiment, validate_trained
 
 def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
     debate = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo_l5_g8_nocot")
-    arm = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo32think_grpo_os3")
-    live = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_grpo_os3")
+    arm = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo32think_cispo_os3")
+    live = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32think_cispo_os3")
 
     validate_experiment(arm)
     trained, frozen = split_agents(arm)
     validate_trained_seats(trained, arm["training"])
 
-    # Debate semantics are inherited byte-for-byte from the latest completed
-    # debate. Protocol.compile() is ordered, so this also locks serial stages.
-    for key in ("protocol", "prompt_config", "fresh_positions", "plan_tokens", "scoring"):
+    # Debate semantics inherit from the latest completed debate — EXCEPT the
+    # protocol, which is think-native for this arm (2026-08-12): native
+    # <think> replaces scratchpad/plan turns, and the solo-opening flag
+    # requires solution-first. The slot asserts below pin its exact shape.
+    for key in ("prompt_config", "fresh_positions", "plan_tokens", "scoring"):
         assert arm[key] == debate[key]
     assert arm["dataset"] == debate["dataset"]
     slots = [(s.speaker, s.slot.name, s.slot.max_total_tokens) for s in Protocol.parse(arm["protocol"]).compile()]
+    # Think-native protocol (2026-08-12): native <think> replaces every
+    # scratchpad/plan turn; solution-first is REQUIRED by
+    # first_speech_non_debate_aware.
     assert slots == [
-        ("alice", "plan", 1000),
-        ("alice", "proposal", 2000),
-        ("bob", "scratchpad", 500),
-        ("bob", "critique", 500),
-        ("alice", "scratchpad", 500),
-        ("alice", "defense", 500),
-        ("bob", "scratchpad", 500),
-        ("bob", "rebuttal", 500),
+        ("alice", "proposal", 1500),
+        ("bob", "critique", 1500),
+        ("alice", "defense", 1500),
+        ("bob", "rebuttal", 1500),
         ("judge", "deliberation", 1000),
         ("judge", "verdict", 256),
     ]
+    think_caps = [
+        (s.speaker, s.slot.max_think_tokens)
+        for s in Protocol.parse(arm["protocol"]).compile()
+        if s.speaker != "judge"
+    ]
+    assert think_caps == [("alice", 1000), ("bob", 1000), ("alice", 1000), ("bob", 1000)]
 
     assert set(trained) == {"alice", "bob"}
     assert {s.model_file_path for s in trained.values()} == {"allenai/Olmo-3-32B-Think-DPO"}
