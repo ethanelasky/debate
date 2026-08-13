@@ -240,6 +240,7 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     rlvr = load_experiment(path, "cs285_mathhard_cispo")
     debate = load_experiment(path, "cs285_mathhard_debate_cispo")
     validate_experiment(debate)
+    assert debate["scoring"]["shaping"][0]["flag"] == "strict_boxed"
 
     # Choice-style blind opening: the trained proposal renders under the task
     # source's own messages, sharing the RLVR arm's prompt distribution.

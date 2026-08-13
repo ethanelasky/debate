@@ -60,7 +60,7 @@ math_pc_olmo_l5:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
   training:
     backend: verl
@@ -166,7 +166,7 @@ math_pc_olmo_l5_g8:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
   training:
     backend: verl
@@ -273,7 +273,7 @@ math_pc_olmo32think_cispo_os3:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math_nocot.yaml}
   training:
     backend: verl
@@ -380,7 +380,7 @@ aime_pc_olmo32_cispo_os2:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
   dataset: {type: aime, seed: 0}
   training:
     backend: verl

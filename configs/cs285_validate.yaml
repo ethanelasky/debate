@@ -197,7 +197,7 @@ cs285_mathhard_debate_cispo:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math.yaml}
   training:
     backend: verl

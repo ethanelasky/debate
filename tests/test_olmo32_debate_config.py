@@ -101,6 +101,7 @@ def test_olmo32_instruct_aime_debate_twin():
     assert arm["dataset"] == live["dataset"]
     assert arm["plan_tokens"] == live["plan_tokens"]
     assert arm["first_speech_non_debate_aware"] is True
+    assert arm["scoring"]["shaping"][0]["flag"] == "strict_boxed"
 
     compiled = Protocol.parse(arm["protocol"]).compile()
     slots = [(s.speaker, s.slot.name, s.slot.max_total_tokens) for s in compiled]
