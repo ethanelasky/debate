@@ -83,3 +83,63 @@ def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
     assert verl["response_length"] == 2048
     assert verl["max_token_len_per_gpu"] == 16384
     assert verl["extra_overrides"] == live["training"]["verl"]["extra_overrides"]
+
+
+def test_olmo32_instruct_aime_debate_twin():
+    """The AIME instruct debate arm is the debate twin of the live instruct
+    RLVR arm: same optimizer recipe, same dataset/eval shape, think budgets
+    gone (no think channel on the instruct model). Throughput deviations
+    (Ethan, 2026-08-13) are pinned explicitly below."""
+    arm = load_experiment("configs/math_pc_olmo.yaml", "aime_pc_olmo32_cispo_os2")
+    think = load_experiment("configs/math_pc_olmo.yaml", "math_pc_olmo32think_cispo_os3")
+    live = load_experiment("configs/math_rlvr_olmo.yaml", "aime_rlvr_olmo32_plan1k_cispo_os3")
+
+    validate_experiment(arm)
+    trained, frozen = split_agents(arm)
+    validate_trained_seats(trained, arm["training"])
+
+    assert arm["dataset"] == live["dataset"]
+    assert arm["plan_tokens"] == live["plan_tokens"]
+    assert arm["first_speech_non_debate_aware"] is True
+
+    compiled = Protocol.parse(arm["protocol"]).compile()
+    slots = [(s.speaker, s.slot.name, s.slot.max_total_tokens) for s in compiled]
+    # Think-arm totals except the 300-token rebuttal (throughput: the closing
+    # speech responds to the defense, it does not re-derive).
+    assert slots == [
+        ("alice", "proposal", 1500),
+        ("bob", "critique", 1500),
+        ("alice", "defense", 1500),
+        ("bob", "rebuttal", 300),
+        ("judge", "deliberation", 1000),
+        ("judge", "verdict", 256),
+    ]
+    assert all(s.slot.max_think_tokens is None for s in compiled)
+
+    assert set(trained) == {"alice", "bob"}
+    assert {s.model_file_path for s in trained.values()} == {"/workspace/models/olmo32-bf16"}
+    assert all(not s.enable_thinking for s in trained.values())
+    assert frozen["judge"].model_file_path == "Qwen/Qwen3.5-4B"
+
+    # oversample_factor deliberately NOT in this set: the debate arm runs 2
+    # against the twin's 3 (first steps showed 0-6 degenerates per 192
+    # debates — the third draw was waste).
+    same_training = {
+        "lora_rank", "loss", "ppo_epochs", "adv_length_norm", "batch_size",
+        "group_size", "lr", "kl_coef", "kl_discount_factor", "eval_every",
+        "eval_n", "save_every", "dynamic_sampling_retries",
+        "kl_mechanism", "drop_zero_advantage", "eval_split", "final_test_eval",
+        "warmup_steps", "lr_schedule", "min_lr_ratio",
+    }
+    assert {k: arm["training"][k] for k in same_training} == {
+        k: live["training"][k] for k in same_training
+    }
+    assert arm["training"]["oversample_factor"] == 2
+
+    # Engine shapes match the think debate arm except the rollout allocation:
+    # 0.45 (more KV for 192 concurrent debates) vs the conservative 0.33.
+    arm_verl = dict(arm["training"]["verl"])
+    think_verl = dict(think["training"]["verl"])
+    assert arm_verl.pop("gpu_memory_utilization") == 0.45
+    assert think_verl.pop("gpu_memory_utilization") == 0.33
+    assert arm_verl == think_verl

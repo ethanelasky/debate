@@ -135,9 +135,14 @@ cs285_mathhard_cispo:
 #     ratio (the RLVR runner has a recompute seam that DebateEnv forbids)
 #   - reward is continuous competitive judge confidence (+ the same 0.1
 #     strict-boxed proposal shaping), not MathEnv correctness
-#   - four trained 512-token speech slots per debate; the 3584-token prompt
-#     window plus 512-token response exactly respects Qwen2.5-Math's 4096-token
-#     context while covering the cumulative transcript without engine truncation
+#   - trained slots: 512-token proposal (the RLVR answer shape) + 384-token
+#     critique/defense/rebuttal. NOT 4x512: the full-pool render scan
+#     (2026-08-13, chat-template tokens, speeches at cap) puts the worst
+#     rebuttal context at 3760 with 512s — the run DIED there at step 30 —
+#     vs 3505 with 384s, under the 3584 guard with zero overflows in 2289
+#     rows. Judge deliberation 384 for the same window: the parity judge
+#     still overflows on 26/2289 rows (1.1%) at verdict — those debates fail
+#     gracefully and oversample backfills; the direct eval never sees a judge.
 # Everything under `training` otherwise mirrors the validated CISPO arm.
 # Run (1xB200):
 #   CONFIG=configs/cs285_validate.yaml bash scripts/pod_run.sh debate cs285_mathhard_debate_cispo
@@ -145,15 +150,20 @@ cs285_mathhard_debate_cispo:
   protocol:
     turns:
       - alice: [{name: proposal, kind: solution, max_total_tokens: 512}]
-      - bob:   [{name: critique, max_total_tokens: 512}]
-      - alice: [{name: defense, max_total_tokens: 512}]
-      - bob:   [{name: rebuttal, max_total_tokens: 512}]
-      - judge: [{name: deliberation, visibility: private, max_total_tokens: 512},
+      - bob:   [{name: critique, max_total_tokens: 384}]
+      - alice: [{name: defense, max_total_tokens: 384}]
+      - bob:   [{name: rebuttal, max_total_tokens: 384}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 384},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
     file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
+  # Blind/solo opening ("choice"-style, matching the MB choice arms and the
+  # olmo think debate arm): slot 0 renders the task source's own messages
+  # verbatim, so the trained opening shares the RLVR arm's prompt distribution
+  # exactly; the debate framing starts at bob's critique.
+  first_speech_non_debate_aware: true
   agents:
     alice:
       trained: true
@@ -170,9 +180,15 @@ cs285_mathhard_debate_cispo:
         alias: critic-bob
         sampling: {train: {temperature: 1.0, top_p: 1.0}}
     judge:
+      # Judge-debater parity (Ethan, 2026-08-12): the frozen judge is the SAME
+      # base model as the trained debaters. Its 4096-token position limit
+      # forces JUDGE_MAX_LEN=4096 at launch (pod_run.sh serves 16384 by
+      # default), and the verdict context can exceed 4096 on the longest
+      # problems (framing + problem up to ~1.4k + 4x512 speeches + 512
+      # deliberation) — those rows fail at the judge and oversample backfills.
       model_settings:
         model_type: local
-        model_file_path: Qwen/Qwen3.5-4B
+        model_file_path: Qwen/Qwen2.5-Math-1.5B-Instruct
         alias: judge
         base_url: http://127.0.0.1:8788/v1
         sampling: {train: {temperature: 1.0, top_p: 1.0}}
@@ -181,7 +197,7 @@ cs285_mathhard_debate_cispo:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math.yaml}
   training:
     backend: verl
@@ -215,3 +231,8 @@ cs285_mathhard_debate_cispo:
     eval_n: 512
     eval_max_tokens: 512
     save_every: 100
+    # Backfill degenerate debates (unparseable opening answer) instead of
+    # training on a short batch — same setting as the olmo think debate arm.
+    # Known deviation from the validated RLVR twin (Ethan, 2026-08-12).
+    dynamic_sampling_retries: 0
+    oversample_factor: 3

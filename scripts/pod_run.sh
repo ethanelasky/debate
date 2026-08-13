@@ -461,9 +461,12 @@ finally:
   # a V0-era engine behaves the same): the judge's verdict context strictly
   # extends its deliberation context, and debate transcripts share long
   # byte-stable prefixes. Reuse rides the existing 0.18 KV pool via LRU.
+  # JUDGE_MAX_LEN: 16384 fits every judge served so far, but vLLM refuses to
+  # boot when it exceeds the model's own position limit — a 4096-ctx judge
+  # (Qwen2.5-Math parity arms) needs JUDGE_MAX_LEN=4096 at launch.
   setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$JUDGE_MODEL" --port "$JUDGE_PORT" \
-    --gpu-memory-utilization 0.18 --max-model-len 16384 \
+    --gpu-memory-utilization 0.18 --max-model-len "${JUDGE_MAX_LEN:-16384}" \
     --max-num-seqs 32 --enable-prefix-caching \
     > /root/judge_server.log 2>&1 9>&- &   # 9>&-: do not inherit the launch lock
   JUDGE_PID=$!
