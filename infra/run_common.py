@@ -11,13 +11,14 @@ or task families.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
+from infra import legacy_olmo_bf16
 from infra.backend.base import LossSpec
 
 
@@ -140,6 +141,7 @@ CANONICAL_OLMO32_REPO = "allenai/Olmo-3.1-32B-Instruct-DPO"
 CANONICAL_OLMO32_REVISION = "fc84a4f699916fcf585aa54371f47897fa934d5c"
 CANONICAL_BF16_CONVERTER = "hf-safetensors-floating-to-bfloat16-v1"
 CANONICAL_BF16_MARKER = ".bf16-conversion.json"
+AUDITED_LEGACY_OLMO32_MODEL = legacy_olmo_bf16.AUDITED_MODEL_PATH
 
 
 def _artifact_json(path: Path, label: str) -> dict:
@@ -180,24 +182,28 @@ def validate_local_policy_artifact(
     model: str,
     *,
     canonical_olmo32_path: str = CANONICAL_OLMO32_MODEL,
+    audited_legacy_olmo32_path: str = AUDITED_LEGACY_OLMO32_MODEL,
     canonical_size_range: tuple[int, int] = (55_000_000_000, 75_000_000_000),
 ) -> str:
     """Fail closed on incomplete local model artifacts before backend startup.
 
     Generic local checkpoints retain the historical config + indexed/unindexed
-    weight check.  The canonical OLMo-32B path is stronger: it is produced by
-    ``convert_hf_safetensors_bf16.py``, so its final marker is the commit point.
-    Requiring and checking that marker prevents a hard-killed conversion from
-    looking launchable merely because all weight shards and config exist.
+    weight check. The canonical OLMo-32B paths are stronger. The primary path
+    requires the converter's commit marker. The distinct legacy-audited path
+    requires a byte-complete manifest plus pinned tensor-layout validation; it
+    makes no claim that the legacy bytes came from the primary converter.
     """
 
     if not os.path.isabs(model):
         return model
     root = Path(os.path.abspath(model))
     canonical_root = Path(os.path.abspath(canonical_olmo32_path))
+    legacy_root = Path(os.path.abspath(audited_legacy_olmo32_path))
     root_resolved = root.resolve(strict=False)
     canonical_resolved = canonical_root.resolve(strict=False)
+    legacy_resolved = legacy_root.resolve(strict=False)
     targets_canonical = root == canonical_root or root_resolved == canonical_resolved
+    targets_legacy = root == legacy_root or root_resolved == legacy_resolved
     if targets_canonical and (
         root != canonical_root
         or root_resolved != canonical_resolved
@@ -208,6 +214,16 @@ def validate_local_policy_artifact(
             f"canonical OLMo artifact {model!r} must use the exact non-symlink path "
             f"{canonical_olmo32_path!r}; aliases and symlink components are refused"
         )
+    if targets_legacy and (
+        root != legacy_root
+        or root_resolved != legacy_resolved
+        or root_resolved != root
+        or legacy_resolved != legacy_root
+    ):
+        raise ValueError(
+            f"audited legacy OLMo artifact {model!r} must use the exact non-symlink path "
+            f"{audited_legacy_olmo32_path!r}; aliases and symlink components are refused"
+        )
     config_path = root / "config.json"
     if not root.is_dir() or not config_path.is_file():
         raise ValueError(
@@ -215,6 +231,13 @@ def validate_local_policy_artifact(
             "attach the volume containing the pinned model rather than falling back to HF"
         )
     model_config = _artifact_json(config_path, "local policy config")
+
+    if targets_legacy:
+        try:
+            legacy_olmo_bf16.validate_audited_artifact(root)
+        except legacy_olmo_bf16.LegacyArtifactError as exc:
+            raise ValueError(f"audited legacy OLMo artifact {model!r} is invalid: {exc}") from exc
+        return model
 
     if not targets_canonical:
         indices = [

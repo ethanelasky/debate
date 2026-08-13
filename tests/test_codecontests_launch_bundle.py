@@ -33,7 +33,7 @@ from scripts.convert_hf_safetensors_bf16 import convert_repository
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "codecontests_rlvr_olmo.yaml"
 TOPOLOGIES = ROOT / "configs" / "topologies.yaml"
-MODEL_ARTIFACT = "/workspace/models/olmo32-bf16"
+MODEL_ARTIFACT = "/workspace/models/olmo32-bf16-legacy-audited-fc84a4f"
 
 CAP_ARMS = {
     1024: {

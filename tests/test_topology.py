@@ -93,6 +93,16 @@ def test_apply_topology_concatenates_extra_overrides():
     assert apply_topology(arm, topo)["extra_overrides"] == ["++a=1", "++b=2"]
 
 
+def test_b200x2_preloads_base_and_syncs_only_layered_lora():
+    import yaml
+
+    with open(rc.TOPOLOGY_FILE) as fh:
+        table = yaml.safe_load(fh)
+    overrides = table["2xB200"]["extra_overrides"]
+    assert "actor_rollout_ref.rollout.load_format=safetensors" in overrides
+    assert "actor_rollout_ref.rollout.layered_summon=true" in overrides
+
+
 def test_apply_topology_empty_topology_is_identity():
     arm = {"n_gpus": 2, "extra_overrides": ["++a=1"]}
     assert apply_topology(dict(arm), {}) == arm

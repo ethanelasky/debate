@@ -145,13 +145,13 @@ codecontests_rlvr_olmo_long:
 # completions came from, so the short budget's evidence does not apply here.
 codecontests_rlvr_olmo31_32b:
   _extends: codecontests_rlvr_olmo
-  # Same canonical, run-validated local artifact as the AIME 32B campaign:
-  # allenai/Olmo-3.1-32B-Instruct-DPO @ fc84a4f, shard-streaming converted
-  # from the upstream repo's 121GB fp32 weights to 61GB bf16. The bare HF repo
-  # silently OOM-killed TP2 rollout workers; pod_run.sh preflights this local
-  # directory, model family, bf16-sized shard set and every index reference
-  # before launch. That is a completeness/size check, not a content checksum.
-  model: /workspace/models/olmo32-bf16
+  # The shared pre-marker BF16 artifact is never modified or mislabeled as a
+  # product of the newer converter. Before launch, audit its weights into this
+  # distinct hardlinked snapshot and write a pinned BF16 runtime config there;
+  # the shared source stays untouched. Preflight then re-hashes every byte and
+  # checks all 707 tensor names, BF16 dtypes, shapes and offsets against pinned
+  # revision fc84a4f. See scripts/audit_legacy_olmo_bf16.py.
+  model: /workspace/models/olmo32-bf16-legacy-audited-fc84a4f
   max_completion_tokens: 8192
   dataset:
     soft_token_budget: 4096
