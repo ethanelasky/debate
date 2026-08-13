@@ -136,10 +136,6 @@ def test_olmo32_instruct_aime_debate_twin():
     }
     assert arm["training"]["oversample_factor"] == 2
 
-    # Engine shapes match the think debate arm except the rollout allocation:
-    # 0.45 (more KV for 192 concurrent debates) vs the conservative 0.33.
-    arm_verl = dict(arm["training"]["verl"])
-    think_verl = dict(think["training"]["verl"])
-    assert arm_verl.pop("gpu_memory_utilization") == 0.45
-    assert think_verl.pop("gpu_memory_utilization") == 0.33
-    assert arm_verl == think_verl
+    # Engine shapes identical to the think debate arm's, including the
+    # judge-safe 0.33 rollout allocation (0.45 died on a vLLM scheduler bug).
+    assert arm["training"]["verl"] == think["training"]["verl"]

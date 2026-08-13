@@ -332,10 +332,10 @@ math_pc_olmo32think_cispo_os3:
 #     direct-eval shape (plan 1k, answer cap inherited 1000)
 #   - THROUGHPUT deviations from the twin (Ethan, 2026-08-13, ~20min/step was
 #     too slow): oversample 2 not 3 (first steps showed 0-6 degenerates per
-#     192 debates — the third draw was waste) and rollout gmu 0.45 not 0.33
-#     (more KV for 192 concurrent debates; the 0.18 judge still colocates on
-#     GPU 0 — if vLLM refuses to boot on the free-memory check, step this
-#     down before touching anything else).
+#     192 debates — the third draw was waste) and a 300-token rebuttal.
+#     gmu stays 0.33: the 0.45 attempt (run 0j24zfrk) died in step 1 on a
+#     vLLM 0.24 scheduler KeyError (req_id_to_index) — the only engine knob
+#     that changed; 0.33 has ~19 crash-free debate steps behind it.
 aime_pc_olmo32_cispo_os2:
   protocol:
     turns:
@@ -414,7 +414,7 @@ aime_pc_olmo32_cispo_os2:
       strategy: fsdp2
       rollout_tp: 2
       checkpoint_dir: /workspace/checkpoints
-      gpu_memory_utilization: 0.45
+      gpu_memory_utilization: 0.33
       prompt_length: 8192
       response_length: 2048
       max_token_len_per_gpu: 16384
