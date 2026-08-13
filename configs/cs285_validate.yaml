@@ -38,27 +38,17 @@
 #     [-10, 10] (gradient zeroed past delta ~2.6). Compound effect ~1.3-1.9x
 #     their pull — watch loss/kl_loss; drop kl_coef toward 0.032 only if it
 #     runs hot vs the reference curve.
-cs285_mathhard_grpo:
-  model: Qwen/Qwen2.5-Math-1.5B-Instruct
-  temperature: 0.8
-  top_p: 0.95
-  max_completion_tokens: 512
-  min_completion_tokens: 8     # hw4 run script's --min_new_tokens 8
-  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_hw4.yaml}
+# Shared optimizer/loop for every arm below. Only `training:` — the RLVR
+# experiment-level keys (model / temperature / top_p / max|min_completion_tokens)
+# are absent from run_debate's EXPERIMENT_KEYS and would fail validate_experiment.
+# `loss` stays per-arm.
+_cs285_recipe:
   training:
     backend: verl
     verl:
-      # n_gpus / rollout_tp / gpu_memory_utilization come from the 1xB200
-      # topology entry (configs/topologies.yaml).
-      # NOT 768: the level-5 pools carry a 1397-token max rendered prompt
-      # (31 train rows / 3 eval rows above 512). hw4 left-truncates in
-      # training and applies NO cap at eval; our guard hard-errors instead,
-      # so 768 dies deterministically at the step-0 eval. 1536 covers the
-      # longest row — eval matches hw4 exactly; the 31 truncated-by-them
-      # train rows we keep whole (diff-sample audit, 2026-08-11).
-      prompt_length: 1536
+      # n_gpus / rollout_tp / gpu_memory_utilization come from the topology
+      # entry (configs/topologies.yaml).
       response_length: 512
-      max_token_len_per_gpu: 8192
       checkpoint_dir: /workspace/checkpoints
       extra_overrides:
         # clip_grad, not actor.grad_clip: the FSDP engine clips with
@@ -81,7 +71,6 @@ cs285_mathhard_grpo:
     # lora_alpha = 2*rank = 32, matching. Also: kl_coef > 0 REQUIRES LoRA on
     # our verl path (ref_logprobs raises without it).
     lora_rank: 16
-    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
     ppo_epochs: 2
     # micro_batch is load-bearing beyond step count: _pack stamps
     # global_batch_size per forward_backward CALL, so a smaller micro_batch
@@ -108,6 +97,26 @@ cs285_mathhard_grpo:
     eval_max_tokens: 512
     save_every: 100
 
+cs285_mathhard_grpo:
+  _extends: _cs285_recipe
+  model: Qwen/Qwen2.5-Math-1.5B-Instruct
+  temperature: 0.8
+  top_p: 0.95
+  max_completion_tokens: 512
+  min_completion_tokens: 8     # hw4 run script's --min_new_tokens 8
+  dataset: {type: math, levels: 5, seed: 0, prompt_file: infra/prompts/tasks/math_hw4.yaml}
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
+    verl:
+      # NOT 768: the level-5 pools carry a 1397-token max rendered prompt
+      # (31 train rows / 3 eval rows above 512). hw4 left-truncates in
+      # training and applies NO cap at eval; our guard hard-errors instead,
+      # so 768 dies deterministically at the step-0 eval. 1536 covers the
+      # longest row — eval matches hw4 exactly; the 31 truncated-by-them
+      # train rows we keep whole (diff-sample audit, 2026-08-11).
+      prompt_length: 1536
+      max_token_len_per_gpu: 8192
+
 # Same run, CISPO loss (asymmetric DAPO-style bounds, our campaign setting).
 # Everything else identical — the controlled algorithm comparison Ethan asked
 # for ("see if our choice of algorithm also works").
@@ -115,6 +124,23 @@ cs285_mathhard_cispo:
   _extends: cs285_mathhard_grpo
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+
+# GSPO twin: sequence-level IS with paper-scale bounds; only the loss changes.
+cs285_mathhard_gspo:
+  _extends: cs285_mathhard_grpo
+  training:
+    loss: {kind: gspo, clip_low: 0.9997, clip_high: 1.0004}
+
+# DAPO twin, per the aime_rlvr_olmo32_dapo translation: clip-higher, no KL,
+# dynamic sampling (retry cap 5). Overlong shaping still omitted.
+cs285_mathhard_dapo:
+  _extends: cs285_mathhard_grpo
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.0
+    # inert at coef 0; the base's `loss` mechanism refuses a zero coefficient
+    kl_mechanism: advantage
+    dynamic_sampling_retries: 5
 
 
 # Debate-reward twin of cs285_mathhard_cispo (Ethan, 2026-08-11). Keep the
@@ -134,19 +160,21 @@ cs285_mathhard_cispo:
 #     logprobs anchor CISPO, so tempered/truncated sampling would corrupt the
 #     ratio (the RLVR runner has a recompute seam that DebateEnv forbids)
 #   - reward is continuous competitive judge confidence (+ the same 0.1
-#     answer-format proposal shaping), not MathEnv correctness
+#     strict-boxed proposal shaping), not MathEnv correctness
 #   - trained slots: 512-token proposal (the RLVR answer shape) + 300-token
 #     critique/defense/rebuttal. NOT 4x512: the full-pool render scan
 #     (2026-08-13, chat-template tokens, speeches at cap) puts the worst
 #     rebuttal context at 3760 with 512s — the run DIED there at step 30 —
-#     vs 3253 with 300s, under the 3584 guard with zero overflows in 2289
-#     rows. Judge deliberation 384 for the same window: the parity judge
+#     under the 3584 guard with zero overflows in 2289 rows at the shorter
+#     budget. Judge deliberation 384 for the same window: the parity judge
 #     still overflows on 26/2289 rows (1.1%) at verdict — those debates fail
 #     gracefully and oversample backfills; the direct eval never sees a judge.
-# Everything under `training` otherwise mirrors the validated CISPO arm.
-# Run (1xB200):
+# `training` inherits _cs285_recipe; only loss, the verl shapes, and
+# oversampling are set here.
+# Run (1xH200; the RLVR twins ran 1xB200):
 #   CONFIG=configs/cs285_validate.yaml bash scripts/pod_run.sh debate cs285_mathhard_debate_cispo
 cs285_mathhard_debate_cispo:
+  _extends: _cs285_recipe
   protocol:
     turns:
       - alice: [{name: proposal, kind: solution, max_total_tokens: 512}]
@@ -160,9 +188,10 @@ cs285_mathhard_debate_cispo:
     entry: math_proposer_critic
   fresh_positions: true
   # Blind/solo opening ("choice"-style, matching the MB choice arms and the
-  # olmo think debate arm): slot 0 renders the task source's own messages
-  # verbatim, so the trained opening shares the RLVR arm's prompt distribution
-  # exactly; the debate framing starts at bob's critique.
+  # olmo think debate arm): slot 0 renders this arm's task source messages
+  # verbatim, with alice's system prompt and preamble suppressed
+  # (prompts.py solo_slot0). Slot 0 only — alice's later `defense` is fully
+  # debate-aware. Debate framing starts at bob's critique.
   first_speech_non_debate_aware: true
   agents:
     alice:
@@ -200,37 +229,13 @@ cs285_mathhard_debate_cispo:
       - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math.yaml}
   training:
-    backend: verl
-    verl:
-      prompt_length: 3584
-      response_length: 512
-      max_token_len_per_gpu: 4096
-      checkpoint_dir: /workspace/checkpoints
-      extra_overrides:
-        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
-        - "++actor_rollout_ref.actor.optim.weight_decay=0.0"
-        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
-    wandb_entity: palaestra-research
-    wandb_project: debate-math
-    lora_rank: 16
+    # must match cs285_mathhard_cispo (pinned by tests/test_cs285_parity.py)
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
-    ppo_epochs: 2
-    micro_batch: 64
-    warmup_steps: 100
-    adv_length_norm: none
-    adv_population_std: true
-    drop_zero_advantage: false
-    kl_mechanism: loss
-    steps: 501
-    batch_size: 8
-    group_size: 8
-    lr: 3.0e-5
-    kl_coef: 0.05
-    kl_discount_factor: 0.0
-    eval_every: 100
-    eval_n: 512
-    eval_max_tokens: 512
-    save_every: 100
+    verl:
+      # 3584 + 512 = 4096 = max_token_len_per_gpu: one worst-case sequence per
+      # forward/backward pass.
+      prompt_length: 3584
+      max_token_len_per_gpu: 4096
     # Backfill degenerate debates (unparseable opening answer) instead of
     # training on a short batch — same setting as the olmo think debate arm.
     # Known deviation from the validated RLVR twin (Ethan, 2026-08-12).

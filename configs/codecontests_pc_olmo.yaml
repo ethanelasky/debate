@@ -34,8 +34,10 @@
 # bottom exists to check them before a 100-step run: if verl reports truncation,
 # raise prompt_length first, then max_token_len_per_gpu, then drop
 # gpu_memory_utilization.
+_includes: [_olmo_training.yaml]
 
 codecontests_pc_olmo:
+  _extends: _olmo_train_codecontests
   protocol:
     turns:
       - alice: [{name: scratchpad, visibility: private, max_total_tokens: 1024},
@@ -104,40 +106,15 @@ codecontests_pc_olmo:
     # per eval, 20 times over a 100-step run.
     timeout_seconds: 10
   training:
-    backend: verl
     verl:
       n_gpus: 1                      # H100/A100-80GB: 7B LoRA FSDP + colocated vllm + judge server
-      strategy: fsdp2                # needs the modeling_olmo3 rope patch (provision_pod.sh)
-      checkpoint_dir: /workspace/checkpoints
       gpu_memory_utilization: 0.33   # judge 0.18 + rollout 0.33 + 7B FSDP init peak must fit 80GB
       prompt_length: 12288           # see sizing note above (MATH needs 8192)
       response_length: 1536          # largest slot cap (the proposal)
       max_token_len_per_gpu: 16384   # >= prompt_length + response_length
-    # The TEAM, not the api key's personal default entity — without this,
-    # runs land in whoever launched them's own namespace and the rest of
-    # the team cannot see them.
-    wandb_entity: palaestra-research
-    wandb_project: debate-rebuild
-    lora_rank: 32
-    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
-    ppo_epochs: 1
-    adv_length_norm: count
-    steps: 100
-    batch_size: 8
-    group_size: 4
-    lr: 1.0e-5
-    kl_coef: 0.02
-    kl_discount_factor: 0.0
     # RLVR eval: greedy CodeContestsEnv pass-rate on the held-out split, which
     # RUNS THE VERIFIER (unlike math's, which just parses a number).
-    eval_every: 5
-    # The whole held-out split. Only 116 rows survive filtering, so a larger
-    # eval_n changes nothing — and +-4.6pp binomial noise at n=116 means small
-    # trends here are not callable. Read it as a floor/ceiling check, not a
-    # sensitive metric.
-    eval_n: 116
     eval_max_tokens: 1536
-    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
 # Tiny live-verification arm: proves the pod path end to end (judge server,
 # verifier subprocesses, verl sizing) before committing to a real run.

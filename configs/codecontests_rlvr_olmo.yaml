@@ -11,8 +11,10 @@
 # byte-for-byte rather than shipped.
 #
 # Run (on the pod): scripts/pod_run.sh rlvr codecontests_rlvr_olmo_smoke
+_includes: [_olmo_training.yaml]
 
 codecontests_rlvr_olmo:
+  _extends: _olmo_train_codecontests
   model: allenai/Olmo-3-7B-Instruct-DPO
   max_completion_tokens: 2048
   dataset:
@@ -57,10 +59,8 @@ codecontests_rlvr_olmo:
     soft_token_budget: 1536
     overshoot_penalty: 0.1
   training:
-    backend: verl
     verl:
       n_gpus: 1
-      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
       gpu_memory_utilization: 0.45 # no judge server here: rollout can take more than debate's 0.33
       # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
       # 1850 max, plus the answer-gen preamble.
@@ -70,29 +70,11 @@ codecontests_rlvr_olmo:
       # soft_token_budget would make the penalty dead config.
       response_length: 2048
       max_token_len_per_gpu: 8192    # >= prompt_length + response_length
-      checkpoint_dir: /workspace/checkpoints
-    # The TEAM, not the api key's personal default entity — without this,
-    # runs land in whoever launched them's own namespace and the rest of
-    # the team cannot see them.
-    wandb_entity: palaestra-research
-    wandb_project: debate-rebuild
-    lora_rank: 32
-    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
-    ppo_epochs: 1
-    adv_length_norm: count
-    steps: 100
     # 8x8 = 64 rollouts/step. verl micro-batches against max_token_len_per_gpu,
     # so batch size costs wall-clock, not peak memory; the 16x8 arm below is
     # the same run at double the rollouts. Base arm is the cheaper one.
     batch_size: 8
-    group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
-    lr: 1.0e-4
-    kl_coef: 0.02
-    kl_discount_factor: 0.0
-    eval_every: 5
-    eval_n: 256        # +-3.1pp binomial noise
     eval_max_tokens: 2048
-    save_every: 25
 
 # 1-step smoke: proves the whole path — dataset load, prompt render, rollout,
 # code extraction, subprocess verifier, reward, optimizer step — before
