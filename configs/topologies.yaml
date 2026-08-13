@@ -15,7 +15,7 @@
   rollout_tp: 1
   gpu_memory_utilization: 0.42
 
-# Validated: qwen2.5 judge-probe, 3 debate steps + colocated judge (2026-08-13).
+# Validated: judge-probe smoke (2026-08-13).
 1xH200:
   n_gpus: 1
   rollout_tp: 1

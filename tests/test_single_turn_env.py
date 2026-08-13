@@ -127,12 +127,10 @@ def test_aggregate_reward_std_is_population_std():
     from infra.train import _aggregate
 
     env = ScoreByLength()
-    # rewards are len(text): [1, 3] -> mean 2, population std 1
     groups = env.rollout(env.tasks(1), _policy(["a", "ccc"]), group_size=2)
     out = _aggregate(groups[0], "train")
     assert out["train/reward_mean"] == 2.0
     assert out["train/reward_std"] == 1.0
-    # zero variance reads exactly 0.0 — the collapse signature
     same = env.rollout(env.tasks(1), _policy(["dd", "ee"]), group_size=2)
     assert _aggregate(same[0], "train")["train/reward_std"] == 0.0
 

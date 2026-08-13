@@ -282,10 +282,6 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
         for cs in env.protocol.compile()
         if cs.speaker in trained
     ]
-    # 512 proposal (RLVR answer shape) + 300 later speeches. History: 4x512
-    # overflows the 3584 prompt guard (worst rebuttal 3760; crashed u7oky38d
-    # step 30); 384s cleared it but left 26/2289 judge-verdict overflows;
-    # 300 (Ethan, 2026-08-13, judge-probe launch) trims verdict ctx ~252 more.
     assert trained_slots == [
         ("alice", "proposal", 512),
         ("bob", "critique", 300),

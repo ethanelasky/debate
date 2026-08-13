@@ -121,8 +121,6 @@ def _aggregate(trajs: list[Trajectory], prefix: str) -> dict[str, float]:
     mean_reward = sum(t.reward for t in trajs) / len(trajs)
     out: dict[str, float] = {
         f"{prefix}/reward_mean": mean_reward,
-        # Population std: in the uniform-reward collapse mode the variance
-        # dies before the mean moves.
         f"{prefix}/reward_std": (
             sum((t.reward - mean_reward) ** 2 for t in trajs) / len(trajs)
         )
@@ -486,7 +484,7 @@ def _train_with_logger(
         metrics.update(pack_stats)
 
         if datums:
-            from infra.rl.kl import apply_kl_penalty, entropy_proxy
+            from infra.rl.kl import apply_kl_penalty, entropy_proxy, ref_kl_metrics
 
             if cfg.sampling.temperature != 1.0 and hasattr(backend, "forward"):
                 # Tempered sampling breaks the ratio anchor: vLLM's returned
@@ -510,6 +508,7 @@ def _train_with_logger(
                 with ph("kl_ref_logprobs"):
                     for datum, lp in zip(datums, backend.ref_logprobs(datums)):
                         datum.ref_logprobs = lp
+                metrics.update(ref_kl_metrics(datums))
             elif cfg.kl_coef > 0:
                 # ref_logprobs is a FULL forward pass over every datum on the
                 # frozen base — the cost of kl_coef, and worth seeing separately.

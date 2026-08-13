@@ -149,8 +149,6 @@ cs285_mathhard_cispo:
 cs285_mathhard_debate_cispo:
   protocol:
     turns:
-      # Speeches 384 -> 300 (Ethan, 2026-08-13, judge-probe launch): trims the
-      # verdict context by ~252 tokens, shrinking the 26/2289 judge overflows.
       - alice: [{name: proposal, kind: solution, max_total_tokens: 512}]
       - bob:   [{name: critique, max_total_tokens: 300}]
       - alice: [{name: defense, max_total_tokens: 300}]

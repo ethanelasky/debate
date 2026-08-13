@@ -249,9 +249,7 @@ def _token_weighted_loss_means(per_micro: list[tuple[dict, int]]) -> dict[str, f
 
 
 def _effective_grad_clip(config) -> float:
-    """The emitted clip_grad can be overridden through extra_overrides, which
-    hydra appends last (last-wins), so the effective value must honor that
-    order rather than trusting config.grad_clip."""
+    """Last clip_grad in extra_overrides wins over config.grad_clip (hydra last-wins)."""
     for o in reversed(tuple(config.extra_overrides)):
         key, sep, val = str(o).partition("=")
         if sep and key.lstrip("+").endswith("actor.optim.clip_grad"):
@@ -260,11 +258,8 @@ def _effective_grad_clip(config) -> float:
 
 
 def _grad_norm_metrics(grad_norm: float, clip_norm: float) -> dict[str, float]:
-    """The engine reports the PRE-clip norm, and on a non-finite one it skips
-    the update entirely with only a worker-stdout WARN as a trace. clip_grad_
-    norm_ scales down to the threshold, so the post-clip norm is min(pre, clip);
-    when the norm is non-finite no update happened and there is no post-clip
-    value to report."""
+    """Engine reports the pre-clip norm; post-clip = min(pre, clip). Non-finite
+    means the engine skipped the update, so no post-clip value exists."""
     if not math.isfinite(grad_norm):
         return {"optim/nonfinite_grad_step": 1.0}
     return {
