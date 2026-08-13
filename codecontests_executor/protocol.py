@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 PROTOCOL_VERSION = "palaestra.codecontests.executor.v2"
-IMPLEMENTATION_VERSION = "3"
+IMPLEMENTATION_VERSION = "4"
 
 DEEP_MIND_SOURCE_URL = (
     "https://raw.githubusercontent.com/google-deepmind/code_contests/"
@@ -104,6 +104,16 @@ MAX_SOURCE_DURATION_NS = WALL_CEILING_NS
 # active slot, followed by a 5-second response-delivery margin.  This is not
 # added to the signed candidate wall-time limit enforced inside the sandbox.
 CLIENT_HTTP_OVERHEAD_SECONDS = 15
+# The reverse tunnel is supervised independently from the verifier client.  A
+# request whose response is lost must remain replayable while that supervisor
+# rides out a transient host-network outage.  This is deliberately finite and
+# is part of the frozen protocol policy rather than an open-ended client retry.
+TRANSPORT_RECOVERY_WINDOW_SECONDS = 180
+# A retry that begins just before the recovery deadline still needs bounded
+# time to re-attest and deliver the cached signed response.  Without this
+# explicit margin, max-wall execution plus max clock skew lands exactly on the
+# request-expiry/prune boundary.
+REPLAY_DELIVERY_MARGIN_SECONDS = 15
 MAX_INT64 = (1 << 63) - 1
 MAX_UINT64 = (1 << 64) - 1
 
@@ -116,8 +126,28 @@ MAX_REQUEST_BODY_BYTES = (
     4 * ((MAX_CODE_BYTES + 2) // 3) + 4 * ((MAX_STDIN_BYTES + 2) // 3) + (256 * 1024)
 )
 MAX_RESPONSE_BODY_BYTES = 6 * MIB
-MAX_REQUEST_TTL_NS = 180 * 1_000_000_000
 MAX_CLOCK_SKEW_NS = 30 * 1_000_000_000
+# A request is created only after initial identity attestation.  Its validity
+# covers one maximum execution, HTTP/queue overhead, a full tunnel-recovery
+# window after response loss, final replay delivery, and the permitted
+# client/server clock skew.
+DEFAULT_EXECUTE_REQUEST_TTL_NS = (
+    (
+        WALL_CEILING_NS // 1_000_000_000
+        + CLIENT_HTTP_OVERHEAD_SECONDS
+        + TRANSPORT_RECOVERY_WINDOW_SECONDS
+        + REPLAY_DELIVERY_MARGIN_SECONDS
+    )
+    * 1_000_000_000
+    + MAX_CLOCK_SKEW_NS
+)
+MAX_REQUEST_TTL_NS = DEFAULT_EXECUTE_REQUEST_TTL_NS
+# Completed responses remain available briefly beyond signed request expiry.
+# New work is never admitted from an expired request, but an exact authenticated
+# replay can still recover the response to work that already ran.
+REPLAY_CACHE_GRACE_NS = TRANSPORT_RECOVERY_WINDOW_SECONDS * 1_000_000_000
+REPLAY_CACHE_CAPACITY = 8192
+REPLAY_CACHE_BYTES = 256 * MIB
 
 CANDIDATE_FAILURE_CATEGORIES = frozenset(
     {
@@ -310,6 +340,12 @@ def limit_policy_identity() -> dict[str, Any]:
         "wall_ceiling_ns": WALL_CEILING_NS,
         "wall_clamp": "none; requests_above_ceiling_rejected",
         "client_http_overhead_seconds": CLIENT_HTTP_OVERHEAD_SECONDS,
+        "transport_recovery_window_seconds": TRANSPORT_RECOVERY_WINDOW_SECONDS,
+        "replay_delivery_margin_seconds": REPLAY_DELIVERY_MARGIN_SECONDS,
+        "execute_request_ttl_ns": DEFAULT_EXECUTE_REQUEST_TTL_NS,
+        "replay_cache_grace_ns": REPLAY_CACHE_GRACE_NS,
+        "replay_cache_capacity": REPLAY_CACHE_CAPACITY,
+        "replay_cache_bytes": REPLAY_CACHE_BYTES,
         "stdout_cap_bytes": STDOUT_CAP_BYTES,
         "stderr_cap_bytes": STDERR_CAP_BYTES,
         "file_size_cap_bytes": FILE_SIZE_CAP_BYTES,

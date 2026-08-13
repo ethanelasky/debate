@@ -254,6 +254,37 @@ def test_final_adapter_survives_final_verifier_failure():
     assert backend.saves == [("final", 1)]
 
 
+def test_periodic_eval_failure_keeps_exact_recovery_checkpoint():
+    backend = VersionedBackend()
+    env = VersionRecordingEnv(backend)
+    cfg = Config(
+        steps=3,
+        batch_size=1,
+        group_size=2,
+        eval_every=2,
+        eval_n=1,
+        # The ordinary save cadence is deliberately later than the failing
+        # first post-training eval, matching the 10-vs-25 production incident.
+        save_every=25,
+    )
+
+    def fail_at_second_eval(_env, _policy, _n, _split, _prefix):
+        if backend.version == 2:
+            raise RuntimeError("synthetic verifier infrastructure failure")
+        return {}
+
+    with (
+        mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None),
+        mock.patch.object(train_mod, "evaluate", fail_at_second_eval),
+        pytest.raises(RuntimeError, match="verifier infrastructure failure"),
+    ):
+        train(env, backend, cfg)
+
+    # step-00002 is the policy after exactly two completed rollout batches and
+    # is written before its evaluator can raise; no final save is reached.
+    assert backend.saves == [("step-00002", 2)]
+
+
 def test_final_save_sleeps_rollout_after_zero_datum_step():
     backend = VersionedBackend()
     env = VersionRecordingEnv(backend, degenerate_train=True)

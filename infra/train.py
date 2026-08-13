@@ -318,7 +318,18 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         # N completed rollout-batch steps. A step may contain zero optimizer
         # calls (all groups degenerate) or several (ppo_epochs > 1).
         top_metrics: dict[str, float] = {}
-        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
+        eval_due = bool(cfg.eval_every and step % cfg.eval_every == 0)
+        # A verifier/transport failure must invalidate the evaluation, not erase
+        # every optimizer update since the last coarse save interval. When
+        # checkpointing is enabled, each periodic evaluation point is therefore
+        # also a recovery point. Step 0 and a continuation's start_step are not
+        # re-saved: they have no new updates and may name the checkpoint loaded.
+        save_due = bool(
+            cfg.save_every
+            and step > cfg.start_step
+            and (step % cfg.save_every == 0 or eval_due)
+        )
+        if save_due:
             top_metrics["checkpoint_saved"] = 1.0
             with ph("save"):
                 backend.save(f"step-{step:05d}")
@@ -330,7 +341,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         # matching eval points, and N/K intervals yield N/K + 1 evals with
         # the last one at x = steps (after the loop). The engine was just
         # synced, so the eval serves the current weights.
-        if cfg.eval_every and step % cfg.eval_every == 0:
+        if eval_due:
             eval_policy = _eval_policy(policy, cfg)
             with ph("evaluate"):
                 prefix = "dev" if cfg.eval_split == "dev" else "eval"

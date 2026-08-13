@@ -98,6 +98,16 @@ def test_loader_keeps_rows_with_a_reward_suite(env):
     assert [r["name"] for r in env.test_rows] == ["sum", "echo", "no_truth"]
 
 
+def test_remote_env_uses_only_the_four_service_execution_workers(tmp_path, monkeypatch):
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+
+    remote_env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT)
+
+    assert remote_env.grade_workers == codecontests_module._MAX_CONCURRENT_REMOTE_VERIFIERS
+    assert remote_env.grade_workers == 4
+
+
 def test_split_off_test_rows_when_no_test_path(tmp_path):
     path = _write_jsonl(tmp_path / "train.jsonl", ROWS * 4)
     env = CodeContestsEnv(path=path, timeout_seconds=TIMEOUT)
@@ -390,6 +400,7 @@ def _remote_execution(
     error=None,
     stdout_truncated=False,
     stderr_truncated=False,
+    attested_service_total_ns=0,
 ):
     result_payload = None
     if outcome == "candidate_failure":
@@ -407,6 +418,7 @@ def _remote_execution(
         stderr=stderr,
         result_payload=result_payload,
         error=error,
+        attested_service_total_ns=attested_service_total_ns,
     )
 
 
@@ -490,6 +502,56 @@ def test_remote_client_import_is_lazy(monkeypatch):
     finally:
         codecontests_module._reset_sandbox_probe_for_tests()
     assert imported == [codecontests_module.__file__]
+
+
+def test_remote_grader_preflight_recovers_first_call_transport_outage(
+    install_remote_executor,
+):
+    from codecontests_executor.client import RemoteExecutorClient
+    from codecontests_executor.protocol import (
+        encode_envelope,
+        sign_payload,
+        static_identity,
+    )
+
+    key = b"h" * 32
+    bearer = b"b" * 32
+    identity = static_identity(
+        service_id="executor-preflight-test",
+        launcher_sha256="a" * 64,
+    )
+
+    class FirstCallOutageTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, **kwargs):  # type: ignore[no-untyped-def]
+            assert kwargs["method"] == "GET"
+            self.calls += 1
+            if self.calls <= 2:
+                raise ConnectionResetError("tunnel is still reconnecting")
+            return 200, encode_envelope(sign_payload(identity, key))
+
+    transport = FirstCallOutageTransport()
+    sleeps: list[float] = []
+    client = RemoteExecutorClient(
+        base_url="http://127.0.0.1:8787",
+        bearer_token=bearer,
+        hmac_key=key,
+        expected_identity=identity,
+        transport=transport,
+        transport_retries=2,
+        sleep=sleeps.append,
+    )
+    install_remote_executor(client)
+
+    codecontests_module.verify_code_execution_sandbox()
+    # The production singleton preflight caches only after the third, signed
+    # identity response succeeds.
+    codecontests_module.verify_code_execution_sandbox()
+
+    assert transport.calls == 3
+    assert sleeps == [1.0, 2.0]
 
 
 def test_remote_unknown_is_infrastructure_failure(install_remote_executor):
@@ -596,9 +658,15 @@ def test_remote_launch_attestation_retry_preserves_nearly_exhausted_budget(
     client = install_remote_executor(
         _FakeRemoteExecutor(
             [
-                _remote_execution(stdout=b"first\n"),
+                _remote_execution(
+                    stdout=b"first\n",
+                    attested_service_total_ns=8_500_000_000,
+                ),
                 _launch_attestation_unknown(),
-                _remote_execution(stdout=b"second\n"),
+                _remote_execution(
+                    stdout=b"second\n",
+                    attested_service_total_ns=1_400_000_000,
+                ),
             ],
             on_execute=advance,
         )
@@ -918,8 +986,12 @@ def test_remote_cases_receive_remaining_total_timeout_budget(
     client = install_remote_executor(
         _FakeRemoteExecutor(
             [
-                _remote_execution(stdout=b"one"),
-                _remote_execution(stdout=b"two"),
+                _remote_execution(
+                    stdout=b"one", attested_service_total_ns=3_200_000_000
+                ),
+                _remote_execution(
+                    stdout=b"two", attested_service_total_ns=3_200_000_000
+                ),
             ],
             on_execute=advance,
         )
@@ -951,7 +1023,14 @@ def test_remote_late_response_is_timeout_and_stops_later_cases(
 
     client = install_remote_executor(
         _FakeRemoteExecutor(
-            [_remote_execution(stdout=b"one"), _remote_execution(stdout=b"two")],
+            [
+                _remote_execution(
+                    stdout=b"one", attested_service_total_ns=11_000_000_000
+                ),
+                _remote_execution(
+                    stdout=b"two", attested_service_total_ns=11_000_000_000
+                ),
+            ],
             on_execute=overrun,
         )
     )
@@ -961,6 +1040,96 @@ def test_remote_late_response_is_timeout_and_stops_later_cases(
     result = run_stdin_tests("print(input())", ["one", "two"], ["one", "two"], timeout=10)
     assert result["status"] == "timeout" and result["timeout"] is True
     assert len(client.calls) == 1
+
+
+def test_remote_replay_outage_time_is_not_charged_to_candidate(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 0.0}
+    durations = iter([157.0, 1.0])
+
+    def advance():
+        clock["now"] += next(durations)
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    stdout=b"one", attested_service_total_ns=1_000_000_000
+                ),
+                _remote_execution(
+                    stdout=b"two", attested_service_total_ns=1_000_000_000
+                ),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    result = run_stdin_tests(
+        "print(input())", ["one", "two"], ["one", "two"], timeout=10
+    )
+
+    assert result["passed"] is True
+    assert len(client.calls) == 2
+    second_limit = client.calls[1]["raw_limits"]["time_limit"]
+    assert second_limit["seconds"] == 9
+    assert second_limit["nanos"] == 0
+
+
+def test_transport_recovery_exhaustion_is_infrastructure_not_candidate_timeout(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 0.0}
+
+    def exhaust_recovery():
+        clock["now"] += 180.0
+
+    install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="unknown",
+                    category="TRANSPORT_OR_ATTESTATION",
+                    error="TimeoutError",
+                    attested_service_total_ns=None,
+                )
+            ],
+            on_execute=exhaust_recovery,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="UNKNOWN.*TRANSPORT_OR_ATTESTATION",
+    ):
+        run_stdin_tests("print('never scored')", [""], ["never scored"], timeout=10)
+
+
+@pytest.mark.parametrize("attested_total", [True, -1, 1.5, "1"])
+def test_remote_accepted_result_requires_valid_signed_service_timing(
+    install_remote_executor, attested_total
+):
+    install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    stdout=b"ok", attested_service_total_ns=attested_total
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="valid signed service timing",
+    ):
+        run_stdin_tests("print('ok')", [""], ["ok"], timeout=10)
 
 
 def test_remote_solution_admission_matches_four_active_service_slots(monkeypatch):

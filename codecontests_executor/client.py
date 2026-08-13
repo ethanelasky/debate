@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
+import math
 import os
 import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -17,10 +20,12 @@ from typing import Any, Protocol
 
 from .protocol import (
     CLIENT_HTTP_OVERHEAD_SECONDS,
+    DEFAULT_EXECUTE_REQUEST_TTL_NS,
     MAX_REQUEST_BODY_BYTES,
     MAX_RESPONSE_BODY_BYTES,
     MAX_RESULT_TIMING_NS,
     PROTOCOL_VERSION,
+    TRANSPORT_RECOVERY_WINDOW_SECONDS,
     ExecutorProtocolError,
     encode_envelope,
     make_execute_request,
@@ -52,6 +57,10 @@ class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise ExecutorProtocolError("executor redirects are forbidden")
 
 
+class _RetryableHTTPTransportError(OSError):
+    """HTTP connection/framing failure that is safe to retry by request ID."""
+
+
 class UrllibTransport:
     def __init__(self, opener: Any | None = None):
         self._opener = opener or urllib.request.build_opener(_RejectRedirectHandler())
@@ -75,18 +84,90 @@ class UrllibTransport:
             response = self._opener.open(request, timeout=timeout_seconds)
         except urllib.error.HTTPError as exc:
             response = exc
+        except http.client.HTTPException as exc:
+            # urllib does not consistently wrap failures raised while parsing
+            # the status line/headers in URLError.  Keep those failures on the
+            # transport-recovery path rather than treating them as a signed
+            # executor protocol response.
+            raise _RetryableHTTPTransportError(
+                "executor HTTP response framing failed"
+            ) from exc
         with response:
             if response.geturl() != url:
                 raise ExecutorProtocolError(
                     "executor response endpoint does not match request"
                 )
-            data = response.read(MAX_RESPONSE_BODY_BYTES + 1)
+            content_length = self._content_length(response)
+            if (
+                content_length is not None
+                and content_length > MAX_RESPONSE_BODY_BYTES
+            ):
+                raise ExecutorProtocolError("executor response exceeds byte limit")
+            try:
+                data = self._read_bounded(response)
+            except http.client.IncompleteRead as exc:
+                raise _RetryableHTTPTransportError(
+                    "executor HTTP response body was truncated"
+                ) from exc
+            except http.client.HTTPException as exc:
+                raise _RetryableHTTPTransportError(
+                    "executor HTTP response body framing failed"
+                ) from exc
             if len(data) > MAX_RESPONSE_BODY_BYTES:
                 raise ExecutorProtocolError("executor response exceeds byte limit")
+            if content_length is not None and len(data) != content_length:
+                # HTTPResponse.read(amount) can return a short body without
+                # raising IncompleteRead.  A signed response may already have
+                # been produced server-side, so this must enter the exact-body
+                # replay path instead of becoming a terminal JSON/HMAC error.
+                raise _RetryableHTTPTransportError(
+                    "executor HTTP response body length mismatch"
+                )
             status = response.status
             if isinstance(status, bool) or not isinstance(status, int):
                 raise ExecutorProtocolError("executor response status is invalid")
             return status, data
+
+    @staticmethod
+    def _content_length(response: Any) -> int | None:
+        headers = getattr(response, "headers", None)
+        values = headers.get_all("Content-Length") if headers is not None else None
+        if not values:
+            return None
+        tokens = [part.strip() for value in values for part in value.split(",")]
+        if not tokens or any(
+            not token or any(character not in "0123456789" for character in token)
+            for token in tokens
+        ):
+            raise _RetryableHTTPTransportError(
+                "executor HTTP Content-Length is invalid"
+            )
+        normalized = [token.lstrip("0") or "0" for token in tokens]
+        max_length_digits = len(str(MAX_RESPONSE_BODY_BYTES))
+        if any(len(token) > max_length_digits for token in normalized):
+            raise ExecutorProtocolError("executor response exceeds byte limit")
+        lengths = {int(token) for token in normalized}
+        if len(lengths) != 1:
+            raise _RetryableHTTPTransportError(
+                "executor HTTP Content-Length values conflict"
+            )
+        return lengths.pop()
+
+    @staticmethod
+    def _read_bounded(response: Any) -> bytes:
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_RESPONSE_BODY_BYTES:
+            chunk = response.read(
+                min(64 * 1024, MAX_RESPONSE_BODY_BYTES + 1 - size)
+            )
+            if not isinstance(chunk, bytes):
+                raise ExecutorProtocolError("executor response body is invalid")
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
 
 
 @dataclass(frozen=True)
@@ -98,6 +179,11 @@ class RemoteExecution:
     stderr: bytes
     result_payload: dict[str, Any] | None
     error: str | None = None
+    # Authenticated service-side wall time for this exact request.  The
+    # CodeContests driver uses it to keep tunnel/reconnect time out of the
+    # candidate's shared solution budget while still charging queue, sandbox,
+    # and execution time.  UNKNOWN results deliberately carry no credit.
+    attested_service_total_ns: int | None = None
 
     @classmethod
     def unknown(cls, category: str, error: str | None = None) -> RemoteExecution:
@@ -109,6 +195,7 @@ class RemoteExecution:
             stderr=b"",
             result_payload=None,
             error=error,
+            attested_service_total_ns=None,
         )
 
 
@@ -248,7 +335,13 @@ class RemoteExecutorClient:
         client_provenance: Mapping[str, Any] | None = None,
         transport: Transport | None = None,
         overload_retries: int = 2,
+        transport_retries: int = 32,
+        transport_recovery_window_seconds: float = (
+            TRANSPORT_RECOVERY_WINDOW_SECONDS
+        ),
+        transport_retry_max_delay_seconds: float = 15.0,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         if len(bearer_token) < 32 or len(hmac_key) < 32:
             raise ExecutorProtocolError("executor secrets must contain 32+ bytes")
@@ -275,11 +368,40 @@ class RemoteExecutorClient:
         )
         if self.client_provenance != expected_client:
             raise ExecutorProtocolError("local client/verifier provenance mismatch")
+        if (
+            isinstance(overload_retries, bool)
+            or not isinstance(overload_retries, int)
+            or overload_retries < 0
+            or isinstance(transport_retries, bool)
+            or not isinstance(transport_retries, int)
+            or transport_retries < 0
+        ):
+            raise ExecutorProtocolError("executor retry counts are invalid")
+        for value in (
+            transport_recovery_window_seconds,
+            transport_retry_max_delay_seconds,
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ExecutorProtocolError("transport retry timing is invalid")
         self.identity_digest = payload_digest(identity)
         self.transport = transport or UrllibTransport()
         self.overload_retries = overload_retries
+        self.transport_retries = transport_retries
+        self.transport_recovery_window_seconds = float(
+            transport_recovery_window_seconds
+        )
+        self.transport_retry_max_delay_seconds = float(
+            transport_retry_max_delay_seconds
+        )
         self.sleep = sleep
+        self.monotonic = monotonic
         self._identity_verified = False
+        self._identity_lock = threading.Lock()
 
     @classmethod
     def from_env(cls, *, verifier_path: str | None = None) -> RemoteExecutorClient:
@@ -337,7 +459,10 @@ class RemoteExecutorClient:
             headers["Content-Type"] = "application/json"
         return headers
 
-    def verify_identity(self, *, timeout_seconds: float = 5.0) -> None:
+    def _verify_identity_unlocked(self, *, timeout_seconds: float = 5.0) -> None:
+        # Never retain a stale success if an explicit or reconnect-time
+        # attestation attempt fails partway through.
+        self._identity_verified = False
         status, data = self.transport.request(
             method="GET",
             url=f"{self.base_url}/v1/identity",
@@ -352,6 +477,101 @@ class RemoteExecutorClient:
         if identity != self.expected_identity:
             raise ExecutorProtocolError("executor identity mismatch")
         self._identity_verified = True
+
+    def verify_identity(self, *, timeout_seconds: float = 5.0) -> None:
+        """Verify frozen identity with bounded transport recovery.
+
+        Signed/protocol failures are terminal.  Only connection-level failures
+        use the client's configured retry count, exponential backoff, and hard
+        recovery deadline; this is the public preflight used before the grader
+        caches a remote client.
+        """
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ExecutorProtocolError("identity timeout is invalid")
+        per_attempt_timeout = float(timeout_seconds)
+        deadline = self.monotonic() + self.transport_recovery_window_seconds
+        transport_failures = 0
+
+        while True:
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("executor identity recovery deadline expired")
+            attempt_timeout = min(per_attempt_timeout, remaining)
+            started = self.monotonic()
+            if not self._identity_lock.acquire(timeout=attempt_timeout):
+                error: Exception = TimeoutError("executor identity lock timed out")
+            else:
+                try:
+                    request_timeout = attempt_timeout - (
+                        self.monotonic() - started
+                    )
+                    if request_timeout <= 0:
+                        error = TimeoutError("executor identity deadline expired")
+                    else:
+                        try:
+                            self._verify_identity_unlocked(
+                                timeout_seconds=request_timeout
+                            )
+                        except (
+                            TimeoutError,
+                            OSError,
+                            urllib.error.URLError,
+                        ) as exc:
+                            error = exc
+                        else:
+                            return
+                finally:
+                    self._identity_lock.release()
+
+            # ExecutorProtocolError intentionally bypasses this block: a
+            # reachable endpoint with invalid HMAC/provenance is not made safe
+            # by reconnecting or retrying.
+            if transport_failures >= self.transport_retries:
+                raise error
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "executor identity recovery deadline expired"
+                ) from error
+            delay = min(
+                float(1 << min(transport_failures, 4)),
+                self.transport_retry_max_delay_seconds,
+                remaining,
+            )
+            transport_failures += 1
+            self.sleep(delay)
+
+    def _ensure_identity(self, *, timeout_seconds: float = 5.0) -> None:
+        if self._identity_verified:
+            return
+        started = self.monotonic()
+        if not self._identity_lock.acquire(timeout=timeout_seconds):
+            raise TimeoutError("executor identity lock timed out")
+        try:
+            if not self._identity_verified:
+                remaining = timeout_seconds - (self.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError("executor identity deadline expired")
+                self._verify_identity_unlocked(timeout_seconds=remaining)
+        finally:
+            self._identity_lock.release()
+
+    def _forget_identity(self, *, timeout_seconds: float | None = None) -> None:
+        # A lost connection may come back bound to a different service. Force a
+        # fresh signed identity check before any retry is allowed to execute.
+        if timeout_seconds is None:
+            self._identity_lock.acquire()
+        elif not self._identity_lock.acquire(timeout=max(0.0, timeout_seconds)):
+            raise TimeoutError("executor identity lock timed out")
+        try:
+            self._identity_verified = False
+        finally:
+            self._identity_lock.release()
 
     @staticmethod
     def _validate_result(
@@ -420,13 +640,69 @@ class RemoteExecutorClient:
         stdin: str,
         raw_limits: Mapping[str, Any],
     ) -> RemoteExecution:
-        if not self._identity_verified:
-            try:
-                self.verify_identity()
-            except (TimeoutError, ExecutorProtocolError, OSError, urllib.error.URLError) as exc:
+        transport_failures = 0
+        # Initial attestation has the same hard recovery budget as a later
+        # reconnect. Start its deadline before the first potentially blocking
+        # network call rather than after the first timeout returns.
+        recovery_deadline: float | None = (
+            self.monotonic() + self.transport_recovery_window_seconds
+        )
+
+        def remaining_recovery_time() -> float | None:
+            if recovery_deadline is None:
+                return None
+            return recovery_deadline - self.monotonic()
+
+        def recovery_exhausted() -> RemoteExecution:
+            return RemoteExecution.unknown("TRANSPORT_OR_ATTESTATION", "TimeoutError")
+
+        def retry_transport(exc: BaseException) -> RemoteExecution | None:
+            nonlocal recovery_deadline, transport_failures
+            if transport_failures >= self.transport_retries:
                 return RemoteExecution.unknown(
                     "TRANSPORT_OR_ATTESTATION", type(exc).__name__
                 )
+            now = self.monotonic()
+            if recovery_deadline is None:
+                recovery_deadline = now + self.transport_recovery_window_seconds
+            remaining = recovery_deadline - now
+            if remaining <= 0:
+                return RemoteExecution.unknown(
+                    "TRANSPORT_OR_ATTESTATION", type(exc).__name__
+                )
+            delay = min(
+                float(1 << min(transport_failures, 4)),
+                self.transport_retry_max_delay_seconds,
+                remaining,
+            )
+            transport_failures += 1
+            # Give the external tunnel supervisor a bounded window to restore
+            # connectivity. The next loop iteration must re-attest identity.
+            self.sleep(delay)
+            return None
+
+        # Attest before minting the request validity interval.  An initial
+        # 156-second host-network outage therefore does not consume the time
+        # needed for a maximum-duration candidate or an idempotent replay.
+        while not self._identity_verified:
+            remaining = remaining_recovery_time()
+            if remaining is None or remaining <= 0:
+                return recovery_exhausted()
+            try:
+                self._ensure_identity(timeout_seconds=min(5.0, remaining))
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                unknown = retry_transport(exc)
+                if unknown is not None:
+                    return unknown
+            except ExecutorProtocolError as exc:
+                return RemoteExecution.unknown(
+                    "TRANSPORT_OR_ATTESTATION", type(exc).__name__
+                )
+
+        # A later response-loss episode receives its own bounded recovery
+        # window; the just-completed initial attestation cannot consume it.
+        transport_failures = 0
+        recovery_deadline = None
         try:
             # The maximum source-derived wall is 120s.  The remaining validity
             # interval bounds queue and response handling without changing the
@@ -437,7 +713,7 @@ class RemoteExecutorClient:
                 raw_limits=raw_limits,
                 identity_digest_value=self.identity_digest,
                 client_provenance=self.client_provenance,
-                ttl_ns=150 * 1_000_000_000,
+                ttl_ns=DEFAULT_EXECUTE_REQUEST_TTL_NS,
             )
             request_digest_value = payload_digest(request)
             body = encode_envelope(sign_payload(request, self._hmac_key))
@@ -451,14 +727,38 @@ class RemoteExecutorClient:
             / 1_000_000_000
             + CLIENT_HTTP_OVERHEAD_SECONDS
         )
-        for attempt in range(self.overload_retries + 1):
+        overload_attempt = 0
+        while True:
+            if not self._identity_verified:
+                remaining = remaining_recovery_time()
+                if remaining is None or remaining <= 0:
+                    return recovery_exhausted()
+                try:
+                    self._ensure_identity(timeout_seconds=min(5.0, remaining))
+                except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                    unknown = retry_transport(exc)
+                    if unknown is not None:
+                        return unknown
+                    continue
+                except ExecutorProtocolError as exc:
+                    # A reachable endpoint with the wrong/invalid signed
+                    # identity is not a reconnect race and is never retried.
+                    return RemoteExecution.unknown(
+                        "TRANSPORT_OR_ATTESTATION", type(exc).__name__
+                    )
+            request_timeout = timeout
+            remaining = remaining_recovery_time()
+            if remaining is not None:
+                if remaining <= 0:
+                    return recovery_exhausted()
+                request_timeout = min(request_timeout, remaining)
             try:
                 _status, data = self.transport.request(
                     method="POST",
                     url=f"{self.base_url}/v1/execute",
                     headers=self._headers(json_body=True),
                     body=body,
-                    timeout_seconds=timeout,
+                    timeout_seconds=request_timeout,
                 )
                 envelope = strict_json_loads(data)
                 result = verify_envelope(
@@ -470,7 +770,27 @@ class RemoteExecutorClient:
                     request_digest_value=request_digest_value,
                     identity_digest_value=self.identity_digest,
                 )
-            except (TimeoutError, ExecutorProtocolError, OSError, urllib.error.URLError) as exc:
+            except (TimeoutError, OSError, urllib.error.URLError) as exc:
+                # Start the recovery deadline at the transport failure, before
+                # even waiting for another client's attestation lock.
+                if recovery_deadline is None:
+                    recovery_deadline = (
+                        self.monotonic() + self.transport_recovery_window_seconds
+                    )
+                remaining = remaining_recovery_time()
+                if remaining is None or remaining <= 0:
+                    return recovery_exhausted()
+                try:
+                    self._forget_identity(timeout_seconds=remaining)
+                except TimeoutError:
+                    return recovery_exhausted()
+                unknown = retry_transport(exc)
+                if unknown is not None:
+                    return unknown
+                continue
+            except ExecutorProtocolError as exc:
+                # Invalid signatures, request binding, or attestation are never
+                # made acceptable by retrying the same response.
                 return RemoteExecution.unknown(
                     "TRANSPORT_OR_ATTESTATION", type(exc).__name__
                 )
@@ -485,9 +805,11 @@ class RemoteExecutorClient:
                 # evidence. Preserve it for fail-closed operator diagnostics;
                 # it never changes the verdict or retry policy here.
                 error=result["evidence"].get("controller_error"),
+                attested_service_total_ns=result["timing"]["total_ns"],
             )
             if not execution.retryable:
                 return execution
-            if attempt < self.overload_retries:
-                self.sleep(0.05 * (attempt + 1))
-        return RemoteExecution.unknown("OVERLOAD_RETRIES_EXHAUSTED")
+            if overload_attempt >= self.overload_retries:
+                return RemoteExecution.unknown("OVERLOAD_RETRIES_EXHAUSTED")
+            overload_attempt += 1
+            self.sleep(0.05 * overload_attempt)

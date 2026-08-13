@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ import subprocess
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +26,7 @@ from .protocol import (
     CONFIGURED_VM_VCPUS,
     FILE_SIZE_CAP_BYTES,
     MAX_REQUEST_BODY_BYTES,
+    MAX_RESPONSE_BODY_BYTES,
     MAX_RESULT_TIMING_NS,
     MEMORY_EVENT_KEYS,
     MINIMUM_GUEST_MEMORY_BYTES,
@@ -31,6 +34,9 @@ from .protocol import (
     PIDS_EVENT_KEYS,
     PINNED_GVISOR_RLIMIT_NPROC,
     PROTOCOL_VERSION,
+    REPLAY_CACHE_BYTES,
+    REPLAY_CACHE_CAPACITY,
+    REPLAY_CACHE_GRACE_NS,
     REQUIRED_PYTHON_PACKAGES,
     ROOTFS_SHA256,
     RUNSC_RELEASE_ARCHIVE_SHA512,
@@ -58,6 +64,11 @@ DEFAULT_PORT = 8080
 ACTIVE_SANDBOXES = 4
 DEFAULT_QUEUE_CAPACITY = 16
 DEFAULT_QUEUE_WAIT_NS = 10 * 1_000_000_000
+# The cache keeps small results for a high-throughput eval while bounding both
+# metadata and response-body memory.  If either bound is reached, new unique
+# requests fail retryably before sandbox execution; unexpired entries are never
+# evicted in a way that could cause the same request to execute twice.
+REPLAY_SINGLE_FLIGHT_WAIT_SECONDS = 135.0
 ROOTFS_MANIFEST_PATH = "/var/lib/codecontests-executor/rootfs.manifest.json"
 ROOTFS_MANIFEST_FORMAT = "palaestra.codecontests.rootfs-manifest.v1"
 SERVER_BUNDLE_FILES = (
@@ -70,6 +81,16 @@ SERVER_BUNDLE_FILES = (
     "supervisor.py",
 )
 EXPECTED_HOST_VCPUS = SERVICE_CPU_AFFINITY_VCPUS
+
+
+@dataclass
+class _ReplayEntry:
+    request_digest: str
+    request_id: str
+    limits: dict[str, Any]
+    retain_until_unix_ns: int
+    reserved_bytes: int = 0
+    response: tuple[int, bytes] | None = None
 
 
 def _validated_listener(host: str, port: int) -> tuple[str, int]:
@@ -644,6 +665,8 @@ class ExecutorApplication:
         supervisor: SandboxSupervisor,
         queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
         queue_wait_ns: int = DEFAULT_QUEUE_WAIT_NS,
+        replay_cache_capacity: int = REPLAY_CACHE_CAPACITY,
+        replay_cache_bytes: int = REPLAY_CACHE_BYTES,
     ):
         if len(bearer_token) < 32 or len(hmac_key) < 32:
             raise ValueError("application secrets must contain at least 32 bytes")
@@ -651,6 +674,15 @@ class ExecutorApplication:
             bearer_token.decode("ascii", errors="strict")
         except UnicodeDecodeError as exc:
             raise ValueError("bearer token must be ASCII") from exc
+        if (
+            isinstance(replay_cache_capacity, bool)
+            or not isinstance(replay_cache_capacity, int)
+            or replay_cache_capacity <= 0
+            or isinstance(replay_cache_bytes, bool)
+            or not isinstance(replay_cache_bytes, int)
+            or replay_cache_bytes <= 0
+        ):
+            raise ValueError("replay cache bounds must be positive integers")
         self._bearer_token = bearer_token
         self._hmac_key = hmac_key
         self.identity = identity
@@ -659,6 +691,12 @@ class ExecutorApplication:
         self.queue_wait_ns = queue_wait_ns
         self._active = threading.BoundedSemaphore(ACTIVE_SANDBOXES)
         self._admitted = threading.BoundedSemaphore(ACTIVE_SANDBOXES + queue_capacity)
+        self._replay_cache_capacity = replay_cache_capacity
+        self._replay_cache_byte_limit = replay_cache_bytes
+        self._replay_cache_bytes = 0
+        self._replay_reserved_bytes = 0
+        self._replay_entries: dict[str, _ReplayEntry] = {}
+        self._replay_condition = threading.Condition()
 
     def authorized(self, authorization: str | None) -> bool:
         if not isinstance(authorization, str) or not authorization.isascii():
@@ -880,6 +918,125 @@ class ExecutorApplication:
         result["controller_error"] = error
         return result
 
+    def _prune_replay_locked(self, now_unix_ns: int) -> None:
+        expired = [
+            request_id
+            for request_id, entry in self._replay_entries.items()
+            if entry.response is not None
+            and entry.retain_until_unix_ns <= now_unix_ns
+        ]
+        for request_id in expired:
+            entry = self._replay_entries.pop(request_id)
+            assert entry.response is not None
+            self._replay_cache_bytes -= len(entry.response[1])
+
+    def _await_replay(
+        self, request_id: str, request_digest: str
+    ) -> tuple[str, tuple[int, bytes] | _ReplayEntry | None]:
+        """Return an existing exact replay, or coordinate with its owner."""
+
+        deadline = time.monotonic() + REPLAY_SINGLE_FLIGHT_WAIT_SECONDS
+        with self._replay_condition:
+            while True:
+                self._prune_replay_locked(time.time_ns())
+                entry = self._replay_entries.get(request_id)
+                if entry is None:
+                    return "missing", None
+                if not hmac.compare_digest(entry.request_digest, request_digest):
+                    return "mismatch", None
+                if entry.response is not None:
+                    return "response", entry.response
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "wait_timeout", entry
+                self._replay_condition.wait(timeout=remaining)
+
+    def _claim_replay(
+        self, request: dict[str, Any], request_digest: str
+    ) -> tuple[str, _ReplayEntry | None]:
+        """Reserve a validated unique request without evicting live history."""
+
+        request_id = request["request_id"]
+        with self._replay_condition:
+            self._prune_replay_locked(time.time_ns())
+            entry = self._replay_entries.get(request_id)
+            if entry is not None:
+                if not hmac.compare_digest(entry.request_digest, request_digest):
+                    return "mismatch", None
+                return "existing", entry
+            if (
+                len(self._replay_entries) >= self._replay_cache_capacity
+                or self._replay_cache_bytes >= self._replay_cache_byte_limit
+            ):
+                return "capacity", None
+            entry = _ReplayEntry(
+                request_digest=request_digest,
+                request_id=request_id,
+                limits=copy.deepcopy(request["task"]["limits"]),
+                # Never forget an admitted ID while its signed request remains
+                # valid; completion extends this through the recovery window.
+                retain_until_unix_ns=request["expires_at_unix_ns"],
+            )
+            self._replay_entries[request_id] = entry
+            return "owner", entry
+
+    def _abandon_replay(self, entry: _ReplayEntry) -> None:
+        """Release a reservation when no sandbox execution was attempted."""
+
+        with self._replay_condition:
+            current = self._replay_entries.get(entry.request_id)
+            if current is entry and entry.response is None:
+                self._replay_reserved_bytes -= entry.reserved_bytes
+                entry.reserved_bytes = 0
+                del self._replay_entries[entry.request_id]
+                self._replay_condition.notify_all()
+
+    def _complete_replay(
+        self, entry: _ReplayEntry, response: tuple[int, bytes]
+    ) -> None:
+        with self._replay_condition:
+            current = self._replay_entries.get(entry.request_id)
+            if current is not entry or entry.response is not None:
+                raise RuntimeError("idempotency reservation changed during execution")
+            response_bytes = len(response[1])
+            if response_bytes > entry.reserved_bytes:
+                raise RuntimeError("response exceeded idempotency byte reservation")
+            entry.response = response
+            entry.retain_until_unix_ns = max(
+                entry.retain_until_unix_ns,
+                time.time_ns() + REPLAY_CACHE_GRACE_NS,
+            )
+            self._replay_reserved_bytes -= entry.reserved_bytes
+            entry.reserved_bytes = 0
+            self._replay_cache_bytes += response_bytes
+            self._replay_condition.notify_all()
+
+    def _reserve_execution_bytes(self, entry: _ReplayEntry) -> bool:
+        """Atomically reserve worst-case response bytes before execution."""
+
+        with self._replay_condition:
+            if self._replay_entries.get(entry.request_id) is not entry:
+                return False
+            if entry.reserved_bytes:
+                return True
+            if (
+                self._replay_cache_bytes
+                + self._replay_reserved_bytes
+                + MAX_RESPONSE_BODY_BYTES
+                > self._replay_cache_byte_limit
+            ):
+                return False
+            entry.reserved_bytes = MAX_RESPONSE_BODY_BYTES
+            self._replay_reserved_bytes += entry.reserved_bytes
+            return True
+
+    @staticmethod
+    def _entry_request(entry: _ReplayEntry) -> dict[str, Any]:
+        return {
+            "request_id": entry.request_id,
+            "task": {"limits": entry.limits},
+        }
+
     def execute(self, body: bytes) -> tuple[int, bytes]:
         started_ns = time.monotonic_ns()
         try:
@@ -891,11 +1048,36 @@ class ExecutorApplication:
             return HTTPStatus.UNAUTHORIZED, b'{"error":"unauthorized"}'
 
         request_digest = payload_digest(request)
+        request_id = request.get("request_id")
+        if isinstance(request_id, str):
+            replay_state, replay_value = self._await_replay(
+                request_id, request_digest
+            )
+            if replay_state == "response":
+                assert isinstance(replay_value, tuple)
+                return replay_value
+            if replay_state == "mismatch":
+                return (
+                    HTTPStatus.BAD_REQUEST,
+                    self._signed_protocol_error(request_digest),
+                )
+            if replay_state == "wait_timeout":
+                assert isinstance(replay_value, _ReplayEntry)
+                entry_request = self._entry_request(replay_value)
+                return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
+                    entry_request,
+                    request_digest,
+                    self._overload("QUEUE_DEADLINE", replay_value.limits),
+                    queued_ns=0,
+                    started_ns=started_ns,
+                )
+
         try:
             request = validate_execute_request(
                 request,
                 expected_identity_digest=self.identity_digest,
                 expected_client_provenance=self.identity["expected_client_provenance"],
+                now_ns=time.time_ns(),
             )
         except ExecutorProtocolError:
             return (
@@ -903,7 +1085,51 @@ class ExecutorApplication:
                 self._signed_protocol_error(request_digest),
             )
 
+        while True:
+            claim_state, entry = self._claim_replay(request, request_digest)
+            if claim_state == "owner":
+                assert entry is not None
+                break
+            if claim_state == "mismatch":
+                return (
+                    HTTPStatus.BAD_REQUEST,
+                    self._signed_protocol_error(request_digest),
+                )
+            if claim_state == "capacity":
+                return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
+                    request,
+                    request_digest,
+                    self._overload("OVERLOADED", request["task"]["limits"]),
+                    queued_ns=0,
+                    started_ns=started_ns,
+                )
+            assert claim_state == "existing" and entry is not None
+            replay_state, replay_value = self._await_replay(
+                request["request_id"], request_digest
+            )
+            if replay_state == "response":
+                assert isinstance(replay_value, tuple)
+                return replay_value
+            if replay_state == "mismatch":
+                return (
+                    HTTPStatus.BAD_REQUEST,
+                    self._signed_protocol_error(request_digest),
+                )
+            if replay_state == "wait_timeout":
+                assert isinstance(replay_value, _ReplayEntry)
+                return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
+                    request,
+                    request_digest,
+                    self._overload("QUEUE_DEADLINE", request["task"]["limits"]),
+                    queued_ns=0,
+                    started_ns=started_ns,
+                )
+            assert replay_state == "missing"
+
+        cache_completed = False
+        execution_attempted = False
         if not self._admitted.acquire(blocking=False):
+            self._abandon_replay(entry)
             return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
                 request,
                 request_digest,
@@ -921,6 +1147,7 @@ class ExecutorApplication:
             acquired_active = self._active.acquire(timeout=wait_ns / 1_000_000_000)
             queued_ns = time.monotonic_ns() - queue_started_ns
             if not acquired_active:
+                self._abandon_replay(entry)
                 return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
                     request,
                     request_digest,
@@ -928,7 +1155,17 @@ class ExecutorApplication:
                     queued_ns=queued_ns,
                     started_ns=started_ns,
                 )
+            if not self._reserve_execution_bytes(entry):
+                self._abandon_replay(entry)
+                return HTTPStatus.SERVICE_UNAVAILABLE, self._signed_result(
+                    request,
+                    request_digest,
+                    self._overload("OVERLOADED", request["task"]["limits"]),
+                    queued_ns=queued_ns,
+                    started_ns=started_ns,
+                )
             try:
+                execution_attempted = True
                 execution = self.supervisor.execute(request)
             except Exception as exc:  # noqa: BLE001 - controller trust boundary
                 # The signed response deliberately exposes only the bounded
@@ -947,17 +1184,37 @@ class ExecutorApplication:
             execution = self._normalize_execution(
                 execution, request["task"]["limits"]
             )
-            return HTTPStatus.OK, self._signed_result(
+            response_body = self._signed_result(
                 request,
                 request_digest,
                 execution,
                 queued_ns=queued_ns,
                 started_ns=started_ns,
             )
+            if len(response_body) > MAX_RESPONSE_BODY_BYTES:
+                response_body = self._signed_result(
+                    request,
+                    request_digest,
+                    self._controller_unknown(
+                        "CONTROLLER_RESULT_INVALID",
+                        "response_size",
+                        request["task"]["limits"],
+                    ),
+                    queued_ns=queued_ns,
+                    started_ns=started_ns,
+                )
+            if len(response_body) > MAX_RESPONSE_BODY_BYTES:
+                raise RuntimeError("bounded controller response exceeds protocol cap")
+            response = (int(HTTPStatus.OK), response_body)
+            self._complete_replay(entry, response)
+            cache_completed = True
+            return response
         finally:
             if acquired_active:
                 self._active.release()
             self._admitted.release()
+            if not cache_completed and not execution_attempted:
+                self._abandon_replay(entry)
 
 
 class ExecutorHTTPServer(ThreadingHTTPServer):

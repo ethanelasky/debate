@@ -993,6 +993,29 @@ def _run_stdin_tests_remote(
                         "remote CodeContests executor returned UNKNOWN on case "
                         f"{i}: {category or 'UNCLASSIFIED'}{detail}{diagnostics}"
                     )
+                # The signed service timer includes admission, queueing,
+                # sandbox setup, and candidate execution, but not time spent
+                # after the response was lost while the client restored and
+                # re-attested its reverse tunnel.  Charge the former to the
+                # candidate and refund only the latter.  This value was
+                # HMAC/schema validated by RemoteExecutorClient; fake or older
+                # clients lacking it fail closed rather than granting credit.
+                attested_total_ns = getattr(
+                    execution, "attested_service_total_ns", None
+                )
+                if (
+                    isinstance(attested_total_ns, bool)
+                    or not isinstance(attested_total_ns, int)
+                    or attested_total_ns < 0
+                ):
+                    raise VerifierInfrastructureError(
+                        "remote CodeContests executor lacks valid signed service timing "
+                        f"on case {i}"
+                    )
+                deadline += max(
+                    0.0,
+                    execution_elapsed - (attested_total_ns / 1_000_000_000),
+                )
                 break
             if outcome not in {"executed", "candidate_failure"}:
                 raise VerifierInfrastructureError(
@@ -1426,7 +1449,11 @@ def _filter_cf_rating(
 
 
 class CodeContestsEnv(SingleTurnEnv):
-    # Grading shells out to a subprocess per sample, so threads overlap.
+    # Local grading shells out to a subprocess per sample, so threads overlap.
+    # Remote grading has a four-sandbox service boundary; its worker pool is
+    # narrowed to the same four slots in __init__.  Keeping 32 worker threads
+    # blocked on the remote semaphore makes an already-invalid evaluation slow
+    # to cancel after a transport failure.
     grade_workers = max(1, _MAX_CONCURRENT_VERIFIERS)
     # Suites must stay live on Task.meta for reward()/grade(), but may never
     # enter generic RLVR transcript, wandb, raw-fallback, or Docent records.
@@ -1456,6 +1483,11 @@ class CodeContestsEnv(SingleTurnEnv):
         min_cf_rating: Optional[int] = None,
         max_cf_rating: Optional[int] = None,
     ):
+        self.grade_workers = (
+            _MAX_CONCURRENT_REMOTE_VERIFIERS
+            if _executor_mode() == "remote"
+            else max(1, _MAX_CONCURRENT_VERIFIERS)
+        )
         if (
             min_cf_rating is not None
             and max_cf_rating is not None

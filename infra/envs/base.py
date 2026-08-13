@@ -229,7 +229,25 @@ class SingleTurnEnv(Env):
         if workers > 1 and kept:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [pool.submit(self.reward_sample, tasks[gi], s) for gi, s in kept]
-                scored = [f.result() for f in futures]
+                future_indices = {future: index for index, future in enumerate(futures)}
+                ordered_scores: list[tuple[float, dict[str, Any]] | None] = [
+                    None
+                ] * len(futures)
+                try:
+                    # Observe whichever verifier finishes first rather than
+                    # blocking on submission order.  If one result proves the
+                    # grading boundary is broken, cancel every request that has
+                    # not started yet; executing the rest of a now-invalid eval
+                    # only delays trainer teardown and burns paid compute.
+                    for future in concurrent.futures.as_completed(futures):
+                        ordered_scores[future_indices[future]] = future.result()
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+                if any(score is None for score in ordered_scores):
+                    raise RuntimeError("parallel reward scoring completed incompletely")
+                scored = [score for score in ordered_scores if score is not None]
         else:
             scored = [self.reward_sample(tasks[gi], s) for gi, s in kept]
 

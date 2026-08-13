@@ -6,6 +6,8 @@ behaviors both of them relied on, so the shared implementation cannot drift:
 group shape, fidelity drops, and pooled == inline results.
 """
 
+import threading
+
 import pytest
 
 from infra.backend.base import Backend, Sample, SamplingParams
@@ -155,3 +157,41 @@ def test_reward_exceptions_propagate(workers):
     env = ExplodingGrader(workers=workers)
     with pytest.raises(RuntimeError, match="verifier crashed"):
         env.rollout(env.tasks(2), _policy(["a", "boom", "ccc", "dddd"]), group_size=2)
+
+
+def test_pooled_reward_failure_cancels_work_that_has_not_started():
+    """A failed verifier invalidates the batch; queued candidates must not run."""
+    release_second = threading.Event()
+    second_started = threading.Event()
+
+    class FailFastEnv(ScoreByLength):
+        def reward(self, task, text):
+            self.calls.append(text)
+            if text == "boom":
+                assert second_started.wait(timeout=1)
+                raise RuntimeError("verifier crashed")
+            if text == "running":
+                second_started.set()
+                release_second.wait(timeout=0.2)
+            elif text.startswith("queued-"):
+                # If a worker wins the small race between publishing the
+                # exception and the caller cancelling futures, keep it from
+                # draining the remaining queue before cancellation lands.
+                release_second.wait(timeout=0.2)
+            return float(len(text)), {"length": float(len(text))}
+
+    env = FailFastEnv(workers=2)
+    try:
+        with pytest.raises(RuntimeError, match="verifier crashed"):
+            env.rollout(
+                env.tasks(10),
+                _policy(["boom", "running", *[f"queued-{i}" for i in range(8)]]),
+                group_size=1,
+            )
+    finally:
+        release_second.set()
+
+    assert "boom" in env.calls
+    # The two workers plus at most one dequeue race may start; the remaining
+    # submissions are cancelled rather than executing a doomed evaluation.
+    assert len(env.calls) <= 3
