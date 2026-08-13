@@ -1,4 +1,7 @@
-# MonitoringBench migration — interface spec (authoritative for implementers/reviewers)
+# MonitoringBench migration — interface spec
+
+> Historical migration record. The migration described here has landed; use
+> the current task-family and debate APIs as the implementation authority.
 
 Governing plan: `/Users/cankucukkurt/.claude/plans/cuddly-shimmying-balloon.md` (user-approved 2026-08-01).
 Provenance record: `MB_DEBATE_PLAN.md` (this repo, copied from the old worktree).
@@ -101,8 +104,9 @@ Ground truth is `meta["label"]`.
      `topology`, `prompt_config{file_path,entry}`, `fresh_positions: false`, `flip: false`,
      `speech_token_limit`, `agents{alice,bob,judge}` (all frozen, `_preset` allowed),
      `judge_config{schema_name,retries}`, `dataset{files:[...], task_ids?, seed}`.
-     Dataset -> `MonitoringBenchTaskSource`. `solution_extractor`: none needed (no solution
-     slots) — pass a stub that raises if called.
+     Dataset -> `MonitoringBenchTaskSource`; build `DebateEnv` with
+     `MonitoringBenchFamily`. This protocol has no solution slots, so
+     `parse_answers` is never exercised.
    - Results: read `env.last_states` + `env._verdict(state)` (docent_export.py:101-116 pattern;
      pure-eval Trajectory.info is insufficient). Per-row jsonl:
      `{task_id, label, positions{Debater_A,Debater_B}, winner, verdict_ok, failed,

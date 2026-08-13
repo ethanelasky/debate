@@ -144,7 +144,7 @@ mb_rlvr_qwen36:
   # budget is what every rollout and every eval generation costs. Prompt parity
   # with the eval arm is unaffected — that is a property of the rendered
   # messages, not of the generation cap — but a truncated assessment scores as
-  # unparseable, so watch train/answer_tag for a drop against the smoke's 1.0.
+  # unparseable, so watch train/answer_format_valid for a drop against the smoke's 1.0.
   max_completion_tokens: 1000
   dataset:
     type: monitoringbench

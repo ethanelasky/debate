@@ -17,6 +17,7 @@ from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.protocol import Protocol
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
+from infra.envs.tasks.base import AnswerParse
 from infra.envs.tasks.math import MathFamily
 from infra.models.base import Model, ModelResponse
 
@@ -273,6 +274,8 @@ def test_grading_deduped_within_group():
     assert len(trajs) == 2
     assert all(t.info["solution_correct"] == 1.0 for t in trajs)
     assert env.last_rollout_info["grade_errors"] == 0
+    assert env.last_rollout_info["grader_requests"] == 1
+    assert env.last_rollout_info["grader_error_rate"] == 0.0
 
 
 def test_grade_exception_recorded_not_propagated():
@@ -287,6 +290,8 @@ def test_grade_exception_recorded_not_propagated():
     (t,) = groups[0]
     assert "solution_correct" not in t.info  # graded as None, not a crash
     assert env.last_rollout_info["grade_errors"] == 1
+    assert env.last_rollout_info["grader_requests"] == 1
+    assert env.last_rollout_info["grader_error_rate"] == 1.0
 
 
 def test_grading_goes_through_grade_batch():
@@ -310,6 +315,23 @@ def test_grading_goes_through_grade_batch():
     assert env.last_rollout_info["grade_errors"] == 0
 
 
+@pytest.mark.parametrize("results", [[], [True, False]])
+def test_grade_batch_cardinality_must_match_unique_requests(results):
+    class MalformedBatchFamily(MathFamily):
+        def grade_batch(self, items):
+            self.last_grade_errors = 0
+            return results
+
+    backend = ScriptedBackend(["\\boxed{2}", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [GOOD_VERDICT], family=MalformedBatchFamily())
+    with pytest.raises(
+        RuntimeError,
+        match=r"MalformedBatchFamily\.grade_batch returned (0|2) results for 1 unique grading requests",
+    ):
+        env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+
 def test_unscoreable_verdict_drops_debate():
     backend = ScriptedBackend(["\\boxed{2}", "Defense."])
     policy = Policy(backend, SamplingParams(max_tokens=128))
@@ -317,6 +339,65 @@ def test_unscoreable_verdict_drops_debate():
     env = make_env(["alice"], ["not json at all"] * 8)
     groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
     assert groups == [[]]
+
+
+def test_solution_census_precedes_failure_filtering():
+    """Produced answers survive both their own parse failure and a later
+    judge failure in the rollout-level denominator."""
+    # Proposals are generated as one batch. State 1 fails immediately because
+    # no relaxed answer can be extracted; state 2 reaches its judge, which
+    # then fails. The two surviving defenses are the next backend batch.
+    backend = ScriptedBackend(
+        ["\\boxed{2}", "not an answer", "the answer is 6", "Defense.", "Defense."]
+    )
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [GOOD_VERDICT, "not json"])
+    env.config.verdict_retries = 0
+    env.rollout(TaskSource().tasks(3), policy, group_size=1)
+
+    info = env.last_rollout_info
+    assert info["expected_solution_slots"] == 3.0
+    assert info["produced_solution_slots"] == 3.0
+    assert info["answer_format_valid_count"] == 1.0
+    assert info["extracted_solution_slots"] == 2.0
+    # Includes state 2's extracted answer despite its later judge failure.
+    assert info["gradeable_solution_slots"] == 2.0
+    assert info["answer_format_valid_rate"] == pytest.approx(1 / 3)
+    assert info["solution_production_rate"] == 1.0
+    assert info["extracted_solution_rate"] == pytest.approx(2 / 3)
+    assert info["gradeable_solution_rate"] == 1.0
+    assert info["grader_requests"] == 2.0
+    assert info["grader_error_rate"] == 0.0
+    assert info["debates_failed"] == 2
+
+
+def test_solution_census_missing_generation_and_all_fail():
+    # An empty Sample fails fidelity before DebateRound can append a record.
+    backend = ScriptedBackend([""])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(["alice"], [])
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+    assert groups == [[]]
+    expected = {
+        "debates": 1,
+        "debates_failed": 1,
+        "debates_unscoreable": 0,
+        "fail_reasons": {"alice/proposal": 1},
+        "grade_errors": 0,
+        "grader_requests": 0.0,
+        "expected_solution_slots": 1.0,
+        "produced_solution_slots": 0.0,
+        "answer_format_valid_count": 0.0,
+        "extracted_solution_slots": 0.0,
+        "gradeable_solution_slots": 0.0,
+        "answer_format_valid_rate": 0.0,
+        "solution_production_rate": 0.0,
+        "extracted_solution_rate": 0.0,
+        "gradeable_solution_rate": 0.0,
+        "grader_error_rate": 0.0,
+    }
+    assert {key: env.last_rollout_info[key] for key in expected} == expected
 
 
 def test_continuous_scoring_uses_json_confidence():
@@ -348,6 +429,7 @@ def test_docent_export(tmp_path):
     assert len(omni.messages) == 1 + 4  # system + proposal/critique/defense/verdict
     assert run.metadata["verdict"]["winner"] == "Debater_A"
     assert run.metadata["verdict"]["confidence"]["Debater_A"]["json"] == 0.8
+    assert omni.messages[1].metadata["answer_format_valid"] is True
     # judge view: rendered context ends with its own verdict as assistant
     judge_view = run.transcripts[3]
     assert judge_view.messages[0].role == "system"
@@ -427,7 +509,14 @@ def test_format_reward_targets_solution_datum():
         ["alice"],
         [GOOD_VERDICT],
         scoring=ScoringConfig(
-            shaping=[{"kind": "format_reward", "coeff": 0.25, "slots": ["proposal"], "flag": "strict_boxed"}]
+            shaping=[
+                {
+                    "kind": "format_reward",
+                    "coeff": 0.25,
+                    "slots": ["proposal"],
+                    "flag": "answer_format_valid",
+                }
+            ]
         ),
     )
     groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
@@ -435,6 +524,43 @@ def test_format_reward_targets_solution_datum():
     # proposal datum gets +0.25 (boxed present); defense datum only the base +1
     assert t.datum_rewards == [1.25, 1.0]
     assert t.reward == pytest.approx(1.125)  # mean, for logging
+
+
+def test_format_shaping_and_census_share_the_extraction_parse():
+    class SingleParseFamily(MathFamily):
+        def __init__(self):
+            self.parse_calls = 0
+
+        def parse_answers(self, text):
+            self.parse_calls += 1
+            if self.parse_calls > 1:
+                raise AssertionError("solution answer was parsed more than once")
+            return AnswerParse(strict=2.0, relaxed=2.0)
+
+    family = SingleParseFamily()
+    backend = ScriptedBackend(["any answer", "Defense."])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    env = make_env(
+        ["alice"],
+        [GOOD_VERDICT],
+        family=family,
+        scoring=ScoringConfig(
+            shaping=[
+                {
+                    "kind": "format_reward",
+                    "coeff": 0.25,
+                    "slots": ["proposal"],
+                    "flag": "answer_format_valid",
+                }
+            ]
+        ),
+    )
+
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+    assert family.parse_calls == 1
+    assert groups[0][0].datum_rewards == [1.25, 1.0]
+    assert env.last_rollout_info["answer_format_valid_count"] == 1.0
 
 
 def make_solo_env(protocol=PROTOCOL, fresh_positions=True):
@@ -586,4 +712,3 @@ def test_length_normalize_balances_seats():
     datums, _ = grpo_pack([alice], length_normalize="count", drop_zero_advantage=False)
     assert abs(datums[0].advantages[0]) == pytest.approx(abs(datums[0].advantages[0]))
     assert total_mass([bob], "count") == pytest.approx(raw_bob)  # 1 datum: /1
-

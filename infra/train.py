@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Callable
 
 from infra.backend.base import Backend, LossSpec, OptimParams, SamplingParams
 from infra.envs.base import Env, Policy, Trajectory
@@ -105,6 +106,11 @@ class Config:
     # instead of starting a new one at x=0.
     start_step: int = 0
     wandb_run_id: str | None = None
+    # Immutable scientific identity of the task population and grading
+    # protocol. Runners resolve this only after TaskFamily.source() has loaded
+    # its cohort; resumed W&B runs must match it exactly before mutable config
+    # is updated.
+    protocol_identity: dict[str, str] = field(default_factory=dict)
     on_rollout: object | None = None  # callback(step, env) after each train rollout
     seed: int = 0
 
@@ -112,8 +118,15 @@ class Config:
 def _aggregate(trajs: list[Trajectory], prefix: str) -> dict[str, float]:
     if not trajs:
         return {f"{prefix}/n": 0.0}
+    mean_reward = sum(t.reward for t in trajs) / len(trajs)
     out: dict[str, float] = {
-        f"{prefix}/reward_mean": sum(t.reward for t in trajs) / len(trajs),
+        f"{prefix}/reward_mean": mean_reward,
+        # Population std: in the uniform-reward collapse mode the variance
+        # dies before the mean moves.
+        f"{prefix}/reward_std": (
+            sum((t.reward - mean_reward) ** 2 for t in trajs) / len(trajs)
+        )
+        ** 0.5,
         f"{prefix}/n": float(len(trajs)),
     }
     keys = {k for t in trajs for k, v in t.info.items() if isinstance(v, (int, float))}
@@ -147,6 +160,50 @@ def _rollout_info_metrics(env: Env, prefix: str) -> dict[str, float]:
                 if isinstance(vv, (int, float)):
                     out[f"{prefix}/{k}/{kk}"] = float(vv)
     return out
+
+
+class _RolloutInfoAccumulator:
+    """Sum rollout census counts and recompute explicitly declared ratios.
+
+    Environments may expose ``rollout_rate_specs`` as
+    ``rate_name -> (numerator_name, denominator_name)``. This prevents a
+    dynamic-resampling retry from adding already-derived rates (which can
+    exceed one and weights unequal rollout sizes incorrectly). Any published
+    ``*_rate`` must declare its components rather than receiving an implicit
+    and potentially dishonest aggregation rule.
+    """
+
+    def __init__(self, env: Env, prefix: str):
+        self.env = env
+        self.prefix = prefix
+        self.totals: dict[str, float] = {}
+        self.rates_seen: set[str] = set()
+
+    def capture(self) -> None:
+        specs = getattr(self.env, "rollout_rate_specs", {})
+        for key, value in _rollout_info_metrics(self.env, self.prefix).items():
+            name = key.removeprefix(f"{self.prefix}/")
+            if name.endswith("_rate"):
+                if name not in specs:
+                    raise RuntimeError(
+                        f"{type(self.env).__name__} published rollout rate {name!r} "
+                        "without declaring numerator/denominator in rollout_rate_specs"
+                    )
+                self.rates_seen.add(name)
+                continue
+            self.totals[key] = self.totals.get(key, 0.0) + value
+
+    def metrics(self) -> dict[str, float]:
+        out = dict(self.totals)
+        specs = getattr(self.env, "rollout_rate_specs", {})
+        for rate in self.rates_seen:
+            numerator, denominator = specs[rate]
+            numerator_value = out.get(f"{self.prefix}/{numerator}", 0.0)
+            denominator_value = out.get(f"{self.prefix}/{denominator}", 0.0)
+            out[f"{self.prefix}/{rate}"] = (
+                numerator_value / denominator_value if denominator_value else 0.0
+            )
+        return out
 
 
 def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
@@ -192,6 +249,7 @@ def _resample_degenerate(
     group_size: int,
     groups: list[list[Trajectory]],
     retries: int,
+    capture_rollout_info: Callable[[], None] | None = None,
 ) -> dict[str, float]:
     """DAPO dynamic sampling: replace degenerate groups in-place with rollouts
     on fresh tasks, up to `retries` rounds. A replacement that is itself
@@ -204,6 +262,8 @@ def _resample_degenerate(
         if not degenerate:
             break
         fresh = env.rollout(env.tasks(len(degenerate), "train"), policy, group_size)
+        if capture_rollout_info is not None:
+            capture_rollout_info()
         # env.tasks may return fewer than asked (exhausted pool); unpaired
         # slots stay degenerate rather than dropping out of the accounting.
         still = list(degenerate[len(fresh):])
@@ -266,9 +326,8 @@ class _Phases:
         return out
 
 
-def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
-    """eval_env: evaluate on a DIFFERENT env than training (e.g. debate
-    training with plain-RLVR MathEnv evals). None = eval on `env`."""
+def _validate_train_config(backend: Backend, cfg: Config) -> None:
+    """Validate before opening external logging state."""
     if cfg.oversample_factor < 1.0:
         raise ValueError(
             f"oversample_factor must be >= 1.0 (1.0 = off), got {cfg.oversample_factor}"
@@ -292,7 +351,31 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             "kl_mechanism 'loss' needs a backend exposing ref_logprobs "
             "(verl + LoRA); this backend does not."
         )
+
+
+def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
+    """Train while owning exactly one logger/W&B run for the full call.
+
+    ``eval_env`` evaluates on a different env than training (e.g. debate
+    training with plain-RLVR MathEnv evals). None evaluates on ``env``.
+    """
+    _validate_train_config(backend, cfg)
     logger = _make_logger(cfg)
+    try:
+        _train_with_logger(env, backend, cfg, eval_env, logger)
+    finally:
+        close = getattr(logger, "close", None)
+        if close is not None:
+            close()
+
+
+def _train_with_logger(
+    env: Env,
+    backend: Backend,
+    cfg: Config,
+    eval_env: Env | None,
+    logger: Callable[[int, dict[str, Any]], None],
+) -> None:
     policy = Policy(backend, cfg.sampling, cfg.chat_template_kwargs)
     base_optim = cfg.optim or OptimParams(lr=cfg.lr)
 
@@ -338,6 +421,11 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 backend.save(f"step-{step:05d}")
         with ph("rollout"):
             ds_metrics: dict[str, float] = {}
+            rollout_info = _RolloutInfoAccumulator(env, "train")
+
+            def capture_rollout_info() -> None:
+                rollout_info.capture()
+
             if cfg.oversample_factor > 1.0:
                 # One oversized generation round instead of serial retries.
                 # env.tasks may return fewer than asked (exhausted pool);
@@ -346,12 +434,19 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                 # same single-final-rollout stance as the retry path below.
                 n_draw = int(round(cfg.batch_size * cfg.oversample_factor))
                 drawn = env.rollout(env.tasks(n_draw, "train"), policy, cfg.group_size)
+                capture_rollout_info()
                 groups, ds_metrics = _select_oversampled(drawn, cfg.batch_size)
             else:
                 groups = env.rollout(env.tasks(cfg.batch_size, "train"), policy, cfg.group_size)
+                capture_rollout_info()
                 if cfg.dynamic_sampling_retries > 0:
                     ds_metrics = _resample_degenerate(
-                        env, policy, cfg.group_size, groups, cfg.dynamic_sampling_retries
+                        env,
+                        policy,
+                        cfg.group_size,
+                        groups,
+                        cfg.dynamic_sampling_retries,
+                        capture_rollout_info,
                     )
         # on_rollout/_log_transcripts fire exactly once, after the final
         # resample round: env's last-rollout state (last_rollout_records /
@@ -365,7 +460,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
             except Exception as e:  # transcript capture must never kill training
                 print(f"[on_rollout] {type(e).__name__}: {e}")
         metrics = _aggregate([t for g in groups for t in g], "train")
-        metrics.update(_rollout_info_metrics(env, "train"))
+        metrics.update(rollout_info.metrics())
         metrics.update(ds_metrics)  # keys only when the toggle is on; 0.0 otherwise
         # The lr actually applied this step — the only visible trace of the
         # warmup schedule (verl's loss/optim metrics don't carry it).
@@ -448,7 +543,7 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
         logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, cfg.eval_split, prefix))
     if cfg.final_test_eval:
         # The 3-way protocol's single read of the held-out test split.
-        logger(cfg.steps, evaluate(env, final_policy, cfg.eval_n, "test", "test"))
+        logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, "test", "test"))
 
     backend.save("final")
 
@@ -512,20 +607,68 @@ def _save_dirty_patch(run) -> None:
         print(f"[wandb] dirty-patch capture skipped: {type(e).__name__}: {e}")
 
 
-def _make_logger(cfg: Config):
-    run = None
+class _RunLogger:
+    """Callable metric logger that exclusively owns its W&B run, if any."""
+
+    def __init__(self, run=None):
+        self.run = run
+        self._closed = False
+
+    def __call__(self, step: int, metrics: dict[str, Any]) -> None:
+        if self.run is not None:
+            self.run.log(metrics, step=step)
+        shown = {k: round(v, 4) for k, v in sorted(metrics.items()) if isinstance(v, float)}
+        print(f"[step {step}] {shown}")
+
+    def close(self) -> None:
+        """Finish the owned run at most once; no-W&B loggers are a no-op."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.run is not None:
+            self.run.finish()
+
+
+def _make_logger(cfg: Config) -> _RunLogger:
+    logger = _RunLogger()
     if cfg.wandb_project:
         import wandb
 
         if cfg.wandb_run_id:
             # resume="must": appending to the named run is the entire point; a
             # silent fallback to a fresh run would re-split the x-axis.
-            # config included on resume too: a continuation that changes lr or
-            # steps must not keep advertising the original run's values.
+            # Preflight through the READ-ONLY public API. Even opening the run
+            # with wandb.init mutates its resume state, so an incompatible
+            # continuation must be rejected before init is called at all.
+            api = wandb.Api()
+            run_path = (
+                f"{cfg.wandb_entity}/{cfg.wandb_project}/{cfg.wandb_run_id}"
+                if cfg.wandb_entity
+                else f"{cfg.wandb_project}/{cfg.wandb_run_id}"
+            )
+            stored_identity = dict(api.run(run_path).config).get("protocol_identity")
+            current_identity = dict(cfg.protocol_identity)
+            if stored_identity != current_identity:
+                raise ValueError(
+                    "refusing to resume W&B run with a different or missing "
+                    f"protocol_identity: stored={stored_identity!r}, "
+                    f"current={current_identity!r}"
+                )
             run = wandb.init(
                 project=cfg.wandb_project, entity=cfg.wandb_entity, id=cfg.wandb_run_id,
-                resume="must", config=vars(cfg) | _env_identity(), allow_val_change=True,
+                resume="must",
             )
+            logger = _RunLogger(run)
+            # Continuations may intentionally change operational knobs such as
+            # lr or steps. Update those only after identity equality, and omit
+            # the identity key so the immutable stored value is never rewritten.
+            mutable_config = vars(cfg).copy()
+            mutable_config.pop("protocol_identity")
+            try:
+                run.config.update(mutable_config | _env_identity(), allow_val_change=True)
+            except BaseException:
+                logger.close()
+                raise
         else:
             run = wandb.init(
                 project=cfg.wandb_project,
@@ -533,16 +676,72 @@ def _make_logger(cfg: Config):
                 name=cfg.run_name,
                 config=vars(cfg) | _env_identity(),
             )
-        if run is not None and dict(run.config).get("env/git_dirty") == "yes":
-            _save_dirty_patch(run)
+            logger = _RunLogger(run)
+        try:
+            if run is not None and dict(run.config).get("env/git_dirty") == "yes":
+                _save_dirty_patch(run)
+        except BaseException:
+            logger.close()
+            raise
+    return logger
 
-    def log(step: int, metrics: dict[str, Any]) -> None:
-        if run is not None:
-            run.log(metrics, step=step)
-        shown = {k: round(v, 4) for k, v in sorted(metrics.items()) if isinstance(v, float)}
-        print(f"[step {step}] {shown}")
 
-    return log
+def resolve_protocol_identity(dataset_type: str, family: Any) -> dict[str, str]:
+    """Combine the registry key with a family's resolved protocol metadata.
+
+    ``dataset_type`` is runner-owned because it selects the registry entry;
+    allowing a family to restate it would create two competing authorities.
+    Call this only after ``family.source()`` has resolved its cohort.
+    """
+    if not isinstance(dataset_type, str) or not dataset_type.strip():
+        raise ValueError(
+            f"dataset_type must be a nonempty string, got {dataset_type!r}"
+        )
+    family_identity = family.protocol_identity()
+    if not isinstance(family_identity, dict):
+        raise ValueError(
+            "TaskFamily.protocol_identity() must return dict[str, str], got "
+            f"{type(family_identity).__name__}"
+        )
+    if "dataset_type" in family_identity:
+        raise ValueError(
+            "TaskFamily.protocol_identity() must not include reserved key "
+            "'dataset_type'; the runner-owned registry key is authoritative"
+        )
+    invalid = [
+        (key, value)
+        for key, value in family_identity.items()
+        if not isinstance(key, str) or not isinstance(value, str)
+    ]
+    if invalid:
+        raise ValueError(
+            "TaskFamily.protocol_identity() must return dict[str, str]; "
+            f"invalid entries: {invalid!r}"
+        )
+    return {"dataset_type": dataset_type} | family_identity
+
+
+def validate_resume_args(args: Any) -> None:
+    """Reject continuation flags that cannot identify a valid lineage."""
+    if not getattr(args, "wandb_resume", None):
+        return
+    if getattr(args, "no_wandb", False):
+        raise ValueError("--wandb-resume cannot be combined with --no-wandb")
+    if not getattr(args, "load", None):
+        raise ValueError("--wandb-resume requires --load <checkpoint>")
+    # A step-N checkpoint is saved before update N and therefore carries its
+    # absolute continuation step in the name. ``final`` and service-owned
+    # opaque checkpoint URIs carry optimizer state but no portable step
+    # metadata. Guessing zero would restart the W&B x-axis, LR schedule, and
+    # step-seeded shuffles, so those require the operator to state the step.
+    if getattr(args, "start_step", None) is None and re.search(
+        r"(?:^|/)step-\d+/?$", str(args.load)
+    ) is None:
+        raise ValueError(
+            "--wandb-resume with a final or opaque checkpoint requires an "
+            "explicit --start-step; only load paths ending in step-N encode "
+            "their absolute continuation step"
+        )
 
 
 def main() -> None:
@@ -584,8 +783,13 @@ def main() -> None:
     backend = TinkerBackend(cfg.base_model, lora_rank=cfg.lora_rank)
     if args.load:
         backend.load(args.load)
-    env = get_family("math").source({"seed": cfg.seed})
-    train(env, backend, cfg)
+    family = get_family(args.env)
+    try:
+        env = family.source({"seed": cfg.seed})
+        cfg.protocol_identity = resolve_protocol_identity(args.env, family)
+        train(env, backend, cfg)
+    finally:
+        family.close()
 
 
 if __name__ == "__main__":

@@ -84,7 +84,12 @@ class TinySource(SingleTurnEnv):
         ]
 
     def reward(self, task, text):
-        return (1.0 if "GOOD" in text else 0.0), {"correct": float("GOOD" in text)}
+        correct = float("GOOD" in text)
+        return correct, {
+            "correct_strict": correct,
+            "correct_relaxed": correct,
+            "answer_format_valid": float(bool(text.strip())),
+        }
 
 
 def _run(tmp_path, script, *, n_tasks=1, group_size=1, plan_max=1000, ceiling=2000):
@@ -175,7 +180,11 @@ def test_reward_reads_the_answer_not_the_plan(tmp_path):
     # GOOD appears only in the plan: the answer is what gets scored
     _, _, groups = _run(tmp_path, ["GOOD plan", "bad answer"])
     assert groups[0][0].reward == 0.0
-    assert groups[0][0].info["correct"] == 0.0
+    assert groups[0][0].info == {
+        "correct_strict": 0.0,
+        "correct_relaxed": 0.0,
+        "answer_format_valid": 1.0,
+    }
 
 
 def test_groups_and_per_sample_plans(tmp_path):
@@ -195,7 +204,6 @@ def test_plan_fidelity_failure_drops_the_chain(tmp_path):
     _, backend, groups = _run(tmp_path, ["", "ok plan", "GOOD"], group_size=2)
     assert len(backend.calls[1][0]) == 1  # one answer convo, not two
     assert len(groups[0]) == 1
-    assert groups[0][0].info["samples_dropped_fidelity"] == 1.0
 
 
 def test_answer_fidelity_failure_drops_the_trajectory(tmp_path):

@@ -16,11 +16,11 @@ from typing import Any, Optional
 
 from datasets import load_dataset
 
+from infra.envs.answer_parsing import parse_number
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
-from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
-from infra.envs.tasks.math import MathEnv, relaxed_extract, strict_extract
-from infra.envs.answer_parsing import extract_number_from_boxed_answer, parse_number
+from infra.envs.tasks.base import AnswerParse, TaskFamily, reject_unknown_keys
+from infra.envs.tasks.math import MathEnv, _numeric_protocol_identity, parse_numeric_answers
 
 DATASET_ID = "di-zhang-fdu/AIME_1983_2024"
 PROMPT_FILE = "math.yaml"  # deliberately the math family's prompt: one answer prompt
@@ -93,17 +93,43 @@ class AimeEnv(SingleTurnEnv):
 class AimeFamily(TaskFamily):
     def source(self, ds: dict) -> Env:
         reject_unknown_keys(
-            ds, {"seed", "eval_subset_size", "prompt_file", "think_overshoot_penalty"}, "aime"
+            ds,
+            {
+                "seed",
+                "eval_subset_size",
+                "prompt_file",
+                "think_overshoot_penalty",
+                "correct_reward",
+                "format_reward",
+                "relaxed_correct_bonus",
+            },
+            "aime",
         )
-        return AimeEnv(
-            seed=int(ds.get("seed", 0)),
-            eval_subset_size=int(ds.get("eval_subset_size", 512)),
+        seed = int(ds.get("seed", 0))
+        eval_subset_size = int(ds.get("eval_subset_size", 512))
+        prompt_path = resolve_prompt_file(
+            (str(ds["prompt_file"]) if ds.get("prompt_file") else None), PROMPT_FILE
+        )
+        env = AimeEnv(
+            seed=seed,
+            eval_subset_size=eval_subset_size,
+            correct_reward=float(ds.get("correct_reward", 1.0)),
+            format_reward=float(ds.get("format_reward", 0.1)),
+            relaxed_correct_bonus=float(ds.get("relaxed_correct_bonus", 0.1)),
             think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
-            prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
+            prompt_file=str(prompt_path),
         )
+        self._protocol_identity = _numeric_protocol_identity(
+            env,
+            dataset_id=DATASET_ID,
+            seed=seed,
+            eval_subset_size=eval_subset_size,
+            prompt_path=prompt_path,
+        )
+        return env
 
-    def extractor(self, relaxed: bool):
-        return relaxed_extract if relaxed else strict_extract
+    def parse_answers(self, text: str) -> AnswerParse:
+        return parse_numeric_answers(text)
 
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
         gt = meta.get("gt")
@@ -114,5 +140,5 @@ class AimeFamily(TaskFamily):
         except (TypeError, ValueError):
             return None
 
-    def format_flags(self, text: str) -> dict[str, float]:
-        return {"strict_boxed": float(extract_number_from_boxed_answer(text) is not None)}
+    def protocol_identity(self) -> dict[str, str]:
+        return dict(getattr(self, "_protocol_identity", {}))

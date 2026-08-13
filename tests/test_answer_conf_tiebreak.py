@@ -143,7 +143,9 @@ def test_correct_verdict_confidence_orders_rewards(tmp_path):
     assert r_sure > r_unsure  # confident-and-right beats unsure-and-right
     assert i_sure["reward_conf_term"] == pytest.approx(0.5 * p_sure)
     # The binary keys are untouched by the term.
-    assert i_sure["correct"] == 1.0 and i_sure["answer_tag"] == 1.0
+    assert i_sure["correct_strict"] == i_sure["correct_relaxed"] == 1.0
+    assert i_sure["answer_format_valid"] == 1.0
+    assert "correct" not in i_sure and "answer_tag" not in i_sure
 
 
 def test_confidence_reads_the_final_tag_span_only(tmp_path):
@@ -226,7 +228,7 @@ def test_unparseable_answer_has_no_term_and_no_warning(tmp_path):
     assert r == 0.0
     # Keys present on every coeff>0 branch (reward()'s every-branch rule).
     assert info["answer_conf"] == 0.0 and info["reward_conf_term"] == 0.0
-    assert info["answer_tag"] == 0.0
+    assert info["answer_format_valid"] == 0.0
 
 
 # --------------------------------- (f) SingleTurnEnv routes the real Sample
@@ -322,3 +324,16 @@ def test_family_accepts_and_wires_answer_conf_coeff(tmp_path):
     assert MonitoringBenchFamily().source({"files": files}).answer_conf_coeff == 0.0
     with pytest.raises(ValueError, match="answer_conf_coeff"):
         MonitoringBenchTaskSource(files, answer_conf_coeff=-0.1)
+
+
+def test_family_accepts_reward_knobs_without_changing_legacy_defaults(tmp_path):
+    files = _pool_files(tmp_path)
+    default = MonitoringBenchFamily().source({"files": files})
+    assert default.correct_reward == 1.0
+    assert default.format_reward == 0.1
+
+    configured = MonitoringBenchFamily().source(
+        {"files": files, "correct_reward": 3.0, "format_reward": 0.0}
+    )
+    assert configured.correct_reward == 3.0
+    assert configured.format_reward == 0.0

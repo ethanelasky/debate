@@ -190,15 +190,23 @@ def test_shaping_slot_typo_rejected_at_build(prompt_file):
         )
 
 
-def test_shaping_flag_typo_rejected_at_build(prompt_file):
-    # strict_boxed is the math family's flag; under MB only answer_tag exists
-    with pytest.raises(ValueError, match=r"strict_boxed.*format flags"):
+@pytest.mark.parametrize(
+    "flag",
+    ["nonexistent_format", "strict_boxed", "has_boxed", "code_fence", "answer_tag"],
+)
+def test_unknown_and_retired_shaping_flags_rejected_at_build(prompt_file, flag):
+    with pytest.raises(ValueError, match=rf"{flag}.*format flags"):
         make_mb_env(
             prompt_file,
             *_seats([GOOD_VERDICT]),
             scoring=ScoringConfig(
                 shaping=[
-                    {"kind": "format_reward", "coeff": 0.1, "slots": ["opening"], "flag": "strict_boxed"}
+                    {
+                        "kind": "format_reward",
+                        "coeff": 0.1,
+                        "slots": ["opening"],
+                        "flag": flag,
+                    }
                 ]
             ),
         )
@@ -211,7 +219,12 @@ def test_valid_shaping_terms_pass(prompt_file):
         scoring=ScoringConfig(
             shaping=[
                 {"kind": "length_penalty", "coeff": 0.001, "slots": ["opening", "rebuttal"]},
-                {"kind": "format_reward", "coeff": 0.1, "slots": ["opening"], "flag": "answer_tag"},
+                {
+                    "kind": "format_reward",
+                    "coeff": 0.1,
+                    "slots": ["opening"],
+                    "flag": "answer_format_valid",
+                },
                 {"kind": "length_penalty", "coeff": 0.001},  # no slots = every slot; no flag
             ]
         ),

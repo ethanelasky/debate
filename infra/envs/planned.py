@@ -32,6 +32,7 @@ from infra.envs.base import (
     Task,
     Trajectory,
     datum_from_sample,
+    _validate_predict_results,
 )
 from infra.envs.task_prompts import (
     _PLACEHOLDER,
@@ -81,6 +82,7 @@ class PlannedEnv(Env):
         # min()-clamping is how the plan silently shrank to 1000 before.
         self.answer_max_tokens = int(answer_max_tokens) if answer_max_tokens is not None else None
         self.last_rollout_records: list[dict[str, Any]] = []
+        self.last_rollout_info: dict[str, int | float] = {}
 
     def tasks(self, n: int, split: str = "train") -> list[Task]:
         return self.inner.tasks(n, split)
@@ -111,6 +113,21 @@ class PlannedEnv(Env):
         return self.plan_template.replace(PROBLEM_PLACEHOLDER, str(question)).strip()
 
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        # Clear externally observed state before rendering or generation. The
+        # counters are then advanced only after each stage satisfies the
+        # Policy.predict result-shape contract.
+        self.last_rollout_records = []
+        self.last_rollout_info = {
+            "tasks_requested": len(tasks),
+            "plan_samples_attempted": 0,
+            "plan_samples_kept": 0,
+            "plan_samples_dropped_fidelity": 0,
+            "answer_requests": 0,
+            "answer_samples_attempted": 0,
+            "answer_samples_kept": 0,
+            "answer_samples_dropped_fidelity": 0,
+            "samples_dropped_fidelity": 0,
+        }
         # Turn 1: the task's CONTEXT (everything before the eliciting message)
         # + the plan cue. For math/codecontests that context is just the system
         # card and the problem rides in the cue's <PROBLEM>; for MB it is the
@@ -124,21 +141,37 @@ class PlannedEnv(Env):
         plan_results = policy.predict(
             plan_convos, n=group_size, limits=SlotLimits(max_total_tokens=self.plan_max_tokens)
         )
+        _validate_predict_results(
+            plan_results,
+            requests=len(tasks),
+            samples_per_request=group_size,
+            stage="plan",
+        )
 
         # Turn 2: each surviving plan continues into the eliciting message,
         # rendered by the inner env exactly as its single-turn arm would. The
         # context is already in the conversation from turn 1, so only the cue
         # is appended.
         pending: list[tuple[int, Any, list[dict[str, str]]]] = []
-        n_dropped = 0
+        plan_samples_attempted = sum(len(samples) for samples in plan_results)
+        plan_samples_dropped = 0
         for ti, samples in enumerate(plan_results):
             body = [dict(tasks[ti].messages[-1])]
             for s in samples:
                 if not s.fidelity_ok():
-                    n_dropped += 1
+                    plan_samples_dropped += 1
                     continue
                 convo = plan_convos[ti] + [{"role": "assistant", "content": s.text.strip()}] + body
                 pending.append((ti, s, convo))
+        self.last_rollout_info.update(
+            {
+                "plan_samples_attempted": plan_samples_attempted,
+                "plan_samples_kept": len(pending),
+                "plan_samples_dropped_fidelity": plan_samples_dropped,
+                "answer_requests": len(pending),
+                "samples_dropped_fidelity": plan_samples_dropped,
+            }
+        )
         answer_limits = (
             SlotLimits(max_total_tokens=self.answer_max_tokens)
             if self.answer_max_tokens is not None
@@ -147,13 +180,32 @@ class PlannedEnv(Env):
         answer_results = (
             policy.predict([c for _, _, c in pending], n=1, limits=answer_limits) if pending else []
         )
+        _validate_predict_results(
+            answer_results,
+            requests=len(pending),
+            samples_per_request=1,
+            stage="answer",
+        )
+        answer_samples_attempted = sum(len(samples) for samples in answer_results)
+        aligned_answers = []
+        for pending_item, samples in zip(pending, answer_results):
+            answer = samples[0]
+            aligned_answers.append((*pending_item, answer, answer.fidelity_ok()))
+        answer_samples_kept = sum(int(fidelity_ok) for *_, fidelity_ok in aligned_answers)
+        answer_samples_dropped = answer_samples_attempted - answer_samples_kept
+        self.last_rollout_info.update(
+            {
+                "answer_samples_attempted": answer_samples_attempted,
+                "answer_samples_kept": answer_samples_kept,
+                "answer_samples_dropped_fidelity": answer_samples_dropped,
+                "samples_dropped_fidelity": plan_samples_dropped + answer_samples_dropped,
+            }
+        )
 
         groups: list[list[Trajectory]] = [[] for _ in tasks]
         records: list[dict[str, Any]] = []
-        for (ti, plan_s, convo), answers in zip(pending, answer_results):
-            a = answers[0]
-            if not a.fidelity_ok():
-                n_dropped += 1
+        for ti, plan_s, convo, a, fidelity_ok in aligned_answers:
+            if not fidelity_ok:
                 continue
             # Scored via the inner env's SAMPLE-level seam with the ANSWER
             # sample, so a logprob-reading grader (MB's confidence tiebreaker)
@@ -170,7 +222,11 @@ class PlannedEnv(Env):
             records.append(
                 {
                     "task_index": ti,
-                    "meta": {k: v for k, v in tasks[ti].meta.items() if k != "bindings"},
+                    # PlannedEnv is only a rollout-shape wrapper. Metadata
+                    # disclosure remains owned by the source environment so
+                    # verifier-private fields are redacted before any
+                    # transcript, Docent, or W&B consumer can observe them.
+                    "meta": self.inner.export_meta(tasks[ti]),
                     "messages": convo,
                     "completion": a.text,
                     "stop_reason": a.stop_reason,
@@ -179,8 +235,4 @@ class PlannedEnv(Env):
                 }
             )
         self.last_rollout_records = records
-        # Same deliberate contract violation as SingleTurnEnv.rollout: a
-        # batch-level counter stamped on one sample.
-        if n_dropped and groups and groups[0]:
-            groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
         return groups

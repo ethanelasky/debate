@@ -139,3 +139,20 @@ def test_default_eval_behavior_gets_final_point_too():
     assert any(k.startswith("eval/") for _, m in logged for k in m)
     assert not any(k.startswith(("dev/", "test/")) for _, m in logged for k in m)
     assert env.eval_splits == ["test", "test", "test"]  # 2 in-loop + final
+
+
+def test_final_test_eval_uses_the_direct_eval_env():
+    train_env = SplitRecordingEnv()
+    direct_eval_env = SplitRecordingEnv()
+    cfg = Config(
+        steps=0,
+        eval_every=0,
+        final_test_eval=True,
+        eval_n=2,
+        save_every=0,
+    )
+    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, metrics: None):
+        train(train_env, NullBackend(), cfg, eval_env=direct_eval_env)
+
+    assert direct_eval_env.eval_splits == ["test"]
+    assert train_env.eval_splits == []

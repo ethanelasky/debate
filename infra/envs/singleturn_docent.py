@@ -30,10 +30,12 @@ def agent_runs(records: list[dict[str, Any]]) -> list[AgentRun]:
     for rec in records:
         info = rec.get("info") or {}
         meta = rec.get("meta") or {}
-        correct = info.get("correct_relaxed", info.get("correct"))
-        status = (
-            "correct" if correct == 1.0 else "incorrect" if correct == 0.0 else "ungraded"
-        )
+        if info.get("correct_strict"):
+            status = "strict-correct"
+        elif info.get("correct_relaxed"):
+            status = "relaxed-only-correct"
+        else:
+            status = "incorrect"
         messages = [_msg(m) for m in rec["messages"]]
         messages.append(AssistantMessage(content=rec.get("completion") or ""))
         runs.append(

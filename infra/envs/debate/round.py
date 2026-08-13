@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol as TypingProtocol
 
 from infra.backend.base import Datum, Sample, SamplingParams
-from infra.envs.base import Policy, SlotLimits, datum_from_sample
+from infra.envs.base import Policy, SlotLimits, _validate_predict_results, datum_from_sample
 from infra.envs.debate.protocol import CompiledSlot, Kind, Protocol, Visibility
 from infra.models.base import Model, ModelInput, ModelResponse, SamplingProfile, SpeechStructure
 
@@ -62,6 +62,10 @@ class SlotRecord:
     text: str                       # post-think visible text (think stripped at record time)
     thinking: Optional[str] = None  # stored; NEVER rendered into any context
     extracted: Any = None           # solution: parsed answer; decision: verdict dict
+    # Solution slots only. DebateEnv's answer extractor computes this from the
+    # same family parse that produced ``extracted`` so shaping, census, and
+    # transcript metadata cannot drift by reparsing independently.
+    answer_format_valid: Optional[bool] = None
     sample: Optional[Sample] = None      # trained seats
     datum: Optional[Datum] = None        # trained seats (advantages zeroed; mask from budget forcing)
     response: Optional[ModelResponse] = None  # frozen seats
@@ -173,6 +177,12 @@ class PolicySeat(SeatRunner):
         for limits, idxs in by_limits.items():
             convos = [requests[i].messages for i in idxs]
             outs = self.policy.predict(convos, n=1, limits=limits)
+            _validate_predict_results(
+                outs,
+                requests=len(convos),
+                samples_per_request=1,
+                stage="trained seat",
+            )
             for i, samples in zip(idxs, outs):
                 s = samples[0]
                 if not s.fidelity_ok():
@@ -463,6 +473,9 @@ def create_retry_feedback(
 
 
 VerdictParser = Callable[[str], Optional[dict]]
+# A solution answer plus the generic strict-format result from one family
+# parse. Keeping this tuple internal lets DebateRound stay task-domain blind.
+AnswerExtractor = Callable[[str], tuple[Any, bool]]
 
 # Custom mid-round position binding: called with (state, chooser_speaker,
 # extracted) when a solution slot's extraction lands; replaces the default
@@ -482,7 +495,7 @@ class DebateRound:
         verdict_parser: Optional[VerdictParser] = None,
         verdict_retries: int = 4,
         judge_schema: str = "competitive",
-        solution_extractor: Optional[Callable[[str], Any]] = None,
+        answer_extractor: Optional[AnswerExtractor] = None,
         fresh_positions: bool = False,
         decision_json_schema: Optional[dict] = None,
         speech_token_limit: Optional[int] = None,
@@ -501,7 +514,7 @@ class DebateRound:
         self.verdict_retries = verdict_retries
         self.decision_json_schema = decision_json_schema
         self.judge_schema = judge_schema  # shapes the retry feedback's example
-        self.solution_extractor = solution_extractor
+        self.answer_extractor = answer_extractor
         self.fresh_positions = fresh_positions
         self.position_binder = position_binder
         # Solution-slot retry mirrors the verdict retry, but only when a
@@ -554,7 +567,7 @@ class DebateRound:
                 results = self._retry_unparseable(step, states, live, results, runner)
             if (
                 step.slot.kind == Kind.SOLUTION
-                and self.solution_extractor is not None
+                and self.answer_extractor is not None
                 and self.solution_retry_feedback is not None
             ):
                 results = self._retry_with_feedback(
@@ -563,7 +576,7 @@ class DebateRound:
                     live,
                     results,
                     runner,
-                    parser=self.solution_extractor,
+                    parser=lambda text: self.answer_extractor(text)[0],
                     feedback=lambda st, text, attempt: self.solution_retry_feedback(text, attempt),
                     max_retries=self.solution_retries,
                 )
@@ -644,6 +657,11 @@ class DebateRound:
                     )
                 )
             fresh = runner.generate(requests)
+            if len(fresh) != len(requests):
+                raise RuntimeError(
+                    f"seat {step.speaker} retry generation returned {len(fresh)} results "
+                    f"for {len(requests)} requests"
+                )
             for j, res in zip(bad, fresh):
                 retries[j] += 1
                 res.retries = retries[j]
@@ -674,8 +692,8 @@ class DebateRound:
         if not res.text.strip():
             state.meta.setdefault("empty_slots", []).append(f"{step.speaker}/{step.slot.name}@{step.turn}")
 
-        if step.slot.kind == Kind.SOLUTION and self.solution_extractor is not None:
-            record.extracted = self.solution_extractor(res.text)
+        if step.slot.kind == Kind.SOLUTION and self.answer_extractor is not None:
+            record.extracted, record.answer_format_valid = self.answer_extractor(res.text)
             binds_position = self.position_binder is not None or self.fresh_positions
             if record.extracted is None and binds_position:
                 # Record the failed attempt (extracted None) before failing the

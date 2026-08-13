@@ -49,8 +49,8 @@ _base_math_pc:
     confidence_source: json
     shaping:
       # +0.1 on the proposal DATUM (not the whole trajectory) when the answer
-      # was strictly \boxed — trajectory-specific reward via per-datum GRPO.
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+      # had a valid answer format — trajectory-specific reward via per-datum GRPO.
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   # L3-4: the contested band for a 4B (L1-2 ran 71-88% correct -> debates
   # uncontested; L5-only sits near the always-wrong floor at this scale, the
   # old repo's own warning). L5 arm below for harder runs / the 9B.

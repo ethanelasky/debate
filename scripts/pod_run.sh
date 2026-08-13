@@ -10,7 +10,7 @@
 #      ${var:?message} expansions below, not a code this script chooses
 #   2  unknown mode, unresolvable judge config, or legacy checkpoint layout
 #   3  judge vLLM failed to start, serve, or free its port
-#   4  editable pip install failed or timed out
+#   4  editable pip install/dependency preflight failed or timed out
 #   5  a trainer is already running, another pod_run.sh holds the launch lock,
 #      or the pod is mid-teardown (a watchdog has committed to stopping it)
 #   6  the idle watchdog could not be started (pod would bill unprotected)
@@ -333,6 +333,54 @@ kill_judge() {
 # the judge: an install failure then aborts with nothing to clean up.
 if ! timeout -k 30s 600 "$PY" -m pip install -q -e . --no-deps; then
   echo "FATAL: editable install of /root/debate failed or exceeded 600s (NFS stall writing to site-packages?), or $PY / timeout is missing (rc 127)" >&2
+  exit 4
+fi
+
+# The editable install deliberately uses --no-deps because the shared GPU env
+# is provisioned as one jointly-resolved unit. That also means a prebuilt env
+# can be older than this checkout while the editable install still succeeds.
+# Verify the symbolic grader stack before starting a judge or touching a GPU;
+# these are required project dependencies even when this particular run uses a
+# non-symbolic task family.
+if ! timeout -k 10s 60 "$PY" - <<'PYEOF'
+import importlib
+from importlib import metadata
+
+expected = {
+    "math-verify": "0.9.0",
+    "latex2sympy2-extended": "1.11.0",
+    "sympy": "1.14.0",
+    "antlr4-python3-runtime": "4.13.2",
+}
+modules = ("math_verify", "latex2sympy2_extended", "sympy", "antlr4")
+errors = []
+for module in modules:
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        errors.append(f"cannot import {module}: {type(exc).__name__}: {exc}")
+for distribution, wanted in expected.items():
+    try:
+        installed = metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        errors.append(f"{distribution} is not installed (expected {wanted})")
+    else:
+        if installed != wanted:
+            errors.append(f"{distribution}=={installed} (expected {wanted})")
+if errors:
+    detail = "\n  - ".join(errors)
+    raise SystemExit(
+        "FATAL: the provisioned Python environment has a missing or stale "
+        f"symbolic grader stack:\n  - {detail}\n"
+        "Re-provision the environment with scripts/provision_pod.sh or "
+        "scripts/provision_blackwell.sh. Shared environments are write-once: "
+        "build a new VENV_NAME (or rebuild only after all users have stopped); "
+        "pod_run.sh will not repair it because its editable install uses --no-deps."
+    )
+print("symbolic dependency preflight: ok")
+PYEOF
+then
+  echo "FATAL: symbolic dependency preflight failed or exceeded 60s; no judge or trainer was started" >&2
   exit 4
 fi
 

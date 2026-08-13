@@ -69,12 +69,13 @@ def _grade(
         "cf_rating": row["cf_rating"],
         "difficulty": row.get("difficulty"),
         "reward": reward,
-        "correct": bool(info["correct"]),
-        "has_code": bool(info["has_code"]),
+        "correct_strict": bool(info["correct_strict"]),
+        "correct_relaxed": bool(info["correct_relaxed"]),
+        "answer_format_valid": bool(info["answer_format_valid"]),
         "cpp_code": bool(info["cpp_code"]),
         "exec_timeout": bool(info["exec_timeout"]),
         "exec_error": bool(info["exec_error"]),
-        "tests_passed_frac": info["tests_passed_frac"],
+        "gdm_tests_passed_frac": info["gdm_tests_passed_frac"],
         "finish_reason": output.finish_reason,
         "token_count": len(output.token_ids),
         "text": output.text,
@@ -87,13 +88,19 @@ def _summary(records: list[dict[str, Any]], inventory: dict[str, Any]) -> dict[s
     greedy = [r for r in records if r["kind"] == "greedy_test"]
     for band in [_band_name(*x) for x in BANDS]:
         rows = [r for r in greedy if r["band"] == band]
-        correct = sum(r["correct"] for r in rows)
+        correct_strict = sum(r["correct_strict"] for r in rows)
+        correct_relaxed = sum(r["correct_relaxed"] for r in rows)
         result["greedy"][band] = {
             "n": len(rows),
-            "correct": correct,
-            "accuracy": correct / len(rows) if rows else None,
-            "wilson_95": _wilson(correct, len(rows)),
-            "has_code_rate": sum(r["has_code"] for r in rows) / len(rows) if rows else None,
+            "correct_strict": correct_strict,
+            "correct_relaxed": correct_relaxed,
+            "strict_accuracy": correct_strict / len(rows) if rows else None,
+            "relaxed_accuracy": correct_relaxed / len(rows) if rows else None,
+            "strict_wilson_95": _wilson(correct_strict, len(rows)),
+            "relaxed_wilson_95": _wilson(correct_relaxed, len(rows)),
+            "answer_format_valid_rate": (
+                sum(r["answer_format_valid"] for r in rows) / len(rows) if rows else None
+            ),
             "timeout_rate": sum(r["exec_timeout"] for r in rows) / len(rows) if rows else None,
             "exec_error_rate": sum(r["exec_error"] for r in rows) / len(rows) if rows else None,
             "length_stop_rate": sum(r["finish_reason"] == "length" for r in rows) / len(rows)
@@ -104,12 +111,16 @@ def _summary(records: list[dict[str, Any]], inventory: dict[str, Any]) -> dict[s
 
     for cap in (1000, 1200, 1400):
         rows = [r for r in greedy if r["cf_rating"] <= cap]
-        correct = sum(r["correct"] for r in rows)
+        correct_strict = sum(r["correct_strict"] for r in rows)
+        correct_relaxed = sum(r["correct_relaxed"] for r in rows)
         result["greedy"][f"cumulative_le_{cap}"] = {
             "n": len(rows),
-            "correct": correct,
-            "accuracy": correct / len(rows) if rows else None,
-            "wilson_95": _wilson(correct, len(rows)),
+            "correct_strict": correct_strict,
+            "correct_relaxed": correct_relaxed,
+            "strict_accuracy": correct_strict / len(rows) if rows else None,
+            "relaxed_accuracy": correct_relaxed / len(rows) if rows else None,
+            "strict_wilson_95": _wilson(correct_strict, len(rows)),
+            "relaxed_wilson_95": _wilson(correct_relaxed, len(rows)),
         }
 
     sampled = [r for r in records if r["kind"] == "sampled_train_g8"]
@@ -118,28 +129,41 @@ def _summary(records: list[dict[str, Any]], inventory: dict[str, Any]) -> dict[s
         groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             groups[row["task_index"]].append(row)
-        correct_by_group = [sum(r["correct"] for r in group) for group in groups.values()]
-        n_groups = len(correct_by_group)
-        mixed = sum(0 < value < 8 for value in correct_by_group)
-        any_pass = sum(value > 0 for value in correct_by_group)
-        all_pass = sum(value == 8 for value in correct_by_group)
-        correct = sum(correct_by_group)
+        relaxed_correct_by_group = [
+            sum(r["correct_relaxed"] for r in group) for group in groups.values()
+        ]
+        strict_correct = sum(r["correct_strict"] for r in rows)
+        n_groups = len(relaxed_correct_by_group)
+        mixed = sum(0 < value < 8 for value in relaxed_correct_by_group)
+        any_pass = sum(value > 0 for value in relaxed_correct_by_group)
+        all_pass = sum(value == 8 for value in relaxed_correct_by_group)
+        relaxed_correct = sum(relaxed_correct_by_group)
         result["sampled_g8"][band] = {
             "tasks": n_groups,
             "rollouts": len(rows),
-            "correct": correct,
-            "sample_accuracy": correct / len(rows) if rows else None,
-            "wilson_95": _wilson(correct, len(rows)),
+            "correct_strict": strict_correct,
+            "correct_relaxed": relaxed_correct,
+            "strict_sample_accuracy": strict_correct / len(rows) if rows else None,
+            "relaxed_sample_accuracy": relaxed_correct / len(rows) if rows else None,
+            "strict_wilson_95": _wilson(strict_correct, len(rows)),
+            "relaxed_wilson_95": _wilson(relaxed_correct, len(rows)),
             "mixed_groups": mixed,
             "mixed_group_rate": mixed / n_groups if n_groups else None,
             "pass_at_8_tasks": any_pass,
             "pass_at_8_rate": any_pass / n_groups if n_groups else None,
-            "all_fail_groups": sum(value == 0 for value in correct_by_group),
+            "all_fail_groups": sum(value == 0 for value in relaxed_correct_by_group),
             "all_pass_groups": all_pass,
             "successes_per_group": dict(
-                sorted((str(k), v) for k, v in __import__("collections").Counter(correct_by_group).items())
+                sorted(
+                    (str(k), v)
+                    for k, v in __import__("collections")
+                    .Counter(relaxed_correct_by_group)
+                    .items()
+                )
             ),
-            "has_code_rate": sum(r["has_code"] for r in rows) / len(rows) if rows else None,
+            "answer_format_valid_rate": (
+                sum(r["answer_format_valid"] for r in rows) / len(rows) if rows else None
+            ),
             "timeout_rate": sum(r["exec_timeout"] for r in rows) / len(rows) if rows else None,
             "exec_error_rate": sum(r["exec_error"] for r in rows) / len(rows) if rows else None,
             "length_stop_rate": sum(r["finish_reason"] == "length" for r in rows) / len(rows)

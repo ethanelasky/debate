@@ -5,12 +5,14 @@ from infra.envs.tasks.aime import AimeFamily
 from infra.envs.tasks.base import TaskFamily
 from infra.envs.tasks.codecontests import CodeContestsFamily
 from infra.envs.tasks.math import MathFamily
+from infra.envs.tasks.math_symbolic import SymbolicMathFamily
 from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 
 TASK_FAMILIES: dict[str, type[TaskFamily]] = {
     "aime": AimeFamily,
     "codecontests": CodeContestsFamily,
     "math": MathFamily,
+    "math_symbolic": SymbolicMathFamily,
     "monitoringbench": MonitoringBenchFamily,
 }
 

@@ -209,7 +209,12 @@ def _choice_wiring(exp: dict, protocol: Protocol):
 
 
 def build_eval_env(exp: dict, task_source) -> DebateEnv:
-    """Experiment dict + task source -> all-frozen DebateEnv (pure eval)."""
+    """Experiment dict + task source -> all-frozen DebateEnv (pure eval).
+
+    A successfully returned env owns its family; callers must close
+    ``env.family`` when they are done.  If env construction fails after the
+    family is created, this builder closes it before propagating the error.
+    """
     from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 
     validate_experiment(exp)
@@ -239,7 +244,12 @@ def build_eval_env(exp: dict, task_source) -> DebateEnv:
         solution_retries=solution_retries,
         solution_retry_feedback=retry_feedback,
     )
-    return DebateEnv(config, task_source, MonitoringBenchFamily())
+    family = MonitoringBenchFamily()
+    try:
+        return DebateEnv(config, task_source, family)
+    except BaseException:
+        family.close()
+        raise
 
 
 def build_task_source(exp: dict, task_ids: Optional[list[str]], seed: Optional[int]):
@@ -641,54 +651,57 @@ def main(argv: Optional[list[str]] = None, task_source=None) -> None:
         return
 
     env = build_eval_env(exp, task_source)
-    tasks = env.tasks(args.limit if args.limit is not None else 10**9, split="test")
-    if not tasks:
-        raise ValueError("no tasks selected")
-    env.rollout(tasks, policy=None, group_size=1)
-    rows = result_rows(env)
-    summary = {"experiment": args.experiment, **summarize(rows, args.matched_fpr)}
+    try:
+        tasks = env.tasks(args.limit if args.limit is not None else 10**9, split="test")
+        if not tasks:
+            raise ValueError("no tasks selected")
+        env.rollout(tasks, policy=None, group_size=1)
+        rows = result_rows(env)
+        summary = {"experiment": args.experiment, **summarize(rows, args.matched_fpr)}
 
-    out = (
-        Path(args.out)
-        if args.out
-        else Path("outputs") / f"{args.experiment}_{datetime.now():%Y%m%d_%H%M%S}.results.jsonl"
-    )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
-        for row in rows:
-            f.write(json.dumps(row) + "\n")
-    summary_path = out.with_suffix(".summary.json")
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
-
-    if args.docent_jsonl or args.docent_collection:
-        from infra.envs.debate.docent_export import agent_runs, export_jsonl, upload
-
-        runs = agent_runs(env)
-        if args.docent_jsonl:
-            export_jsonl(runs, args.docent_jsonl)
-        if args.docent_collection:
-            upload(runs, collection_name=args.docent_collection)
-
-    if summary["n_failed"]:
-        print(
-            "\n" + "!" * 70 + f"\n!! {summary['n_failed']}/{summary['n_attempted']} ROUNDS FAILED: "
-            f"{summary['fail_reasons']}\n" + "!" * 70 + "\n",
-            file=sys.stderr,
+        out = (
+            Path(args.out)
+            if args.out
+            else Path("outputs") / f"{args.experiment}_{datetime.now():%Y%m%d_%H%M%S}.results.jsonl"
         )
-    print(json.dumps(summary, indent=2))
-    print(f"results: {out}\nsummary: {summary_path}", file=sys.stderr)
-    if summary["n_scored"] == 0:
-        print("ERROR: zero rounds scored; every metric above is empty.", file=sys.stderr)
-        raise SystemExit(1)
-    if summary["failure_rate"] > args.max_failure_rate:
-        print(
-            f"ERROR: {summary['n_failed']}/{summary['n_attempted']} rounds failed "
-            f"({summary['failure_rate']:.1%} > --max-failure-rate "
-            f"{args.max_failure_rate:.1%}); the metrics above are computed over the "
-            "surviving rounds only and are not a valid read of the pool.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        summary_path = out.with_suffix(".summary.json")
+        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+        if args.docent_jsonl or args.docent_collection:
+            from infra.envs.debate.docent_export import agent_runs, export_jsonl, upload
+
+            runs = agent_runs(env)
+            if args.docent_jsonl:
+                export_jsonl(runs, args.docent_jsonl)
+            if args.docent_collection:
+                upload(runs, collection_name=args.docent_collection)
+
+        if summary["n_failed"]:
+            print(
+                "\n" + "!" * 70 + f"\n!! {summary['n_failed']}/{summary['n_attempted']} ROUNDS FAILED: "
+                f"{summary['fail_reasons']}\n" + "!" * 70 + "\n",
+                file=sys.stderr,
+            )
+        print(json.dumps(summary, indent=2))
+        print(f"results: {out}\nsummary: {summary_path}", file=sys.stderr)
+        if summary["n_scored"] == 0:
+            print("ERROR: zero rounds scored; every metric above is empty.", file=sys.stderr)
+            raise SystemExit(1)
+        if summary["failure_rate"] > args.max_failure_rate:
+            print(
+                f"ERROR: {summary['n_failed']}/{summary['n_attempted']} rounds failed "
+                f"({summary['failure_rate']:.1%} > --max-failure-rate "
+                f"{args.max_failure_rate:.1%}); the metrics above are computed over the "
+                "surviving rounds only and are not a valid read of the pool.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    finally:
+        env.family.close()
 
 
 if __name__ == "__main__":

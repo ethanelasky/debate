@@ -26,6 +26,12 @@ VERL_PIN="${VERL_PIN:-e9618406de5bad40041d7612554e465ec2003ec1}"
 # resolved env, never in-place.
 VLLM_PIN="${VLLM_PIN:-vllm==0.24.*}"
 MAX_JOBS="${MAX_JOBS:-2}"
+SYMBOLIC_DEPS=(
+  "math-verify[antlr4_13_2]==0.9.0"
+  "latex2sympy2-extended==1.11.0"
+  "sympy==1.14.0"
+  "antlr4-python3-runtime==4.13.2"
+)
 VOL="${VOL:-/workspace}"
 ENV_DIR="$VOL/envs/verl-sm90"
 export HF_HOME="${HF_HOME:-$VOL/hf}"
@@ -168,6 +174,7 @@ timeout -k 30s 3600 uv pip install -p "$P" --override "$OVERRIDE" "$VLLM_PIN" \
   "verl @ git+https://github.com/volcengine/verl@${VERL_PIN}" \
   "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb>=0.18" jinja2 codetiming \
   backoff "docent-python>=0.1.74" "pydantic>=2.0" "openai>=1.0" pyyaml \
+  "${SYMBOLIC_DEPS[@]}" \
   "transformers>=5.13,<6" || {
   echo "FATAL: joint vllm+verl resolve failed or exceeded 3600s (git clone of verl hanging, or NFS-stalled \$UV_CACHE_DIR=$UV_CACHE_DIR)" >&2; exit 1; }
 # transformers >=5.13 is a HARD floor: 5.10-5.12 misapply OLMo-3's YaRN factor

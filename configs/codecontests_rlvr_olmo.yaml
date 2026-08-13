@@ -309,7 +309,7 @@ codecontests_rlvr_olmo_easy1000_b16_smoke1:
 
 # 10 steps at the real 8x8 shape on the 32B. The first run whose numbers are
 # worth reading: the 7B smoke showed the plumbing works but the model is too
-# weak on CodeContests (eval/correct ~0.03, a third of programs crashing).
+# weak on CodeContests (eval/correct_relaxed ~0.03, a third of programs crashing).
 codecontests_rlvr_olmo31_32b_smoke10:
   _extends: codecontests_rlvr_olmo31_32b
   training:

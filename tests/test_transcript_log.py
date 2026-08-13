@@ -40,7 +40,11 @@ class MetaEnv(SingleTurnEnv):
         ]
 
     def reward(self, task, text):
-        return 1.0, {"correct": 1.0}
+        return 1.0, {
+            "correct_strict": 1.0,
+            "correct_relaxed": 1.0,
+            "answer_format_valid": 1.0,
+        }
 
 
 def _policy(script):
@@ -60,7 +64,10 @@ def test_rollout_retains_records_without_bindings():
     # rollout() also stamps the length metrics (tokens, over_budget) that every
     # run reports, and pinning the exact dict here would make adding a metric
     # look like a regression in a test about bindings.
-    assert all(r["reward"] == 1.0 and r["info"]["correct"] == 1.0 for r in recs)
+    assert all(
+        r["reward"] == 1.0 and r["info"]["correct_strict"] == 1.0
+        for r in recs
+    )
     # each rollout overwrites, never appends
     env.rollout(env.tasks(1), _policy(["third"]), group_size=1)
     assert [r["completion"] for r in env.last_rollout_records] == ["third"]
@@ -81,7 +88,11 @@ def test_singleturn_sample_rows_shape_and_truncation():
             "completion": "ans",
             "stop_reason": "stop",
             "reward": 1.1,
-            "info": {"correct": 1.0},
+            "info": {
+                "correct_strict": 1.0,
+                "correct_relaxed": 1.0,
+                "answer_format_valid": 1.0,
+            },
         }
     ]
     (row,) = singleturn_sample_rows(records, step=7)

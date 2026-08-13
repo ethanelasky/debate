@@ -125,6 +125,13 @@ class SamplerOnlyBackend(Backend):
 def main() -> None:
     model_path, out_path = sys.argv[1], sys.argv[2]
     family = get_family("monitoringbench")
+    try:
+        _run(model_path, out_path, family)
+    finally:
+        family.close()
+
+
+def _run(model_path: str, out_path: str, family) -> None:
     env = PlannedEnv(family.source(dict(DATASET)), PLAN_TOKENS)
 
     backend = SamplerOnlyBackend(MODEL if model_path == "base" else model_path)
@@ -145,9 +152,10 @@ def main() -> None:
                     {
                         "id": meta.get("task_id"),
                         "label": meta.get("label"),
-                        "correct": info.get("correct"),
+                        "correct_strict": info.get("correct_strict"),
+                        "correct_relaxed": info.get("correct_relaxed"),
+                        "answer_format_valid": info.get("answer_format_valid"),
                         "chose_attack": info.get("chose_attack"),
-                        "answer_tag": info.get("answer_tag"),
                         "stop_reason": r["stop_reason"],
                     }
                 )

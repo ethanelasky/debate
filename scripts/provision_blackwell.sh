@@ -33,6 +33,12 @@ VLLM_PIN="${VLLM_PIN:-vllm==0.24.*}"
 # hosts ship several times that; raise via MAX_JOBS only after `free -g`
 # confirms ~16GB per job, and only for the flash-attn attempt.
 MAX_JOBS="${MAX_JOBS:-2}"
+SYMBOLIC_DEPS=(
+  "math-verify[antlr4_13_2]==0.9.0"
+  "latex2sympy2-extended==1.11.0"
+  "sympy==1.14.0"
+  "antlr4-python3-runtime==4.13.2"
+)
 VOL="${VOL:-/workspace}"
 # verl-b200, NOT verl-sm90: the volume is shared with sm90 pods and verl-sm90
 # holds an sm90-built flash-attn that backend autodetection could pick up.
@@ -144,6 +150,7 @@ timeout -k 30s 3600 uv pip install -p "$P" --link-mode=copy --override "$OVERRID
   "verl @ git+https://github.com/volcengine/verl@${VERL_PIN}" \
   "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb>=0.18" jinja2 codetiming \
   backoff "docent-python>=0.1.74" "pydantic>=2.0" "openai>=1.0" pyyaml ninja \
+  "${SYMBOLIC_DEPS[@]}" \
   "transformers>=5.13,<6" || {
   echo "FATAL: joint vllm+verl resolve failed or exceeded 3600s (git clone of verl hanging, or NFS-stalled \$UV_CACHE_DIR=$UV_CACHE_DIR)" >&2; exit 1; }
 # transformers >=5.13 is a HARD floor: 5.10-5.12 misapply OLMo-3's YaRN factor

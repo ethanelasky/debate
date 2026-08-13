@@ -21,7 +21,7 @@ state: {
 }
 
 record: {
-  label: "SlotRecord — DebateRound._ingest, one per protocol slot\ntext / thinking (never rendered onward)\nextracted <- family extractor | verdict parser\nsample + datum (trained seats only)"
+  label: "SlotRecord — DebateRound._ingest, one per protocol slot\ntext / thinking (never rendered onward)\nextracted + answer_format_valid <- family parse | verdict parser\nsample + datum (trained seats only)"
 }
 
 traj: {
@@ -41,12 +41,12 @@ grad: {
 row -> task: "family.source() parses the dataset"
 task -> state: "meta -> bindings (question -> TOPIC)"
 state -> record: "ONE DebateRound drives ALL states, slot by slot"
-record -> traj: "verdict -> ladder; family.grade() -> metric"
+record -> traj: "verdict -> ladder; family.grade_batch() -> metric"
 traj -> datum: "grpo_pack: center within (task, arm, seat) group"
 datum -> grad: "forward_backward x N, optim_step"
 
 domain: {
-  label: "Domain knowledge lives ONLY here\n1. Task.meta fields\n2. prompt template YAML\n3. family.extractor() -> SlotRecord.extracted\n4. family.grade() -> info metric"
+  label: "Domain knowledge lives ONLY here\n1. Task.meta fields\n2. prompt template YAML\n3. family.parse_answers() -> SlotRecord answer fields\n4. family.grade_batch() -> info metric"
   style.fill: "#fff4e6"
 }
 

@@ -10,15 +10,25 @@ from pathlib import Path
 
 import pytest
 
+import infra.envs.tasks.codecontests as codecontests_module
+from infra.backend.base import SamplingParams
 from infra.config import resolve_experiments_from_file
+from infra.envs.base import Policy, Task
+from infra.envs.debate.docent_export import export_jsonl
+from infra.envs.planned import PlannedEnv
+from infra.envs.singleturn_docent import agent_runs
 from infra.envs.tasks import get_family
 from infra.envs.tasks.codecontests import (
     CodeContestsEnv,
     CodeContestsFamily,
     extract_code,
     is_cpp_code,
+    parse_code_answers,
     run_stdin_tests,
 )
+from infra.envs.tasks.base import GraderInfrastructureError
+from infra.transcript_log import singleturn_sample_rows
+from test_single_turn_env import ScriptedBackend
 
 SUM_SOLUTION = "a, b = map(int, input().split())\nprint(a + b)"
 ECHO_SOLUTION = "print(input().strip())"
@@ -170,6 +180,131 @@ def test_tasks_carry_meta_and_hide_test_io(env):
         for case in t.meta["rlvr_inputs"] + t.meta["rlvr_outputs"] + t.meta["truth_inputs"] + t.meta["truth_outputs"]:
             assert case not in prompt  # verifier cases must never be prompted
     assert [t.meta["name"] for t in env.tasks(2, split="test")] == ["sum", "echo"]
+
+
+def test_verifier_suites_are_redacted_before_all_transcript_consumers(env, tmp_path):
+    sentinels = {
+        "rlvr_inputs": "RLVR-INPUT-SENTINEL",
+        "rlvr_outputs": "RLVR-OUTPUT-SENTINEL",
+        "truth_inputs": "TRUTH-INPUT-SENTINEL",
+        "truth_outputs": "TRUTH-OUTPUT-SENTINEL",
+        "gdm_inputs": "GDM-INPUT-SENTINEL",
+        "gdm_outputs": "GDM-OUTPUT-SENTINEL",
+        "cco_inputs": "CCO-INPUT-SENTINEL",
+        "cco_outputs": "CCO-OUTPUT-SENTINEL",
+    }
+    base = env.tasks(1, split="test")[0]
+    task = Task(
+        messages=base.messages,
+        meta={
+            "question": "Safe problem statement",
+            "name": "safe-name",
+            "cf_rating": 800,
+            "difficulty": {"nested": "NOMINALLY-SAFE-KEY-SENTINEL"},
+            "split": "test",
+            **{key: [value] for key, value in sentinels.items()},
+        },
+    )
+    policy = Policy(
+        ScriptedBackend(["```python\nprint('definitely wrong')\n```"]),
+        SamplingParams(max_tokens=32),
+    )
+    env.rollout([task], policy, group_size=1)
+    (record,) = env.last_rollout_records
+    assert record["meta"] == {
+        "question": "Safe problem statement",
+        "name": "safe-name",
+        "cf_rating": 800,
+        "split": "test",
+    }
+
+    record_payload = json.dumps(record, default=str)
+    docent_path = tmp_path / "docent.jsonl"
+    export_jsonl(agent_runs([record]), str(docent_path))
+    docent_payload = docent_path.read_text()
+    wandb_rows_payload = json.dumps(singleturn_sample_rows([record], step=7))
+    for sentinel in sentinels.values():
+        assert sentinel not in record_payload
+        assert sentinel not in docent_payload
+        assert sentinel not in wandb_rows_payload
+    assert "NOMINALLY-SAFE-KEY-SENTINEL" not in record_payload
+    assert "NOMINALLY-SAFE-KEY-SENTINEL" not in docent_payload
+    assert "NOMINALLY-SAFE-KEY-SENTINEL" not in wandb_rows_payload
+
+
+def test_planned_wrapper_preserves_real_codecontests_export_boundary(
+    env, tmp_path, monkeypatch
+):
+    """The wrapper must invoke CodeContestsEnv's real metadata allowlist."""
+    sentinels = {
+        "rlvr_inputs": "PLANNED-RLVR-INPUT-SENTINEL",
+        "rlvr_outputs": "PLANNED-RLVR-OUTPUT-SENTINEL",
+        "truth_inputs": "PLANNED-TRUTH-INPUT-SENTINEL",
+        "truth_outputs": "PLANNED-TRUTH-OUTPUT-SENTINEL",
+        "gdm_inputs": "PLANNED-GDM-INPUT-SENTINEL",
+        "gdm_outputs": "PLANNED-GDM-OUTPUT-SENTINEL",
+        "cco_inputs": "PLANNED-CCO-INPUT-SENTINEL",
+        "cco_outputs": "PLANNED-CCO-OUTPUT-SENTINEL",
+    }
+    scalar_sentinel = "PLANNED-PRIVATE-SCALAR-SENTINEL"
+    base = env.tasks(1, split="test")[0]
+    task = Task(
+        messages=base.messages,
+        meta={
+            "question": "Safe planned problem statement",
+            "name": "safe-planned-name",
+            "cf_rating": 900,
+            "difficulty": "safe-difficulty",
+            "split": "test",
+            "private_scalar": scalar_sentinel,
+            **{key: [value] for key, value in sentinels.items()},
+        },
+    )
+    # Exercise the real family and wrapper while isolating this disclosure
+    # probe from the code-execution verifier, which is orthogonal here.
+    monkeypatch.setattr(
+        env,
+        "reward_sample",
+        lambda _task, _sample: (
+            0.0,
+            {
+                "answer_format_valid": 1.0,
+                "correct_strict": 0.0,
+                "correct_relaxed": 0.0,
+            },
+        ),
+    )
+    planned = PlannedEnv(env, plan_max_tokens=32, answer_max_tokens=64)
+    policy = Policy(
+        ScriptedBackend(["private plan", "```python\nprint('answer')\n```"]),
+        SamplingParams(max_tokens=64),
+    )
+    planned.rollout([task], policy, group_size=1)
+
+    (record,) = planned.last_rollout_records
+    assert record["meta"] == {
+        "question": "Safe planned problem statement",
+        "name": "safe-planned-name",
+        "cf_rating": 900,
+        "difficulty": "safe-difficulty",
+        "split": "test",
+    }
+    record_payload = json.dumps(record, default=str)
+    docent_path = tmp_path / "planned-docent.jsonl"
+    export_jsonl(agent_runs([record]), str(docent_path))
+    docent_payload = docent_path.read_text()
+    wandb_rows_payload = json.dumps(singleturn_sample_rows([record], step=8))
+    for sentinel in (*sentinels.values(), scalar_sentinel):
+        assert sentinel not in record_payload
+        assert sentinel not in docent_payload
+        assert sentinel not in wandb_rows_payload
+    for safe_value in (
+        "Safe planned problem statement",
+        "safe-planned-name",
+        "safe-difficulty",
+    ):
+        assert safe_value in record_payload
+        assert safe_value in docent_payload
 
 
 # ------------------------------------------------------- generation prompts
@@ -373,7 +508,7 @@ def test_wrong_solution_reports_first_failure():
 
 def test_syntax_error_solution_is_an_error():
     r = run_stdin_tests("def (:", ["1 2"], ["3"], timeout=TIMEOUT)
-    assert r["status"] == "error" and not r["passed"]
+    assert r["status"] == "candidate_error" and not r["passed"]
     assert "SyntaxError" in r["first_failure"]["stderr"]
 
 
@@ -386,6 +521,61 @@ def test_runtime_error_is_a_failure_not_a_crash():
     r = run_stdin_tests("raise ValueError('boom')", ["x"], ["1"], timeout=TIMEOUT)
     assert not r["passed"]
     assert "ValueError" in r["first_failure"]["stderr"]
+
+
+def test_runtime_error_after_expected_output_still_fails():
+    r = run_stdin_tests(
+        "print(1)\nraise ValueError('boom')", ["x"], ["1"], timeout=TIMEOUT
+    )
+    assert r["status"] == "failed" and not r["passed"]
+    assert "ValueError" in r["first_failure"]["stderr"]
+
+
+def test_worker_start_failure_is_fatal_in_direct_reward_and_debate_grade(
+    env, family, monkeypatch
+):
+    def fail_to_start(*args, **kwargs):
+        raise OSError("worker unavailable")
+
+    monkeypatch.setattr(codecontests_module.subprocess, "Popen", fail_to_start)
+    task = env.tasks(1, split="test")[0]
+    with pytest.raises(GraderInfrastructureError, match="failed to start"):
+        env.reward(task, f"```python\n{SUM_SOLUTION}\n```")
+    with pytest.raises(GraderInfrastructureError, match="failed to start"):
+        family.grade_batch([(_meta(), SUM_SOLUTION)])
+
+
+def test_broken_supervisor_result_is_fatal_through_reward_and_grade_batch(
+    env, family, monkeypatch
+):
+    monkeypatch.setattr(
+        codecontests_module,
+        "_run_candidate_case",
+        lambda **kwargs: {"returncode": 0, "stdout": "3"},
+    )
+    task = env.tasks(1, split="test")[0]
+    with pytest.raises(GraderInfrastructureError, match="invalid case schema"):
+        env.reward(task, f"```python\n{SUM_SOLUTION}\n```")
+    with pytest.raises(GraderInfrastructureError, match="invalid case schema"):
+        family.grade_batch([(_meta(), SUM_SOLUTION)])
+
+
+def test_candidate_compile_and_runtime_failures_grade_false(env, family):
+    task = env.tasks(1, split="test")[0]
+    syntax_reward, syntax_info = env.reward(task, "```python\ndef (:\n```")
+    runtime_reward, runtime_info = env.reward(
+        task, "```python\nraise ValueError('candidate bug')\n```"
+    )
+    assert syntax_reward == runtime_reward == pytest.approx(env.format_reward)
+    assert syntax_info["exec_error"] == 1.0
+    assert runtime_info["exec_error"] == 0.0
+    assert syntax_info["correct_relaxed"] == runtime_info["correct_relaxed"] == 0.0
+    assert family.grade_batch(
+        [
+            (_meta(), "def (:"),
+            (_meta(), "raise ValueError('candidate bug')"),
+        ]
+    ) == [False, False]
 
 
 # Forges a result JSON as the LAST line of the runner's real stdout (atexit
@@ -410,6 +600,128 @@ def test_forged_stdout_verdict_is_ignored():
     assert fam.grade({"truth_inputs": ["1 2"], "truth_outputs": ["3"]}, FORGED_STDOUT_SOLUTION) is False
 
 
+def test_frame_inspection_cannot_see_expected_output():
+    # The old in-process exec put expected_output in an outer Python frame.
+    # This exploit prints a discovered grader value; the fresh interpreter has
+    # no such frame or variable and therefore cannot recover the gold.
+    exploit = (
+        "import inspect\n"
+        "found = None\n"
+        "frame = inspect.currentframe()\n"
+        "while frame is not None:\n"
+        "    for key in ('expected_output', 'outputs', 'test_cases'):\n"
+        "        value = frame.f_locals.get(key)\n"
+        "        if value is not None:\n"
+        "            found = value[0] if isinstance(value, list) else value\n"
+        "    frame = frame.f_back\n"
+        "print(found if found is not None else 'NO-GOLD')\n"
+    )
+    sentinel = "FRAME-GOLD-SENTINEL"
+    result = run_stdin_tests(exploit, ["ignored"], [sentinel], timeout=TIMEOUT)
+    assert result["passed"] is False
+    assert sentinel not in result["first_failure"]["actual"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "print('expected', flush=True)\nimport os\nos._exit(0)",
+        "print('expected', flush=True)\nimport os\nos._exit(120)",
+        (
+            "import os\n"
+            "try:\n"
+            "    os._exit(0)\n"
+            "except BaseException:\n"
+            "    pass\n"
+            "print('expected')"
+        ),
+        "print('expected', flush=True)\nraise SystemExit(120)",
+        "print('expected', flush=True)\nimport os\nos.abort()",
+        (
+            "print('expected', flush=True)\n"
+            "import os, signal\n"
+            "os.kill(os.getpid(), signal.SIGKILL)"
+        ),
+    ],
+)
+def test_candidate_hard_exit_is_false_and_next_run_is_healthy(source):
+    result = run_stdin_tests(source, ["x"], ["expected"], timeout=TIMEOUT)
+    assert result["passed"] is False
+    healthy = run_stdin_tests("print('expected')", ["x"], ["expected"], timeout=TIMEOUT)
+    assert healthy["passed"] is True
+
+
+def test_each_case_gets_fresh_module_globals():
+    source = (
+        "try:\n"
+        "    counter += 1\n"
+        "except NameError:\n"
+        "    counter = 1\n"
+        "print(counter)\n"
+    )
+    result = run_stdin_tests(source, ["", ""], ["1", "1"], timeout=TIMEOUT)
+    assert result["passed"] is True and result["tests_passed"] == 2
+
+
+def test_case_cannot_poison_launcher_reused_by_later_case():
+    # Regression for the original shared tmp/bootstrap.py: case 1 replaced
+    # that trusted launcher with a program that echoed case 2's stdin and
+    # returned the normal sentinel. The real solution deliberately raises on
+    # case 2, so the suite must fail even though the forged launcher would
+    # have printed the second expected output exactly.
+    source = (
+        "from pathlib import Path\n"
+        "value = input().strip()\n"
+        "if value == 'poison':\n"
+        "    Path('bootstrap.py').write_text(\n"
+        "        'import sys; print(sys.stdin.read()); raise SystemExit(120)'\n"
+        "    )\n"
+        "    print('first-ok')\n"
+        "else:\n"
+        "    raise RuntimeError('the real case-2 source must execute')\n"
+    )
+    result = run_stdin_tests(
+        source,
+        ["poison", "second-expected"],
+        ["first-ok", "second-expected"],
+        timeout=TIMEOUT,
+    )
+    assert result["passed"] is False
+    assert result["tests_passed"] == 1
+    assert result["first_failure"]["test_idx"] == 1
+    assert "RuntimeError" in result["first_failure"]["stderr"]
+
+
+def test_case_cannot_poison_source_reused_by_later_case():
+    source = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "value = input().strip()\n"
+        "if value == 'poison':\n"
+        "    os.chmod(__file__, 0o600)\n"
+        "    Path(__file__).write_text('print(input())')\n"
+        "    print('first-ok')\n"
+        "else:\n"
+        "    raise RuntimeError('fresh source required')\n"
+    )
+    result = run_stdin_tests(
+        source,
+        ["poison", "second-expected"],
+        ["first-ok", "second-expected"],
+        timeout=TIMEOUT,
+    )
+    assert result["passed"] is False
+    assert result["tests_passed"] == 1
+
+
+def test_output_flood_is_bounded_and_fails():
+    source = "import os\nwhile True: os.write(1, b'x' * 65536)"
+    result = run_stdin_tests(source, [""], ["x"], timeout=5)
+    assert result["passed"] is False
+    assert result["status"] == "candidate_error"
+    assert "output limit" in result["first_failure"]["stderr"].lower()
+
+
 def test_timeout_is_reported_and_graded_false():
     r = run_stdin_tests("while True: pass", ["1"], ["1"], timeout=2)
     assert not r["passed"] and r["timeout"] is True and r["status"] == "timeout"
@@ -424,30 +736,85 @@ def test_reward_correct_solution(env):
     task = env.tasks(1, split="test")[0]  # the sum problem
     reward, info = env.reward(task, f"sure:\n```python\n{SUM_SOLUTION}\n```")
     assert reward == pytest.approx(1.1)
-    assert info["correct"] == 1.0 and info["has_code"] == 1.0
-    assert info["tests_passed_frac"] == pytest.approx(1.0)
-    assert info["gdm_correct"] == info["correct"]
-    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"]
+    assert info["answer_format_valid"] == 1.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"]
+    assert info["gdm_tests_passed_frac"] == pytest.approx(1.0)
+    assert {"correct", "has_code", "tests_passed_frac"}.isdisjoint(info)
 
 
 def test_reward_unfenced_text(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "I think the answer is a + b.")
-    assert reward == 0.0 and info["has_code"] == 0.0 and info["correct"] == 0.0
+    assert reward == 0.0
+    assert info["answer_format_valid"] == 0.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
 
 
 def test_reward_fenced_wrong_code(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "```python\nprint(0)\n```")
     assert reward == pytest.approx(0.1)
-    assert info["correct"] == 0.0 and info["tests_passed_frac"] == 0.0
+    assert info["answer_format_valid"] == 1.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
+    assert info["gdm_tests_passed_frac"] == 0.0
 
 
 def test_reward_cpp_code_gets_format_credit_only(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "```\n#include <iostream>\nint main(){ std::cout<<1; }\n```")
     assert reward == pytest.approx(0.1)
-    assert info["correct"] == 0.0 and info["cpp_code"] == 1.0
+    assert info["answer_format_valid"] == 1.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
+    assert info["cpp_code"] == 1.0
+
+
+def test_unclosed_fence_preserves_relaxed_reward_but_is_not_format_valid(env):
+    task = env.tasks(1, split="test")[0]
+    reward, info = env.reward(task, f"```python\n{SUM_SOLUTION}")
+    assert reward == pytest.approx(1.1)
+    assert info["answer_format_valid"] == 0.0
+    assert info["correct_strict"] == 0.0
+    assert info["correct_relaxed"] == info["gdm_correct"] == 1.0
+
+
+def test_empty_closed_fence_is_not_valid_or_rewarded(env):
+    task = env.tasks(1, split="test")[0]
+    reward, info = env.reward(task, "```python\n```")
+    assert reward == 0.0
+    assert info["answer_format_valid"] == 0.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"```python\n{SUM_SOLUTION}\n```",
+        f"```\n{SUM_SOLUTION}\n```",
+        f"```python\n{SUM_SOLUTION}",
+        "plain prose",
+        "```python\n```",
+    ],
+)
+def test_reward_always_emits_generic_answer_metrics(env, text):
+    _, info = env.reward(env.tasks(1, split="test")[0], text)
+    assert {"answer_format_valid", "correct_strict", "correct_relaxed"} <= set(info)
+    assert {"correct", "has_code", "tests_passed_frac", "code_fence"}.isdisjoint(info)
+
+
+def test_strict_and_relaxed_correctness_share_one_gdm_execution(env, monkeypatch):
+    calls = []
+
+    def fake_run(code, inputs, outputs, timeout):
+        calls.append((code, inputs, outputs, timeout))
+        return {"status": "passed", "passed": True, "tests_passed": 2, "tests_total": 2}
+
+    monkeypatch.setattr(codecontests_module, "run_stdin_tests", fake_run)
+    _, info = env.reward(
+        env.tasks(1, split="test")[0], f"```python\n{SUM_SOLUTION}\n```"
+    )
+    assert len(calls) == 1
+    assert info["correct_strict"] == info["correct_relaxed"] == 1.0
 
 
 # -------------------------------------------------------------------- family
@@ -482,16 +849,33 @@ def test_grade_cpp_solution(family):
     assert family.grade(_meta(), "#include <iostream>\nint main(){ std::cout<<1; }") is False
 
 
-def test_extractor_relaxed_knob(family):
+def test_parse_answers_distinguishes_relaxed_unclosed_fence(family):
     text = "```python\nprint(1)"
-    assert family.extractor(relaxed=True)(text) == "print(1)"
-    assert family.extractor(relaxed=False)(text) is None
+    parsed = family.parse_answers(text)
+    assert parsed == parse_code_answers(text)
+    assert parsed.strict is None and parsed.relaxed == "print(1)"
 
 
-def test_format_flags(family):
-    assert family.format_flags("```python\nprint(1)\n```") == {"code_fence": 1.0}
-    assert family.format_flags("just prose") == {"code_fence": 0.0}
-    assert family.format_flags("```python\nprint(1)") == {"code_fence": 0.0}
+@pytest.mark.parametrize(
+    "text",
+    [
+        "```python\nprint(1)\n```",
+        "```\nprint(1)\n```",
+        "```python\nprint(1)",
+        "plain prose",
+        "```python\n```",
+    ],
+)
+def test_parse_answers_matches_family_parser(family, text):
+    parsed = family.parse_answers(text)
+    assert parsed == parse_code_answers(text)
+
+
+def test_answer_format_valid_comes_from_strict_parse(family):
+    assert family.parse_answers("```python\nprint(1)\n```").answer_format_valid is True
+    assert family.parse_answers("just prose").answer_format_valid is False
+    assert family.parse_answers("```python\nprint(1)").answer_format_valid is False
+    assert family.parse_answers("```python\n```").answer_format_valid is False
 
 
 def test_source_requires_path(family):
@@ -511,6 +895,113 @@ def test_source_builds_env(family, tmp_path):
     env = family.source({"path": path, "test_path": test, "timeout_seconds": TIMEOUT})
     assert isinstance(env, CodeContestsEnv)
     assert len(env.train_rows) == 3 and family.timeout_seconds == TIMEOUT
+
+
+def test_protocol_identity_is_stable_compact_and_resolved(tmp_path):
+    train = Path(_write_jsonl(tmp_path / "train.jsonl", ROWS))
+    test = Path(_write_jsonl(tmp_path / "test.jsonl", ROWS))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"source":"fixture-v1"}\n')
+    config = {
+        "path": str(train),
+        "test_path": str(test),
+        "seed": 7,
+        "eval_subset_size": 2,
+        "timeout_seconds": TIMEOUT,
+        "min_cf_rating": None,
+    }
+
+    first = CodeContestsFamily()
+    first.source(config)
+    second = CodeContestsFamily()
+    second.source(config)
+    identity = first.protocol_identity()
+
+    assert identity == second.protocol_identity()
+    assert identity["grading_protocol"] == "codecontests_fresh_process_per_case_v2"
+    assert identity["train_source_path"] == str(train.resolve())
+    assert identity["eval_source_path"] == str(test.resolve())
+    assert identity["train_manifest_path"] == str(manifest.resolve())
+    assert identity["seed"] == "7" and identity["eval_subset_size"] == "2"
+    assert identity["min_cf_rating"] == "none"
+    assert identity["correct_reward"] == "1.0"
+    assert identity["format_reward"] == "0.1"
+    assert identity["soft_token_budget"] == "none"
+    assert identity["overshoot_penalty"] == "0.0"
+    assert all(isinstance(value, str) for value in identity.values())
+    assert len(json.dumps(identity)) < 5000
+
+
+def test_protocol_identity_changes_with_artifact_manifest_prompt_and_cap(tmp_path):
+    train = Path(_write_jsonl(tmp_path / "train.jsonl", ROWS))
+    test = Path(_write_jsonl(tmp_path / "test.jsonl", ROWS))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"source":"fixture-v1"}\n')
+    prompt = tmp_path / "prompt.yaml"
+    prompt.write_text(
+        "messages:\n"
+        "  - role: user\n"
+        "    name: ANSWER_GEN_USER\n"
+        "    content: 'Solve <PROBLEM>'\n"
+    )
+    config = {
+        "path": str(train),
+        "test_path": str(test),
+        "prompt_file": str(prompt),
+        "eval_subset_size": 2,
+    }
+
+    def identity(**overrides):
+        family = CodeContestsFamily()
+        family.source({**config, **overrides})
+        return family.protocol_identity()
+
+    baseline = identity()
+
+    manifest.write_text('{"source":"fixture-v2"}\n')
+    assert identity()["train_manifest_sha256"] != baseline["train_manifest_sha256"]
+
+    prompt.write_text(
+        "messages:\n"
+        "  - role: user\n"
+        "    name: ANSWER_GEN_USER\n"
+        "    content: 'Carefully solve <PROBLEM>'\n"
+    )
+    assert identity()["prompt_sha256"] != baseline["prompt_sha256"]
+
+    changed_cap = identity(eval_subset_size=1)
+    assert changed_cap["eval_subset_size"] != baseline["eval_subset_size"]
+    assert changed_cap["eval_cohort_sha256"] != baseline["eval_cohort_sha256"]
+
+    with test.open("a") as f:
+        f.write("\n")
+    assert identity()["eval_content_sha256"] != baseline["eval_content_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("knob", "changed_value", "default_identity", "changed_identity"),
+    [
+        ("correct_reward", 2, "1.0", "2.0"),
+        ("format_reward", 0, "0.1", "0.0"),
+        ("soft_token_budget", 17, "none", "17"),
+        ("overshoot_penalty", 0.25, "0.0", "0.25"),
+    ],
+)
+def test_protocol_identity_tracks_each_reward_knob(
+    tmp_path, knob, changed_value, default_identity, changed_identity
+):
+    train = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    test = _write_jsonl(tmp_path / "test.jsonl", ROWS)
+    config = {"path": train, "test_path": test, "eval_subset_size": 2}
+
+    baseline = CodeContestsFamily()
+    baseline.source(config)
+    changed = CodeContestsFamily()
+    changed.source({**config, knob: changed_value})
+
+    assert baseline.protocol_identity()[knob] == default_identity
+    assert changed.protocol_identity()[knob] == changed_identity
+    assert changed.protocol_identity()[knob] != baseline.protocol_identity()[knob]
 
 
 def test_source_passes_cf_rating_bounds(family, tmp_path):
@@ -665,10 +1156,12 @@ def test_same_heldout_completion_reports_both_named_suites(tmp_path):
     env = _paired_env(tmp_path)
     test_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
     reward, info = env.reward(test_task, f"```python\n{SUM_SOLUTION}\n```")
-    assert info["gdm_correct"] == info["correct"] == 1.0
-    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"] == 1.0
+    assert info["correct_strict"] == 1.0
+    assert info["gdm_tests_passed_frac"] == 1.0
     assert info["cco_correct"] == 1.0
     assert info["cco_tests_passed_frac"] == 1.0
+    assert {"correct", "has_code", "tests_passed_frac"}.isdisjoint(info)
     logged = _aggregate([Trajectory(datums=[], reward=reward, info=info)], "eval")
     assert logged["eval/gdm_correct"] == 1.0
     assert logged["eval/gdm_tests_passed_frac"] == 1.0
@@ -689,7 +1182,8 @@ def test_cco_verdict_does_not_change_the_gdm_reward(tmp_path):
     cheat = "print(3)"
     reward, info = env.reward(env.tasks(1, split="test")[0], f"```python\n{cheat}\n```")
     assert reward == pytest.approx(1.1)
-    assert info["gdm_correct"] == info["correct"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"] == 1.0
+    assert info["correct_strict"] == 1.0
     assert info["cco_correct"] == 0.0
 
 

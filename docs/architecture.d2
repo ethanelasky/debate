@@ -19,7 +19,7 @@ core: Task-agnostic core (tokens + scalars only) {
 
 family: TaskFamily registry — ALL domain knowledge {
   reg: "get_family(dataset.type)"
-  fam: "MathFamily | CodeContestsFamily\nsource() extractor() grade() format_flags()"
+  fam: "MathFamily | CodeContestsFamily\nsource() parse_answers() grade_batch()"
   reg -> fam
 }
 
@@ -49,11 +49,11 @@ core.train -> source: env.rollout (RLVR mode) {
 
 # env.py: tasks() only; meta contract {question, gt|tests, [gold, distractor]}
 debate.env -> source: "tasks() — dataset role"
-debate.env -> family.fam: "extractor() at init; grade()/format_flags() post-round" # env.py
+debate.env -> family.fam: "parse_answers() at answer ingest; grade_batch() post-round" # env.py
 
 # DebateRound = the PROTOCOL MACHINE, built once per batch, task-data-free.
 # Per-task data travels as DebateState.bindings (opaque strings).
-debate.env -> debate.round: "built once w/ extractor\n+ verdict parser;\nrun(states)"
+debate.env -> debate.round: "built once w/ answer extractor\n+ verdict parser;\nrun(states)"
 debate.round -> debate.seats: one batched generate per slot
 debate.seats -> core.policy: trained seats # round.py
 debate.seats -> apis: frozen seats

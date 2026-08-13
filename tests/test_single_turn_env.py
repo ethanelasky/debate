@@ -101,23 +101,58 @@ def test_info_reaches_the_trajectory():
     assert groups[0][0].info["length"] == 3.0
 
 
+class LengthStopBackend(ScriptedBackend):
+    """Texts ending in "!" report stop_reason="length" (hit the token cap)."""
+
+    def sample(self, prompts, params, n=1):
+        out = super().sample(prompts, params, n)
+        for samples in out:
+            for s in samples:
+                if s.text.endswith("!"):
+                    s.stop_reason = "length"
+        return out
+
+
+def test_truncated_flag_reaches_info_and_aggregate():
+    from infra.train import _aggregate
+
+    env = ScoreByLength()
+    policy = Policy(LengthStopBackend(["abc!", "ab"]), SamplingParams(max_tokens=32))
+    groups = env.rollout(env.tasks(1), policy, group_size=2)
+    assert [t.info["truncated"] for t in groups[0]] == [1.0, 0.0]
+    assert _aggregate(groups[0], "train")["train/truncated"] == 0.5
+
+
+def test_aggregate_reward_std_is_population_std():
+    from infra.train import _aggregate
+
+    env = ScoreByLength()
+    # rewards are len(text): [1, 3] -> mean 2, population std 1
+    groups = env.rollout(env.tasks(1), _policy(["a", "ccc"]), group_size=2)
+    out = _aggregate(groups[0], "train")
+    assert out["train/reward_mean"] == 2.0
+    assert out["train/reward_std"] == 1.0
+    # zero variance reads exactly 0.0 — the collapse signature
+    same = env.rollout(env.tasks(1), _policy(["dd", "ee"]), group_size=2)
+    assert _aggregate(same[0], "train")["train/reward_std"] == 0.0
+
+
 def test_fidelity_failures_are_dropped_and_counted():
     env = ScoreByLength()
     # "" -> zero tokens -> fidelity_ok() False
     groups = env.rollout(env.tasks(2), _policy(["a", "", "ccc", "dddd"]), group_size=2)
 
     assert [len(g) for g in groups] == [1, 2]
-    assert groups[0][0].info["samples_dropped_fidelity"] == 1.0
+    assert env.last_rollout_info["samples_dropped_fidelity"] == 1
     assert env.calls == ["a", "ccc", "dddd"]  # never graded
 
 
-def test_drop_counter_lost_when_first_group_empty():
-    """The pre-existing quirk, pinned so a refactor cannot change it silently:
-    the counter rides on groups[0][0], so an empty first group discards it."""
+def test_drop_counter_survives_when_first_group_empty():
     env = ScoreByLength()
     groups = env.rollout(env.tasks(2), _policy(["", "", "ccc", "dddd"]), group_size=2)
 
     assert [len(g) for g in groups] == [0, 2]
+    assert env.last_rollout_info["samples_dropped_fidelity"] == 2
     assert all("samples_dropped_fidelity" not in t.info for g in groups for t in g)
 
 

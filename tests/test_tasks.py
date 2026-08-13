@@ -5,14 +5,17 @@ invalid config, where reject_unknown_keys fires before any dataset loading.
 """
 
 import json
+from copy import deepcopy
 
 import pytest
 import yaml
 
+from infra.envs.answer_parsing import extract_last_number, extract_number_from_boxed_answer
+from infra.envs.base import Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks import TASK_FAMILIES, get_family
 from infra.envs.tasks.base import reject_unknown_keys
-from infra.envs.tasks.math import MathFamily, _parse_levels
+from infra.envs.tasks.math import MathEnv, MathFamily, _parse_levels, parse_numeric_answers
 
 
 def test_registry_lookup():
@@ -43,19 +46,91 @@ def test_math_grade(meta, solution, expected):
     assert MathFamily().grade(meta, solution) is expected
 
 
-def test_extractor_strict_vs_relaxed():
-    strict = MathFamily().extractor(False)
-    relaxed = MathFamily().extractor(True)
-    assert strict("the answer is 7") is None
-    assert relaxed("the answer is 7") == 7.0
-    assert strict("\\boxed{42}") == 42.0
-    assert relaxed("\\boxed{42}") == 42.0
-
-
-def test_format_flags_strict_boxed():
+def test_parse_answers_exposes_strict_and_relaxed_candidates():
     fam = MathFamily()
-    assert fam.format_flags("\\boxed{3}")["strict_boxed"] == 1.0
-    assert fam.format_flags("no box")["strict_boxed"] == 0.0
+    for text, expected_strict, expected_relaxed in [
+        ("the answer is 7", None, 7.0),
+        ("\\boxed{42}", 42.0, 42.0),
+        ("\\boxed{41}; correction: 42", 41.0, 41.0),
+    ]:
+        parsed = fam.parse_answers(text)
+        assert parsed == parse_numeric_answers(text)
+        assert parsed.strict == expected_strict
+        assert parsed.relaxed == expected_relaxed
+
+
+def test_answer_format_valid_comes_from_strict_parse():
+    fam = MathFamily()
+    assert fam.parse_answers("\\boxed{3}").answer_format_valid is True
+    assert fam.parse_answers("\\boxed{x}").answer_format_valid is False
+    assert fam.parse_answers("no box").answer_format_valid is False
+
+
+def _offline_math_env(**rewards):
+    env = object.__new__(MathEnv)
+    env.correct_reward = float(rewards.get("correct_reward", 1.0))
+    env.format_reward = float(rewards.get("format_reward", 0.1))
+    env.relaxed_correct_bonus = float(rewards.get("relaxed_correct_bonus", 0.1))
+    env.shaped_reward = 0.0
+    return env
+
+
+def test_math_reward_uses_generic_metrics_without_old_names():
+    task = Task(messages=[], meta={"gt": 2.0})
+    env = _offline_math_env()
+
+    reward, info = env.reward(task, "work\n\\boxed{2}")
+    assert reward == pytest.approx(1.1)
+    assert info == {
+        "correct_strict": 1.0,
+        "correct_relaxed": 1.0,
+        "answer_format_valid": 1.0,
+    }
+    assert not ({"correct", "has_boxed"} & set(info))
+
+
+def _legacy_numeric_reward(text, gt):
+    """Independent copy of the pre-migration numeric reward oracle."""
+    pred_boxed = extract_number_from_boxed_answer(text)
+    pred_relaxed = pred_boxed if pred_boxed is not None else extract_last_number(text)
+    exact_boxed = pred_boxed is not None and abs(pred_boxed - gt) < 1e-6
+    exact_relaxed = pred_relaxed is not None and abs(pred_relaxed - gt) < 1e-6
+    reward = 0.1 if "\\boxed{" in text.lower() else 0.0
+    reward += 1.0 if exact_boxed else 0.0
+    reward += 0.1 if exact_relaxed and not exact_boxed else 0.0
+    return reward
+
+
+@pytest.mark.parametrize(
+    "text, expected_format_valid",
+    [
+        ("\\boxed{oops} but the answer is 2", False),  # malformed raw box
+        ("work then \\boxed{2", False),  # unclosed raw box
+        ("work then \\boxed {2}", True),  # parseable, but no exact raw substring
+        ("<think>\\boxed{2}</think> answer 3", False),  # hidden from parsing, not reward gate
+        ("work then \\boxed{2}", True),  # normal strict
+        ("work then answer 2", False),  # normal relaxed-only
+    ],
+)
+def test_math_reward_matches_legacy_raw_box_gate(text, expected_format_valid):
+    task = Task(messages=[], meta={"gt": 2.0})
+    reward, info = _offline_math_env().reward(task, text)
+
+    assert reward == pytest.approx(_legacy_numeric_reward(text, 2.0))
+    assert info["answer_format_valid"] == float(expected_format_valid)
+    assert set(info) == {"correct_strict", "correct_relaxed", "answer_format_valid"}
+
+
+def test_math_reward_allows_zero_format_reward_without_changing_metrics():
+    task = Task(messages=[], meta={"gt": 2.0})
+    malformed = "\\boxed{oops} but the answer is 2"
+    reward, info = _offline_math_env(format_reward=0).reward(task, malformed)
+    assert reward == pytest.approx(0.1)
+    assert info == {
+        "correct_strict": 0.0,
+        "correct_relaxed": 1.0,
+        "answer_format_valid": 0.0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -77,6 +152,110 @@ def test_math_source_rejects_unknown_key_before_loading():
     with pytest.raises(ValueError) as exc:
         MathFamily().source({"bogus_key": 1})
     assert "bogus_key" in str(exc.value)
+
+
+def _fake_math_dataset(problem_suffix=""):
+    def rows(n, offset):
+        return [
+            {
+                "problem": f"problem {offset + i}{problem_suffix}",
+                "solution": f"\\boxed{{{offset + i}}}",
+                "level": "Level 5",
+            }
+            for i in range(n)
+        ]
+
+    return {"train": rows(40, 0), "test": rows(10, 100)}
+
+
+def test_math_protocol_identity_is_stable_complete_and_defensive(monkeypatch):
+    import infra.envs.tasks.math as math_module
+
+    monkeypatch.setattr(math_module, "_load", lambda: deepcopy(_fake_math_dataset()))
+    config = {
+        "levels": 5,
+        "seed": 3,
+        "eval_subset_size": 6,
+        "correct_reward": 2,
+        "format_reward": 0,
+        "relaxed_correct_bonus": 0.25,
+        "think_overshoot_penalty": 0.125,
+    }
+    first = MathFamily()
+    env = first.source(config)
+    second = MathFamily()
+    second.source(config)
+
+    identity = first.protocol_identity()
+    assert identity == second.protocol_identity()
+    assert identity["grading_protocol"] == "numeric_box_v1"
+    assert identity["dataset_id"] == "the-jb/hendrycks-math"
+    assert identity["dataset_revision"] == "unpinned_legacy"
+    assert identity["levels"] == "5"
+    assert identity["seed"] == "3"
+    assert identity["eval_subset_size"] == "6"
+    assert identity["train_count"] == str(len(env.train_rows))
+    assert identity["dev_count"] == str(len(env.dev_rows))
+    assert identity["test_count"] == str(len(env.test_rows))
+    assert identity["correct_reward"] == "2.0"
+    assert identity["format_reward"] == "0.0"
+    assert identity["relaxed_correct_bonus"] == "0.25"
+    assert identity["think_overshoot_penalty"] == "0.125"
+    assert len(identity["prompt_sha256"]) == 64
+    assert len(identity["split_sha256"]) == 64
+    assert env.correct_reward == 2.0
+    assert env.format_reward == 0.0
+    assert env.relaxed_correct_bonus == 0.25
+    assert env.think_overshoot_penalty == 0.125
+
+    identity["seed"] = "mutated"
+    assert first.protocol_identity()["seed"] == "3"
+
+
+def test_math_protocol_identity_changes_with_config_and_cohort(monkeypatch):
+    import infra.envs.tasks.math as math_module
+
+    dataset = _fake_math_dataset()
+    monkeypatch.setattr(math_module, "_load", lambda: deepcopy(dataset))
+    baseline = MathFamily()
+    baseline.source({"seed": 0, "eval_subset_size": 6})
+
+    different_seed = MathFamily()
+    different_seed.source({"seed": 1, "eval_subset_size": 6})
+    assert different_seed.protocol_identity()["seed"] != baseline.protocol_identity()["seed"]
+
+    dataset["train"][0]["problem"] += " changed"
+    different_cohort = MathFamily()
+    different_cohort.source({"seed": 0, "eval_subset_size": 6})
+    assert (
+        different_cohort.protocol_identity()["split_sha256"]
+        != baseline.protocol_identity()["split_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("knob", "changed_value", "default_identity", "changed_identity"),
+    [
+        ("correct_reward", 2, "1.0", "2.0"),
+        ("format_reward", 0, "0.1", "0.0"),
+        ("relaxed_correct_bonus", 0.25, "0.1", "0.25"),
+        ("think_overshoot_penalty", 0.125, "0.0", "0.125"),
+    ],
+)
+def test_math_protocol_identity_tracks_each_reward_knob(
+    monkeypatch, knob, changed_value, default_identity, changed_identity
+):
+    import infra.envs.tasks.math as math_module
+
+    monkeypatch.setattr(math_module, "_load", lambda: deepcopy(_fake_math_dataset()))
+    baseline = MathFamily()
+    baseline.source({"seed": 0, "eval_subset_size": 6})
+    changed = MathFamily()
+    changed.source({"seed": 0, "eval_subset_size": 6, knob: changed_value})
+
+    assert baseline.protocol_identity()[knob] == default_identity
+    assert changed.protocol_identity()[knob] == changed_identity
+    assert changed.protocol_identity()[knob] != baseline.protocol_identity()[knob]
 
 
 # ------------------------------------------------------- generation prompts
@@ -308,6 +487,21 @@ def test_family_tasks_carry_question(name, tmp_path):
         env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
         row = {"problem": "What is 1+1?", "gt": 2.0, "level": 5}
         tasks = [MathEnv._task(env, row, "train")]
+    elif name == "math_symbolic":
+        # Skip both the pinned dataset load and Math-Verify worker startup;
+        # this generic contract only exercises task construction.
+        from infra.envs.tasks.math_symbolic import PROMPT_FILE, SymbolicMathEnv
+
+        env = object.__new__(SymbolicMathEnv)
+        env.prompts = load_generation_prompts(resolve_prompt_file(None, PROMPT_FILE))
+        row = {
+            "problem": "What is x+x?",
+            "gt": "2x",
+            "category": "Algebra",
+            "level": 5,
+            "row_id": "synthetic-row",
+        }
+        tasks = [SymbolicMathEnv._task(env, row, "train")]
     elif name == "aime":
         # Same shape as the math recipe: skip __init__ (dataset download),
         # exercise task construction directly.

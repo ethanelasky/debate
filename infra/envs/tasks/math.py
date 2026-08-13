@@ -5,24 +5,81 @@ registry existed; both moved here verbatim."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
+from pathlib import Path
 from typing import Any, Optional
 
 from datasets import get_dataset_config_names, load_dataset
 
 from infra.envs.answer_parsing import (
-    extract_last_boxed_content,
     extract_last_number,
     extract_number_from_boxed_answer,
     parse_number,
 )
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
-from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
+from infra.envs.tasks.base import AnswerParse, TaskFamily, reject_unknown_keys
 
 DATASET_ID = "the-jb/hendrycks-math"
 PROMPT_FILE = "math.yaml"
+
+
+def parse_numeric_answers(text: str) -> AnswerParse:
+    """Extract numeric MATH/AIME candidates with strict-first precedence."""
+    strict = extract_number_from_boxed_answer(text)
+    relaxed = strict if strict is not None else extract_last_number(text)
+    return AnswerParse(strict=strict, relaxed=relaxed)
+
+
+def _split_digest(env: Any) -> str:
+    """Hash the exact ordered cohorts that this source will expose."""
+    payload = {
+        split: [[row["problem"], row["gt"]] for row in getattr(env, f"{split}_rows")]
+        for split in ("train", "dev", "test")
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _numeric_protocol_identity(
+    env: Any,
+    *,
+    dataset_id: str,
+    seed: int,
+    eval_subset_size: int,
+    prompt_path: Path,
+    levels: tuple[int, ...] | None = None,
+) -> dict[str, str]:
+    identity = {
+        "grading_protocol": "numeric_box_v1",
+        "dataset_id": dataset_id,
+        "dataset_revision": "unpinned_legacy",
+        "seed": str(seed),
+        "eval_subset_size": str(eval_subset_size),
+        "prompt_sha256": hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
+        "split_sha256": _split_digest(env),
+        "train_count": str(len(env.train_rows)),
+        "dev_count": str(len(env.dev_rows)),
+        "test_count": str(len(env.test_rows)),
+        # Store the resolved values from the source env, not the spelling used
+        # in config, so equivalent inputs (for example 1 and 1.0) have one
+        # stable identity while every reward-affecting coefficient is pinned.
+        "correct_reward": repr(float(env.correct_reward)),
+        "format_reward": repr(float(env.format_reward)),
+        "relaxed_correct_bonus": repr(float(env.relaxed_correct_bonus)),
+        "think_overshoot_penalty": repr(float(env.think_overshoot_penalty)),
+    }
+    if levels is not None:
+        identity["levels"] = ",".join(str(level) for level in levels)
+    return identity
 
 
 def _load(dataset_id: str = DATASET_ID):
@@ -127,10 +184,15 @@ class MathEnv(SingleTurnEnv):
 
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         gt = task.meta["gt"]
-        pred_boxed = extract_number_from_boxed_answer(text)
-        pred_relaxed = pred_boxed if pred_boxed is not None else extract_last_number(text)
+        parsed = parse_numeric_answers(text)
+        pred_boxed = parsed.strict
+        pred_relaxed = parsed.relaxed
         exact_boxed = pred_boxed is not None and abs(pred_boxed - gt) < 1e-6
         exact_relaxed = pred_relaxed is not None and abs(pred_relaxed - gt) < 1e-6
+        # Preserve the established reward protocol exactly. This deliberately
+        # differs from the observational answer_format_valid metric: malformed
+        # raw box starts earn the historical bonus, while spaced ``\boxed {``
+        # forms do not.
         has_boxed = "\\boxed{" in text.lower()
 
         reward = 0.0
@@ -143,9 +205,9 @@ class MathEnv(SingleTurnEnv):
             reward += self.shaped_reward * math.exp(-4.0 * rel_err)
 
         info = {
-            "correct": float(exact_boxed),
+            "correct_strict": float(exact_boxed),
             "correct_relaxed": float(exact_relaxed),
-            "has_boxed": float(has_boxed and extract_last_boxed_content(text) is not None),
+            "answer_format_valid": float(parsed.answer_format_valid),
         }
         return reward, info
 
@@ -170,15 +232,6 @@ class MathEnv(SingleTurnEnv):
         return reward, {**info, "think_overshoot": float(overshoot)}
 
 
-def strict_extract(text: str) -> Optional[float]:
-    return extract_number_from_boxed_answer(text)
-
-
-def relaxed_extract(text: str) -> Optional[float]:
-    v = extract_number_from_boxed_answer(text)
-    return v if v is not None else extract_last_number(text)
-
-
 def _parse_levels(spec) -> tuple[int, ...]:
     """int (5), range string ("3-4"), or list. Scalars/strings survive
     _extends cleanly; lists merge BY INDEX (child [5] over parent [3,4]
@@ -197,19 +250,46 @@ class MathFamily(TaskFamily):
     def source(self, ds: dict) -> Env:
         reject_unknown_keys(
             ds,
-            {"levels", "seed", "eval_subset_size", "prompt_file", "think_overshoot_penalty"},
+            {
+                "levels",
+                "seed",
+                "eval_subset_size",
+                "prompt_file",
+                "think_overshoot_penalty",
+                "correct_reward",
+                "format_reward",
+                "relaxed_correct_bonus",
+            },
             "math",
         )
-        return MathEnv(
-            seed=int(ds.get("seed", 0)),
-            levels=_parse_levels(ds.get("levels", 5)),
-            eval_subset_size=int(ds.get("eval_subset_size", 512)),
-            think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
-            prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
+        seed = int(ds.get("seed", 0))
+        levels = _parse_levels(ds.get("levels", 5))
+        eval_subset_size = int(ds.get("eval_subset_size", 512))
+        prompt_path = resolve_prompt_file(
+            (str(ds["prompt_file"]) if ds.get("prompt_file") else None), PROMPT_FILE
         )
+        env = MathEnv(
+            seed=seed,
+            levels=levels,
+            eval_subset_size=eval_subset_size,
+            correct_reward=float(ds.get("correct_reward", 1.0)),
+            format_reward=float(ds.get("format_reward", 0.1)),
+            relaxed_correct_bonus=float(ds.get("relaxed_correct_bonus", 0.1)),
+            think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
+            prompt_file=str(prompt_path),
+        )
+        self._protocol_identity = _numeric_protocol_identity(
+            env,
+            dataset_id=DATASET_ID,
+            levels=levels,
+            seed=seed,
+            eval_subset_size=eval_subset_size,
+            prompt_path=prompt_path,
+        )
+        return env
 
-    def extractor(self, relaxed: bool):
-        return relaxed_extract if relaxed else strict_extract
+    def parse_answers(self, text: str) -> AnswerParse:
+        return parse_numeric_answers(text)
 
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
         gt = meta.get("gt")
@@ -220,7 +300,5 @@ class MathFamily(TaskFamily):
         except (TypeError, ValueError):
             return None
 
-    def format_flags(self, text: str) -> dict[str, float]:
-        # strict format flag, independent of the (possibly relaxed) extractor
-        # used for position binding
-        return {"strict_boxed": float(extract_number_from_boxed_answer(text) is not None)}
+    def protocol_identity(self) -> dict[str, str]:
+        return dict(getattr(self, "_protocol_identity", {}))

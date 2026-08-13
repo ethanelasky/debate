@@ -164,11 +164,40 @@ def test_build_eval_env_rejects_trained_agents(prompt_file):
 
 def test_build_eval_env_wires_config(prompt_file):
     env = build_eval_env(experiment(prompt_file), MBTaskSource())
-    assert env.config.trained_speakers == []
-    assert env.config.fresh_positions is False
-    assert env.config.flip is False
-    assert env.config.judge.retries == 2  # the authority: DebateRound reads judge.retries
-    assert env.config.speech_token_limit == 32
+    try:
+        assert env.config.trained_speakers == []
+        assert env.config.fresh_positions is False
+        assert env.config.flip is False
+        assert env.config.judge.retries == 2  # the authority: DebateRound reads judge.retries
+        assert env.config.speech_token_limit == 32
+    finally:
+        env.family.close()
+
+
+def test_build_eval_env_closes_family_when_env_construction_fails(prompt_file, monkeypatch):
+    from infra.envs.tasks import monitoringbench
+
+    families = []
+
+    class CountingFamily:
+        def __init__(self):
+            self.close_calls = 0
+            families.append(self)
+
+        def close(self):
+            self.close_calls += 1
+
+    def fail_construction(*args, **kwargs):
+        raise RuntimeError("env construction failed")
+
+    monkeypatch.setattr(monitoringbench, "MonitoringBenchFamily", CountingFamily)
+    monkeypatch.setattr(run_eval, "DebateEnv", fail_construction)
+
+    with pytest.raises(RuntimeError, match="env construction failed"):
+        build_eval_env(experiment(prompt_file), MBTaskSource())
+
+    assert len(families) == 1
+    assert families[0].close_calls == 1
 
 
 # ------------------------------------------------------------------- results
@@ -362,6 +391,75 @@ def test_main_end_to_end_offline(tmp_path, prompt_file, capsys):
     assert BACKGROUND not in captured.out
     assert BACKGROUND not in captured.err
     assert '"n": 4' in captured.out
+
+
+def test_main_closes_family_once_on_success(tmp_path, prompt_file, capsys, monkeypatch):
+    exp_file = write_configs(tmp_path, prompt_file)
+    env = scripted_env(prompt_file, ['{"winner": "Debater_A"}'], n_tasks=1)
+
+    class CountingFamily:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    family = CountingFamily()
+    env.family = family
+    monkeypatch.setattr(run_eval, "build_eval_env", lambda exp, source: env)
+
+    run_eval.main(
+        [
+            "--experiment-file",
+            exp_file,
+            "--experiment",
+            "mb_test_eval",
+            "--out",
+            str(tmp_path / "res.results.jsonl"),
+        ],
+        task_source=MBTaskSource(1),
+    )
+
+    assert family.close_calls == 1
+    capsys.readouterr()
+
+
+def test_main_closes_family_once_when_evaluation_fails(
+    tmp_path, prompt_file, monkeypatch
+):
+    exp_file = write_configs(tmp_path, prompt_file)
+
+    class CountingFamily:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class FailingEnv:
+        def __init__(self):
+            self.family = CountingFamily()
+
+        def tasks(self, n, split):
+            raise RuntimeError("task selection failed")
+
+    env = FailingEnv()
+    monkeypatch.setattr(run_eval, "build_eval_env", lambda exp, source: env)
+
+    with pytest.raises(RuntimeError, match="task selection failed"):
+        run_eval.main(
+            [
+                "--experiment-file",
+                exp_file,
+                "--experiment",
+                "mb_test_eval",
+                "--out",
+                str(tmp_path / "res.results.jsonl"),
+            ],
+            task_source=MBTaskSource(1),
+        )
+
+    assert env.family.close_calls == 1
 
 
 def test_main_limit(tmp_path, prompt_file, capsys):

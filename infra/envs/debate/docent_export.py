@@ -33,7 +33,7 @@ from docent.data_models.chat import (
 )
 
 from infra.envs.debate.round import DebateState, render_context
-from infra.envs.debate.protocol import Visibility
+from infra.envs.debate.protocol import Kind
 
 
 def _assistant(text: str, thinking: Optional[str] = None, **meta) -> AssistantMessage:
@@ -44,7 +44,21 @@ def _assistant(text: str, thinking: Optional[str] = None, **meta) -> AssistantMe
     return AssistantMessage(content=content, metadata=meta or {})
 
 
-def _omniscient_transcript(state: DebateState) -> Transcript:
+def _answer_format_valid(env, state: DebateState, rec) -> bool:
+    """The parsing-only format result recorded by the rollout census.
+
+    Explicit ``states=`` callers may export states that did not pass through
+    DebateEnv.rollout, so fall back to the same family parser when no retained
+    census value exists.
+    """
+    retained = state.meta.get("solution_answer_format_valid", {})
+    key = str(rec.slot.index)
+    if key in retained:
+        return bool(retained[key])
+    return bool(env.family.parse_answers(rec.text).answer_format_valid)
+
+
+def _omniscient_transcript(state: DebateState, env) -> Transcript:
     messages: list[Any] = [
         SystemMessage(
             content="Omniscient debate view: every slot in generation order, "
@@ -54,18 +68,23 @@ def _omniscient_transcript(state: DebateState) -> Transcript:
     ]
     for rec in state.records:
         cs = rec.slot
+        metadata = {
+            "speaker": cs.speaker,
+            "display_name": state.bindings.get(cs.speaker, {}).get("NAME", cs.speaker),
+            "turn": cs.turn,
+            "slot": cs.slot.name,
+            "kind": cs.slot.kind.value,
+            "visibility": cs.slot.visibility.value,
+            "extracted": None if rec.extracted is None else str(rec.extracted),
+            "retries": rec.retries,
+        }
+        if cs.slot.kind == Kind.SOLUTION:
+            metadata["answer_format_valid"] = _answer_format_valid(env, state, rec)
         messages.append(
             _assistant(
                 rec.text,
                 thinking=rec.thinking,
-                speaker=cs.speaker,
-                display_name=state.bindings.get(cs.speaker, {}).get("NAME", cs.speaker),
-                turn=cs.turn,
-                slot=cs.slot.name,
-                kind=cs.slot.kind.value,
-                visibility=cs.slot.visibility.value,
-                extracted=None if rec.extracted is None else str(rec.extracted),
-                retries=rec.retries,
+                **metadata,
             )
         )
     return Transcript(name="omniscient", messages=messages)
@@ -88,11 +107,14 @@ def _speaker_view(state: DebateState, speaker: str, env) -> Optional[Transcript]
             messages.append(UserMessage(content=m["content"]))
         else:
             messages.append(_assistant(m["content"]))
-    messages.append(_assistant(last.text, thinking=last.thinking, slot=last.slot.slot.name))
+    metadata = {"slot": last.slot.slot.name}
+    if last.slot.slot.kind == Kind.SOLUTION:
+        metadata["answer_format_valid"] = _answer_format_valid(env, state, last)
+    messages.append(_assistant(last.text, thinking=last.thinking, **metadata))
     return Transcript(name=f"view:{speaker}", messages=messages)
 
 
-def _solo_turn1_view(state: DebateState) -> Optional[Transcript]:
+def _solo_turn1_view(state: DebateState, env) -> Optional[Transcript]:
     """The slot-0 GENERATION context, verbatim: what the solo author actually
     saw when producing its first speech (first_speech_non_debate_aware — no
     debate framing), plus that speech. The author's regular view presents the
@@ -112,15 +134,14 @@ def _solo_turn1_view(state: DebateState) -> Optional[Transcript]:
             messages.append(UserMessage(content=m["content"]))
         else:
             messages.append(_assistant(m["content"]))
-    messages.append(
-        _assistant(
-            rec.text,
-            thinking=rec.thinking,
-            slot=rec.slot.slot.name,
-            extracted=None if rec.extracted is None else str(rec.extracted),
-            retries=rec.retries,
-        )
-    )
+    metadata = {
+        "slot": rec.slot.slot.name,
+        "extracted": None if rec.extracted is None else str(rec.extracted),
+        "retries": rec.retries,
+    }
+    if rec.slot.slot.kind == Kind.SOLUTION:
+        metadata["answer_format_valid"] = _answer_format_valid(env, state, rec)
+    messages.append(_assistant(rec.text, thinking=rec.thinking, **metadata))
     return Transcript(name=f"view:{rec.slot.speaker}@turn1", messages=messages)
 
 
@@ -155,8 +176,8 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
     states = states if states is not None else getattr(env, "last_states", [])
     runs = []
     for i, st in enumerate(states):
-        transcripts = [_omniscient_transcript(st)]
-        solo_view = _solo_turn1_view(st)
+        transcripts = [_omniscient_transcript(st, env)]
+        solo_view = _solo_turn1_view(st, env)
         if solo_view is not None:
             transcripts.append(solo_view)
         for speaker in env.protocol.speakers:
@@ -168,11 +189,13 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
             "failed": st.failed,
             "flipped": bool(st.meta.get("flipped", False)),
             "empty_slots": st.meta.get("empty_slots", []),
-            "task": {k: v for k, v in st.meta.get("task", {}).items() if isinstance(v, (str, int, float, bool))},
+            # This is the source-owned, already-redacted transcript boundary.
+            # Never fall back to raw st.meta["task"]: it carries private
+            # verifier material (including scalar secrets in some families).
+            "task": dict(st.meta.get("task_export", {})),
             "bindings": {s: b.get("NAME") for s, b in st.bindings.items()},
-            # Ground-truth label per solution slot. The `task` filter above
-            # drops codecontests' inputs/outputs (test cases must never leave
-            # the verifier), so this is the ONLY record of correctness that
+            # Ground-truth label per solution slot. Private verifier inputs do
+            # not cross task_export, so this is the record of correctness that
             # survives export — see DebateEnv._attach_labels.
             "grades": st.meta.get("grades", {}),
         }
@@ -181,7 +204,7 @@ def agent_runs(env, states: Optional[list[DebateState]] = None) -> list[AgentRun
         runs.append(
             AgentRun(
                 name=f"debate-{i}",
-                description=str(st.meta.get("task", {}).get("question", ""))[:300],
+                description=str(st.meta.get("task_export", {}).get("question", ""))[:300],
                 transcripts=transcripts,
                 metadata=meta,
             )

@@ -52,11 +52,10 @@ Each row is self-contained and carries stable problem metadata plus explicitly
 named ``gdm_inputs/gdm_outputs`` and ``cco_inputs/cco_outputs`` suites. The
 runtime never joins a sidecar.
 
-No suite is ever rendered into a prompt. Models see the problem
-statement only. _task() puts test cases in Task.meta and the prompt renderer
-binds only meta["question"]. Raw single-turn transcript records retain task
-metadata for reproducibility, including these lists, so artifact sizing must
-account for them; that metadata is never sent to the model.
+No suite is ever rendered into a prompt or exported in a transcript. Models
+see the problem statement only. _task() keeps test cases in private Task.meta
+for reward/measurement, while CodeContestsEnv.export_meta() uses an explicit
+safe scalar allowlist before a rollout record can reach Docent or W&B.
 
 One thing that looks like a leak and is not: some rlvr_tests cases DO appear
 verbatim in the problem statement (~16% of non-trivial cases across the test
@@ -96,18 +95,17 @@ suites use the same <=10-case, 500 KB/case, 2 MB/problem caps.
 HOW THE VERIFIER WORKS
 ===========================================================================
 
-run_stdin_tests() writes the program, the cases, and a runner script to a
-tempdir and spawns `python runner.py` in its OWN PROCESS GROUP so a timeout
-kills grandchildren too. The runner compiles the program once and exec()s it
-per case with stdin/stdout swapped to StringIO — one interpreter start per
-solution, not per test.
+run_stdin_tests() is the trusted supervisor. It launches a fresh isolated
+Python subprocess for EVERY case, gives it only the solution and that case's
+stdin, captures output in bounded regular files, and compares the output in
+the parent. Expected outputs and verifier results never enter the candidate
+process. Each process has a fresh namespace; a timeout kills its whole process
+group. AS/CPU/file-size/process/fd/core limits are applied best-effort by a
+small bootstrap before it execs the candidate.
 
-The verdict is read from a FILE the runner writes, never from stdout: the
-untrusted program shares the runner's stdout and could otherwise print a
-forged {"passed": true} from an atexit hook after the StringIO swap unwinds.
-The runner also blanks sys.argv so the program cannot find and forge that
-file. Limits: RLIMIT_AS 4GB, RLIMIT_NPROC 256, RLIMIT_FSIZE 64MB (the last
-two are best-effort; macOS skips them).
+This is process isolation for grading integrity, not a malicious-host sandbox.
+A same-UID process can still attack its parent or host; hostile candidates need
+an OS/container boundary.
 
 Comparison is whitespace-normalized with floats collapsed via %g, so
 "3.0000000000" and "3" match. Problems whose statements admit multiple valid
@@ -158,6 +156,7 @@ eval scale. The design trains on the cheap suite and measures with both.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -170,11 +169,17 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
-from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
+from infra.envs.tasks.base import (
+    AnswerParse,
+    GraderInfrastructureError,
+    TaskFamily,
+    reject_unknown_keys,
+)
 
 PROMPT_FILE = "codecontests.yaml"
 
@@ -291,10 +296,58 @@ def extract_code(text: str, relaxed: bool = True) -> Optional[str]:
     return text[opens[-1].end():].strip() or None
 
 
-def has_closed_fence(text: str) -> bool:
-    return bool(text) and bool(
-        PYTHON_CODE_BLOCK_PATTERN.search(text) or GENERIC_BLOCK_PATTERN.search(text)
+def parse_code_answers(text: str) -> AnswerParse:
+    """Extract the strict envelope and the relaxed reward candidate once.
+
+    Strict means a non-empty, closed Python or generic Markdown fence.  The
+    relaxed candidate additionally accepts the trailing unclosed fence used by
+    the historical RLVR reward when a generation is truncated at its cap.
+    """
+    return AnswerParse(
+        strict=extract_code(text, relaxed=False),
+        relaxed=extract_code(text, relaxed=True),
     )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _suite_projection(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The executable suite bytes, retaining row and case order."""
+    suite_keys = (
+        "name",
+        "rlvr_inputs",
+        "rlvr_outputs",
+        "truth_inputs",
+        "truth_outputs",
+        "gdm_inputs",
+        "gdm_outputs",
+        "cco_inputs",
+        "cco_outputs",
+    )
+    return [{key: row.get(key) for key in suite_keys} for row in rows]
+
+
+def _manifest_for(path: Path) -> Optional[Path]:
+    """Find the builder manifest associated with an artifact, if present."""
+    candidates = (path.with_suffix(".manifest.json"), path.parent / "manifest.json")
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _optional(value: Any) -> str:
+    return "none" if value is None else str(value)
 
 
 # ------------------------------------------------------------------ verifier
@@ -306,225 +359,418 @@ def run_stdin_tests(
     outputs: list[str],
     timeout: int = 90,
 ) -> dict[str, Any]:
-    """Run every stdin/stdout case in one subprocess (the runner execs the
-    solution once per case in-process, so we pay one interpreter start per
-    solution rather than one per test)."""
+    """Run cases in fresh candidate processes under one solution deadline.
+
+    This function is the trusted supervisor: expected outputs remain only in
+    this process, while each candidate receives its source path and the
+    current case on stdin.  Candidate failures are ordinary ``False``
+    verdicts; failures of process launch/communication or this supervisor's
+    result contract invalidate grading via ``GraderInfrastructureError``.
+    """
     t0 = time.perf_counter()
-    tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
-
-    _verifier_semaphore.acquire()
+    tmpdir: Optional[str] = None
+    acquired = False
     try:
-        solution_path = os.path.join(tmpdir, "solution.py")
-        with open(solution_path, "w") as f:
-            f.write(solution_code)
-
-        test_cases_path = os.path.join(tmpdir, "test_cases.json")
-        with open(test_cases_path, "w") as f:
-            json.dump({"inputs": inputs, "outputs": outputs}, f)
-
-        runner_path = os.path.join(tmpdir, "runner.py")
-        with open(runner_path, "w") as f:
-            f.write(_TEST_RUNNER_SCRIPT)
-
-        # The runner writes its verdict to this file, never to stdout: the
-        # untrusted solution shares the runner's stdout (e.g. via atexit after
-        # the StringIO swap is undone) and could forge a result JSON line
-        # there. stdout/stderr are captured for diagnostics only.
-        result_path = os.path.join(tmpdir, "result.json")
-
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, runner_path, solution_path, test_cases_path, result_path],
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,  # own process group, so timeout kills grandchildren too
+        if len(inputs) != len(outputs):
+            raise GraderInfrastructureError(
+                "codecontests verifier received mismatched input/output suites"
             )
-        except Exception as exc:  # noqa: BLE001
-            return _failure_result("error", len(inputs), repr(exc), t0)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.communicate()  # reap
-            return _failure_result("timeout", len(inputs), "Total execution timed out.", t0, timeout=True)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            proc.communicate()
-            return _failure_result("error", len(inputs), repr(exc), t0)
-
-        elapsed = time.perf_counter() - t0
-        try:  # verdict comes ONLY from the runner-written result file
-            with open(result_path) as f:
-                result = json.load(f)
-            result["execution_time_seconds"] = elapsed
-            return result
-        except (OSError, json.JSONDecodeError, ValueError):
-            return _failure_result(
-                "error", len(inputs), (stderr or stdout or "")[:1000], t0
+        if timeout <= 0:
+            raise GraderInfrastructureError(
+                "codecontests verifier requires a positive total timeout"
             )
+        if not all(isinstance(case, str) for case in [*inputs, *outputs]):
+            raise GraderInfrastructureError(
+                "codecontests verifier cases must be strings"
+            )
+
+        tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
+        _verifier_semaphore.acquire()
+        acquired = True
+        # The deadline covers all cases for this solution. Semaphore queueing
+        # and trusted setup are not candidate execution and must not consume
+        # the solution's runtime budget.
+        deadline = time.perf_counter() + timeout
+        tests_passed = 0
+        first_failure: Optional[dict[str, Any]] = None
+        saw_candidate_error = False
+        timed_out = False
+
+        for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                case = {
+                    "returncode": -signal.SIGKILL,
+                    "timed_out": True,
+                    "output_limited": False,
+                    "stdout": "",
+                    "stderr": "Total solution execution timed out.",
+                }
+            else:
+                case = _run_candidate_case(
+                    solution_code=solution_code,
+                    test_input=test_input,
+                    remaining=remaining,
+                    tmpdir=tmpdir,
+                )
+            _validate_case_result(case)
+
+            actual = _normalize_output(case["stdout"])
+            expected = _normalize_output(expected_output)
+            case_ok = (
+                case["returncode"] == _NORMAL_RETURN_CODE
+                and not case["timed_out"]
+                and not case["output_limited"]
+                and actual == expected
+            )
+            if case_ok:
+                tests_passed += 1
+            else:
+                # Preserve the historical metric meaning: syntax/compile and
+                # output-limit failures are ``candidate_error``; ordinary
+                # runtime exceptions/signals are simply failed solutions.
+                if case["output_limited"] or "SyntaxError:" in case["stderr"]:
+                    saw_candidate_error = True
+                if first_failure is None:
+                    stderr = case["stderr"]
+                    if case["output_limited"]:
+                        stderr = "Candidate exceeded the output limit.\n" + stderr
+                    if case["timed_out"]:
+                        stderr = "Total solution execution timed out.\n" + stderr
+                    first_failure = {
+                        "test_idx": i,
+                        "expected": expected[:500],
+                        "actual": actual[:500],
+                        "stderr": stderr[:500],
+                    }
+            if case["timed_out"]:
+                timed_out = True
+                break
+
+        passed = tests_passed == len(inputs) and not timed_out
+        status = (
+            "passed"
+            if passed
+            else "timeout"
+            if timed_out
+            else "candidate_error"
+            if saw_candidate_error
+            else "failed"
+        )
+        return {
+            "status": status,
+            "passed": passed,
+            "tests_passed": tests_passed,
+            "tests_total": len(inputs),
+            "timeout": timed_out,
+            "first_failure": first_failure,
+            "execution_time_seconds": time.perf_counter() - t0,
+        }
+    except GraderInfrastructureError:
+        raise
     except Exception as exc:  # noqa: BLE001
-        return _failure_result("error", len(inputs), repr(exc), t0)
+        raise GraderInfrastructureError(
+            "codecontests verifier failed outside candidate execution"
+        ) from exc
     finally:
-        _verifier_semaphore.release()
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if acquired:
+            _verifier_semaphore.release()
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _failure_result(
-    status: str, tests_total: int, stderr: str, t0: float, timeout: bool = False
-) -> dict[str, Any]:
-    return {
-        "status": status,
-        "passed": False,
-        "tests_passed": 0,
-        "tests_total": tests_total,
-        "timeout": timeout,
-        "first_failure": {"test_idx": 0, "expected": "", "actual": "", "stderr": stderr},
-        "execution_time_seconds": time.perf_counter() - t0,
-    }
+_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
+# The isolated bootstrap reports that candidate top-level execution returned
+# normally with this exit status. A direct ``os._exit(0)`` bypasses it and is
+# therefore distinguishable from an ordinary successful script termination.
+_NORMAL_RETURN_CODE = 120
 
 
-# Runner script: execs the solution against each case with stdin/stdout
-# swapped to StringIO, then writes one JSON result to the file given as
-# argv[3] (atomically, via os.replace) — never to stdout, which the solution
-# code shares and could forge.
-_TEST_RUNNER_SCRIPT = r'''
-import json
-import os
-import sys
-import io
-import re
-import resource
-import traceback
-
-# Cap memory at 4GB to prevent OOM when many solutions run concurrently
-try:
-    mem_limit = 4 * 1024 * 1024 * 1024  # 4 GB
-    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
-except (ValueError, resource.error):
-    pass  # Not available on all platforms
-try:
-    resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
-except (ValueError, resource.error):
-    pass  # best-effort (macOS)
-try:
-    fsize_limit = 64 * 1024**2
-    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
-except (ValueError, resource.error):
-    pass  # best-effort (macOS)
-
-def normalize_output(s):
-    lines = s.split("\n")
+def _normalize_output(value: str) -> str:
     normalized = []
-    for line in lines:
+    for line in value.split("\n"):
         line = line.rstrip()
-        def normalize_float(match):
+
+        def normalize_float(match: re.Match[str]) -> str:
             try:
                 return f"{float(match.group(0)):g}"
             except (ValueError, OverflowError):
                 return match.group(0)
-        line = re.sub(r"-?\d+\.\d+(?:[eE][+-]?\d+)?", normalize_float, line)
-        normalized.append(line)
+
+        normalized.append(
+            re.sub(r"-?\d+\.\d+(?:[eE][+-]?\d+)?", normalize_float, line)
+        )
     while normalized and not normalized[-1]:
         normalized.pop()
     return "\n".join(normalized).lower()
 
-def main():
-    solution_path = sys.argv[1]
-    test_cases_path = sys.argv[2]
-    result_path = sys.argv[3]
 
-    def write_result(obj):
-        # temp name + os.replace: the parent never sees a half-written file
-        tmp_path = result_path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(obj, f)
-        os.replace(tmp_path, result_path)
+def _minimal_candidate_env() -> dict[str, str]:
+    """No credentials or experiment controls cross into candidate code."""
+    env = {"PATH": os.defpath}
+    for key in ("LANG", "LC_ALL"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
 
-    # Hide the result path from the solution (it runs in-process and could
-    # read sys.argv, then forge the verdict file from an atexit hook).
-    sys.argv = [solution_path]
 
-    with open(solution_path) as f:
-        solution_code = f.read()
-
-    # Compile once, run many times
+def _kill_and_reap_process_group(proc: subprocess.Popen) -> None:
+    """Kill candidate descendants and ensure the direct child is reaped."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise GraderInfrastructureError(
+            "codecontests verifier worker exposed an invalid pid"
+        )
     try:
-        compiled = compile(solution_code, solution_path, "exec")
-    except SyntaxError as e:
-        write_result({
-            "status": "error", "passed": False,
-            "tests_passed": 0, "tests_total": 0, "timeout": False,
-            "first_failure": {"test_idx": 0, "expected": "", "actual": "",
-                              "stderr": f"SyntaxError: {e}"},
-        })
+        os.killpg(pid, signal.SIGKILL)  # start_new_session makes pgid == pid
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        raise GraderInfrastructureError(
+            "codecontests verifier could not terminate a candidate process group"
+        ) from exc
+    try:
+        proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired as exc:
+        raise GraderInfrastructureError(
+            "codecontests verifier could not reap a candidate subprocess"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise GraderInfrastructureError(
+            "codecontests verifier lost communication while reaping a candidate"
+        ) from exc
+
+
+def _run_candidate_case(
+    *,
+    solution_code: str,
+    test_input: str,
+    remaining: float,
+    tmpdir: str,
+) -> dict[str, Any]:
+    """Launch one candidate process. Gold never crosses this boundary.
+
+    Launcher bytes are supplied afresh through Python's ``-c`` argument, and
+    the source lives in a newly created per-case directory. Nothing a prior
+    candidate can rewrite is executed by a later case.
+    """
+    case_dir = tempfile.mkdtemp(prefix="case_", dir=tmpdir)
+    solution_path = os.path.join(case_dir, "solution.py")
+    try:
+        # Exclusive creation avoids following a path planted by an escaped
+        # descendant. The directory is private and did not exist previously.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(solution_path, flags, 0o400)
+        with os.fdopen(fd, "w", encoding="utf-8") as solution_file:
+            solution_file.write(solution_code)
+
+        with tempfile.TemporaryFile(mode="w+b", dir=case_dir) as stdout_file, tempfile.TemporaryFile(
+            mode="w+b", dir=case_dir
+        ) as stderr_file:
+            result = _supervise_candidate_process(
+                solution_path=solution_path,
+                test_input=test_input,
+                remaining=remaining,
+                cwd=case_dir,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+            )
+            return result
+    except GraderInfrastructureError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise GraderInfrastructureError(
+            "codecontests verifier failed while preparing a candidate case"
+        ) from exc
+    finally:
+        shutil.rmtree(case_dir, ignore_errors=True)
+
+
+def _supervise_candidate_process(
+    *,
+    solution_path: str,
+    test_input: str,
+    remaining: float,
+    cwd: str,
+    stdout_file,
+    stderr_file,
+) -> dict[str, Any]:
+    """Start, bound, reap, and collect one already-prepared candidate."""
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                _RESOURCE_BOOTSTRAP,
+                solution_path,
+                str(max(1, int(remaining + 0.999))),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=_minimal_candidate_env(),
+            cwd=cwd,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise GraderInfrastructureError(
+            "codecontests verifier failed to start a candidate subprocess"
+        ) from exc
+
+    timed_out = False
+    communication_error: Optional[BaseException] = None
+    try:
+        proc.communicate(input=test_input.encode("utf-8"), timeout=remaining)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except Exception as exc:  # noqa: BLE001
+        communication_error = exc
+    finally:
+        _kill_and_reap_process_group(proc)
+    if communication_error is not None:
+        raise GraderInfrastructureError(
+            "codecontests verifier lost communication with a candidate subprocess"
+        ) from communication_error
+
+    returncode = getattr(proc, "returncode", None)
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise GraderInfrastructureError(
+            "codecontests verifier worker exposed an invalid return code"
+        )
+    try:
+        stdout_size = os.fstat(stdout_file.fileno()).st_size
+        stderr_size = os.fstat(stderr_file.fileno()).st_size
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(_OUTPUT_LIMIT_BYTES + 1).decode(
+            "utf-8", errors="replace"
+        )
+        stderr = stderr_file.read(_OUTPUT_LIMIT_BYTES + 1).decode(
+            "utf-8", errors="replace"
+        )
+    except OSError as exc:
+        raise GraderInfrastructureError(
+            "codecontests verifier could not read captured candidate output"
+        ) from exc
+    output_limited = (
+        stdout_size >= _OUTPUT_LIMIT_BYTES
+        or stderr_size >= _OUTPUT_LIMIT_BYTES
+        or returncode == -getattr(signal, "SIGXFSZ", 25)
+    )
+    return {
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "output_limited": output_limited,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _validate_case_result(result: Any) -> None:
+    """Treat a broken trusted-supervisor contract as fatal, never wrong."""
+    if not isinstance(result, dict):
+        raise GraderInfrastructureError(
+            "codecontests verifier supervisor returned a non-object case result"
+        )
+    if set(result) != {
+        "returncode",
+        "timed_out",
+        "output_limited",
+        "stdout",
+        "stderr",
+    }:
+        raise GraderInfrastructureError(
+            "codecontests verifier supervisor returned an invalid case schema"
+        )
+    if (
+        isinstance(result["returncode"], bool)
+        or not isinstance(result["returncode"], int)
+        or not isinstance(result["timed_out"], bool)
+        or not isinstance(result["output_limited"], bool)
+        or not isinstance(result["stdout"], str)
+        or not isinstance(result["stderr"], str)
+    ):
+        raise GraderInfrastructureError(
+            "codecontests verifier supervisor returned invalid case field types"
+        )
+
+
+# Limits are installed inside the isolated child, avoiding preexec_fn (unsafe
+# when verifier launches overlap in threads). The bootstrap has no gold,
+# result path, or control descriptor; it only distinguishes a normal top-level
+# return from hard exits. Candidate argv contains only its own source path.
+_RESOURCE_BOOTSTRAP = r'''
+import os
+import resource
+import sys
+
+def set_limit(name, requested):
+    kind = getattr(resource, name, None)
+    if kind is None:
         return
+    try:
+        _soft, hard = resource.getrlimit(kind)
+        value = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+        resource.setrlimit(kind, (value, value))
+    except (OSError, ValueError):
+        pass
 
-    with open(test_cases_path) as f:
-        cases = json.load(f)
+set_limit("RLIMIT_AS", 4 * 1024 * 1024 * 1024)
+# Keep the CPU backstop slightly beyond the parent's wall-clock deadline so a
+# busy loop is classified as a timeout rather than an ambiguous signal exit.
+set_limit("RLIMIT_CPU", max(1, int(sys.argv[2]) + 2))
+set_limit("RLIMIT_FSIZE", 8 * 1024 * 1024)
+set_limit("RLIMIT_NPROC", 256)
+set_limit("RLIMIT_NOFILE", 64)
+set_limit("RLIMIT_CORE", 0)
 
-    inputs = cases["inputs"]
-    outputs = cases["outputs"]
-    tests_passed = 0
-    tests_total = len(inputs)
-    first_failure = None
+solution = sys.argv[1]
+sys.argv = [solution]
+if hasattr(sys, "orig_argv"):
+    sys.orig_argv = [sys.executable, solution]
+with open(solution, "rb") as source_file:
+    source = source_file.read()
+compiled = compile(source, solution, "exec")
 
-    for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
-        old_stdin = sys.stdin
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        captured_stdout = io.StringIO()
-        captured_stderr = io.StringIO()
+class CandidateHardExit(BaseException):
+    pass
 
-        try:
-            sys.stdin = io.StringIO(test_input)
-            sys.stdout = captured_stdout
-            sys.stderr = captured_stderr
-            # Each exec gets a fresh namespace so globals don't leak.
-            # __name__ must be "__main__" so if __name__ == "__main__" guards work.
-            exec(compiled, {"__builtins__": __builtins__, "__name__": "__main__"})
-        except SystemExit:
-            pass  # Some solutions call exit()
-        except Exception:
-            captured_stderr.write(traceback.format_exc())
-        finally:
-            sys.stdin = old_stdin
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+hard_exit_attempted = False
 
-        actual = captured_stdout.getvalue()
-        stderr = captured_stderr.getvalue()
+def candidate_hard_exit(code=0):
+    global hard_exit_attempted
+    hard_exit_attempted = True
+    raise CandidateHardExit(code)
 
-        if normalize_output(actual) == normalize_output(expected_output):
-            tests_passed += 1
-        else:
-            if first_failure is None:
-                first_failure = {
-                    "test_idx": i,
-                    "expected": normalize_output(expected_output)[:500],
-                    "actual": normalize_output(actual)[:500],
-                    "stderr": stderr[:500],
-                }
+# Distinguish Python's ordinary os._exit API from a top-level return. This is
+# grading-integrity instrumentation, not a hostile-code sandbox: native
+# syscalls remain part of the documented same-UID/container limitation.
+os._exit = candidate_hard_exit
+try:
+    import posix
+    posix._exit = candidate_hard_exit
+except ImportError:
+    pass
 
-    passed = tests_passed == tests_total
-    write_result({
-        "status": "passed" if passed else "failed",
-        "passed": passed,
-        "tests_passed": tests_passed,
-        "tests_total": tests_total,
-        "timeout": False,
-        "first_failure": first_failure,
-    })
-
-if __name__ == "__main__":
-    main()
+try:
+    exec(compiled, {"__name__": "__main__", "__file__": solution})
+except CandidateHardExit:
+    raise SystemExit(1)
+except SystemExit as exc:
+    # ``exit()``/``sys.exit()`` with a success code is common in valid contest
+    # programs and counts as a normal top-level return. Nonzero exits remain
+    # candidate failures.
+    if exc.code not in (None, 0):
+        raise SystemExit(1)
+if hard_exit_attempted:
+    raise SystemExit(1)
+raise SystemExit(120)
 '''
 
 
@@ -756,8 +1002,8 @@ class CodeContestsEnv(SingleTurnEnv):
         # problem statement, and the ONLY field that reaches a prompt.
         #
         # Suites ride in meta for the graders to read. They are verifier inputs,
-        # not public examples: nothing renders them. `name` stays scalar while
-        # docent_export drops the list-valued suites from exported transcripts.
+        # not public examples: nothing renders them, and export_meta() removes
+        # them before any transcript record is constructed.
         return Task(
             messages=self.prompts.render({"PROBLEM": row["problem"]}),
             meta={
@@ -782,6 +1028,23 @@ class CodeContestsEnv(SingleTurnEnv):
             return [self._task(self.rng.choice(self.train_rows), split) for _ in range(n)]
         return [self._task(row, split) for row in self.test_rows[:n]]
 
+    def export_meta(self, task: Task) -> dict[str, Any]:
+        """Expose problem identity, never private verifier suites.
+
+        This explicit allowlist is intentionally narrower than the generic
+        SingleTurnEnv default.  Adding a suite-like field to Task.meta cannot
+        silently make it into ``last_rollout_records`` and downstream Docent
+        or W&B payloads.
+        """
+        safe_keys = ("question", "name", "cf_rating", "difficulty", "split")
+        scalar_types = (str, int, float, bool)
+        return {
+            key: value
+            for key in safe_keys
+            if key in task.meta
+            and ((value := task.meta[key]) is None or isinstance(value, scalar_types))
+        }
+
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         """GDM-only RLVR reward plus paired held-out measurement.
 
@@ -789,13 +1052,14 @@ class CodeContestsEnv(SingleTurnEnv):
         explicitly named ``gdm_inputs`` and additionally run the SAME extracted
         program through CCO. CCO metrics never enter the returned reward.
         """
-        code = extract_code(text, relaxed=True)
+        parsed = parse_code_answers(text)
+        code = parsed.relaxed
         # every key present in EVERY branch, so eval-time averages are means
         # over all samples rather than over the branch that happened to set it
         info: dict[str, Any] = {
-            "correct": 0.0,
-            "has_code": float(code is not None),
-            "tests_passed_frac": 0.0,
+            "answer_format_valid": float(parsed.answer_format_valid),
+            "correct_strict": 0.0,
+            "correct_relaxed": 0.0,
             "gdm_correct": 0.0,
             "gdm_tests_passed_frac": 0.0,
             "cpp_code": 0.0,
@@ -832,12 +1096,17 @@ class CodeContestsEnv(SingleTurnEnv):
         total = result.get("tests_total") or len(gdm_inputs)
         gdm_correct = float(bool(result.get("passed")))
         gdm_passed_frac = result.get("tests_passed", 0) / total if total else 0.0
-        info["gdm_correct"] = info["correct"] = gdm_correct
-        info["gdm_tests_passed_frac"] = info["tests_passed_frac"] = gdm_passed_frac
+        info["gdm_correct"] = info["correct_relaxed"] = gdm_correct
+        info["correct_strict"] = (
+            gdm_correct if parsed.strict is not None else 0.0
+        )
+        info["gdm_tests_passed_frac"] = gdm_passed_frac
         # verifier breakage must be distinguishable from wrong answers
         info["exec_timeout"] = float(bool(result.get("timeout")))
-        info["exec_error"] = float(result.get("status") == "error")
-        return self.format_reward + self.correct_reward * info["correct"], info
+        info["exec_error"] = float(result.get("status") == "candidate_error")
+        # Historical reward semantics deliberately use the relaxed candidate:
+        # a truncated fence still earns format reward and can earn correctness.
+        return self.format_reward + self.correct_reward * gdm_correct, info
 
 
 # -------------------------------------------------------------------- family
@@ -848,6 +1117,7 @@ class CodeContestsFamily(TaskFamily):
         # grade() is called by DebateEnv with only meta, so the per-problem
         # timeout has to live on the family instance.
         self.timeout_seconds = timeout_seconds
+        self._protocol_identity: dict[str, str] = {}
 
     def source(self, ds: dict) -> Env:
         reject_unknown_keys(
@@ -878,7 +1148,7 @@ class CodeContestsFamily(TaskFamily):
                 "ai_debate/data/codecontests/{train,test}.jsonl"
             )
         self.timeout_seconds = int(ds.get("timeout_seconds", self.timeout_seconds))
-        return CodeContestsEnv(
+        env = CodeContestsEnv(
             path=str(path),
             test_path=(str(ds["test_path"]) if ds.get("test_path") else None),
             paired_test_path=(
@@ -904,9 +1174,74 @@ class CodeContestsFamily(TaskFamily):
                 int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
             ),
         )
+        train_path = Path(str(path)).expanduser().resolve()
+        if ds.get("paired_test_path"):
+            eval_path = Path(str(ds["paired_test_path"])).expanduser().resolve()
+            eval_source_kind = "paired_test_path"
+        elif ds.get("test_path"):
+            eval_path = Path(str(ds["test_path"])).expanduser().resolve()
+            eval_source_kind = "test_path"
+        else:
+            eval_path = train_path
+            eval_source_kind = "derived_from_train"
+        prompt_path = resolve_prompt_file(ds.get("prompt_file"), PROMPT_FILE).resolve()
+        train_manifest = _manifest_for(train_path)
+        eval_manifest = _manifest_for(eval_path)
+        self._protocol_identity = {
+            "grading_protocol": "codecontests_fresh_process_per_case_v2",
+            "train_source_path": str(train_path),
+            "eval_source_path": str(eval_path),
+            "eval_source_kind": eval_source_kind,
+            "train_content_sha256": _sha256_file(train_path),
+            "eval_content_sha256": _sha256_file(eval_path),
+            "train_cohort_sha256": _sha256_json(env.train_rows),
+            "eval_cohort_sha256": _sha256_json(env.test_rows),
+            "train_suites_sha256": _sha256_json(_suite_projection(env.train_rows)),
+            "eval_suites_sha256": _sha256_json(_suite_projection(env.test_rows)),
+            "train_manifest_path": (
+                str(train_manifest.resolve()) if train_manifest else "none"
+            ),
+            "train_manifest_sha256": (
+                _sha256_file(train_manifest) if train_manifest else "none"
+            ),
+            "eval_manifest_path": (
+                str(eval_manifest.resolve()) if eval_manifest else "none"
+            ),
+            "eval_manifest_sha256": (
+                _sha256_file(eval_manifest) if eval_manifest else "none"
+            ),
+            "loader_filter_protocol": "codecontests_structural_v1",
+            "seed": str(int(ds.get("seed", 0))),
+            "eval_subset_size": str(int(ds.get("eval_subset_size", 128))),
+            "expected_eval_size": _optional(
+                int(ds["expected_eval_size"])
+                if ds.get("expected_eval_size") is not None
+                else None
+            ),
+            "timeout_seconds": str(self.timeout_seconds),
+            # Resolved source-env values make semantically equivalent config
+            # spellings canonical while pinning every reward-affecting knob.
+            "correct_reward": repr(float(env.correct_reward)),
+            "format_reward": repr(float(env.format_reward)),
+            "soft_token_budget": _optional(env.soft_token_budget),
+            "overshoot_penalty": repr(float(env.overshoot_penalty)),
+            "min_cf_rating": _optional(
+                int(ds["min_cf_rating"])
+                if ds.get("min_cf_rating") is not None
+                else None
+            ),
+            "max_cf_rating": _optional(
+                int(ds["max_cf_rating"])
+                if ds.get("max_cf_rating") is not None
+                else None
+            ),
+            "prompt_file": str(prompt_path),
+            "prompt_sha256": _sha256_file(prompt_path),
+        }
+        return env
 
-    def extractor(self, relaxed: bool) -> Callable[[str], Any]:
-        return lambda text: extract_code(text, relaxed=relaxed)
+    def parse_answers(self, text: str) -> AnswerParse:
+        return parse_code_answers(text)
 
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
         """GROUND-TRUTH LABEL, never a reward. DebateEnv calls this to record
@@ -926,9 +1261,10 @@ class CodeContestsFamily(TaskFamily):
             return None
         if is_cpp_code(solution):
             return False
-        return bool(run_stdin_tests(solution, inputs, outputs, timeout=self.timeout_seconds).get("passed"))
+        result = run_stdin_tests(
+            solution, inputs, outputs, timeout=self.timeout_seconds
+        )
+        return bool(result["passed"])
 
-    def format_flags(self, text: str) -> dict[str, float]:
-        # strict flag: a properly CLOSED fence, independent of the (possibly
-        # relaxed) extractor used for position binding
-        return {"code_fence": float(has_closed_fence(text))}
+    def protocol_identity(self) -> dict[str, str]:
+        return dict(self._protocol_identity)
