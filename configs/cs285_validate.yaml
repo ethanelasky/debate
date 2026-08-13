@@ -138,8 +138,6 @@ cs285_mathhard_dapo:
   training:
     loss: {kind: ppo, clip_low: 0.8, clip_high: 1.28}
     kl_coef: 0.0
-    # inert at coef 0; the base's `loss` mechanism refuses a zero coefficient
-    kl_mechanism: advantage
     dynamic_sampling_retries: 5
 
 

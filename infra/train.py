@@ -57,14 +57,16 @@ class Config:
     # 1.0 = off, loop identical to before.
     oversample_factor: float = 1.0
     kl_coef: float = 0.0            # 0 = no reference-KL penalty
-    # Where kl_coef acts. "advantage" (default): centered k1 penalty added to
+    # Where kl_coef acts. "loss" (default): verl's native differentiable in-loss
+    # KL (k3/low_var_kl vs the frozen ref, recomputed each minibatch) —
+    # hw4/DeepSeekMath semantics; the loop stamps datum.ref_logprobs once per
+    # step and the backend forwards them. Requires a backend exposing
+    # ref_logprobs (verl + LoRA). "advantage": centered k1 penalty added to
     # advantages once per step from the behavior logprobs — reshapes credit
-    # within the batch, zero net pull toward ref (the campaign mechanism).
-    # "loss": verl's native differentiable in-loss KL (k3/low_var_kl vs the
-    # frozen ref, recomputed each minibatch) — hw4/DeepSeekMath semantics; the
-    # loop stamps datum.ref_logprobs once per step and the backend forwards
-    # them. Requires a backend exposing ref_logprobs (verl + LoRA).
-    kl_mechanism: str = "advantage"
+    # within the batch, zero net pull toward ref (the pre-2026-08-11 mechanism;
+    # the only option on backends without ref_logprobs, e.g. tinker).
+    # Inert either way at kl_coef 0.
+    kl_mechanism: str = "loss"
     # Linear lr warmup over the first N steps (0 = off, constant lr). Applied
     # in the loop by rescaling OptimParams.lr per step: verl's own scheduler
     # never advances on our tinker-worker path (optimizer_step only), and the

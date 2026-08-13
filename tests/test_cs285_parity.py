@@ -163,8 +163,15 @@ def test_kl_mechanism_loss_stamps_ref_and_skips_advantage_penalty():
     assert all(d.ref_logprobs == [-0.5, -0.5] for d in backend.fb_datums[0])
 
 
-def test_kl_mechanism_advantage_is_default_path():
-    backend = _run({"kl_coef": 0.05}, steps=1)
+def test_kl_mechanism_loss_is_default_path():
+    with mock.patch("infra.rl.kl.apply_kl_penalty") as penalty:
+        backend = _run({"kl_coef": 0.05}, steps=1)
+    assert backend.ref_calls == 1
+    assert not penalty.called
+
+
+def test_kl_mechanism_advantage_is_opt_in():
+    backend = _run({"kl_coef": 0.05, "kl_mechanism": "advantage"}, steps=1)
     assert backend.ref_calls >= 1  # apply_kl_penalty's ref pass
     assert all(d.ref_logprobs is None for d in backend.fb_datums[0])
 
@@ -229,6 +236,16 @@ def test_kl_mechanism_loss_rejects_non_verl_backend():
 
     with pytest.raises(RuntimeError, match="requires backend 'verl'"):
         build_backend({"backend": "tinker", "kl_mechanism": "loss", "kl_coef": 0.05}, "m", "r")
+
+
+def test_zero_kl_coef_clears_both_mechanism_guards():
+    """No KL is applied at coef 0, so the default must not reject KL-free arms:
+    the DAPO twin is verl + coef 0, the smoke arms are tinker + coef 0."""
+    from infra.run_common import build_backend
+
+    with mock.patch("infra.backend.tinker.TinkerBackend") as built:
+        build_backend({"backend": "tinker", "kl_coef": 0.0}, "m", "r")
+    assert built.called
 
 
 def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():

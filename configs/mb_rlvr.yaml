@@ -186,6 +186,7 @@ mb_rlvr_qwen36:
     # tinker sums), which is what the two decades on either side are for.
     lr: 1.0e-4
     kl_coef: 0.02
+    kl_mechanism: advantage   # tinker ignores ref_log_prob; in-loss KL is verl-only
     kl_discount_factor: 0.0
     # Datums here carry the whole ~16-50k-token prompt, so the default 64 per
     # forward_backward is 1-3M tokens in one call. Lower until a step is known

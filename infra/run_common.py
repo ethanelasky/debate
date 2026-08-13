@@ -397,7 +397,10 @@ def build_backend(
     fall to the backend config's own dataclass defaults.
     """
     backend_kind = str(tr.get("backend", "tinker"))
-    if str(tr.get("kl_mechanism", "advantage")) == "loss" and backend_kind != "verl":
+    # At coef 0 no KL is applied by either mechanism, so the backend pairing
+    # below cannot bite — checking it would only reject valid KL-free arms.
+    _kl_on = tr.get("kl_coef") is not None and float(tr["kl_coef"]) > 0
+    if _kl_on and str(tr.get("kl_mechanism", "loss")) == "loss" and backend_kind != "verl":
         # Tinker HAS ref_logprobs, so the train loop's capability check would
         # pass, stamp the datums, skip the advantage penalty — and tinker's
         # forward_backward would ignore the field: kl_coef silently becomes a
@@ -459,14 +462,9 @@ def build_backend(
             )
         if tr.get("lora_rank") is not None:
             vkw["lora_rank"] = int(tr["lora_rank"])
-        if str(tr.get("kl_mechanism", "advantage")) == "loss":
+        if _kl_on and str(tr.get("kl_mechanism", "loss")) == "loss":
             # In-loss KL: the coefficient rides training.kl_coef; the backend
             # needs it at construction (use_kl_loss is a worker-config knob).
-            if tr.get("kl_coef") is None or float(tr["kl_coef"]) <= 0:
-                raise RuntimeError(
-                    "training.kl_mechanism 'loss' needs training.kl_coef > 0 "
-                    "— the coefficient feeds verl's kl_loss_coef."
-                )
             vkw["kl_loss_coef"] = float(tr["kl_coef"])
         if lr_override is not None:
             vkw["lr"] = float(lr_override)
