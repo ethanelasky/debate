@@ -401,6 +401,11 @@ codecontests_rlvr_olmo31_32b_cap2048_long:
     eval_every: 10
     eval_n: 256
     save_every: 25
+    # Match the current OLMo RL recipe: warm up to 1e-4 over ten updates,
+    # then cosine-decay to 0.2x peak at the end of the 100-step run.
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
 
 # The 1024 arm at the same length as cap2048_long, so the two are overlayable.
 # The 10-step version looked dead — eval pinned at 1/32 for its whole run — but
@@ -425,6 +430,11 @@ codecontests_rlvr_olmo31_32b_cap1024_long:
     eval_every: 10
     eval_n: 256
     save_every: 25
+    # Keep optimizer semantics identical to the 2048 arm so only the token
+    # cap differs in the paired experiment.
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
 
 codecontests_rlvr_olmo31_32b_cap1024:
   _extends: codecontests_rlvr_olmo31_32b_cap2048

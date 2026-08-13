@@ -80,6 +80,10 @@ def test_long_cap_arms_keep_science_and_launch_shape(cap: int, topology_table: d
     tr = exp["training"]
     assert (tr["steps"], tr["batch_size"], tr["group_size"]) == (100, 8, 8)
     assert (tr["eval_every"], tr["eval_n"], tr["save_every"]) == (10, 256, 25)
+    assert tr["lr"] == pytest.approx(1.0e-4)
+    assert tr["warmup_steps"] == 10
+    assert tr["lr_schedule"] == "cosine"
+    assert tr["min_lr_ratio"] == pytest.approx(0.2)
     assert tr["eval_max_tokens"] == cap
     assert tr["verl"]["response_length"] == cap
     assert tr["verl"]["max_token_len_per_gpu"] == 8192
