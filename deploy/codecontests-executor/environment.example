@@ -1,0 +1,4 @@
+CODECONTESTS_EXECUTOR_SERVICE_ID=replace-with-frozen-instance-id
+CODECONTESTS_EXECUTOR_ROOTFS_MANIFEST_SHA256=replace-with-generator-file-sha256
+CODECONTESTS_EXECUTOR_SERVER_BUNDLE_SHA256=replace-with-staged-bundle-sha256
+CODECONTESTS_EXECUTOR_CLIENT_PROVENANCE_FILE=/etc/codecontests-executor/client-provenance.json

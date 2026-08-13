@@ -1,0 +1,15 @@
+[Unit]
+Description=Read-only CodeContests executor rootfs
+Before=@SERVICE_NAME@
+
+[Mount]
+What=/var/lib/codecontests-executor/rootfs
+Where=/var/lib/codecontests-executor/rootfs
+Type=none
+Options=bind,ro,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target
+
+# deployment-run-id=@RUN_ID@
+# deployment-nonce=@DEPLOY_NONCE@

@@ -160,8 +160,11 @@ eval scale. The design trains on the cheap suite and measures with both.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import concurrent.futures
 import functools
+import hashlib
 import importlib.util
 import json
 import logging
@@ -203,6 +206,27 @@ logger = logging.getLogger(__name__)
 # fan-out cannot finish before its slowest item.
 _MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "32"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
+# The external service executes four requests at once. Match that active count
+# here so cross-solution queue time is spent outside each solution's deadline,
+# just like the local verifier semaphore. The service's additional bounded
+# queue remains a transport-burst backstop, not routine candidate time.
+_MAX_CONCURRENT_REMOTE_VERIFIERS = min(
+    4,
+    max(1, int(os.environ.get("MAX_CONCURRENT_REMOTE_VERIFIERS", "4"))),
+)
+_remote_verifier_semaphore = threading.Semaphore(
+    _MAX_CONCURRENT_REMOTE_VERIFIERS
+)
+
+# A signed LAUNCH_ATTESTATION_MISSING result means the isolated controller did
+# not produce a usable terminal attestation.  It is never a candidate verdict
+# and therefore can never be scored.  One fresh-sandbox retry tolerates a rare
+# monitor/ptrace launch race while retaining a hard fail-closed boundary if the
+# same code/input cannot complete twice.  This is deliberately not configurable
+# at launch time: raising it would silently turn a broken executor into an
+# unbounded retry loop paid for by the training job.
+_REMOTE_LAUNCH_ATTESTATION_CATEGORY = "LAUNCH_ATTESTATION_MISSING"
+_REMOTE_LAUNCH_ATTESTATION_RETRIES = 1
 
 # Descriptions containing these admit multiple valid outputs, which exact
 # output comparison would mis-grade. Ported verbatim from the old loader.
@@ -342,6 +366,10 @@ _SANDBOX_BOOTSTRAP_PATH = os.path.join(
 )
 _sandbox_probe_lock = threading.Lock()
 _verified_bubblewrap_path: Optional[str] = None
+_remote_executor_lock = threading.Lock()
+_verified_remote_executor_client: Any | None = None
+_EXECUTOR_MODE_ENV = "CODECONTESTS_EXECUTOR_MODE"
+_REMOTE_ADDRESS_SPACE_BYTES = 4 * 1024 * 1024 * 1024
 _SANDBOX_READY_PREFIX = "CODECONTESTS_SANDBOX_READY:"
 _CANDIDATE_ENV = {
     "HOME": "/nonexistent",
@@ -602,15 +630,59 @@ def _probe_bubblewrap() -> str:
 
 
 def _reset_sandbox_probe_for_tests() -> None:
-    global _verified_bubblewrap_path
+    global _verified_bubblewrap_path, _verified_remote_executor_client
     with _sandbox_probe_lock:
         _verified_bubblewrap_path = None
         _curated_package_mounts.cache_clear()
+    with _remote_executor_lock:
+        _verified_remote_executor_client = None
+
+
+def _executor_mode() -> str:
+    """Resolve the execution boundary without permitting an implicit fallback."""
+    mode = os.environ.get(_EXECUTOR_MODE_ENV, "").strip().lower()
+    if mode in {"", "local"}:
+        return "local"
+    if mode == "remote":
+        return mode
+    raise VerifierInfrastructureError(
+        f"invalid {_EXECUTOR_MODE_ENV}={mode!r}; expected local or remote"
+    )
+
+
+def _new_remote_executor_client() -> Any:
+    # Imported lazily so ordinary local development retains the exact existing
+    # bubblewrap/macOS dependency surface.
+    from codecontests_executor.client import RemoteExecutorClient
+
+    return RemoteExecutorClient.from_env(verifier_path=__file__)
+
+
+def _verified_remote_executor() -> Any:
+    """Return a client whose signed frozen identity was verified in this process."""
+    global _verified_remote_executor_client
+    if _verified_remote_executor_client is not None:
+        return _verified_remote_executor_client
+    with _remote_executor_lock:
+        if _verified_remote_executor_client is not None:
+            return _verified_remote_executor_client
+        try:
+            client = _new_remote_executor_client()
+            client.verify_identity()
+        except Exception as exc:
+            raise VerifierInfrastructureError(
+                "remote CodeContests executor identity/configuration preflight "
+                f"failed: {type(exc).__name__}"
+            ) from exc
+        _verified_remote_executor_client = client
+        return client
 
 
 def verify_code_execution_sandbox() -> None:
-    """Cheap launch preflight; Linux never falls back to unsandboxed code."""
-    if sys.platform == "linux":
+    """Cheap launch preflight; neither boundary ever falls back to the other."""
+    if _executor_mode() == "remote":
+        _verified_remote_executor()
+    elif sys.platform == "linux":
         _verified_bubblewrap()
 
 
@@ -664,6 +736,345 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             pass
 
 
+def _remote_failure_diagnostic(execution: Any) -> str:
+    stderr = bytes(getattr(execution, "stderr", b"")).decode(
+        "utf-8", errors="replace"
+    )
+    category = getattr(execution, "category", None) or "UNCLASSIFIED"
+    diagnostic = f"remote candidate failure: {category}"
+    if stderr:
+        diagnostic += f". {stderr[:500]}"
+    return diagnostic
+
+
+def _remote_output_saturation(execution: Any) -> tuple[bool, bool]:
+    """Read the already-validated, signed output saturation evidence."""
+    payload = getattr(execution, "result_payload", None)
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    if not isinstance(evidence, dict):
+        raise VerifierInfrastructureError(
+            "remote candidate failure lacks signed output saturation evidence"
+        )
+    stdout_truncated = evidence.get("stdout_truncated")
+    stderr_truncated = evidence.get("stderr_truncated")
+    if not isinstance(stdout_truncated, bool) or not isinstance(
+        stderr_truncated, bool
+    ):
+        raise VerifierInfrastructureError(
+            "remote candidate failure has invalid signed output saturation evidence"
+        )
+    return stdout_truncated, stderr_truncated
+
+
+def _remote_monitor_error(stderr: bytes) -> str | None:
+    """Extract the bounded monitor exception class from signed stderr.
+
+    The response envelope and its stderr bytes have already been authenticated
+    and schema-validated by ``RemoteExecutorClient``.  This parser is only for
+    operator diagnostics; failure to decode it never changes retry or reward
+    semantics.
+    """
+    marker = b"PALAESTRA_EXECUTOR_STATUS:"
+    offset = stderr.rfind(marker)
+    if offset < 0:
+        return None
+    frame = stderr[offset + len(marker) :].split(b"\n", 1)[0]
+    _nonce, separator, encoded = frame.partition(b":")
+    if not separator or not encoded:
+        return None
+    try:
+        status = json.loads(
+            base64.b64decode(encoded, validate=True).decode(
+                "ascii", errors="strict"
+            )
+        )
+    except (binascii.Error, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(status, dict)
+        or status.get("candidate_ready_attested") is not False
+    ):
+        return None
+    error = status.get("error")
+    if (
+        not isinstance(error, str)
+        or not error.isascii()
+        or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", error) is None
+    ):
+        return None
+    return error
+
+
+def _remote_unknown_diagnostic(
+    execution: Any,
+    *,
+    solution_code: str,
+    test_input: str,
+) -> str:
+    """Return a bounded, replay-oriented fingerprint for a signed UNKNOWN."""
+    stderr = bytes(getattr(execution, "stderr", b""))
+    payload = getattr(execution, "result_payload", None)
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    timing = payload.get("timing") if isinstance(payload, dict) else None
+    fields = [
+        f"code_sha256={hashlib.sha256(solution_code.encode()).hexdigest()}",
+        f"stdin_sha256={hashlib.sha256(test_input.encode()).hexdigest()}",
+        f"stderr_sha256={hashlib.sha256(stderr).hexdigest()}",
+    ]
+    monitor_error = _remote_monitor_error(stderr)
+    if monitor_error is not None:
+        fields.append(f"monitor_error={monitor_error}")
+    if isinstance(evidence, dict):
+        for key in (
+            "returncode",
+            "host_cpu_usage_us",
+            "host_memory_peak_bytes",
+            "host_pids_peak",
+        ):
+            if key not in evidence:
+                continue
+            value = evidence.get(key)
+            if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+                fields.append(f"{key}={value}")
+    if isinstance(timing, dict):
+        execution_ns = timing.get("execution_ns")
+        if isinstance(execution_ns, int) and not isinstance(execution_ns, bool):
+            fields.append(f"execution_ns={execution_ns}")
+    return " ".join(fields)
+
+
+def _run_stdin_tests_remote(
+    solution_code: str,
+    inputs: list[str],
+    outputs: list[str],
+    *,
+    timeout: int,
+    t0: float,
+) -> dict[str, Any]:
+    """Run one attested, fresh gVisor execution per input.
+
+    Expected outputs remain in this trusted process. The remote boundary sees
+    only candidate source, one stdin value, and resource limits.
+    """
+    _remote_verifier_semaphore.acquire()
+    try:
+        # This verifies the signed, frozen service identity before even a
+        # syntactically invalid candidate can be treated as a measured result.
+        client = _verified_remote_executor()
+        try:
+            compile(solution_code, "<remote-codecontests-solution>", "exec")
+        except SyntaxError as exc:
+            return _failure_result(
+                "error",
+                0,
+                f"SyntaxError: {exc}",
+                t0,
+                candidate_error=True,
+            )
+
+        # Match the local verifier's per-solution budget: setup and identity
+        # preflight are outside it, while every case spends from one deadline.
+        deadline = time.perf_counter() + timeout
+        tests_passed = 0
+        first_failure = None
+        candidate_error = False
+        infrastructure_retries = 0
+        for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
+            launch_diagnostics: list[str] = []
+            for launch_attempt in range(_REMOTE_LAUNCH_ATTESTATION_RETRIES + 1):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    if launch_diagnostics:
+                        raise VerifierInfrastructureError(
+                            "remote CodeContests executor launch-attestation retry "
+                            f"exhausted the solution deadline on case {i}: "
+                            + " | ".join(launch_diagnostics)
+                        )
+                    return _failure_result(
+                        "timeout",
+                        len(inputs),
+                        "Total execution timed out.",
+                        t0,
+                        timeout=True,
+                    )
+
+                # Preserve the one shared solution deadline across RPCs. The
+                # v2 executor accepts nanoseconds, so conservatively floor this
+                # clock sample instead of rounding a fractional remainder up.
+                # A retry always gets the newly remaining budget, never the
+                # original one again.
+                remaining_ns = int(remaining * 1_000_000_000)
+                if remaining_ns <= 0:
+                    if launch_diagnostics:
+                        raise VerifierInfrastructureError(
+                            "remote CodeContests executor launch-attestation retry "
+                            f"exhausted the solution deadline on case {i}: "
+                            + " | ".join(launch_diagnostics)
+                        )
+                    return _failure_result(
+                        "timeout",
+                        len(inputs),
+                        "Total execution timed out.",
+                        t0,
+                        timeout=True,
+                    )
+                remaining_seconds, remaining_nanos = divmod(
+                    remaining_ns, 1_000_000_000
+                )
+                raw_limits = {
+                    "time_limit": {
+                        "seconds": remaining_seconds,
+                        "nanos": remaining_nanos,
+                    },
+                    "memory_limit_bytes": _REMOTE_ADDRESS_SPACE_BYTES,
+                }
+                try:
+                    execution = client.execute(
+                        code=solution_code,
+                        stdin=test_input,
+                        raw_limits=raw_limits,
+                    )
+                except Exception as exc:
+                    raise VerifierInfrastructureError(
+                        "remote CodeContests executor call failed on case "
+                        f"{i}: {type(exc).__name__}"
+                    ) from exc
+
+                outcome = getattr(execution, "outcome", None)
+                category = getattr(execution, "category", None)
+                if (
+                    outcome == "unknown"
+                    and category == _REMOTE_LAUNCH_ATTESTATION_CATEGORY
+                ):
+                    diagnostic = _remote_unknown_diagnostic(
+                        execution,
+                        solution_code=solution_code,
+                        test_input=test_input,
+                    )
+                    launch_diagnostics.append(diagnostic)
+                    if launch_attempt < _REMOTE_LAUNCH_ATTESTATION_RETRIES:
+                        infrastructure_retries += 1
+                        logger.warning(
+                            "retrying signed remote executor launch-attestation "
+                            "failure with a fresh sandbox: case=%d attempt=%d/%d %s",
+                            i,
+                            launch_attempt + 1,
+                            _REMOTE_LAUNCH_ATTESTATION_RETRIES + 1,
+                            diagnostic,
+                        )
+                        continue
+                if outcome == "unknown":
+                    error = getattr(execution, "error", None)
+                    detail = f" ({error})" if error else ""
+                    diagnostics = (
+                        " diagnostics=" + " | ".join(launch_diagnostics)
+                        if launch_diagnostics
+                        else ""
+                    )
+                    raise VerifierInfrastructureError(
+                        "remote CodeContests executor returned UNKNOWN on case "
+                        f"{i}: {category or 'UNCLASSIFIED'}{detail}{diagnostics}"
+                    )
+                break
+            if outcome not in {"executed", "candidate_failure"}:
+                raise VerifierInfrastructureError(
+                    "remote CodeContests executor returned an invalid outcome "
+                    f"on case {i}: {outcome!r}"
+                )
+
+            # A response completing after the shared deadline is still a
+            # candidate timeout, even if its signed per-case outcome says it
+            # exited normally. No later input is submitted. The remote service
+            # policy must independently kill the case at this same deadline.
+            if time.perf_counter() >= deadline:
+                return _failure_result(
+                    "timeout",
+                    len(inputs),
+                    "Total execution timed out.",
+                    t0,
+                    timeout=True,
+                )
+
+            if outcome == "candidate_failure":
+                if category in {"CPU_LIMIT", "WALL_LIMIT"}:
+                    return _failure_result(
+                        "timeout",
+                        len(inputs),
+                        _remote_failure_diagnostic(execution),
+                        t0,
+                        timeout=True,
+                    )
+                candidate_error = True
+                stdout_truncated, stderr_truncated = _remote_output_saturation(
+                    execution
+                )
+                actual = bytes(getattr(execution, "stdout", b"")).decode(
+                    "utf-8", errors="replace"
+                )
+                normalized_actual = normalize_output(actual)
+                normalized_expected = normalize_output(expected_output)
+                # Historical local semantics record the candidate error but
+                # still award this case when its bounded stdout is correct.
+                # This includes a later nonzero exit, file/process limit, or a
+                # stderr-only output saturation. Saturated stdout never passes.
+                if not stdout_truncated and normalized_actual == normalized_expected:
+                    tests_passed += 1
+                    continue
+                if first_failure is None:
+                    diagnostic = _remote_failure_diagnostic(execution)
+                    if stdout_truncated:
+                        diagnostic = "stdout exceeded the 2 MiB limit. " + diagnostic
+                    if stderr_truncated:
+                        diagnostic = diagnostic[:450] + " [stderr truncated]"
+                    first_failure = {
+                        "test_idx": i,
+                        "expected": normalized_expected[:500],
+                        "actual": normalized_actual[:500],
+                        "stderr": diagnostic,
+                    }
+                continue
+
+            actual = bytes(getattr(execution, "stdout", b"")).decode(
+                "utf-8", errors="replace"
+            )
+            normalized_actual = normalize_output(actual)
+            normalized_expected = normalize_output(expected_output)
+            if normalized_actual == normalized_expected:
+                tests_passed += 1
+                continue
+            if first_failure is None:
+                stderr = bytes(getattr(execution, "stderr", b"")).decode(
+                    "utf-8", errors="replace"
+                )
+                first_failure = {
+                    "test_idx": i,
+                    "expected": normalized_expected[:500],
+                    "actual": normalized_actual[:500],
+                    "stderr": stderr[:500],
+                }
+
+        passed = tests_passed == len(inputs)
+        return {
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "tests_passed": tests_passed,
+            "tests_total": len(inputs),
+            "timeout": False,
+            "candidate_error": candidate_error,
+            "infrastructure_retries": infrastructure_retries,
+            "first_failure": first_failure,
+            "execution_time_seconds": time.perf_counter() - t0,
+        }
+    except VerifierInfrastructureError:
+        raise
+    except Exception as exc:
+        raise VerifierInfrastructureError(
+            f"trusted remote CodeContests verifier failed: {type(exc).__name__}"
+        ) from exc
+    finally:
+        _remote_verifier_semaphore.release()
+
+
 def run_stdin_tests(
     solution_code: str,
     inputs: list[str],
@@ -676,6 +1087,14 @@ def run_stdin_tests(
         raise VerifierInfrastructureError(
             "trusted CodeContests suite is ragged: "
             f"{len(inputs)} inputs != {len(outputs)} outputs"
+        )
+    if _executor_mode() == "remote":
+        return _run_stdin_tests_remote(
+            solution_code,
+            inputs,
+            outputs,
+            timeout=timeout,
+            t0=t0,
         )
     try:
         tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
@@ -1142,6 +1561,7 @@ class CodeContestsEnv(SingleTurnEnv):
             "cpp_code": 0.0,
             "exec_timeout": 0.0,
             "exec_error": 0.0,
+            "exec_infrastructure_retries": 0.0,
         }
         has_cco = bool(task.meta.get("cco_inputs"))
         if has_cco:
@@ -1149,6 +1569,7 @@ class CodeContestsEnv(SingleTurnEnv):
             info["cco_tests_passed_frac"] = 0.0
             info["cco_exec_timeout"] = 0.0
             info["cco_exec_error"] = 0.0
+            info["cco_exec_infrastructure_retries"] = 0.0
         if code is None:
             return 0.0, info
         if is_cpp_code(code):
@@ -1167,6 +1588,9 @@ class CodeContestsEnv(SingleTurnEnv):
             )
             info["cco_exec_timeout"] = float(bool(cco.get("timeout")))
             info["cco_exec_error"] = float(bool(cco.get("candidate_error")))
+            info["cco_exec_infrastructure_retries"] = float(
+                cco.get("infrastructure_retries", 0)
+            )
 
         gdm_inputs = task.meta.get("gdm_inputs") or task.meta["rlvr_inputs"]
         gdm_outputs = task.meta.get("gdm_outputs") or task.meta["rlvr_outputs"]
@@ -1183,6 +1607,9 @@ class CodeContestsEnv(SingleTurnEnv):
         # metrics therefore describe only candidate behavior.
         info["exec_timeout"] = float(bool(result.get("timeout")))
         info["exec_error"] = float(bool(result.get("candidate_error")))
+        info["exec_infrastructure_retries"] = float(
+            result.get("infrastructure_retries", 0)
+        )
         return self.format_reward + self.correct_reward * info["correct"], info
 
 

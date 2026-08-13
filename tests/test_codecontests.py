@@ -3,18 +3,20 @@ verifier (real subprocesses), reward, and grading."""
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import runpy
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from infra.config import resolve_experiments_from_file
-from infra.envs.tasks import get_family
 from infra.envs.tasks import codecontests as codecontests_module
+from infra.envs.tasks import get_family
 from infra.envs.tasks.codecontests import (
     CodeContestsEnv,
     CodeContestsFamily,
@@ -362,6 +364,545 @@ def test_is_cpp_code_requires_strong_anchor():
 # ------------------------------------------------------------------ verifier
 
 
+class _FakeRemoteExecutor:
+    def __init__(self, executions, on_execute=None):
+        self.executions = list(executions)
+        self.on_execute = on_execute
+        self.verify_calls = 0
+        self.calls = []
+
+    def verify_identity(self):
+        self.verify_calls += 1
+
+    def execute(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.on_execute is not None:
+            self.on_execute()
+        return self.executions.pop(0)
+
+
+def _remote_execution(
+    *,
+    outcome="executed",
+    category=None,
+    stdout=b"",
+    stderr=b"",
+    error=None,
+    stdout_truncated=False,
+    stderr_truncated=False,
+):
+    result_payload = None
+    if outcome == "candidate_failure":
+        result_payload = {
+            "evidence": {
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+            }
+        }
+    return SimpleNamespace(
+        outcome=outcome,
+        category=category,
+        retryable=False,
+        stdout=stdout,
+        stderr=stderr,
+        result_payload=result_payload,
+        error=error,
+    )
+
+
+@pytest.fixture
+def install_remote_executor(monkeypatch):
+    codecontests_module._reset_sandbox_probe_for_tests()
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+
+    def install(client):
+        monkeypatch.setattr(
+            codecontests_module, "_new_remote_executor_client", lambda: client
+        )
+        return client
+
+    yield install
+    codecontests_module._reset_sandbox_probe_for_tests()
+
+
+def test_remote_executor_keeps_expected_output_local_and_normalizes_result(
+    install_remote_executor,
+):
+    marker = "EXPECTED_OUTPUT_PRIVATE_7ef5"
+    client = install_remote_executor(
+        _FakeRemoteExecutor([_remote_execution(stdout=b"0.5000   \n")])
+    )
+
+    result = run_stdin_tests("print(0.5)", ["public stdin"], [f"0.5\n{marker}"])
+
+    assert not result["passed"]
+    assert client.verify_calls == 1
+    assert len(client.calls) == 1
+    assert set(client.calls[0]) == {"code", "stdin", "raw_limits"}
+    assert client.calls[0]["stdin"] == "public stdin"
+    assert marker not in repr(client.calls[0])
+
+    codecontests_module._reset_sandbox_probe_for_tests()
+    client = install_remote_executor(
+        _FakeRemoteExecutor([_remote_execution(stdout=b"0.5000   \n")])
+    )
+    result = run_stdin_tests("print(0.5)", ["public stdin"], ["0.5"])
+    assert result["passed"]
+
+
+def test_local_mode_never_imports_remote_executor(monkeypatch):
+    monkeypatch.delenv("CODECONTESTS_EXECUTOR_MODE", raising=False)
+    real_import = __import__
+
+    def reject_remote_import(name, *args, **kwargs):
+        if name.startswith("codecontests_executor"):
+            raise AssertionError("local verifier imported remote package")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", reject_remote_import)
+    result = run_stdin_tests("print('local')", [""], ["local"], timeout=TIMEOUT)
+    assert result["passed"]
+
+
+def test_remote_client_import_is_lazy(monkeypatch):
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+    imported = []
+    real_import = __import__
+
+    class FromEnvClient:
+        @classmethod
+        def from_env(cls, *, verifier_path):
+            imported.append(verifier_path)
+            return cls()
+
+        def verify_identity(self):
+            return None
+
+    def substitute_remote_import(name, *args, **kwargs):
+        if name == "codecontests_executor.client":
+            return SimpleNamespace(RemoteExecutorClient=FromEnvClient)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", substitute_remote_import)
+    codecontests_module._reset_sandbox_probe_for_tests()
+    try:
+        codecontests_module.verify_code_execution_sandbox()
+    finally:
+        codecontests_module._reset_sandbox_probe_for_tests()
+    assert imported == [codecontests_module.__file__]
+
+
+def test_remote_unknown_is_infrastructure_failure(install_remote_executor):
+    install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="unknown",
+                    category="OVERLOAD_RETRIES_EXHAUSTED",
+                    error="retry budget spent",
+                )
+            ]
+        )
+    )
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="UNKNOWN.*OVERLOAD_RETRIES_EXHAUSTED",
+    ):
+        run_stdin_tests("print(1)", [""], ["1"])
+
+
+def _launch_attestation_unknown(error="RuntimeError"):
+    nonce = "a" * 64
+    status = base64.b64encode(
+        json.dumps(
+            {
+                "version": 1,
+                "candidate_ready_attested": False,
+                "error": error,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    stderr = (
+        f"PALAESTRA_EXECUTOR_READY:{nonce}:monitor_uid=0:monitor_gid=0\n".encode()
+        + f"PALAESTRA_EXECUTOR_STATUS:{nonce}:".encode()
+        + status
+        + b"\n"
+    )
+    execution = _remote_execution(
+        outcome="unknown",
+        category="LAUNCH_ATTESTATION_MISSING",
+        stderr=stderr,
+    )
+    execution.result_payload = {
+        "timing": {"execution_ns": 123_456},
+        "evidence": {
+            "returncode": 125,
+            "host_cpu_usage_us": 14_616,
+            "host_memory_peak_bytes": 40_808_448,
+            "host_pids_peak": 29,
+        },
+    }
+    return execution
+
+
+def test_remote_launch_attestation_missing_retries_one_fresh_sandbox(
+    install_remote_executor, monkeypatch, caplog
+):
+    clock = {"now": 100.0}
+
+    def advance():
+        clock["now"] += 0.25
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [_launch_attestation_unknown(), _remote_execution(stdout=b"ok\n")],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    with caplog.at_level(logging.WARNING, logger=codecontests_module.__name__):
+        result = run_stdin_tests("print('ok')", ["input"], ["ok"], timeout=10)
+
+    assert result["passed"] is True
+    assert result["infrastructure_retries"] == 1
+    assert len(client.calls) == 2
+    first_limit = client.calls[0]["raw_limits"]["time_limit"]
+    second_limit = client.calls[1]["raw_limits"]["time_limit"]
+    assert first_limit == {"seconds": 10, "nanos": 0}
+    assert second_limit == {"seconds": 9, "nanos": 750_000_000}
+    warning = "\n".join(record.getMessage() for record in caplog.records)
+    assert "fresh sandbox" in warning
+    assert "monitor_error=RuntimeError" in warning
+    assert "code_sha256=" in warning and "stdin_sha256=" in warning
+
+
+def test_remote_launch_attestation_missing_fails_closed_after_one_retry(
+    install_remote_executor,
+):
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [_launch_attestation_unknown(), _launch_attestation_unknown()]
+        )
+    )
+
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match=(
+            "UNKNOWN.*LAUNCH_ATTESTATION_MISSING.*"
+            "monitor_error=RuntimeError.*returncode=125"
+        ),
+    ):
+        run_stdin_tests("print('never scored')", ["input"], ["never scored"])
+    assert len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("category", "stdout", "stderr_truncated"),
+    [
+        ("RUNTIME_ERROR", b"first\n", False),
+        ("OUTPUT_LIMIT", b"first\n", True),
+    ],
+)
+def test_remote_candidate_failure_with_correct_stdout_matches_local_semantics(
+    install_remote_executor, category, stdout, stderr_truncated
+):
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="candidate_failure",
+                    category=category,
+                    stdout=stdout,
+                    stderr=b"candidate diagnostic",
+                    stderr_truncated=stderr_truncated,
+                ),
+                _remote_execution(stdout=b"second\n"),
+            ]
+        )
+    )
+    result = run_stdin_tests("print(input())", ["first", "second"], ["first", "second"])
+
+    assert result["status"] == "passed"
+    assert result["passed"] is True
+    assert result["candidate_error"] is True
+    assert result["timeout"] is False
+    assert result["tests_passed"] == 2
+    assert result["first_failure"] is None
+    assert len(client.calls) == 2
+
+
+def test_remote_stdout_saturation_never_passes_even_when_prefix_matches(
+    install_remote_executor,
+):
+    install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="candidate_failure",
+                    category="OUTPUT_LIMIT",
+                    stdout=b"answer\n",
+                    stdout_truncated=True,
+                )
+            ]
+        )
+    )
+    result = run_stdin_tests("print('answer')", [""], ["answer"])
+    assert result["status"] == "failed"
+    assert result["tests_passed"] == 0
+    assert result["candidate_error"] is True
+    assert "stdout exceeded" in result["first_failure"]["stderr"]
+
+
+def test_remote_candidate_failure_requires_signed_saturation_evidence(
+    install_remote_executor,
+):
+    execution = _remote_execution(outcome="candidate_failure", category="RUNTIME_ERROR")
+    execution.result_payload = None
+    install_remote_executor(_FakeRemoteExecutor([execution]))
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="signed output saturation evidence",
+    ):
+        run_stdin_tests("raise RuntimeError", [""], [""])
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "CPU_LIMIT",
+        "FILE_SPACE_LIMIT",
+        "OUTPUT_LIMIT",
+        "PROCESS_LIMIT",
+        "RUNTIME_ERROR",
+        "WALL_LIMIT",
+    ],
+)
+def test_remote_protocol_candidate_category_mapping(
+    install_remote_executor, category
+):
+    install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="candidate_failure",
+                    category=category,
+                    stderr=b"bounded diagnostic",
+                )
+            ]
+        )
+    )
+    result = run_stdin_tests("print(0)", [""], ["1"], timeout=10)
+    if category in {"CPU_LIMIT", "WALL_LIMIT"}:
+        assert result["status"] == "timeout"
+        assert result["timeout"] is True
+        assert result["candidate_error"] is False
+    else:
+        assert result["status"] == "failed"
+        assert result["timeout"] is False
+        assert result["candidate_error"] is True
+
+
+def test_remote_wall_limit_is_candidate_timeout(install_remote_executor):
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="candidate_failure",
+                    category="WALL_LIMIT",
+                ),
+                _remote_execution(stdout=b"must not run"),
+            ]
+        )
+    )
+    result = run_stdin_tests("while True: pass", ["a", "b"], ["a", "b"], timeout=10)
+    assert result["status"] == "timeout" and result["timeout"] is True
+    assert len(client.calls) == 1
+
+
+def test_remote_mode_preflights_identity_before_candidate_or_syntax_result(
+    install_remote_executor,
+):
+    events = []
+    client = _FakeRemoteExecutor([_remote_execution(stdout=b"ok")])
+
+    def verify_identity():
+        events.append("identity")
+        client.verify_calls += 1
+
+    client.verify_identity = verify_identity
+    original_execute = client.execute
+
+    def execute(**kwargs):
+        events.append("execute")
+        return original_execute(**kwargs)
+
+    client.execute = execute
+    install_remote_executor(client)
+    result = run_stdin_tests("print('ok')", [""], ["ok"])
+    assert result["passed"] and events == ["identity", "execute"]
+
+    codecontests_module._reset_sandbox_probe_for_tests()
+    install_remote_executor(client)
+    result = run_stdin_tests("def (:", [""], [""])
+    assert result["status"] == "error"
+    assert result["tests_total"] == 0
+    assert events[-1] == "identity"
+
+
+def test_executor_mode_is_explicit_and_never_falls_back(monkeypatch):
+    monkeypatch.delenv("CODECONTESTS_EXECUTOR_MODE", raising=False)
+    assert codecontests_module._executor_mode() == "local"
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "local")
+    assert codecontests_module._executor_mode() == "local"
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+    assert codecontests_module._executor_mode() == "remote"
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "automatic")
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="expected local or remote",
+    ):
+        codecontests_module.verify_code_execution_sandbox()
+
+
+def test_pod_run_remote_preflight_skips_bubblewrap_install_path():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "pod_run.sh"
+    # The shell block is already syntax-checked separately. Its branch shape
+    # is asserted directly so a remote launch cannot regress to apt/bwrap.
+    codecontests_block = script.read_text().split(
+        'if [ "$DATASET_TYPE" = codecontests ]; then', 1
+    )[1].split("\nfi\n\n# A local policy", 1)[0]
+    remote_branch = codecontests_block.split("remote)", 1)[1].split(";;", 1)[0]
+    invalid_branch = codecontests_block.rsplit("*)", 1)[1]
+    assert "verify_code_execution_sandbox" in remote_branch
+    assert "apt-get" not in remote_branch
+    assert "bwrap" not in remote_branch
+    assert "invalid CODECONTESTS_EXECUTOR_MODE" in invalid_branch
+    assert "exit 2" in invalid_branch
+
+
+def test_remote_preflight_failure_never_executes_candidate(
+    install_remote_executor,
+):
+    client = _FakeRemoteExecutor([_remote_execution(stdout=b"unsafe")])
+
+    def fail_identity():
+        raise OSError("tunnel unavailable")
+
+    client.verify_identity = fail_identity
+    install_remote_executor(client)
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="identity/configuration preflight failed",
+    ):
+        run_stdin_tests("print('unsafe')", [""], ["unsafe"])
+    assert client.calls == []
+
+
+def test_remote_cases_receive_remaining_total_timeout_budget(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 100.0}
+
+    def advance():
+        clock["now"] += 3.2
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(stdout=b"one"),
+                _remote_execution(stdout=b"two"),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+    result = run_stdin_tests("print(input())", ["one", "two"], ["one", "two"], timeout=10)
+    assert result["passed"]
+    durations = [call["raw_limits"]["time_limit"] for call in client.calls]
+    assert durations[0] == {"seconds": 10, "nanos": 0}
+    assert durations[1]["seconds"] == 6
+    # Binary float representation may put the conservative floor a few ns
+    # below the mathematical 6.8 seconds, but it must never round up to 7.
+    assert 799_999_000 <= durations[1]["nanos"] < 800_000_000
+    assert all(
+        call["raw_limits"]["memory_limit_bytes"] == 4 * 1024**3
+        for call in client.calls
+    )
+
+
+def test_remote_late_response_is_timeout_and_stops_later_cases(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 0.0}
+
+    def overrun():
+        clock["now"] += 11.0
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [_remote_execution(stdout=b"one"), _remote_execution(stdout=b"two")],
+            on_execute=overrun,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+    result = run_stdin_tests("print(input())", ["one", "two"], ["one", "two"], timeout=10)
+    assert result["status"] == "timeout" and result["timeout"] is True
+    assert len(client.calls) == 1
+
+
+def test_remote_solution_admission_matches_four_active_service_slots(monkeypatch):
+    active = 0
+    max_active = 0
+    lock = codecontests_module.threading.Lock()
+    barrier = codecontests_module.threading.Barrier(4)
+
+    class ConcurrentClient:
+        def verify_identity(self):
+            return None
+
+        def execute(self, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(timeout=5)
+                codecontests_module.time.sleep(0.01)
+                return _remote_execution(stdout=b"ok")
+            finally:
+                with lock:
+                    active -= 1
+
+    codecontests_module._reset_sandbox_probe_for_tests()
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+    monkeypatch.setattr(
+        codecontests_module,
+        "_new_remote_executor_client",
+        lambda: ConcurrentClient(),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            results = list(
+                pool.map(
+                    lambda _index: run_stdin_tests("print('ok')", [""], ["ok"]),
+                    range(32),
+                )
+            )
+    finally:
+        codecontests_module._reset_sandbox_probe_for_tests()
+    assert all(result["passed"] for result in results)
+    assert max_active == 4
+
+
 def test_correct_solution_passes_all_cases():
     r = run_stdin_tests(SUM_SOLUTION, ["1 2", "3 4"], ["3", "7"], timeout=TIMEOUT)
     assert r["passed"] and r["tests_passed"] == 2 and r["tests_total"] == 2
@@ -401,6 +942,32 @@ def test_runtime_error_is_a_failure_not_a_crash():
     assert not r["passed"]
     assert r["candidate_error"] is True
     assert "ValueError" in r["first_failure"]["stderr"]
+
+
+def test_correct_stdout_before_runtime_error_preserves_historical_pass():
+    r = run_stdin_tests(
+        "print('answer')\nraise RuntimeError('after output')",
+        [""],
+        ["answer"],
+        timeout=TIMEOUT,
+    )
+    assert r["passed"] is True
+    assert r["tests_passed"] == 1
+    assert r["candidate_error"] is True
+    assert r["first_failure"] is None
+
+
+def test_correct_stdout_with_stderr_saturation_preserves_historical_pass():
+    r = run_stdin_tests(
+        "import sys\nprint('answer')\nsys.stderr.write('x' * (2 * 1024 * 1024))",
+        [""],
+        ["answer"],
+        timeout=TIMEOUT,
+    )
+    assert r["passed"] is True
+    assert r["tests_passed"] == 1
+    assert r["candidate_error"] is True
+    assert r["first_failure"] is None
 
 
 def test_one_worker_thread_recursion_idiom_is_supported():

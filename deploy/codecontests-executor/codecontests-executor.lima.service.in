@@ -1,0 +1,66 @@
+[Unit]
+Description=Palaestra CodeContests isolated executor (@RUN_ID@)
+Requires=var-lib-codecontests\x2dexecutor-rootfs.mount
+After=network.target systemd-sysctl.service var-lib-codecontests\x2dexecutor-rootfs.mount
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@RUN_ROOT@
+ExecStartPre=/usr/bin/python3.12 -I -B @RUN_ROOT@/deploy/codecontests-executor/verify_staged_executor.py --package-dir @RUN_ROOT@/codecontests_executor --inventory @CONFIG_ROOT@/server-bundle.inventory.json
+ExecStart=/usr/bin/python3.12 -B -m codecontests_executor.service --bind 127.0.0.1 --port 8080
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CODECONTESTS_EXECUTOR_BEARER_FILE=%d/bearer
+Environment=CODECONTESTS_EXECUTOR_HMAC_KEY_FILE=%d/hmac-key
+EnvironmentFile=@CONFIG_ROOT@/environment
+LoadCredential=bearer:@CONFIG_ROOT@/bearer
+LoadCredential=hmac-key:@CONFIG_ROOT@/hmac-key
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=600
+TimeoutStopSec=15
+KillMode=control-group
+CPUQuota=400%
+CPUAffinity=0 1 2 3
+MemoryMax=25769803776
+MemorySwapMax=0
+TasksMax=768
+Delegate=cpu memory pids
+DelegateSubgroup=service
+LimitNOFILE=4096
+UMask=0077
+# runsc/gofer must install its own seccomp and privilege transitions before
+# the candidate's OCI noNewPrivileges boundary; inheriting host NNP makes the
+# pinned gofer self-exec fail EPERM. The candidate boundary is still set and
+# attested inside the sandbox.
+NoNewPrivileges=no
+AmbientCapabilities=
+LockPersonality=yes
+# Pinned runsc systrap needs executable runtime mappings. The untrusted
+# candidate executes behind gVisor's virtual memory/syscall boundary, so this
+# host-service filter is not that boundary.
+MemoryDenyWriteExecute=no
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=no
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codecontests-executor/requests
+ReadOnlyPaths=/opt/gvisor/20260721.0
+ReadOnlyPaths=@RUN_ROOT@
+ReadOnlyPaths=@CONFIG_ROOT@
+BindReadOnlyPaths=@ROOTFS_MANIFEST_PATH@:/var/lib/codecontests-executor/rootfs.manifest.json
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+
+# deployment-run-id=@RUN_ID@
+# deployment-nonce=@DEPLOY_NONCE@

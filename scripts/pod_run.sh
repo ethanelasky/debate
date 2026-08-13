@@ -257,13 +257,11 @@ case "$MODE" in
 esac
 [ -f "$CONFIG" ] || { echo "FATAL: config $CONFIG not found (cwd $(pwd))" >&2; exit 2; }
 
-# CodeContests executes model-authored Python, so its Linux sandbox is a hard
-# launch dependency rather than something to discover after model boot. The
-# RunPod PyTorch images are Ubuntu and run this launcher as root; install the
-# distro's bubblewrap + libseccomp runtime into the ephemeral pod when absent,
-# then exercise the real user/mount/PID/network namespace, uid drop, rlimits,
-# and seccomp policy. Container runtimes sometimes deny user namespaces even
-# when bwrap is installed, so a version check is not a sufficient preflight.
+# CodeContests executes model-authored Python, so its selected execution
+# boundary is a hard launch dependency rather than something to discover after
+# model boot. Remote mode verifies the signed frozen executor identity through
+# the loopback tunnel and never installs/probes bwrap. Local mode retains the
+# existing namespace/seccomp preflight and never falls back to remote.
 DATASET_TYPE="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
 import sys
 from infra.config import load_experiment
@@ -276,35 +274,56 @@ PYEOF
   exit 2
 }
 if [ "$DATASET_TYPE" = codecontests ]; then
-  SANDBOX_INSTALL=0
-  command -v bwrap >/dev/null 2>&1 || SANDBOX_INSTALL=1
-  "$PY" - <<'PYEOF' >/dev/null 2>&1 || SANDBOX_INSTALL=1
+  CODECONTESTS_EXECUTOR_MODE_VALUE="${CODECONTESTS_EXECUTOR_MODE:-local}"
+  case "$CODECONTESTS_EXECUTOR_MODE_VALUE" in
+    remote)
+      if ! timeout -k 5s 30 "$PY" - <<'PYEOF'
+from infra.envs.tasks.codecontests import verify_code_execution_sandbox
+
+verify_code_execution_sandbox()
+print("== CodeContests signed remote executor identity preflight passed ==")
+PYEOF
+      then
+        echo "FATAL: CodeContests remote executor identity/configuration preflight failed; candidate code was not run" >&2
+        exit 2
+      fi
+      ;;
+    local|"")
+      SANDBOX_INSTALL=0
+      command -v bwrap >/dev/null 2>&1 || SANDBOX_INSTALL=1
+      "$PY" - <<'PYEOF' >/dev/null 2>&1 || SANDBOX_INSTALL=1
 import ctypes
 ctypes.CDLL("libseccomp.so.2")
 PYEOF
-  if [ "$SANDBOX_INSTALL" = 1 ]; then
-    if [ "$(id -u)" != 0 ] || ! command -v apt-get >/dev/null 2>&1; then
-      echo "FATAL: CodeContests requires bwrap + libseccomp.so.2; automatic apt install needs root on an apt-based image" >&2
-      exit 2
-    fi
-    echo "== installing CodeContests sandbox dependencies (bubblewrap, libseccomp2) =="
-    timeout -k 30s 300 apt-get update -qq &&
-      timeout -k 30s 300 env DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y -qq bubblewrap libseccomp2 || {
-          echo "FATAL: could not install CodeContests sandbox dependencies within 300s" >&2
+      if [ "$SANDBOX_INSTALL" = 1 ]; then
+        if [ "$(id -u)" != 0 ] || ! command -v apt-get >/dev/null 2>&1; then
+          echo "FATAL: CodeContests requires bwrap + libseccomp.so.2; automatic apt install needs root on an apt-based image" >&2
           exit 2
-        }
-  fi
-  if ! timeout -k 5s 30 "$PY" - <<'PYEOF'
+        fi
+        echo "== installing CodeContests sandbox dependencies (bubblewrap, libseccomp2) =="
+        timeout -k 30s 300 apt-get update -qq &&
+          timeout -k 30s 300 env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq bubblewrap libseccomp2 || {
+              echo "FATAL: could not install CodeContests sandbox dependencies within 300s" >&2
+              exit 2
+            }
+      fi
+      if ! timeout -k 5s 30 "$PY" - <<'PYEOF'
 from infra.envs.tasks.codecontests import verify_code_execution_sandbox
 
 verify_code_execution_sandbox()
 print("== CodeContests Linux sandbox feasibility probe passed ==")
 PYEOF
-  then
-    echo "FATAL: CodeContests sandbox cannot establish its namespaces, unprivileged uid, or seccomp policy; candidate code was not run" >&2
-    exit 2
-  fi
+      then
+        echo "FATAL: CodeContests sandbox cannot establish its namespaces, unprivileged uid, or seccomp policy; candidate code was not run" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "FATAL: invalid CODECONTESTS_EXECUTOR_MODE='$CODECONTESTS_EXECUTOR_MODE_VALUE'; expected local or remote" >&2
+      exit 2
+      ;;
+  esac
 fi
 
 # A local policy path is an intentional artifact selection, not an HF repo

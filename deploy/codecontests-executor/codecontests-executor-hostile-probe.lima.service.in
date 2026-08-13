@@ -1,0 +1,54 @@
+[Unit]
+Description=Palaestra CodeContests hostile executor probe (@RUN_ID@)
+Requires=var-lib-codecontests\x2dexecutor-rootfs.mount
+After=systemd-sysctl.service var-lib-codecontests\x2dexecutor-rootfs.mount
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=@RUN_ROOT@
+ExecStartPre=/usr/bin/python3.12 -I -B @RUN_ROOT@/deploy/codecontests-executor/verify_staged_executor.py --package-dir @RUN_ROOT@/codecontests_executor --inventory @CONFIG_ROOT@/server-bundle.inventory.json
+ExecStart=/usr/bin/python3.12 -B @RUN_ROOT@/scripts/probe_codecontests_executor_live.py --output @PROBE_OUTPUT@ --host-path-probe @HOST_PATH_PROBE@
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=@CONFIG_ROOT@/environment
+TimeoutStartSec=1800
+TimeoutStopSec=15
+KillMode=control-group
+CPUQuota=400%
+CPUAffinity=0 1 2 3
+MemoryMax=25769803776
+MemorySwapMax=0
+TasksMax=768
+Delegate=cpu memory pids
+DelegateSubgroup=service
+LimitNOFILE=4096
+UMask=0077
+# Required by pinned runsc/gofer setup; candidate NNP is enforced in OCI.
+NoNewPrivileges=no
+AmbientCapabilities=
+LockPersonality=yes
+# Required by the pinned runsc systrap platform.
+MemoryDenyWriteExecute=no
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=no
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codecontests-executor/requests
+ReadWritePaths=@PROBE_OUTPUT_DIR@
+ReadOnlyPaths=/opt/gvisor/20260721.0
+ReadOnlyPaths=@RUN_ROOT@
+ReadOnlyPaths=@CONFIG_ROOT@
+ReadOnlyPaths=@HOST_PATH_PROBE@
+BindReadOnlyPaths=@ROOTFS_MANIFEST_PATH@:/var/lib/codecontests-executor/rootfs.manifest.json
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+SystemCallArchitectures=native
+
+# deployment-run-id=@RUN_ID@
+# deployment-nonce=@DEPLOY_NONCE@
