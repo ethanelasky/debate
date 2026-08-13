@@ -218,15 +218,16 @@ _remote_verifier_semaphore = threading.Semaphore(
     _MAX_CONCURRENT_REMOTE_VERIFIERS
 )
 
-# A signed LAUNCH_ATTESTATION_MISSING result means the isolated controller did
-# not produce a usable terminal attestation.  It is never a candidate verdict
-# and therefore can never be scored.  One fresh-sandbox retry tolerates a rare
-# monitor/ptrace launch race while retaining a hard fail-closed boundary if the
-# same code/input cannot complete twice.  This is deliberately not configurable
-# at launch time: raising it would silently turn a broken executor into an
-# unbounded retry loop paid for by the training job.
-_REMOTE_LAUNCH_ATTESTATION_CATEGORY = "LAUNCH_ATTESTATION_MISSING"
-_REMOTE_LAUNCH_ATTESTATION_RETRIES = 1
+# These signed UNKNOWN results mean the isolated controller did not produce a
+# usable candidate verdict and therefore can never be scored. One fresh-sandbox
+# retry tolerates a rare monitor/ptrace or host-controller race while retaining
+# a hard fail-closed boundary if the same code/input cannot complete twice.
+# This is deliberately not configurable at launch time: raising it would turn
+# a broken executor into an unbounded retry loop paid for by training.
+_REMOTE_FRESH_SANDBOX_RETRY_CATEGORIES = frozenset(
+    {"LAUNCH_ATTESTATION_MISSING", "CONTROLLER_EXCEPTION"}
+)
+_REMOTE_FRESH_SANDBOX_RETRIES = 1
 
 # Descriptions containing these admit multiple valid outputs, which exact
 # output comparison would mis-grade. Ported verbatim from the old loader.
@@ -821,6 +822,12 @@ def _remote_unknown_diagnostic(
         f"stdin_sha256={hashlib.sha256(test_input.encode()).hexdigest()}",
         f"stderr_sha256={hashlib.sha256(stderr).hexdigest()}",
     ]
+    category = getattr(execution, "category", None)
+    if isinstance(category, str):
+        fields.append(f"category={category}")
+    controller_error = getattr(execution, "error", None)
+    if isinstance(controller_error, str):
+        fields.append(f"controller_error={controller_error}")
     monitor_error = _remote_monitor_error(stderr)
     if monitor_error is not None:
         fields.append(f"monitor_error={monitor_error}")
@@ -880,15 +887,15 @@ def _run_stdin_tests_remote(
         candidate_error = False
         infrastructure_retries = 0
         for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
-            launch_diagnostics: list[str] = []
-            for launch_attempt in range(_REMOTE_LAUNCH_ATTESTATION_RETRIES + 1):
+            infrastructure_diagnostics: list[str] = []
+            for infrastructure_attempt in range(_REMOTE_FRESH_SANDBOX_RETRIES + 1):
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
-                    if launch_diagnostics:
+                    if infrastructure_diagnostics:
                         raise VerifierInfrastructureError(
-                            "remote CodeContests executor launch-attestation retry "
+                            "remote CodeContests executor fresh-sandbox retry "
                             f"exhausted the solution deadline on case {i}: "
-                            + " | ".join(launch_diagnostics)
+                            + " | ".join(infrastructure_diagnostics)
                         )
                     return _failure_result(
                         "timeout",
@@ -906,11 +913,11 @@ def _run_stdin_tests_remote(
                 # failure may refund only its own RPC wall time below.
                 remaining_ns = int(remaining * 1_000_000_000)
                 if remaining_ns <= 0:
-                    if launch_diagnostics:
+                    if infrastructure_diagnostics:
                         raise VerifierInfrastructureError(
-                            "remote CodeContests executor launch-attestation retry "
+                            "remote CodeContests executor fresh-sandbox retry "
                             f"exhausted the solution deadline on case {i}: "
-                            + " | ".join(launch_diagnostics)
+                            + " | ".join(infrastructure_diagnostics)
                         )
                     return _failure_result(
                         "timeout",
@@ -949,15 +956,15 @@ def _run_stdin_tests_remote(
                 category = getattr(execution, "category", None)
                 if (
                     outcome == "unknown"
-                    and category == _REMOTE_LAUNCH_ATTESTATION_CATEGORY
+                    and category in _REMOTE_FRESH_SANDBOX_RETRY_CATEGORIES
                 ):
                     diagnostic = _remote_unknown_diagnostic(
                         execution,
                         solution_code=solution_code,
                         test_input=test_input,
                     )
-                    launch_diagnostics.append(diagnostic)
-                    if launch_attempt < _REMOTE_LAUNCH_ATTESTATION_RETRIES:
+                    infrastructure_diagnostics.append(diagnostic)
+                    if infrastructure_attempt < _REMOTE_FRESH_SANDBOX_RETRIES:
                         # This signed infrastructure failure did not yield a
                         # usable attested candidate result. Restore only the
                         # wall time spent inside this failed RPC; earlier cases
@@ -966,11 +973,11 @@ def _run_stdin_tests_remote(
                         deadline += execution_elapsed
                         infrastructure_retries += 1
                         logger.warning(
-                            "retrying signed remote executor launch-attestation "
+                            "retrying signed remote executor infrastructure "
                             "failure with a fresh sandbox: case=%d attempt=%d/%d %s",
                             i,
-                            launch_attempt + 1,
-                            _REMOTE_LAUNCH_ATTESTATION_RETRIES + 1,
+                            infrastructure_attempt + 1,
+                            _REMOTE_FRESH_SANDBOX_RETRIES + 1,
                             diagnostic,
                         )
                         continue
@@ -978,8 +985,8 @@ def _run_stdin_tests_remote(
                     error = getattr(execution, "error", None)
                     detail = f" ({error})" if error else ""
                     diagnostics = (
-                        " diagnostics=" + " | ".join(launch_diagnostics)
-                        if launch_diagnostics
+                        " diagnostics=" + " | ".join(infrastructure_diagnostics)
+                        if infrastructure_diagnostics
                         else ""
                     )
                     raise VerifierInfrastructureError(

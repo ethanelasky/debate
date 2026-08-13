@@ -481,6 +481,10 @@ class RemoteExecutorClient:
                 stdout=stdout,
                 stderr=stderr,
                 result_payload=result,
+                # This value is inside the authenticated and schema-validated
+                # evidence. Preserve it for fail-closed operator diagnostics;
+                # it never changes the verdict or retry policy here.
+                error=result["evidence"].get("controller_error"),
             )
             if not execution.retryable:
                 return execution

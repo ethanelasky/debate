@@ -648,6 +648,63 @@ def test_remote_launch_attestation_missing_fails_closed_after_one_retry(
     assert len(client.calls) == 2
 
 
+def test_remote_controller_exception_retries_one_fresh_sandbox(
+    install_remote_executor, monkeypatch, caplog
+):
+    clock = {"now": 100.0}
+
+    def advance():
+        clock["now"] += 0.25
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(
+                    outcome="unknown",
+                    category="CONTROLLER_EXCEPTION",
+                    error="FileNotFoundError",
+                ),
+                _remote_execution(stdout=b"ok\n"),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    with caplog.at_level(logging.WARNING, logger=codecontests_module.__name__):
+        result = run_stdin_tests("print('ok')", ["input"], ["ok"], timeout=10)
+
+    assert result["passed"] is True
+    assert result["infrastructure_retries"] == 1
+    assert len(client.calls) == 2
+    assert client.calls[0]["raw_limits"] == client.calls[1]["raw_limits"]
+    warning = "\n".join(record.getMessage() for record in caplog.records)
+    assert "fresh sandbox" in warning
+    assert "category=CONTROLLER_EXCEPTION" in warning
+    assert "controller_error=FileNotFoundError" in warning
+    assert "code_sha256=" in warning and "stdin_sha256=" in warning
+
+
+def test_remote_controller_exception_fails_closed_after_one_retry(
+    install_remote_executor,
+):
+    unknown = lambda: _remote_execution(
+        outcome="unknown",
+        category="CONTROLLER_EXCEPTION",
+        error="FileNotFoundError",
+    )
+    client = install_remote_executor(_FakeRemoteExecutor([unknown(), unknown()]))
+
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="UNKNOWN.*CONTROLLER_EXCEPTION.*FileNotFoundError",
+    ):
+        run_stdin_tests("print('never scored')", ["input"], ["never scored"])
+    assert len(client.calls) == 2
+
+
 @pytest.mark.parametrize(
     ("category", "stdout", "stderr_truncated"),
     [

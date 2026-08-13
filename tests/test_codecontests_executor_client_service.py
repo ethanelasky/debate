@@ -349,6 +349,22 @@ def test_malformed_controller_result_becomes_signed_unknown():
     result = client.execute(code="pass", stdin="", raw_limits=RAW_LIMITS)
     assert result.outcome == "unknown"
     assert result.category == "CONTROLLER_RESULT_INVALID"
+    assert result.error == "schema"
+
+
+def test_controller_exception_class_survives_signed_client_boundary(monkeypatch):
+    _identity, supervisor, _app, _transport, client = _stack()
+
+    def fail(_request):
+        raise FileNotFoundError("private server-side detail")
+
+    monkeypatch.setattr(supervisor, "execute", fail)
+    result = client.execute(code="pass", stdin="", raw_limits=RAW_LIMITS)
+
+    assert result.outcome == "unknown"
+    assert result.category == "CONTROLLER_EXCEPTION"
+    assert result.error == "FileNotFoundError"
+    assert result.result_payload["evidence"]["controller_error"] == "FileNotFoundError"
 
 
 def test_signed_executed_result_with_nonzero_returncode_is_unknown():

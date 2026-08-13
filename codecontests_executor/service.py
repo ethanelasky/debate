@@ -14,6 +14,7 @@ import stat
 import subprocess
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -930,6 +931,14 @@ class ExecutorApplication:
             try:
                 execution = self.supervisor.execute(request)
             except Exception as exc:  # noqa: BLE001 - controller trust boundary
+                # The signed response deliberately exposes only the bounded
+                # exception class. Keep the trusted server-side traceback so a
+                # rare fail-closed controller error can actually be repaired.
+                print(
+                    f"executor_controller_exception type={type(exc).__name__}",
+                    flush=True,
+                )
+                traceback.print_exception(exc, limit=16)
                 execution = self._controller_unknown(
                     "CONTROLLER_EXCEPTION",
                     type(exc).__name__,
