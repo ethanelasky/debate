@@ -574,11 +574,58 @@ def test_remote_launch_attestation_missing_retries_one_fresh_sandbox(
     first_limit = client.calls[0]["raw_limits"]["time_limit"]
     second_limit = client.calls[1]["raw_limits"]["time_limit"]
     assert first_limit == {"seconds": 10, "nanos": 0}
-    assert second_limit == {"seconds": 9, "nanos": 750_000_000}
+    assert second_limit == {"seconds": 10, "nanos": 0}
     warning = "\n".join(record.getMessage() for record in caplog.records)
     assert "fresh sandbox" in warning
     assert "monitor_error=RuntimeError" in warning
     assert "code_sha256=" in warning and "stdin_sha256=" in warning
+
+
+def test_remote_launch_attestation_retry_preserves_nearly_exhausted_budget(
+    install_remote_executor, monkeypatch
+):
+    clock = {"now": 100.0}
+    # The infrastructure failure itself outlives the 1.5 seconds of candidate
+    # budget that remained. Refunding only that failed RPC must still permit
+    # the approved retry with the same 1.5-second candidate budget.
+    execution_durations = iter([8.5, 1.75, 1.4])
+
+    def advance():
+        clock["now"] += next(execution_durations)
+
+    client = install_remote_executor(
+        _FakeRemoteExecutor(
+            [
+                _remote_execution(stdout=b"first\n"),
+                _launch_attestation_unknown(),
+                _remote_execution(stdout=b"second\n"),
+            ],
+            on_execute=advance,
+        )
+    )
+    monkeypatch.setattr(
+        codecontests_module.time, "perf_counter", lambda: clock["now"]
+    )
+
+    result = run_stdin_tests(
+        "print(input())",
+        ["first", "second"],
+        ["first", "second"],
+        timeout=10,
+    )
+
+    assert result["passed"] is True
+    assert result["infrastructure_retries"] == 1
+    assert len(client.calls) == 3
+
+    def limit_seconds(call):
+        limit = call["raw_limits"]["time_limit"]
+        return limit["seconds"] + limit["nanos"] / 1_000_000_000
+
+    assert limit_seconds(client.calls[0]) == 10
+    assert limit_seconds(client.calls[1]) == pytest.approx(1.5, abs=1e-8)
+    assert limit_seconds(client.calls[2]) == pytest.approx(1.5, abs=1e-8)
+    assert limit_seconds(client.calls[2]) < 10
 
 
 def test_remote_launch_attestation_missing_fails_closed_after_one_retry(

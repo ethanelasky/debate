@@ -901,8 +901,9 @@ def _run_stdin_tests_remote(
                 # Preserve the one shared solution deadline across RPCs. The
                 # v2 executor accepts nanoseconds, so conservatively floor this
                 # clock sample instead of rounding a fractional remainder up.
-                # A retry always gets the newly remaining budget, never the
-                # original one again.
+                # A retry gets the newly remaining candidate budget, never a
+                # fresh solution timeout. A signed unscorable infrastructure
+                # failure may refund only its own RPC wall time below.
                 remaining_ns = int(remaining * 1_000_000_000)
                 if remaining_ns <= 0:
                     if launch_diagnostics:
@@ -928,6 +929,7 @@ def _run_stdin_tests_remote(
                     },
                     "memory_limit_bytes": _REMOTE_ADDRESS_SPACE_BYTES,
                 }
+                execution_started_at = time.perf_counter()
                 try:
                     execution = client.execute(
                         code=solution_code,
@@ -939,6 +941,9 @@ def _run_stdin_tests_remote(
                         "remote CodeContests executor call failed on case "
                         f"{i}: {type(exc).__name__}"
                     ) from exc
+                execution_elapsed = max(
+                    0.0, time.perf_counter() - execution_started_at
+                )
 
                 outcome = getattr(execution, "outcome", None)
                 category = getattr(execution, "category", None)
@@ -953,6 +958,12 @@ def _run_stdin_tests_remote(
                     )
                     launch_diagnostics.append(diagnostic)
                     if launch_attempt < _REMOTE_LAUNCH_ATTESTATION_RETRIES:
+                        # This signed infrastructure failure did not yield a
+                        # usable attested candidate result. Restore only the
+                        # wall time spent inside this failed RPC; earlier cases
+                        # and local retry overhead continue spending from the
+                        # same solution deadline.
+                        deadline += execution_elapsed
                         infrastructure_retries += 1
                         logger.warning(
                             "retrying signed remote executor launch-attestation "
