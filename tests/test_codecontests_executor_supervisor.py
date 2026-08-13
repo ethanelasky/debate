@@ -104,6 +104,14 @@ status = {
     "file_size_observed_bytes": 0,
     "writable_available_bytes": 0,
 }
+if mode == "monitor_failure":
+    status = {
+        "version": 1,
+        "candidate_ready_attested": False,
+        "error": "RuntimeError",
+        "site": "trace_measure",
+        "source_line": 3021,
+    }
 encoded = base64.b64encode(json.dumps(
     status, sort_keys=True, separators=(",", ":")
 ).encode()).decode()
@@ -242,6 +250,25 @@ def test_sigkilled_monitor_without_terminal_attestation_remains_unknown(tmp_path
     assert result["outcome"] == "unknown"
     assert result["category"] == "LAUNCH_ATTESTATION_MISSING"
     assert result["returncode"] == -signal.SIGKILL
+
+
+def test_false_terminal_monitor_status_remains_launch_unknown(tmp_path):
+    supervisor = _probe(tmp_path, "monitor_failure")
+
+    result = supervisor.execute(_request())
+
+    assert result["outcome"] == "unknown"
+    assert result["category"] == "LAUNCH_ATTESTATION_MISSING"
+    stderr = base64.b64decode(result["stderr_b64"])
+    encoded_status = stderr.rsplit(b":", 1)[-1].strip()
+    status = json.loads(base64.b64decode(encoded_status))
+    assert status == {
+        "version": 1,
+        "candidate_ready_attested": False,
+        "error": "RuntimeError",
+        "site": "trace_measure",
+        "source_line": 3021,
+    }
 
 
 def test_pre_ready_controller_exit_does_not_mask_launch_failure_as_drain(

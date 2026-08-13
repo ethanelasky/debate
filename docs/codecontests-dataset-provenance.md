@@ -48,9 +48,9 @@ counts at load time.
 At evaluation, one temperature-zero completion is extracted once and executed
 against both suites. W&B receives `eval/gdm_correct`,
 `eval/gdm_tests_passed_frac`, `eval/cco_correct`, and
-`eval/cco_tests_passed_frac`; `eval/correct` remains a backward-compatible GDM
-alias. CCO never enters the RLVR training reward. ByteDance CodeContests+ is not
-used by this pipeline.
+`eval/cco_tests_passed_frac`; the generic `eval/correct_strict` and
+`eval/correct_relaxed` metrics reflect the GDM result. CCO never enters the RLVR
+training reward. ByteDance CodeContests+ is not used by this pipeline.
 
 ---
 

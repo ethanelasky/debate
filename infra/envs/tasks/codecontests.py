@@ -180,11 +180,16 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
-from infra.envs.tasks.base import TaskFamily, reject_unknown_keys
+from infra.envs.tasks.base import (
+    AnswerParse,
+    GraderInfrastructureError,
+    TaskFamily,
+    reject_unknown_keys,
+)
 from infra.envs.tasks.codecontests_sandbox import OUTPUT_LIMIT_BYTES
 
 PROMPT_FILE = "codecontests.yaml"
@@ -228,6 +233,22 @@ _REMOTE_FRESH_SANDBOX_RETRY_CATEGORIES = frozenset(
     {"LAUNCH_ATTESTATION_MISSING", "CONTROLLER_EXCEPTION"}
 )
 _REMOTE_FRESH_SANDBOX_RETRIES = 1
+_REMOTE_MONITOR_FAILURE_SITES = frozenset(
+    {
+        "pipe_setup",
+        "candidate_spawn",
+        "source_delivery",
+        "setup_readiness",
+        "initial_attestation",
+        "gate_release",
+        "ptrace_continue",
+        "relay_start",
+        "trace_measure",
+        "relay_drain",
+        "teardown_evidence",
+        "candidate_boundary",
+    }
+)
 
 # Descriptions containing these admit multiple valid outputs, which exact
 # output comparison would mis-grade. Ported verbatim from the old loader.
@@ -324,9 +345,11 @@ def extract_code(text: str, relaxed: bool = True) -> Optional[str]:
     return text[opens[-1].end():].strip() or None
 
 
-def has_closed_fence(text: str) -> bool:
-    return bool(text) and bool(
-        PYTHON_CODE_BLOCK_PATTERN.search(text) or GENERIC_BLOCK_PATTERN.search(text)
+def parse_code_answers(text: str) -> AnswerParse:
+    """Extract the strict envelope and relaxed reward candidate once."""
+    return AnswerParse(
+        strict=extract_code(text, relaxed=False),
+        relaxed=extract_code(text, relaxed=True),
     )
 
 
@@ -351,10 +374,49 @@ def normalize_output(value: str) -> str:
     return "\n".join(normalized).lower()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _suite_projection(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    suite_keys = (
+        "name",
+        "rlvr_inputs",
+        "rlvr_outputs",
+        "truth_inputs",
+        "truth_outputs",
+        "gdm_inputs",
+        "gdm_outputs",
+        "cco_inputs",
+        "cco_outputs",
+    )
+    return [{key: row.get(key) for key in suite_keys} for row in rows]
+
+
+def _manifest_for(path: Path) -> Optional[Path]:
+    candidates = (path.with_suffix(".manifest.json"), path.parent / "manifest.json")
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _optional(value: Any) -> str:
+    return "none" if value is None else str(value)
+
+
 # ------------------------------------------------------------------ verifier
 
 
-class VerifierInfrastructureError(RuntimeError):
+class VerifierInfrastructureError(GraderInfrastructureError):
     """Trusted verifier setup/state failed; the rollout is scientifically invalid."""
 
 
@@ -679,6 +741,61 @@ def _verified_remote_executor() -> Any:
         return client
 
 
+def _executor_protocol_identity() -> dict[str, str]:
+    """Describe the resolved execution boundary for immutable run lineage.
+
+    Remote mode binds the run to the exact signed identity that the client has
+    just attested.  The canonical identity digest includes the service instance,
+    runtime policy, rootfs, and expected client/verifier provenance; the server
+    bundle digest is repeated explicitly so it remains visible in W&B rather
+    than being hidden behind one opaque hash.  Paths, URLs, and credentials are
+    operational routing state and deliberately do not enter the lineage.
+    """
+    mode = _executor_mode()
+    if mode == "local":
+        return {
+            "executor_mode": "local",
+            "executor_protocol": (
+                "local_bubblewrap_seccomp_v1"
+                if sys.platform == "linux"
+                else "local_process_rlimit_development_v1"
+            ),
+        }
+
+    client = _verified_remote_executor()
+    identity = getattr(client, "expected_identity", None)
+    if not isinstance(identity, dict):
+        raise VerifierInfrastructureError(
+            "attested remote CodeContests executor identity is unavailable"
+        )
+    try:
+        from codecontests_executor.protocol import payload_digest
+
+        identity_sha256 = payload_digest(identity)
+    except Exception as exc:
+        raise VerifierInfrastructureError(
+            "attested remote CodeContests executor identity is malformed"
+        ) from exc
+    client_identity_sha256 = getattr(client, "identity_digest", None)
+    if client_identity_sha256 != identity_sha256:
+        raise VerifierInfrastructureError(
+            "attested remote CodeContests executor identity digest disagrees"
+        )
+    server_bundle_sha256 = identity.get("server_bundle_sha256")
+    if not isinstance(server_bundle_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", server_bundle_sha256
+    ) is None:
+        raise VerifierInfrastructureError(
+            "attested remote CodeContests server bundle digest is malformed"
+        )
+    return {
+        "executor_mode": "remote",
+        "executor_protocol": "signed_external_gvisor_v4",
+        "executor_identity_sha256": identity_sha256,
+        "executor_server_bundle_sha256": server_bundle_sha256,
+    }
+
+
 def verify_code_execution_sandbox() -> None:
     """Cheap launch preflight; neither boundary ever falls back to the other."""
     if _executor_mode() == "remote":
@@ -768,7 +885,7 @@ def _remote_output_saturation(execution: Any) -> tuple[bool, bool]:
 
 
 def _remote_monitor_error(stderr: bytes) -> str | None:
-    """Extract the bounded monitor exception class from signed stderr.
+    """Extract bounded monitor failure diagnostics from signed stderr.
 
     The response envelope and its stderr bytes have already been authenticated
     and schema-validated by ``RemoteExecutorClient``.  This parser is only for
@@ -803,7 +920,18 @@ def _remote_monitor_error(stderr: bytes) -> str | None:
         or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", error) is None
     ):
         return None
-    return error
+    site = status.get("site")
+    if not isinstance(site, str) or site not in _REMOTE_MONITOR_FAILURE_SITES:
+        return error
+    diagnostic = f"{error}@{site}"
+    source_line = status.get("source_line")
+    if (
+        isinstance(source_line, int)
+        and not isinstance(source_line, bool)
+        and 1 <= source_line <= 999_999
+    ):
+        diagnostic += f":L{source_line}"
+    return diagnostic
 
 
 def _remote_unknown_diagnostic(
@@ -872,9 +1000,9 @@ def _run_stdin_tests_remote(
             compile(solution_code, "<remote-codecontests-solution>", "exec")
         except SyntaxError as exc:
             return _failure_result(
-                "error",
-                0,
-                f"SyntaxError: {exc}",
+                "candidate_error",
+                len(inputs),
+                f"{type(exc).__name__}: {exc}",
                 t0,
                 candidate_error=True,
             )
@@ -1045,22 +1173,15 @@ def _run_stdin_tests_remote(
                         t0,
                         timeout=True,
                     )
-                candidate_error = True
                 stdout_truncated, stderr_truncated = _remote_output_saturation(
                     execution
                 )
+                candidate_error = candidate_error or category == "OUTPUT_LIMIT"
                 actual = bytes(getattr(execution, "stdout", b"")).decode(
                     "utf-8", errors="replace"
                 )
                 normalized_actual = normalize_output(actual)
                 normalized_expected = normalize_output(expected_output)
-                # Historical local semantics record the candidate error but
-                # still award this case when its bounded stdout is correct.
-                # This includes a later nonzero exit, file/process limit, or a
-                # stderr-only output saturation. Saturated stdout never passes.
-                if not stdout_truncated and normalized_actual == normalized_expected:
-                    tests_passed += 1
-                    continue
                 if first_failure is None:
                     diagnostic = _remote_failure_diagnostic(execution)
                     if stdout_truncated:
@@ -1095,8 +1216,9 @@ def _run_stdin_tests_remote(
                 }
 
         passed = tests_passed == len(inputs)
+        status = "passed" if passed else "candidate_error" if candidate_error else "failed"
         return {
-            "status": "passed" if passed else "failed",
+            "status": status,
             "passed": passed,
             "tests_passed": tests_passed,
             "tests_total": len(inputs),
@@ -1151,7 +1273,7 @@ def run_stdin_tests(
             compile(solution_code, solution_path, "exec")
         except SyntaxError as exc:
             return _failure_result(
-                "error", 0, f"SyntaxError: {exc}", t0,
+                "candidate_error", len(inputs), f"{type(exc).__name__}: {exc}", t0,
                 candidate_error=True,
             )
         try:
@@ -1255,12 +1377,16 @@ def run_stdin_tests(
                     f"readiness marker on case {i}: {stderr[:1000]}"
                 )
             stderr = stderr.replace(ready_marker, "", 1)
-            candidate_error = candidate_error or proc.returncode != 0
-            candidate_error = candidate_error or stdout_truncated or stderr_truncated
+            output_truncated = stdout_truncated or stderr_truncated
+            candidate_error = candidate_error or output_truncated
 
             normalized_actual = normalize_output(actual)
             normalized_expected = normalize_output(expected_output)
-            if not stdout_truncated and normalized_actual == normalized_expected:
+            if (
+                proc.returncode == 0
+                and not output_truncated
+                and normalized_actual == normalized_expected
+            ):
                 tests_passed += 1
                 continue
 
@@ -1278,8 +1404,9 @@ def run_stdin_tests(
                 }
 
         passed = tests_passed == len(inputs)
+        status = "passed" if passed else "candidate_error" if candidate_error else "failed"
         return {
-            "status": "passed" if passed else "failed",
+            "status": status,
             "passed": passed,
             "tests_passed": tests_passed,
             "tests_total": len(inputs),
@@ -1455,17 +1582,6 @@ class CodeContestsEnv(SingleTurnEnv):
     # blocked on the remote semaphore makes an already-invalid evaluation slow
     # to cancel after a transport failure.
     grade_workers = max(1, _MAX_CONCURRENT_VERIFIERS)
-    # Suites must stay live on Task.meta for reward()/grade(), but may never
-    # enter generic RLVR transcript, wandb, raw-fallback, or Docent records.
-    artifact_private_meta_keys = SingleTurnEnv.artifact_private_meta_keys | frozenset(
-        {
-            "rlvr_inputs", "rlvr_outputs",
-            "truth_inputs", "truth_outputs",
-            "gdm_inputs", "gdm_outputs",
-            "cco_inputs", "cco_outputs",
-        }
-    )
-
     def __init__(
         self,
         path: str,
@@ -1592,6 +1708,17 @@ class CodeContestsEnv(SingleTurnEnv):
             return [self._task(self.rng.choice(self.train_rows), split) for _ in range(n)]
         return [self._task(row, split) for row in self.test_rows[:n]]
 
+    def export_meta(self, task: Task) -> dict[str, Any]:
+        """Expose stable problem identity, never private verifier suites."""
+        safe_keys = ("question", "name", "cf_rating", "difficulty", "split")
+        scalar_types = (str, int, float, bool)
+        return {
+            key: value
+            for key in safe_keys
+            if key in task.meta
+            and ((value := task.meta[key]) is None or isinstance(value, scalar_types))
+        }
+
     def reward(self, task: Task, text: str) -> tuple[float, dict[str, Any]]:
         """GDM-only RLVR reward plus paired held-out measurement.
 
@@ -1599,13 +1726,14 @@ class CodeContestsEnv(SingleTurnEnv):
         explicitly named ``gdm_inputs`` and additionally run the SAME extracted
         program through CCO. CCO metrics never enter the returned reward.
         """
-        code = extract_code(text, relaxed=True)
+        parsed = parse_code_answers(text)
+        code = parsed.relaxed
         # every key present in EVERY branch, so eval-time averages are means
         # over all samples rather than over the branch that happened to set it
         info: dict[str, Any] = {
-            "correct": 0.0,
-            "has_code": float(code is not None),
-            "tests_passed_frac": 0.0,
+            "answer_format_valid": float(parsed.answer_format_valid),
+            "correct_strict": 0.0,
+            "correct_relaxed": 0.0,
             "gdm_correct": 0.0,
             "gdm_tests_passed_frac": 0.0,
             "cpp_code": 0.0,
@@ -1637,7 +1765,7 @@ class CodeContestsEnv(SingleTurnEnv):
                 cco.get("tests_passed", 0) / cco_total if cco_total else 0.0
             )
             info["cco_exec_timeout"] = float(bool(cco.get("timeout")))
-            info["cco_exec_error"] = float(bool(cco.get("candidate_error")))
+            info["cco_exec_error"] = float(cco.get("status") == "candidate_error")
             info["cco_exec_infrastructure_retries"] = float(
                 cco.get("infrastructure_retries", 0)
             )
@@ -1651,16 +1779,17 @@ class CodeContestsEnv(SingleTurnEnv):
         total = result.get("tests_total") or len(gdm_inputs)
         gdm_correct = float(bool(result.get("passed")))
         gdm_passed_frac = result.get("tests_passed", 0) / total if total else 0.0
-        info["gdm_correct"] = info["correct"] = gdm_correct
-        info["gdm_tests_passed_frac"] = info["tests_passed_frac"] = gdm_passed_frac
+        info["gdm_correct"] = info["correct_relaxed"] = gdm_correct
+        info["correct_strict"] = gdm_correct if parsed.strict is not None else 0.0
+        info["gdm_tests_passed_frac"] = gdm_passed_frac
         # Infrastructure failures raise and invalidate the rollout. These
         # metrics therefore describe only candidate behavior.
         info["exec_timeout"] = float(bool(result.get("timeout")))
-        info["exec_error"] = float(bool(result.get("candidate_error")))
+        info["exec_error"] = float(result.get("status") == "candidate_error")
         info["exec_infrastructure_retries"] = float(
             result.get("infrastructure_retries", 0)
         )
-        return self.format_reward + self.correct_reward * info["correct"], info
+        return self.format_reward + self.correct_reward * gdm_correct, info
 
 
 # -------------------------------------------------------------------- family
@@ -1671,6 +1800,7 @@ class CodeContestsFamily(TaskFamily):
         # grade() is called by DebateEnv with only meta, so the per-problem
         # timeout has to live on the family instance.
         self.timeout_seconds = timeout_seconds
+        self._protocol_identity: dict[str, str] = {}
 
     def source(self, ds: dict) -> Env:
         reject_unknown_keys(
@@ -1701,7 +1831,7 @@ class CodeContestsFamily(TaskFamily):
                 "ai_debate/data/codecontests/{train,test}.jsonl"
             )
         self.timeout_seconds = int(ds.get("timeout_seconds", self.timeout_seconds))
-        return CodeContestsEnv(
+        env = CodeContestsEnv(
             path=str(path),
             test_path=(str(ds["test_path"]) if ds.get("test_path") else None),
             paired_test_path=(
@@ -1727,9 +1857,60 @@ class CodeContestsFamily(TaskFamily):
                 int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
             ),
         )
+        train_path = Path(str(path)).expanduser().resolve()
+        if ds.get("paired_test_path"):
+            eval_path = Path(str(ds["paired_test_path"])).expanduser().resolve()
+            eval_source_kind = "paired_test_path"
+        elif ds.get("test_path"):
+            eval_path = Path(str(ds["test_path"])).expanduser().resolve()
+            eval_source_kind = "test_path"
+        else:
+            eval_path = train_path
+            eval_source_kind = "derived_from_train"
+        prompt_path = resolve_prompt_file(ds.get("prompt_file"), PROMPT_FILE).resolve()
+        train_manifest = _manifest_for(train_path)
+        eval_manifest = _manifest_for(eval_path)
+        self._protocol_identity = {
+            "grading_protocol": "codecontests_fresh_process_per_case_v3",
+            "train_source_path": str(train_path),
+            "eval_source_path": str(eval_path),
+            "eval_source_kind": eval_source_kind,
+            "train_content_sha256": _sha256_file(train_path),
+            "eval_content_sha256": _sha256_file(eval_path),
+            "train_cohort_sha256": _sha256_json(env.train_rows),
+            "eval_cohort_sha256": _sha256_json(env.test_rows),
+            "train_suites_sha256": _sha256_json(_suite_projection(env.train_rows)),
+            "eval_suites_sha256": _sha256_json(_suite_projection(env.test_rows)),
+            "train_manifest_path": str(train_manifest.resolve()) if train_manifest else "none",
+            "train_manifest_sha256": _sha256_file(train_manifest) if train_manifest else "none",
+            "eval_manifest_path": str(eval_manifest.resolve()) if eval_manifest else "none",
+            "eval_manifest_sha256": _sha256_file(eval_manifest) if eval_manifest else "none",
+            "loader_filter_protocol": "codecontests_structural_v1",
+            "seed": str(int(ds.get("seed", 0))),
+            "eval_subset_size": str(int(ds.get("eval_subset_size", 128))),
+            "expected_eval_size": _optional(
+                int(ds["expected_eval_size"])
+                if ds.get("expected_eval_size") is not None
+                else None
+            ),
+            "timeout_seconds": str(self.timeout_seconds),
+            "correct_reward": repr(float(env.correct_reward)),
+            "format_reward": repr(float(env.format_reward)),
+            "soft_token_budget": _optional(env.soft_token_budget),
+            "overshoot_penalty": repr(float(env.overshoot_penalty)),
+            "min_cf_rating": _optional(
+                int(ds["min_cf_rating"]) if ds.get("min_cf_rating") is not None else None
+            ),
+            "max_cf_rating": _optional(
+                int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
+            ),
+            "prompt_file": str(prompt_path),
+            "prompt_sha256": _sha256_file(prompt_path),
+        } | _executor_protocol_identity()
+        return env
 
-    def extractor(self, relaxed: bool) -> Callable[[str], Any]:
-        return lambda text: extract_code(text, relaxed=relaxed)
+    def parse_answers(self, text: str) -> AnswerParse:
+        return parse_code_answers(text)
 
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
         """GROUND-TRUTH LABEL, never a reward. DebateEnv calls this to record
@@ -1786,7 +1967,5 @@ class CodeContestsFamily(TaskFamily):
         self.last_grade_errors = sum(error for _, error in scored)
         return [grade for grade, _ in scored]
 
-    def format_flags(self, text: str) -> dict[str, float]:
-        # strict flag: a properly CLOSED fence, independent of the (possibly
-        # relaxed) extractor used for position binding
-        return {"code_fence": float(has_closed_fence(text))}
+    def protocol_identity(self) -> dict[str, str]:
+        return dict(self._protocol_identity)

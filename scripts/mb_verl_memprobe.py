@@ -103,10 +103,18 @@ def main() -> None:
 
     ds = dict(exp["dataset"])
     ds.pop("type")
-    env = get_family("monitoringbench").source(ds)
+    family = get_family("monitoringbench")
+    try:
+        _run_probe(args, exp, prompt_cap, resp_cap, ds, family, AutoTokenizer)
+    finally:
+        family.close()
+
+
+def _run_probe(args, exp, prompt_cap, resp_cap, ds, family, tokenizer_cls) -> None:
+    env = family.source(ds)
 
     # ---- phase 1: audit — every pool row, real templates, real chat template
-    tokenizer = AutoTokenizer.from_pretrained(str(exp["model"]))
+    tokenizer = tokenizer_cls.from_pretrained(str(exp["model"]))
 
     def render_len(messages) -> int:
         # Policy.render's unwrap: some tokenizer wrappers return a

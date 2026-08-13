@@ -80,12 +80,10 @@ codecontests_pc_olmo:
     scoring: continuous
     confidence_source: json
     shaping:
-      # flag: code_fence, NOT math's strict_boxed. CodeContestsFamily.format_flags
-      # emits only {"code_fence"}; FormatReward silently pays nothing for a flag
-      # the family never sets, so a copy-paste from the math config would be a
-      # dead shaping term with no error. +0.1 on the proposal DATUM when the
-      # program came back in a properly CLOSED fence.
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: code_fence}
+      # +0.1 on the proposal DATUM when the family accepts its answer format;
+      # for CodeContests that means the program came back in a properly CLOSED
+      # fence.
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset:
     type: codecontests
     # Pinned JSONL, not a download: the loader drops rows the exact-output

@@ -8,7 +8,7 @@ import json
 import pytest
 
 from infra.envs.debate.judge_accuracy import from_jsonl, judge_was_right, tally
-from infra.envs.tasks.base import TaskFamily
+from infra.envs.tasks.base import AnswerParse, TaskFamily
 
 A, B = "Debater_A", "Debater_B"
 
@@ -118,7 +118,7 @@ def test_accuracy_is_none_rather_than_zero_when_nothing_is_decidable():
 def test_end_to_end_from_exported_jsonl(tmp_path):
     """The real contract test: labels attached during rollout must survive
     export and be readable by the derivation with no re-grading."""
-    from tests.test_debate_env import GOOD_VERDICT, ScriptedBackend, TaskSource, make_env
+    from test_debate_env import GOOD_VERDICT, ScriptedBackend, TaskSource, make_env
     from infra.backend.base import SamplingParams
     from infra.envs.base import Policy
     from infra.envs.debate.docent_export import agent_runs, export_jsonl
@@ -141,11 +141,10 @@ def test_end_to_end_from_exported_jsonl(tmp_path):
 
 def test_label_survives_export_where_the_ground_truth_cannot(tmp_path):
     """The codecontests case. Its ground truth is the test cases, which are
-    list-valued and so are stripped by the exporter's scalar filter (they must
-    never leave the verifier). Without the persisted label there would be
-    nothing left to derive from — math only escapes this because its `gt` is a
-    float that survives the same filter."""
-    from tests.test_debate_env import GOOD_VERDICT, ScriptedBackend, TaskSource, make_env
+    private verifier material and must never leave the source-owned export
+    boundary. Include a scalar secret too: shape-based filtering would leak
+    it. The raw metadata must nevertheless remain available to grading."""
+    from test_debate_env import GOOD_VERDICT, ScriptedBackend, TaskSource, make_env
     from infra.backend.base import SamplingParams
     from infra.envs.base import Policy, Task
     from infra.envs.debate.docent_export import agent_runs, export_jsonl
@@ -158,19 +157,24 @@ def test_label_survives_export_where_the_ground_truth_cannot(tmp_path):
                     meta={
                         "question": "solve it",
                         "name": "problem-1",
-                        "inputs": ["1\n"],      # list-valued: stripped by the
-                        "outputs": ["2\n"],     # exporter, like codecontests
+                        "inputs": ["PRIVATE_SUITE_INPUT\n"],
+                        "outputs": ["PRIVATE_SUITE_OUTPUT\n"],
+                        "scalar_secret": "PRIVATE_SCALAR_SECRET",
                     },
                 )
                 for _ in range(n)
             ]
 
+        def export_meta(self, task):
+            return {key: task.meta[key] for key in ("question", "name")}
+
     class TestCaseFamily(TaskFamily):
         def source(self, ds):
             raise NotImplementedError("test family; the source is TestCaseSource")
 
-        def extractor(self, relaxed):
-            return lambda text: text.strip() or None
+        def parse_answers(self, text):
+            answer = text.strip() or None
+            return AnswerParse(strict=answer, relaxed=answer)
 
         def grade(self, meta, solution):
             # Reads exactly the keys the export drops.
@@ -178,21 +182,38 @@ def test_label_survives_export_where_the_ground_truth_cannot(tmp_path):
                 return None
             return "print" in str(solution)
 
-        def format_flags(self, text):
-            return {}
-
     backend = ScriptedBackend(["print(2)", "Defense."])
     policy = Policy(backend, SamplingParams(max_tokens=128))
     env = make_env(["alice"], [GOOD_VERDICT], task_source=TestCaseSource(), family=TestCaseFamily())
     env.rollout(TestCaseSource().tasks(1), policy, group_size=1)
 
-    path = export_jsonl(agent_runs(env), str(tmp_path / "cc.jsonl"))
-    line = json.loads(open(path).read().splitlines()[0])
+    # The private projection remains intact inside DebateState, and the grade
+    # proves the verifier consumed it successfully.
+    assert env.last_states[0].meta["task"]["inputs"] == ["PRIVATE_SUITE_INPUT\n"]
+    assert env.last_states[0].meta["task"]["scalar_secret"] == "PRIVATE_SCALAR_SECRET"
+    assert env.last_states[0].meta["grades"] == {"alice": True}
 
-    # ground truth is gone from the export...
-    assert "inputs" not in line["metadata"]["task"]
-    assert "outputs" not in line["metadata"]["task"]
+    path = export_jsonl(agent_runs(env), str(tmp_path / "cc.jsonl"))
+    payload = open(path).read().splitlines()[0]
+    line = json.loads(payload)
+
+    # Only the source allowlist crosses the boundary. This excludes both
+    # collection-valued suites and a scalar a shape filter would accept.
+    assert line["metadata"]["task"] == {"question": "solve it", "name": "problem-1"}
+    assert "PRIVATE_SUITE_INPUT" not in payload
+    assert "PRIVATE_SUITE_OUTPUT" not in payload
+    assert "PRIVATE_SCALAR_SECRET" not in payload
     # ...but the label it produced is not, so accuracy is still derivable
     assert line["metadata"]["grades"] == {"alice": True}
     acc = from_jsonl(path)
     assert (acc.decidable, acc.correct) == (1, 1)
+
+    # Externally supplied/synthetic states without the projection fail closed;
+    # raw metadata is never used as an export fallback, even for description.
+    env.last_states[0].meta.pop("task_export")
+    [run] = agent_runs(env)
+    assert run.metadata["task"] == {}
+    assert run.description == ""
+    closed_payload = run.model_dump_json()
+    assert "PRIVATE_SUITE_INPUT" not in closed_payload
+    assert "PRIVATE_SCALAR_SECRET" not in closed_payload

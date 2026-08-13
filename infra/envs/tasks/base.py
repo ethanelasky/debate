@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import concurrent.futures
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from infra.config import reject_unknown_keys as _reject_unknown_keys
 from infra.envs.base import Env
@@ -28,6 +29,27 @@ from infra.envs.task_prompts import (  # re-exported for family modules
     load_generation_prompts,
     resolve_prompt_file,
 )
+
+
+@dataclass(frozen=True)
+class AnswerParse:
+    """A family's strict and fallback candidates extracted from one answer.
+
+    Candidates are raw, serializable values for the family verifier. Format
+    validity is deliberately derived from strict extraction rather than stored
+    as independent state that could disagree with it.
+    """
+
+    strict: Any
+    relaxed: Any
+
+    @property
+    def answer_format_valid(self) -> bool:
+        return self.strict is not None
+
+
+class GraderInfrastructureError(Exception):
+    """A fatal verifier transport/worker failure that invalidates the run."""
 
 
 class TaskFamily(ABC):
@@ -44,9 +66,14 @@ class TaskFamily(ABC):
         RLVR arm."""
 
     @abstractmethod
-    def extractor(self, relaxed: bool) -> Callable[[str], Any]:
-        """Visible slot text -> parsed solution (None = unparseable). Binds
-        debate POSITIONs; `relaxed` is the dataset.relaxed_extraction knob."""
+    def parse_answers(self, text: str) -> AnswerParse:
+        """Return serializable strict and fallback candidates from visible text.
+
+        Parsing may use verifier resources owned by the family (for example a
+        symbolic-math worker). Infrastructure failures must surface as
+        GraderInfrastructureError rather than being converted to a missing
+        candidate.
+        """
 
     @abstractmethod
     def grade(self, meta: dict[str, Any], solution: Any) -> Optional[bool]:
@@ -65,11 +92,12 @@ class TaskFamily(ABC):
         """(meta, solution) pairs -> grades, positionally. THE seam callers
         grade through; grade() is the per-pair primitive behind it.
 
-        Contract: never raises — a grade failure must not kill a rollout — so
-        a per-item exception grades as None and is counted in
-        last_grade_errors. Callers dedup before calling (grading can be
-        expensive); implementations may assume items are distinct but not
-        rely on it.
+        Ordinary per-item grade failures never kill a rollout: an Exception
+        grades as None and is counted in last_grade_errors. The sole exception
+        is GraderInfrastructureError, which signals a fatal verifier
+        transport/worker failure and is re-raised so the run is invalidated.
+        Callers dedup before calling (grading can be expensive);
+        implementations may assume items are distinct but not rely on it.
 
         Override this for verifiers that want the batch whole: a learned
         verifier scores one batched GPU/API call rather than len(items)
@@ -83,6 +111,8 @@ class TaskFamily(ABC):
         def _one(item: tuple[dict[str, Any], Any]) -> tuple[Optional[bool], bool]:
             try:
                 return self.grade(*item), False
+            except GraderInfrastructureError:
+                raise
             except Exception:  # noqa: BLE001
                 return None, True
 
@@ -94,10 +124,12 @@ class TaskFamily(ABC):
         self.last_grade_errors = sum(err for _, err in scored)
         return [g for g, _ in scored]
 
-    def format_flags(self, text: str) -> dict[str, float]:
-        """Strict-format flags on solution slots, consumed by shaping terms
-        (e.g. format_reward on "strict_boxed")."""
+    def protocol_identity(self) -> dict[str, str]:
+        """Immutable-protocol metadata used to identify reproducible runs."""
         return {}
+
+    def close(self) -> None:
+        """Release family-owned resources. Stateless families need no work."""
 
 
 def reject_unknown_keys(ds: dict, known: set[str], family: str) -> None:
@@ -106,6 +138,8 @@ def reject_unknown_keys(ds: dict, known: set[str], family: str) -> None:
 
 
 __all__ = [
+    "AnswerParse",
+    "GraderInfrastructureError",
     "TaskFamily",
     "reject_unknown_keys",
     "GenerationPrompts",

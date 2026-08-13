@@ -4,7 +4,8 @@ scratchpad on by default (PlannedEnv's two-turn shape, reproduced at message
 level), single blind turn with --no-scratchpad.
 
 Purpose: screening candidate policy models for the next RLVR arm — the number
-this reports is what the training run's eval/correct curve would start from.
+this reports is what the training run's eval/correct_strict curve would start
+from.
 Prompts come from the family's answer-generation config and the PlannedEnv
 plan cue, so the rendered messages are identical to the RLVR rollout's for the
 same row by construction (modulo the chat template, which is the candidate
@@ -352,6 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
+    family = get_family("monitoringbench")
+    try:
+        return _run(args, family)
+    finally:
+        family.close()
+
+
+def _run(args, family) -> int:
     files = [str(_resolve(f)) for f in (args.data or DEFAULT_DATA_PATHS)]
     ds = {
         "files": files,
@@ -361,7 +370,7 @@ def main(argv=None) -> int:
             "test": str(_resolve(args.dev_ids)),
         },
     }
-    src = get_family("monitoringbench").source(ds)
+    src = family.source(ds)
     # PlannedEnv owns the plan-cue mechanics; instantiating it also runs its
     # template validations even though we drive the turns ourselves.
     planned = PlannedEnv(src, args.plan_tokens) if args.scratchpad else None
@@ -466,7 +475,12 @@ def main(argv=None) -> int:
 
     scored = 0
     errors = 0
-    agg = {"correct": 0.0, "answer_tag": 0.0, "chose_attack": 0.0}
+    agg = {
+        "correct_strict": 0.0,
+        "correct_relaxed": 0.0,
+        "answer_format_valid": 0.0,
+        "chose_attack": 0.0,
+    }
     tp = fp = 0
     parsed_correct = 0
     parsed_n = 0
@@ -484,16 +498,17 @@ def main(argv=None) -> int:
             continue
         _, info = src.reward(tasks[i], res.text)
         row.update(
-            choice_correct=bool(info["correct"]),
-            answer_tag=bool(info["answer_tag"]),
+            correct_strict=bool(info["correct_strict"]),
+            correct_relaxed=bool(info["correct_relaxed"]),
+            answer_format_valid=bool(info["answer_format_valid"]),
             chose_attack=bool(info["chose_attack"]),
         )
         scored += 1
         for k in agg:
             agg[k] += info[k]
-        if info["answer_tag"]:
+        if info["answer_format_valid"]:
             parsed_n += 1
-            parsed_correct += int(info["correct"])
+            parsed_correct += int(info["correct_strict"])
             if info["chose_attack"]:
                 if row["label"] == "attack":
                     tp += 1
@@ -506,8 +521,11 @@ def main(argv=None) -> int:
         "n": len(tasks),
         "scored": scored,
         "request_errors": errors,
-        "accuracy": (agg["correct"] / scored) if scored else None,  # eval/correct parity
-        "answer_tag_rate": (agg["answer_tag"] / scored) if scored else None,
+        "strict_accuracy": (agg["correct_strict"] / scored) if scored else None,
+        "relaxed_accuracy": (agg["correct_relaxed"] / scored) if scored else None,
+        "answer_format_valid_rate": (
+            agg["answer_format_valid"] / scored if scored else None
+        ),
         "chose_attack_rate": (agg["chose_attack"] / scored) if scored else None,
         "accuracy_on_parsed": (parsed_correct / parsed_n) if parsed_n else None,
         "tpr": (tp / n_attack) if n_attack else None,
@@ -525,9 +543,10 @@ def main(argv=None) -> int:
         return "-" if v is None else f"{v:.3f}"
 
     print(
-        f"[result] {args.model}: accuracy {fmt(summary['accuracy'])} "
-        f"(on-parsed {fmt(summary['accuracy_on_parsed'])}, tag rate "
-        f"{fmt(summary['answer_tag_rate'])}) | chose_attack "
+        f"[result] {args.model}: strict accuracy {fmt(summary['strict_accuracy'])} "
+        f"(relaxed {fmt(summary['relaxed_accuracy'])}, on-valid "
+        f"{fmt(summary['accuracy_on_parsed'])}, format-valid rate "
+        f"{fmt(summary['answer_format_valid_rate'])}) | chose_attack "
         f"{fmt(summary['chose_attack_rate'])} | TPR {fmt(summary['tpr'])} / FPR {fmt(summary['fpr'])} "
         f"| errors {errors}/{len(tasks)}"
     )

@@ -240,7 +240,7 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     rlvr = load_experiment(path, "cs285_mathhard_cispo")
     debate = load_experiment(path, "cs285_mathhard_debate_cispo")
     validate_experiment(debate)
-    assert debate["scoring"]["shaping"][0]["flag"] == "strict_boxed"
+    assert debate["scoring"]["shaping"][0]["flag"] == "answer_format_valid"
 
     # Choice-style blind opening: the trained proposal renders under the task
     # source's own messages, sharing the RLVR arm's prompt distribution.
@@ -283,12 +283,12 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
         for cs in env.protocol.compile()
         if cs.speaker in trained
     ]
-    # 512 proposal (RLVR answer shape) + 384 later speeches: the full-pool
+    # 512 proposal (RLVR answer shape) + 300 later speeches: the full-pool
     # render scan (2026-08-13) shows 4x512 overflows the 3584 prompt guard on
     # the longest problems (worst rebuttal 3760; crashed run u7oky38d step 30).
     assert trained_slots == [
         ("alice", "proposal", 512),
-        ("bob", "critique", 384),
-        ("alice", "defense", 384),
-        ("bob", "rebuttal", 384),
+        ("bob", "critique", 300),
+        ("alice", "defense", 300),
+        ("bob", "rebuttal", 300),
     ]

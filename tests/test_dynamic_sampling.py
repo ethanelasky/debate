@@ -8,6 +8,8 @@ tests drive train() end to end with a scripted env and a no-op backend.
 
 from unittest import mock
 
+import pytest
+
 import infra.train as train_mod
 from infra.backend.base import Datum
 from infra.envs.base import Env, Task, Trajectory
@@ -26,6 +28,7 @@ def _traj(reward: float) -> Trajectory:
             )
         ],
         reward=reward,
+        info={"accuracy": reward},
     )
 
 
@@ -40,8 +43,33 @@ DEGEN = (1.0, 1.0)     # constant reward: zero variance, grpo_pack drops it
 class ScriptEnv(Env):
     """rollout() returns the next scripted batch; every call is recorded."""
 
-    def __init__(self, scripted: list[list[list[Trajectory]]]):
+    rollout_rate_specs = {
+        "answer_format_valid_rate": (
+            "answer_format_valid_count",
+            "produced_solution_slots",
+        ),
+        "solution_production_rate": (
+            "produced_solution_slots",
+            "expected_solution_slots",
+        ),
+        "extracted_solution_rate": (
+            "extracted_solution_slots",
+            "produced_solution_slots",
+        ),
+        "gradeable_solution_rate": (
+            "gradeable_solution_slots",
+            "extracted_solution_slots",
+        ),
+        "grader_error_rate": ("grade_errors", "grader_requests"),
+    }
+
+    def __init__(
+        self,
+        scripted: list[list[list[Trajectory]]],
+        rollout_infos: list[dict] | None = None,
+    ):
         self.scripted = list(scripted)
+        self.rollout_infos = list(rollout_infos or [])
         self.task_calls: list[int] = []
         self.rollout_calls: list[int] = []
         self.group_sizes: list[int] = []
@@ -56,6 +84,8 @@ class ScriptEnv(Env):
         assert self.scripted, "rollout called more times than scripted"
         batch = self.scripted.pop(0)
         assert len(batch) == len(tasks), "scripted batch size mismatch"
+        if self.rollout_infos:
+            self.last_rollout_info = self.rollout_infos.pop(0)
         return batch
 
 
@@ -81,8 +111,11 @@ class FakeBackend:
         self.saved.append(name)
 
 
-def _run(scripted, *, retries: int, steps: int = 1):
-    env = ScriptEnv([[_group(*rewards) for rewards in batch] for batch in scripted])
+def _run(scripted, *, retries: int, steps: int = 1, rollout_infos=None):
+    env = ScriptEnv(
+        [[_group(*rewards) for rewards in batch] for batch in scripted],
+        rollout_infos=rollout_infos,
+    )
     backend = FakeBackend()
     cfg = Config(
         steps=steps,
@@ -163,6 +196,93 @@ def test_all_healthy_batch_no_extra_rollouts():
     assert metrics["train/degenerate_after_resample"] == 0.0
 
 
+def test_rollout_counters_sum_initial_and_retry_calls():
+    _, _, logged = _run(
+        [[HEALTHY, DEGEN], [HEALTHY]],
+        retries=1,
+        rollout_infos=[
+            {
+                "tasks_requested": 2,
+                "grade_errors": 1,
+                "fail_reasons": {"transport": 1},
+            },
+            {
+                "tasks_requested": 1,
+                "grade_errors": 2,
+                "fail_reasons": {"transport": 2, "parse": 1},
+            },
+        ],
+    )
+    metrics = logged[0]
+    assert metrics["train/tasks_requested"] == 3.0
+    assert metrics["train/grade_errors"] == 3.0
+    assert metrics["train/fail_reasons/transport"] == 3.0
+    assert metrics["train/fail_reasons/parse"] == 1.0
+    # Accuracy/reward aggregation still describes the retained groups, not all
+    # rollout attempts, and n remains exactly two retained groups of size two.
+    assert metrics["train/accuracy"] == 0.5
+    assert metrics["train/reward_mean"] == 0.5
+    assert metrics["train/n"] == 4.0
+
+
+def test_rollout_counters_single_call_are_not_double_counted():
+    _, _, logged = _run(
+        [[HEALTHY, HEALTHY]],
+        retries=3,
+        rollout_infos=[{"tasks_requested": 2, "fail_reasons": {"parse": 1}}],
+    )
+    metrics = logged[0]
+    assert metrics["train/tasks_requested"] == 2.0
+    assert metrics["train/fail_reasons/parse"] == 1.0
+
+
+def test_rollout_rates_recomputed_from_summed_counts_across_unequal_calls():
+    _, _, logged = _run(
+        [[HEALTHY, DEGEN], [HEALTHY]],
+        retries=1,
+        rollout_infos=[
+            {
+                "expected_solution_slots": 8,
+                "produced_solution_slots": 4,
+                "answer_format_valid_count": 2,
+                "extracted_solution_slots": 3,
+                "gradeable_solution_slots": 2,
+                "grader_requests": 3,
+                "grade_errors": 1,
+                "solution_production_rate": 0.5,
+                "answer_format_valid_rate": 0.5,
+                "extracted_solution_rate": 0.75,
+                "gradeable_solution_rate": 2 / 3,
+                "grader_error_rate": 1 / 3,
+            },
+            {
+                "expected_solution_slots": 1,
+                "produced_solution_slots": 1,
+                "answer_format_valid_count": 1,
+                "extracted_solution_slots": 1,
+                "gradeable_solution_slots": 1,
+                "grader_requests": 1,
+                "grade_errors": 0,
+                "solution_production_rate": 1.0,
+                "answer_format_valid_rate": 1.0,
+                "extracted_solution_rate": 1.0,
+                "gradeable_solution_rate": 1.0,
+                "grader_error_rate": 0.0,
+            },
+        ],
+    )
+    metrics = logged[0]
+    assert metrics["train/solution_production_rate"] == pytest.approx(5 / 9)
+    assert metrics["train/answer_format_valid_rate"] == pytest.approx(3 / 5)
+    assert metrics["train/extracted_solution_rate"] == pytest.approx(4 / 5)
+    assert metrics["train/gradeable_solution_rate"] == pytest.approx(3 / 4)
+    assert metrics["train/grader_error_rate"] == pytest.approx(1 / 4)
+    assert all(
+        0.0 <= metrics[f"train/{rate}"] <= 1.0
+        for rate in ScriptEnv.rollout_rate_specs
+    )
+
+
 def _args():
     parser = runner_parser(None)
     return parser.parse_args(["--experiment-file", "f.yaml", "--experiment", "e"])
@@ -205,8 +325,18 @@ def test_planned_env_answer_turn_carries_its_own_cap():
 # ---- oversample_factor (upfront variant) ----
 
 
-def _run_oversampled(scripted_batch, *, batch_size: int, factor: float, steps: int = 1):
-    env = ScriptEnv([[_group(*rewards) for rewards in batch] for batch in scripted_batch])
+def _run_oversampled(
+    scripted_batch,
+    *,
+    batch_size: int,
+    factor: float,
+    steps: int = 1,
+    rollout_infos=None,
+):
+    env = ScriptEnv(
+        [[_group(*rewards) for rewards in batch] for batch in scripted_batch],
+        rollout_infos=rollout_infos,
+    )
     backend = FakeBackend()
     cfg = Config(
         steps=steps,
@@ -248,6 +378,18 @@ def test_oversample_pads_with_degenerate_when_draw_is_short_on_healthy():
     # The padded degen group rides along and grpo_pack drops it, as ever.
     assert metrics["pack/n_datums_dropped_zero_advantage"] == 2.0
     assert metrics["train/n"] == 4.0
+
+
+def test_oversample_rollout_counters_capture_the_single_draw_once():
+    _, _, logged = _run_oversampled(
+        [[DEGEN, HEALTHY, HEALTHY, HEALTHY]],
+        batch_size=2,
+        factor=2.0,
+        rollout_infos=[{"tasks_requested": 4, "fail_reasons": {"fidelity": 2}}],
+    )
+    metrics = logged[0]
+    assert metrics["train/tasks_requested"] == 4.0
+    assert metrics["train/fail_reasons/fidelity"] == 2.0
 
 
 def test_oversample_and_retries_are_mutually_exclusive():

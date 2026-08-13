@@ -48,6 +48,22 @@ _PR_GET_NO_NEW_PRIVS = 39
 _PR_CAPBSET_DROP = 24
 _CAP_LAST_CAP = 40
 _CANDIDATE_READY_TIMEOUT_SECONDS = 5.0
+_MONITOR_FAILURE_SITES = frozenset(
+    {
+        "pipe_setup",
+        "candidate_spawn",
+        "source_delivery",
+        "setup_readiness",
+        "initial_attestation",
+        "gate_release",
+        "ptrace_continue",
+        "relay_start",
+        "trace_measure",
+        "relay_drain",
+        "teardown_evidence",
+        "candidate_boundary",
+    }
+)
 _PTRACE_TRACEME = 0
 _PTRACE_CONT = 7
 _PTRACE_KILL = 8
@@ -109,6 +125,67 @@ _VFORK_CHILD_PHASES = frozenset(
 _VFORK_RELEASE_EXEC = "exec"
 _VFORK_RELEASE_EXIT = "exit"
 _VFORK_RELEASE_TERMINAL = "terminal"
+
+
+class _MonitorStageError(RuntimeError):
+    """Attach one bounded, stable operator site to a monitor failure."""
+
+    def __init__(self, site: str, cause: BaseException):
+        if site not in _MONITOR_FAILURE_SITES:
+            site = "candidate_boundary"
+        error_type = type(cause).__name__
+        if (
+            not error_type
+            or len(error_type) > 128
+            or not error_type.isascii()
+            or not error_type.replace("_", "a").isalnum()
+        ):
+            error_type = "Exception"
+        self.site = site
+        self.error_type = error_type
+        self.source_line = _trusted_monitor_source_line(cause)
+        super().__init__(f"{site}:{error_type}")
+
+
+def _trusted_monitor_source_line(exc: BaseException) -> int | None:
+    """Return the terminal traceback line only when it belongs to this module."""
+    source_line: int | None = None
+    traceback = exc.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_globals is globals():
+            candidate_line = traceback.tb_lineno
+            if 1 <= candidate_line <= 999_999:
+                source_line = candidate_line
+        traceback = traceback.tb_next
+    return source_line
+
+
+def _monitor_failure_status(exc: BaseException) -> dict[str, Any]:
+    """Build diagnostics without including exception text or candidate data."""
+    if isinstance(exc, _MonitorStageError):
+        site = exc.site
+        error_type = exc.error_type
+        source_line = exc.source_line
+    else:
+        site = "candidate_boundary"
+        error_type = type(exc).__name__
+        source_line = _trusted_monitor_source_line(exc)
+        if (
+            not error_type
+            or len(error_type) > 128
+            or not error_type.isascii()
+            or not error_type.replace("_", "a").isalnum()
+        ):
+            error_type = "Exception"
+    status: dict[str, Any] = {
+        "version": 1,
+        "candidate_ready_attested": False,
+        "error": error_type,
+        "site": site,
+    }
+    if source_line is not None:
+        status["source_line"] = source_line
+    return status
 
 _SIGCHLD = 17
 _CLONE_VM = 0x00000100
@@ -2848,12 +2925,17 @@ def _run_candidate(
     source: bytes,
     limits: tuple[int, int, int, int, int],
 ) -> dict[str, Any]:
-    code_read, code_write = os.pipe()
-    ready_read, ready_write = os.pipe()
-    gate_read, gate_write = os.pipe()
+    code_read = code_write = -1
+    ready_read = ready_write = -1
+    gate_read = gate_write = -1
     address_space, cpu_seconds, file_size, process_count, open_files = limits
     proc: subprocess.Popen[bytes] | None = None
+    failure_site = "pipe_setup"
     try:
+        code_read, code_write = os.pipe()
+        ready_read, ready_write = os.pipe()
+        gate_read, gate_write = os.pipe()
+        failure_site = "candidate_spawn"
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -2886,6 +2968,7 @@ def _run_candidate(
             start_new_session=True,
             pass_fds=(code_read, ready_write, gate_read),
         )
+        failure_site = "source_delivery"
         os.close(code_read)
         code_read = -1
         os.close(ready_write)
@@ -2895,14 +2978,18 @@ def _run_candidate(
         _write_all(code_write, struct.pack("!Q", len(source)) + source)
         os.close(code_write)
         code_write = -1
+        failure_site = "setup_readiness"
         if not _wait_ready(ready_read, proc):
             raise RuntimeError("candidate setup readiness failed")
+        failure_site = "initial_attestation"
         _attest_initial_trace_stop(proc, limits)
         os.close(ready_read)
         ready_read = -1
+        failure_site = "gate_release"
         _write_all(gate_write, b"G")
         os.close(gate_write)
         gate_write = -1
+        failure_site = "ptrace_continue"
         _ptrace(_PTRACE_CONT, proc.pid)
         assert proc.stdout is not None and proc.stderr is not None
         teardown_control = _TeardownControl()
@@ -2928,8 +3015,10 @@ def _run_candidate(
                 teardown_control,
             ),
         )
+        failure_site = "relay_start"
         stdout_thread.start()
         stderr_thread.start()
+        failure_site = "trace_measure"
         (
             returncode,
             cpu_usage_us,
@@ -2951,10 +3040,12 @@ def _run_candidate(
             file_size_limit=file_size,
             teardown_control=teardown_control,
         )
+        failure_site = "relay_drain"
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
         if stdout_thread.is_alive() or stderr_thread.is_alive():
             raise RuntimeError("candidate output relay did not drain")
+        failure_site = "teardown_evidence"
         _validate_teardown_evidence(
             teardown_control,
             stdout_truncated=stdout_state["exceeded"],
@@ -2987,6 +3078,10 @@ def _run_candidate(
             "file_size_observed_bytes": file_size_observed_bytes,
             "writable_available_bytes": writable_available_bytes,
         }
+    except BaseException as exc:
+        if isinstance(exc, _MonitorStageError):
+            raise
+        raise _MonitorStageError(failure_site, exc) from exc
     finally:
         for fd in (
             code_read,
@@ -3038,14 +3133,7 @@ def main() -> None:
         status = _run_candidate(source, limits)
     except BaseException as exc:  # noqa: BLE001 - trusted monitor boundary
         try:
-            _emit_status(
-                nonce,
-                {
-                    "version": 1,
-                    "candidate_ready_attested": False,
-                    "error": type(exc).__name__,
-                },
-            )
+            _emit_status(nonce, _monitor_failure_status(exc))
         finally:
             # PTRACE_O_TRACEEXIT may leave killed tracees stopped with relay
             # pipe descriptors open.  Bypass non-daemon thread shutdown so

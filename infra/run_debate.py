@@ -27,9 +27,14 @@ optimization/loop knobs only):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+from pathlib import Path
+from urllib.parse import urlsplit
 
-from infra.backend.base import SamplingParams
+from infra.backend.base import LossSpec, OptimParams, SamplingParams
 from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
@@ -41,13 +46,14 @@ from infra.models.factory import instantiate_model
 from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
+    apply_topology,
     build_backend,
     resolve_topology,
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
 )
-from infra.train import Config, train
+from infra.train import Config, resolve_protocol_identity, train, validate_resume_args
 
 EXPERIMENT_KEYS = {
     "protocol",
@@ -64,6 +70,40 @@ EXPERIMENT_KEYS = {
 }
 
 AGENT_KEYS = {"trained", "model_settings"}
+
+
+def _safe_docent_component(value: str, *, fallback: str) -> str:
+    """Return a readable, traversal-safe component without slug collisions."""
+    if (
+        len(value.encode("utf-8")) <= 128
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+    ):
+        return value
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")[:80]
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{slug or fallback}-{digest}"
+
+
+def _docent_launch_id(pid: int | None = None) -> str:
+    """Return an auditable identifier unique to a simultaneous process launch."""
+    return f"pid-{os.getpid() if pid is None else pid}"
+
+
+def _docent_run_dir(run_name: str, *, launch_id: str | None = None) -> str:
+    """Return a stable Docent directory for one process launch of one run.
+
+    Sweep arms share a working directory, so the run name must namespace their
+    rollout files.  Unsafe or overlong names get a readable slug plus a digest:
+    the digest prevents distinct names that sanitize alike from colliding.  A
+    launch component prevents simultaneous commands with the same run name
+    from overwriting identically numbered steps.
+    """
+    launch_id = _docent_launch_id() if launch_id is None else launch_id
+    return os.path.join(
+        "docent",
+        _safe_docent_component(run_name, fallback="run"),
+        _safe_docent_component(launch_id, fallback="launch"),
+    )
 
 
 def validate_experiment(exp: dict) -> None:
@@ -100,6 +140,292 @@ def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSe
 # training.backend -> the model_type trained seats must declare: verl serves
 # rollouts through the local OpenAI shim, tinker samples through tinker.
 BACKEND_MODEL_TYPES = {"tinker": ModelType.TINKER, "verl": ModelType.LOCAL}
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_locator(value: object, *, field: str) -> str | None:
+    """Reject URL forms that could smuggle credentials into identity hashes."""
+    if value is None:
+        return None
+    locator = str(value)
+    if "://" in locator:
+        parsed = urlsplit(locator)
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(
+                f"{field} may not contain URL credentials, query parameters, or "
+                "fragments when constructing protocol identity"
+            )
+    return locator
+
+
+def _resolved_protocol(exp: dict) -> Protocol:
+    proto_spec = exp["protocol"]
+    if isinstance(proto_spec, str):
+        proto_spec = exp["_protocols"][proto_spec]
+    return Protocol.parse(proto_spec)
+
+
+def _protocol_payload(protocol: Protocol) -> list[dict]:
+    return [
+        {
+            "turn": cs.turn,
+            "speaker": cs.speaker,
+            "sequence": cs.seq,
+            "name": cs.slot.name,
+            "kind": cs.slot.kind.value,
+            "visibility": cs.slot.visibility.value,
+            "max_think_tokens": cs.slot.max_think_tokens,
+            "max_visible_tokens": cs.slot.max_visible_tokens,
+            "max_total_tokens": cs.slot.max_total_tokens,
+        }
+        for cs in protocol.compile()
+    ]
+
+
+def _model_payload(settings: ModelSettings) -> dict:
+    train_sampling = resolved_sampling_profile(settings, "train")
+    return {
+        "model_type": settings.model_type.name.lower(),
+        "model": _safe_locator(settings.model_file_path, field="model_file_path"),
+        "alias": settings.alias,
+        "resolved_max_new_tokens": settings.resolved_max_new_tokens,
+        "resolved_reasoning_effort": settings.resolved_reasoning_effort,
+        "resolved_thinking_budget_tokens": settings.resolved_thinking_budget_tokens,
+        "enable_thinking": settings.enable_thinking,
+        "capture_token_logprobs": settings.capture_token_logprobs,
+        "require_token_logprobs": settings.require_token_logprobs,
+        "provider_order": settings.provider_order,
+        "quantizations": settings.quantizations,
+        "allow_fallbacks": settings.allow_fallbacks,
+        "data_collection": settings.data_collection,
+        "base_url": _safe_locator(settings.base_url, field="base_url"),
+        "train_sampling": train_sampling.model_dump(mode="json"),
+    }
+
+
+def _effective_protocol_training(tr: dict, args=None) -> dict:
+    def configured(key: str, default):
+        value = tr.get(key)
+        return default if value is None else value
+
+    batch_size = (
+        getattr(args, "batch_size", None)
+        if args is not None and getattr(args, "batch_size", None) is not None
+        else configured("batch_size", Config.batch_size)
+    )
+    group_size = (
+        getattr(args, "group_size", None)
+        if args is not None and getattr(args, "group_size", None) is not None
+        else configured("group_size", Config.group_size)
+    )
+    return {
+        "batch_size": int(batch_size),
+        "group_size": int(group_size),
+        "dynamic_sampling_retries": int(
+            configured("dynamic_sampling_retries", Config.dynamic_sampling_retries)
+        ),
+        "oversample_factor": float(configured("oversample_factor", Config.oversample_factor)),
+        "rl_seed": int(configured("rl_seed", Config.seed)),
+        "eval_n": int(configured("eval_n", Config.eval_n)),
+        "eval_split": str(configured("eval_split", Config.eval_split)),
+        "final_test_eval": bool(configured("final_test_eval", Config.final_test_eval)),
+        "eval_max_tokens": (
+            None
+            if tr.get("eval_max_tokens", Config.eval_max_tokens) is None
+            else int(tr["eval_max_tokens"])
+        ),
+    }
+
+
+def _redacted_verl_overrides(values: object) -> list[str]:
+    """Retain algorithm overrides while stripping credentials/output paths."""
+    out: list[str] = []
+    secret_markers = (
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "bearer_token",
+        "secret",
+        "password",
+        "credential",
+    )
+    operational_path_markers = (
+        "checkpoint", "output_dir", "save_dir", "log_dir", "logging_dir", "wandb_dir"
+    )
+    for raw in values or ():
+        item = str(raw)
+        if "=" not in item:
+            out.append(item)
+            continue
+        key, value = item.split("=", 1)
+        normalized = key.lstrip("+").lower()
+        if any(marker in normalized for marker in secret_markers) or normalized.endswith(
+            (".token", "_token", "-token")
+        ):
+            value = "<redacted>"
+        elif os.path.isabs(value) and any(
+            marker in normalized for marker in operational_path_markers
+        ):
+            value = "<operational-path>"
+        elif "://" in value:
+            parsed = urlsplit(value)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                value = "<redacted-url>"
+        out.append(f"{key}={value}")
+    return out
+
+
+def _effective_learning_protocol(tr: dict, topology: dict | None = None) -> dict:
+    """Resolve the immutable learning algorithm, excluding operations only.
+
+    Run length, peak learning rate, resume/checkpoint/output locations,
+    W&B/logging, and save/eval cadence remain mutable. Ambiguous fields stay in
+    the identity so a resume cannot silently change the optimization method.
+    """
+    def configured(key: str, default):
+        value = tr.get(key)
+        return default if value is None else value
+
+    loss = LossSpec(**(tr.get("loss") or {}))
+    optim = OptimParams(lr=Config.lr)
+    backend = str(tr.get("backend", "tinker"))
+    payload = {
+        "backend": backend,
+        "lora_rank": int(configured("lora_rank", Config.lora_rank)),
+        "loss": {
+            "kind": loss.kind,
+            "clip_low": float(loss.clip_low),
+            "clip_high": float(loss.clip_high),
+            "entropy_coefficient": 0.0,
+        },
+        "updates": {
+            "micro_batch": int(configured("micro_batch", Config.micro_batch)),
+            "ppo_epochs": int(configured("ppo_epochs", Config.ppo_epochs)),
+        },
+        "advantages": {
+            "norm_by_std": bool(configured("norm_adv_by_std", Config.norm_adv_by_std)),
+            "population_std": bool(
+                configured("adv_population_std", Config.adv_population_std)
+            ),
+            "length_norm": str(configured("adv_length_norm", Config.adv_length_norm)),
+            "drop_zero": bool(
+                configured("drop_zero_advantage", Config.drop_zero_advantage)
+            ),
+        },
+        "kl": {
+            "coefficient": float(configured("kl_coef", Config.kl_coef)),
+            "mechanism": str(configured("kl_mechanism", Config.kl_mechanism)),
+            "discount_factor": float(
+                configured("kl_discount_factor", Config.kl_discount_factor)
+            ),
+        },
+        "optimizer": {
+            "betas": list(optim.betas),
+            "eps": float(optim.eps),
+            "weight_decay": float(optim.weight_decay),
+            "grad_clip": float(optim.grad_clip),
+            "warmup_steps": int(configured("warmup_steps", Config.warmup_steps)),
+            "lr_schedule": str(configured("lr_schedule", Config.lr_schedule)),
+            "min_lr_ratio": float(configured("min_lr_ratio", Config.min_lr_ratio)),
+        },
+    }
+    if backend == "verl":
+        from infra.backend.verl import VerlBackendConfig
+
+        # Match build_backend's exact topology-default/arm-override merge.
+        # Only the already-classified immutable subset is selected below;
+        # memory capacity and output locations remain operational.
+        v = apply_topology(dict(tr.get("verl") or {}), topology or {})
+        payload["verl"] = {
+            "strategy": str(v.get("strategy", VerlBackendConfig.strategy)),
+            "n_gpus": int(v.get("n_gpus", VerlBackendConfig.n_gpus)),
+            "prompt_length": int(v.get("prompt_length", VerlBackendConfig.prompt_length)),
+            "response_length": int(v.get("response_length", VerlBackendConfig.response_length)),
+            "max_token_len_per_gpu": int(
+                v.get("max_token_len_per_gpu", VerlBackendConfig.max_token_len_per_gpu)
+            ),
+            "rollout_tp": int(v.get("rollout_tp", VerlBackendConfig.rollout_tp)),
+            "use_remove_padding": bool(
+                v.get("use_remove_padding", VerlBackendConfig.use_remove_padding)
+            ),
+            "extra_overrides": _redacted_verl_overrides(v.get("extra_overrides")),
+        }
+    return payload
+
+
+def debate_protocol_identity(
+    exp: dict,
+    dataset_type: str,
+    family,
+    trained: dict[str, ModelSettings],
+    frozen: dict[str, ModelSettings],
+    *,
+    args=None,
+    topology: dict | None = None,
+) -> dict[str, str]:
+    """Family identity plus debate topology, prompts, models, and scoring."""
+    base = resolve_protocol_identity(dataset_type, family)
+    prompt = exp["prompt_config"]
+    prompt_bytes = Path(prompt["file_path"]).read_bytes()
+    protocol = _resolved_protocol(exp)
+    tr = exp.get("training") or {}
+    training_protocol = _effective_protocol_training(tr, args)
+    plan_tokens = exp.get("plan_tokens")
+    agents = {
+        speaker: {"trained": speaker in trained, **_model_payload(settings)}
+        for speaker, settings in sorted((trained | frozen).items())
+    }
+    payload = {
+        "schema": "debate-runner-v2",
+        "protocol": _protocol_payload(protocol),
+        "prompt": {
+            "entry": str(prompt["entry"]),
+            "file_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        },
+        "agents": agents,
+        "learning": _effective_learning_protocol(tr, topology),
+        "judge": JudgeConfig(**(exp.get("judge_config") or {})).model_dump(mode="json"),
+        "scoring": ScoringConfig(**(exp.get("scoring") or {})).model_dump(mode="json"),
+        "positions": {
+            "fresh_positions": bool(exp.get("fresh_positions", True)),
+            "flip": bool(exp.get("flip", False)),
+            "first_speech_non_debate_aware": bool(
+                exp.get("first_speech_non_debate_aware", False)
+            ),
+        },
+        "solution_extraction": (
+            "relaxed"
+            if bool((exp.get("dataset") or {}).get("relaxed_extraction", True))
+            else "strict"
+        ),
+        "direct_eval": {
+            "wrapper": "planned" if plan_tokens is not None else "direct",
+            "plan_tokens": None if plan_tokens is None else int(plan_tokens),
+            "sampling": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_tokens": training_protocol["eval_max_tokens"],
+            },
+            **training_protocol,
+        },
+    }
+    runner = {
+        "runner_protocol": "debate-runner-v2",
+        "runner_protocol_sha256": _canonical_sha256(payload),
+        "runner_prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        "runner_prompt_entry": str(prompt["entry"]),
+    }
+    collision = set(base) & set(runner)
+    if collision:
+        raise ValueError(f"family protocol identity collides with runner keys: {sorted(collision)}")
+    return base | runner
 
 
 def validate_trained_seats(trained: dict[str, ModelSettings], tr: dict) -> None:
@@ -152,10 +478,7 @@ def debate_gen_budgets(protocol: Protocol, trained: dict[str, ModelSettings], tr
 
 
 def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, ModelSettings]) -> DebateEnv:
-    proto_spec = exp["protocol"]
-    if isinstance(proto_spec, str):
-        proto_spec = exp["_protocols"][proto_spec]
-    protocol = Protocol.parse(proto_spec)
+    protocol = _resolved_protocol(exp)
 
     frozen_models = {
         speaker: instantiate_model(settings, is_debater=speaker != "judge", binding="train")
@@ -202,29 +525,36 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
 
     ds = dict(exp.get("dataset") or {})
     family = get_family(ds.pop("type", None))
-    config = DebateEnvConfig(
-        protocol=protocol,
-        prompt_file=exp["prompt_config"]["file_path"],
-        prompt_entry=exp["prompt_config"]["entry"],
-        trained_speakers=list(trained),
-        frozen_models=frozen_models,
-        trained_sampling=trained_sampling,
-        trained_chat_kwargs=trained_chat_kwargs,
-        frozen_sampling=frozen_sampling,
-        judge_model_settings=judge_settings,
-        judge=JudgeConfig(**(exp.get("judge_config") or {})),
-        scoring=ScoringConfig(**(exp.get("scoring") or {})),
-        fresh_positions=exp.get("fresh_positions", True),
-        flip=exp.get("flip", False),
-        first_speech_non_debate_aware=bool(exp.get("first_speech_non_debate_aware", False)),
-    )
-    relaxed = bool(ds.pop("relaxed_extraction", True))
-    task_source = family.source(ds)
-    return DebateEnv(config, task_source, family, relaxed_extraction=relaxed)
+    try:
+        config = DebateEnvConfig(
+            protocol=protocol,
+            prompt_file=exp["prompt_config"]["file_path"],
+            prompt_entry=exp["prompt_config"]["entry"],
+            trained_speakers=list(trained),
+            frozen_models=frozen_models,
+            trained_sampling=trained_sampling,
+            trained_chat_kwargs=trained_chat_kwargs,
+            frozen_sampling=frozen_sampling,
+            judge_model_settings=judge_settings,
+            judge=JudgeConfig(**(exp.get("judge_config") or {})),
+            scoring=ScoringConfig(**(exp.get("scoring") or {})),
+            fresh_positions=exp.get("fresh_positions", True),
+            flip=exp.get("flip", False),
+            first_speech_non_debate_aware=bool(
+                exp.get("first_speech_non_debate_aware", False)
+            ),
+        )
+        relaxed = bool(ds.pop("relaxed_extraction", True))
+        task_source = family.source(ds)
+        return DebateEnv(config, task_source, family, relaxed_extraction=relaxed)
+    except BaseException:
+        family.close()
+        raise
 
 
-def main() -> None:
+def _main(cleanups: list) -> None:
     args = runner_parser(__doc__).parse_args()
+    validate_resume_args(args)
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
@@ -237,7 +567,13 @@ def main() -> None:
     tr = exp.get("training") or {}
     validate_trained_seats(trained, tr)
 
+    dataset_type = (exp.get("dataset") or {}).get("type")
     env = build_env(exp, trained, frozen)
+    cleanups.append(env.family.close)
+    topology = resolve_topology()
+    protocol_identity = debate_protocol_identity(
+        exp, dataset_type, env.family, trained, frozen, args=args, topology=topology
+    )
     lead = trained_settings[0]
 
     run_name = args.experiment + run_identity_suffix(
@@ -250,7 +586,7 @@ def main() -> None:
         lr_override=args.lr,
         load_given=bool(args.load),
         gen_budgets=debate_gen_budgets(env.protocol, trained, tr),
-        topology=resolve_topology(),
+        topology=topology,
     )
     if args.load:
         backend.load(args.load)
@@ -273,17 +609,24 @@ def main() -> None:
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
         run_name=run_name,
+        protocol_identity=protocol_identity,
         chat_template_kwargs=(
             {"enable_thinking": bool(lead.enable_thinking)} if lead.enable_thinking is not None else None
         ),
         **training_config_kwargs(tr, args),
     )
-    # Comprehensive docent capture: every training rollout's debates -> JSONL
+    # Comprehensive docent capture: every training rollout's debates -> JSONL.
+    # The run-specific directory prevents concurrent sweep arms from overwriting
+    # one another's identically numbered steps.
+    launch_id = _docent_launch_id()
+    docent_dir = _docent_run_dir(run_name, launch_id=launch_id)
+
     def _export_docent(step: int, env_) -> None:
         from infra.envs.debate.docent_export import agent_runs, export_jsonl
 
-        os.makedirs("docent", exist_ok=True)
-        export_jsonl(agent_runs(env_), f"docent/step-{step:05d}.jsonl")
+        os.makedirs(docent_dir, exist_ok=True)
+        path = os.path.join(docent_dir, f"step-{step:05d}.jsonl")
+        export_jsonl(agent_runs(env_), path)
 
     cfg.on_rollout = _export_docent
 
@@ -299,6 +642,15 @@ def main() -> None:
 
         eval_env = PlannedEnv(eval_env, int(plan_tokens))
     train(env, backend, cfg, eval_env=eval_env)
+
+
+def main() -> None:
+    cleanups: list = []
+    try:
+        _main(cleanups)
+    finally:
+        for cleanup in reversed(cleanups):
+            cleanup()
 
 
 if __name__ == "__main__":

@@ -165,7 +165,7 @@ def test_forced_close_flows_through_rollout_into_the_penalty():
     (traj,) = groups[0]
     assert traj.reward == pytest.approx(1.1 - 0.1)  # boxed-correct minus overshoot
     assert traj.info["think_overshoot"] == 1.0
-    assert traj.info["correct"] == 1.0
+    assert traj.info["correct_strict"] == 1.0
     mask = traj.datums[0].mask
     assert mask is not None and mask.count(0.0) == FORCED_CLOSE_LEN  # injected close untrained
 

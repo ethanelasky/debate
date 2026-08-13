@@ -2,6 +2,8 @@
 answer prompt, grades integers with the shared extractor. Network-dependent
 loading is exercised once via the HF cache; everything else is offline."""
 
+from copy import deepcopy
+
 import pytest
 
 from infra.envs.tasks import get_family
@@ -48,13 +50,130 @@ def test_reward_grades_boxed_integers(env):
     gt = int(t.meta["gt"])
     r_good, info_good = env.reward(t, f"Derivation.\n\\boxed{{{gt}}}")
     r_bad, info_bad = env.reward(t, f"Derivation.\n\\boxed{{{gt + 1}}}")
-    assert info_good["correct"] == 1.0 and info_bad["correct"] == 0.0
+    assert info_good == {
+        "correct_strict": 1.0,
+        "correct_relaxed": 1.0,
+        "answer_format_valid": 1.0,
+    }
+    assert info_bad == {
+        "correct_strict": 0.0,
+        "correct_relaxed": 0.0,
+        "answer_format_valid": 1.0,
+    }
+    assert not ({"correct", "has_boxed"} & set(info_good))
     assert r_good > r_bad
 
 
-def test_family_grade_and_extractor(env):
+def test_family_grade_and_parse_answers(env):
     fam = get_family("aime")
     assert fam.grade({"gt": 60.0}, 60) is True
     assert fam.grade({"gt": 60.0}, 61) is False
-    assert fam.extractor(relaxed=True)("no box, answer 60") == 60.0
-    assert fam.extractor(relaxed=False)("no box, answer 60") is None
+    parsed = fam.parse_answers("no box, answer 60")
+    assert parsed.strict is None and parsed.relaxed == 60.0
+
+
+def test_aime_numeric_parser_does_not_accept_symbolic_arithmetic():
+    parsed = get_family("aime").parse_answers("\\boxed{2+2}")
+    assert parsed.strict is None
+    assert parsed.relaxed == 2.0  # numeric fallback, not symbolic evaluation
+    assert parsed.answer_format_valid is False
+
+
+def _fake_aime_dataset(problem_suffix=""):
+    return {
+        "train": [
+            {
+                "Question": f"AIME problem {i}{problem_suffix}",
+                "Answer": str(i % 1000),
+                "ID": f"fake-{i}",
+            }
+            for i in range(100)
+        ]
+    }
+
+
+def test_aime_protocol_identity_is_stable_and_sensitive(monkeypatch):
+    import infra.envs.tasks.aime as aime_module
+
+    dataset = _fake_aime_dataset()
+    monkeypatch.setattr(aime_module, "load_dataset", lambda _dataset_id: deepcopy(dataset))
+
+    first = get_family("aime")
+    first_env = first.source(
+        {
+            "seed": 7,
+            "eval_subset_size": 20,
+            "correct_reward": 2,
+            "format_reward": 0,
+            "relaxed_correct_bonus": 0.25,
+            "think_overshoot_penalty": 0.125,
+        }
+    )
+    second = get_family("aime")
+    second.source(
+        {
+            "seed": 7,
+            "eval_subset_size": 20,
+            "correct_reward": 2,
+            "format_reward": 0,
+            "relaxed_correct_bonus": 0.25,
+            "think_overshoot_penalty": 0.125,
+        }
+    )
+    identity = first.protocol_identity()
+    assert identity == second.protocol_identity()
+    assert identity["grading_protocol"] == "numeric_box_v1"
+    assert identity["dataset_id"] == "di-zhang-fdu/AIME_1983_2024"
+    assert identity["dataset_revision"] == "unpinned_legacy"
+    assert identity["seed"] == "7"
+    assert identity["eval_subset_size"] == "20"
+    assert identity["train_count"] == str(len(first_env.train_rows))
+    assert identity["dev_count"] == str(len(first_env.dev_rows))
+    assert identity["test_count"] == str(len(first_env.test_rows))
+    assert identity["correct_reward"] == "2.0"
+    assert identity["format_reward"] == "0.0"
+    assert identity["relaxed_correct_bonus"] == "0.25"
+    assert identity["think_overshoot_penalty"] == "0.125"
+    assert len(identity["prompt_sha256"]) == len(identity["split_sha256"]) == 64
+    assert first_env.format_reward == 0.0
+
+    dataset["train"][0]["Question"] += " changed"
+    changed = get_family("aime")
+    changed.source(
+        {
+            "seed": 7,
+            "eval_subset_size": 20,
+            "correct_reward": 2,
+            "format_reward": 0,
+            "relaxed_correct_bonus": 0.25,
+            "think_overshoot_penalty": 0.125,
+        }
+    )
+    assert changed.protocol_identity()["split_sha256"] != identity["split_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("knob", "changed_value", "default_identity", "changed_identity"),
+    [
+        ("correct_reward", 2, "1.0", "2.0"),
+        ("format_reward", 0, "0.1", "0.0"),
+        ("relaxed_correct_bonus", 0.25, "0.1", "0.25"),
+        ("think_overshoot_penalty", 0.125, "0.0", "0.125"),
+    ],
+)
+def test_aime_protocol_identity_tracks_each_reward_knob(
+    monkeypatch, knob, changed_value, default_identity, changed_identity
+):
+    import infra.envs.tasks.aime as aime_module
+
+    monkeypatch.setattr(
+        aime_module, "load_dataset", lambda _dataset_id: deepcopy(_fake_aime_dataset())
+    )
+    baseline = get_family("aime")
+    baseline.source({"seed": 7, "eval_subset_size": 20})
+    changed = get_family("aime")
+    changed.source({"seed": 7, "eval_subset_size": 20, knob: changed_value})
+
+    assert baseline.protocol_identity()[knob] == default_identity
+    assert changed.protocol_identity()[knob] == changed_identity
+    assert changed.protocol_identity()[knob] != baseline.protocol_identity()[knob]

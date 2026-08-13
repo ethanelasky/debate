@@ -42,7 +42,7 @@ math_rlvr_olmo_l5:
 # CoT-discovery arm: the neutral prompt (math_nocot.yaml — no step-by-step
 # ask, no answer-only ban; deletion-only variant, test-pinned). Question: does
 # verifier-reward RL discover derivations when the prompt is silent on them?
-# Paired with math_pc_olmo_l5_g8_nocot; watch eval/has_boxed + response length
+# Paired with math_pc_olmo_l5_g8_nocot; watch eval/answer_format_valid + response length
 # alongside eval/correct_relaxed at step 0 for the starting behavior.
 math_rlvr_olmo_l5_nocot:
   _extends: math_rlvr_olmo_l5
@@ -88,7 +88,7 @@ aime_rlvr_olmo32:
   model: /workspace/models/olmo32-bf16
   # 1000, matching the MB scratchpad arm's budgets (Ethan 2026-08-07): plan
   # 1000 + answer 1000. The answer prompt asks for concise-but-rigorous
-  # justification, not the old step-by-step derivation; watch eval/has_boxed
+  # justification, not the old step-by-step derivation; watch eval/answer_format_valid
   # at step 0 for truncation regardless (direct QA truncated 48% at 3000
   # under the old prompt).
   max_completion_tokens: 1000

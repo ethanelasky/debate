@@ -331,3 +331,20 @@ def test_final_eval_transcripts_are_captured_before_next_split():
         (1, "dev", ("dev", "dev")),
         (1, "test", ("dev", "dev", "test")),
     ]
+
+
+def test_final_test_eval_uses_the_direct_eval_env():
+    train_env = SplitRecordingEnv()
+    direct_eval_env = SplitRecordingEnv()
+    cfg = Config(
+        steps=0,
+        eval_every=0,
+        final_test_eval=True,
+        eval_n=2,
+        save_every=0,
+    )
+    with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, metrics: None):
+        train(train_env, NullBackend(), cfg, eval_env=direct_eval_env)
+
+    assert direct_eval_env.eval_splits == ["test"]
+    assert train_env.eval_splits == []

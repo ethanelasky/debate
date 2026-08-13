@@ -22,8 +22,10 @@ from infra.envs.tasks.codecontests import (
     CodeContestsFamily,
     extract_code,
     is_cpp_code,
+    parse_code_answers,
     run_stdin_tests,
 )
+from infra.envs.tasks.base import GraderInfrastructureError
 
 SUM_SOLUTION = "a, b = map(int, input().split())\nprint(a + b)"
 ECHO_SOLUTION = "print(input().strip())"
@@ -327,6 +329,106 @@ def test_source_accepts_prompt_file_key(tmp_path):
     assert env.tasks(1, split="test")[0].messages[0]["content"] == "Terse."
 
 
+@pytest.mark.parametrize(
+    ("platform", "executor_protocol"),
+    [
+        ("linux", "local_bubblewrap_seccomp_v1"),
+        ("darwin", "local_process_rlimit_development_v1"),
+    ],
+)
+def test_family_protocol_identity_distinguishes_local_execution_boundaries(
+    tmp_path, monkeypatch, platform, executor_protocol
+):
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    monkeypatch.delenv("CODECONTESTS_EXECUTOR_MODE", raising=False)
+    monkeypatch.setattr(codecontests_module.sys, "platform", platform)
+
+    family = CodeContestsFamily(timeout_seconds=TIMEOUT)
+    family.source({"path": path, "test_path": path})
+    identity = family.protocol_identity()
+
+    assert identity["grading_protocol"] == "codecontests_fresh_process_per_case_v3"
+    assert identity["executor_mode"] == "local"
+    assert identity["executor_protocol"] == executor_protocol
+    assert "executor_identity_sha256" not in identity
+    assert "executor_server_bundle_sha256" not in identity
+
+
+def test_family_protocol_identity_binds_remote_frozen_identity_and_server_bundle(
+    tmp_path, monkeypatch
+):
+    from codecontests_executor.protocol import payload_digest, static_identity
+    from infra.train import resolve_protocol_identity
+
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+
+    def resolved_identity(service_id: str, server_bundle_sha256: str):
+        frozen = static_identity(
+            service_id=service_id,
+            launcher_sha256="1" * 64,
+            server_bundle_sha256=server_bundle_sha256,
+        )
+        client = SimpleNamespace(
+            expected_identity=frozen,
+            identity_digest=payload_digest(frozen),
+        )
+        monkeypatch.setattr(
+            codecontests_module, "_verified_remote_executor", lambda: client
+        )
+        family = CodeContestsFamily(timeout_seconds=TIMEOUT)
+        family.source({"path": path, "test_path": path})
+        return resolve_protocol_identity("codecontests", family), frozen
+
+    first, first_frozen = resolved_identity("judge-a", "a" * 64)
+    different_instance, _ = resolved_identity("judge-b", "a" * 64)
+    different_bundle, second_frozen = resolved_identity("judge-a", "b" * 64)
+
+    assert first["grading_protocol"] == "codecontests_fresh_process_per_case_v3"
+    assert first["executor_mode"] == "remote"
+    assert first["executor_protocol"] == "signed_external_gvisor_v4"
+    assert first["executor_identity_sha256"] == payload_digest(first_frozen)
+    assert first["executor_server_bundle_sha256"] == "a" * 64
+    # Exact resume comparison now rejects either a different frozen service
+    # identity or a different staged server implementation bundle.
+    assert different_instance["executor_server_bundle_sha256"] == "a" * 64
+    assert different_instance["executor_identity_sha256"] != first[
+        "executor_identity_sha256"
+    ]
+    assert different_instance != first
+    assert different_bundle["executor_identity_sha256"] == payload_digest(
+        second_frozen
+    )
+    assert different_bundle["executor_server_bundle_sha256"] == "b" * 64
+    assert different_bundle != first
+
+
+def test_remote_protocol_identity_fails_closed_on_malformed_bundle_digest(
+    tmp_path, monkeypatch
+):
+    from codecontests_executor.protocol import payload_digest, static_identity
+
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    frozen = static_identity(service_id="judge-a", launcher_sha256="1" * 64)
+    frozen["server_bundle_sha256"] = "not-a-digest"
+    client = SimpleNamespace(
+        expected_identity=frozen,
+        identity_digest=payload_digest(frozen),
+    )
+    monkeypatch.setenv("CODECONTESTS_EXECUTOR_MODE", "remote")
+    monkeypatch.setattr(
+        codecontests_module, "_verified_remote_executor", lambda: client
+    )
+
+    with pytest.raises(
+        codecontests_module.VerifierInfrastructureError,
+        match="server bundle digest is malformed",
+    ):
+        CodeContestsFamily(timeout_seconds=TIMEOUT).source(
+            {"path": path, "test_path": path}
+        )
+
+
 # ---------------------------------------------------------------- extraction
 
 
@@ -573,15 +675,25 @@ def test_remote_unknown_is_infrastructure_failure(install_remote_executor):
         run_stdin_tests("print(1)", [""], ["1"])
 
 
-def _launch_attestation_unknown(error="RuntimeError"):
+def _launch_attestation_unknown(
+    error="RuntimeError",
+    *,
+    site: str | None = None,
+    source_line: int | None = None,
+):
     nonce = "a" * 64
+    status_payload = {
+        "version": 1,
+        "candidate_ready_attested": False,
+        "error": error,
+    }
+    if site is not None:
+        status_payload["site"] = site
+    if source_line is not None:
+        status_payload["source_line"] = source_line
     status = base64.b64encode(
         json.dumps(
-            {
-                "version": 1,
-                "candidate_ready_attested": False,
-                "error": error,
-            },
+            status_payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii")
@@ -619,7 +731,13 @@ def test_remote_launch_attestation_missing_retries_one_fresh_sandbox(
 
     client = install_remote_executor(
         _FakeRemoteExecutor(
-            [_launch_attestation_unknown(), _remote_execution(stdout=b"ok\n")],
+            [
+                _launch_attestation_unknown(
+                    site="trace_measure",
+                    source_line=3_021,
+                ),
+                _remote_execution(stdout=b"ok\n"),
+            ],
             on_execute=advance,
         )
     )
@@ -639,8 +757,19 @@ def test_remote_launch_attestation_missing_retries_one_fresh_sandbox(
     assert second_limit == {"seconds": 10, "nanos": 0}
     warning = "\n".join(record.getMessage() for record in caplog.records)
     assert "fresh sandbox" in warning
-    assert "monitor_error=RuntimeError" in warning
+    assert "monitor_error=RuntimeError@trace_measure:L3021" in warning
     assert "code_sha256=" in warning and "stdin_sha256=" in warning
+
+
+def test_remote_monitor_diagnostic_ignores_unbounded_location_fields():
+    execution = _launch_attestation_unknown(
+        site="../../candidate-controlled",
+        source_line=1_000_000,
+    )
+
+    assert codecontests_module._remote_monitor_error(execution.stderr) == (
+        "RuntimeError"
+    )
 
 
 def test_remote_launch_attestation_retry_preserves_nearly_exhausted_budget(
@@ -780,7 +909,7 @@ def test_remote_controller_exception_fails_closed_after_one_retry(
         ("OUTPUT_LIMIT", b"first\n", True),
     ],
 )
-def test_remote_candidate_failure_with_correct_stdout_matches_local_semantics(
+def test_remote_candidate_failure_with_correct_stdout_still_fails(
     install_remote_executor, category, stdout, stderr_truncated
 ):
     client = install_remote_executor(
@@ -799,12 +928,11 @@ def test_remote_candidate_failure_with_correct_stdout_matches_local_semantics(
     )
     result = run_stdin_tests("print(input())", ["first", "second"], ["first", "second"])
 
-    assert result["status"] == "passed"
-    assert result["passed"] is True
-    assert result["candidate_error"] is True
+    assert result["status"] in {"failed", "candidate_error"}
+    assert result["passed"] is False
     assert result["timeout"] is False
-    assert result["tests_passed"] == 2
-    assert result["first_failure"] is None
+    assert result["tests_passed"] == 1
+    assert result["first_failure"]["test_idx"] == 0
     assert len(client.calls) == 2
 
 
@@ -824,7 +952,7 @@ def test_remote_stdout_saturation_never_passes_even_when_prefix_matches(
         )
     )
     result = run_stdin_tests("print('answer')", [""], ["answer"])
-    assert result["status"] == "failed"
+    assert result["status"] == "candidate_error"
     assert result["tests_passed"] == 0
     assert result["candidate_error"] is True
     assert "stdout exceeded" in result["first_failure"]["stderr"]
@@ -874,9 +1002,10 @@ def test_remote_protocol_candidate_category_mapping(
         assert result["timeout"] is True
         assert result["candidate_error"] is False
     else:
-        assert result["status"] == "failed"
+        expected_status = "candidate_error" if category == "OUTPUT_LIMIT" else "failed"
+        assert result["status"] == expected_status
         assert result["timeout"] is False
-        assert result["candidate_error"] is True
+        assert result["candidate_error"] is (category == "OUTPUT_LIMIT")
 
 
 def test_remote_wall_limit_is_candidate_timeout(install_remote_executor):
@@ -921,8 +1050,8 @@ def test_remote_mode_preflights_identity_before_candidate_or_syntax_result(
     codecontests_module._reset_sandbox_probe_for_tests()
     install_remote_executor(client)
     result = run_stdin_tests("def (:", [""], [""])
-    assert result["status"] == "error"
-    assert result["tests_total"] == 0
+    assert result["status"] == "candidate_error"
+    assert result["tests_total"] == 1
     assert events[-1] == "identity"
 
 
@@ -1198,9 +1327,9 @@ def test_wrong_solution_reports_first_failure():
     assert r["first_failure"]["expected"] == "3" and r["first_failure"]["actual"] == "0"
 
 
-def test_syntax_error_solution_is_an_error():
+def test_syntax_error_solution_is_a_candidate_error():
     r = run_stdin_tests("def (:", ["1 2"], ["3"], timeout=TIMEOUT)
-    assert r["status"] == "error" and not r["passed"]
+    assert r["status"] == "candidate_error" and not r["passed"]
     assert r["candidate_error"] is True
     assert "SyntaxError" in r["first_failure"]["stderr"]
 
@@ -1213,34 +1342,34 @@ def test_float_normalization():
 def test_runtime_error_is_a_failure_not_a_crash():
     r = run_stdin_tests("raise ValueError('boom')", ["x"], ["1"], timeout=TIMEOUT)
     assert not r["passed"]
-    assert r["candidate_error"] is True
+    assert r["status"] == "failed"
+    assert r["candidate_error"] is False
     assert "ValueError" in r["first_failure"]["stderr"]
 
 
-def test_correct_stdout_before_runtime_error_preserves_historical_pass():
+def test_correct_stdout_before_runtime_error_still_fails():
     r = run_stdin_tests(
         "print('answer')\nraise RuntimeError('after output')",
         [""],
         ["answer"],
         timeout=TIMEOUT,
     )
-    assert r["passed"] is True
-    assert r["tests_passed"] == 1
-    assert r["candidate_error"] is True
-    assert r["first_failure"] is None
+    assert r["passed"] is False
+    assert r["status"] == "failed"
+    assert r["tests_passed"] == 0
+    assert r["first_failure"] is not None
 
 
-def test_correct_stdout_with_stderr_saturation_preserves_historical_pass():
+def test_correct_stdout_with_stderr_saturation_fails():
     r = run_stdin_tests(
         "import sys\nprint('answer')\nsys.stderr.write('x' * (2 * 1024 * 1024))",
         [""],
         ["answer"],
         timeout=TIMEOUT,
     )
-    assert r["passed"] is True
-    assert r["tests_passed"] == 1
-    assert r["candidate_error"] is True
-    assert r["first_failure"] is None
+    assert r["passed"] is False
+    assert r["tests_passed"] == 0
+    assert r["first_failure"] is not None
 
 
 def test_one_worker_thread_recursion_idiom_is_supported():
@@ -1348,7 +1477,7 @@ def test_candidate_does_not_inherit_parent_environment_secrets(monkeypatch):
 def test_candidate_stdout_is_bounded():
     solution = "import sys\nsys.stdout.write('x' * (3 * 1024 * 1024))\n"
     r = run_stdin_tests(solution, [""], [""], timeout=TIMEOUT)
-    assert r["status"] == "failed" and not r["passed"]
+    assert r["status"] == "candidate_error" and not r["passed"]
     assert "2 MiB limit" in r["first_failure"]["stderr"]
 
 
@@ -1488,37 +1617,41 @@ def test_reward_correct_solution(env):
     task = env.tasks(1, split="test")[0]  # the sum problem
     reward, info = env.reward(task, f"sure:\n```python\n{SUM_SOLUTION}\n```")
     assert reward == pytest.approx(1.1)
-    assert info["correct"] == 1.0 and info["has_code"] == 1.0
-    assert info["tests_passed_frac"] == pytest.approx(1.0)
-    assert info["gdm_correct"] == info["correct"]
-    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"]
+    assert info["answer_format_valid"] == 1.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"]
+    assert info["gdm_tests_passed_frac"] == pytest.approx(1.0)
 
 
 def test_reward_unfenced_text(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "I think the answer is a + b.")
-    assert reward == 0.0 and info["has_code"] == 0.0 and info["correct"] == 0.0
+    assert reward == 0.0
+    assert info["answer_format_valid"] == 0.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
 
 
 def test_reward_fenced_wrong_code(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "```python\nprint(0)\n```")
     assert reward == pytest.approx(0.1)
-    assert info["correct"] == 0.0 and info["tests_passed_frac"] == 0.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
+    assert info["gdm_tests_passed_frac"] == 0.0
 
 
 def test_reward_cpp_code_gets_format_credit_only(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "```\n#include <iostream>\nint main(){ std::cout<<1; }\n```")
     assert reward == pytest.approx(0.1)
-    assert info["correct"] == 0.0 and info["cpp_code"] == 1.0
+    assert info["correct_strict"] == info["correct_relaxed"] == 0.0
+    assert info["cpp_code"] == 1.0
 
 
 def test_reward_candidate_syntax_error_is_observable_not_infrastructure(env):
     task = env.tasks(1, split="test")[0]
     reward, info = env.reward(task, "```python\ndef (: \n```")
     assert reward == pytest.approx(0.1)
-    assert info["correct"] == 0.0
+    assert info["correct_relaxed"] == 0.0
     assert info["exec_error"] == 1.0
     assert info["exec_timeout"] == 0.0
 
@@ -1611,16 +1744,17 @@ def test_grade_batch_propagates_verifier_infrastructure_failure(
         family.grade_batch([(_meta(), SUM_SOLUTION)])
 
 
-def test_extractor_relaxed_knob(family):
+def test_parse_answers_distinguishes_relaxed_unclosed_fence(family):
     text = "```python\nprint(1)"
-    assert family.extractor(relaxed=True)(text) == "print(1)"
-    assert family.extractor(relaxed=False)(text) is None
+    parsed = family.parse_answers(text)
+    assert parsed == parse_code_answers(text)
+    assert parsed.strict is None and parsed.relaxed == "print(1)"
 
 
-def test_format_flags(family):
-    assert family.format_flags("```python\nprint(1)\n```") == {"code_fence": 1.0}
-    assert family.format_flags("just prose") == {"code_fence": 0.0}
-    assert family.format_flags("```python\nprint(1)") == {"code_fence": 0.0}
+def test_answer_format_valid_comes_from_strict_parse(family):
+    assert family.parse_answers("```python\nprint(1)\n```").answer_format_valid is True
+    assert family.parse_answers("just prose").answer_format_valid is False
+    assert family.parse_answers("```python\nprint(1)").answer_format_valid is False
 
 
 def test_source_requires_path(family):
@@ -1893,8 +2027,9 @@ def test_same_heldout_completion_reports_both_named_suites(tmp_path):
     env = _paired_env(tmp_path)
     test_task = next(t for t in env.tasks(2, split="test") if t.meta["name"] == "sum")
     reward, info = env.reward(test_task, f"```python\n{SUM_SOLUTION}\n```")
-    assert info["gdm_correct"] == info["correct"] == 1.0
-    assert info["gdm_tests_passed_frac"] == info["tests_passed_frac"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"] == 1.0
+    assert info["correct_strict"] == 1.0
+    assert info["gdm_tests_passed_frac"] == 1.0
     assert info["cco_correct"] == 1.0
     assert info["cco_tests_passed_frac"] == 1.0
     logged = _aggregate([Trajectory(datums=[], reward=reward, info=info)], "eval")
@@ -1917,7 +2052,7 @@ def test_cco_verdict_does_not_change_the_gdm_reward(tmp_path):
     cheat = "print(3)"
     reward, info = env.reward(env.tasks(1, split="test")[0], f"```python\n{cheat}\n```")
     assert reward == pytest.approx(1.1)
-    assert info["gdm_correct"] == info["correct"] == 1.0
+    assert info["gdm_correct"] == info["correct_relaxed"] == 1.0
     assert info["cco_correct"] == 0.0
 
 
@@ -1935,7 +2070,7 @@ def test_paired_candidate_error_metrics_are_suite_specific(tmp_path):
     assert info["gdm_correct"] == 1.0
     assert info["exec_error"] == 0.0
     assert info["cco_correct"] == 0.0
-    assert info["cco_exec_error"] == 1.0
+    assert info["cco_exec_error"] == 0.0
 
 
 def test_paired_loader_drops_rows_missing_either_suite(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import io
+import os
 import signal
 import struct
 import subprocess
@@ -610,6 +611,30 @@ launcher.main()
     assert completed.returncode == launcher._INFRA_EXIT
     assert b"PTRACED_RELAY_ARMED\n" in completed.stderr
     assert elapsed < 1.5
+
+
+def test_monitor_failure_status_has_only_bounded_trusted_diagnostics() -> None:
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            launcher._read_exact(read_fd, 1)
+    finally:
+        os.close(read_fd)
+    caught.value.args = ("candidate-controlled secret",)
+
+    status = launcher._monitor_failure_status(
+        launcher._MonitorStageError("trace_measure", caught.value)
+    )
+
+    assert status["version"] == 1
+    assert status["candidate_ready_attested"] is False
+    assert status["error"] == "RuntimeError"
+    assert status["site"] == "trace_measure"
+    assert isinstance(status["source_line"], int)
+    assert launcher._read_exact.__code__.co_firstlineno <= status["source_line"]
+    assert status["source_line"] <= launcher._read_exact.__code__.co_firstlineno + 20
+    assert "candidate-controlled secret" not in repr(status)
 
 
 def test_output_relay_records_evidence_and_never_signals(

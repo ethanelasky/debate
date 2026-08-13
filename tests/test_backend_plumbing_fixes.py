@@ -347,3 +347,38 @@ def test_user_pinned_attn_implementation_is_not_duplicated(monkeypatch):
         model_path="m", extra_overrides=(user,)
     ).hydra_overrides()
     assert [o for o in overrides if "attn_implementation" in o] == [user]
+
+
+# ---------------------------------------------------------------- grad norm
+
+
+def test_effective_grad_clip_default_and_override():
+    from infra.backend.verl import _effective_grad_clip
+
+    assert _effective_grad_clip(VerlBackendConfig(model_path="m")) == 1.0
+    cfg = VerlBackendConfig(
+        model_path="m",
+        grad_clip=1.0,
+        extra_overrides=(
+            "++actor_rollout_ref.actor.optim.weight_decay=0.0",
+            "++actor_rollout_ref.actor.optim.clip_grad=0.5",
+        ),
+    )
+    assert _effective_grad_clip(cfg) == 0.5
+
+
+def test_grad_norm_metrics_post_clip_and_nonfinite():
+    from infra.backend.verl import _grad_norm_metrics
+
+    assert _grad_norm_metrics(0.3, 0.5) == {
+        "optim/nonfinite_grad_step": 0.0,
+        "optim/grad_norm_clipped": 0.3,
+    }
+    assert _grad_norm_metrics(7.2, 0.5) == {
+        "optim/nonfinite_grad_step": 0.0,
+        "optim/grad_norm_clipped": 0.5,
+    }
+    for bad in (float("nan"), float("inf")):
+        out = _grad_norm_metrics(bad, 0.5)
+        assert out["optim/nonfinite_grad_step"] == 1.0
+        assert "optim/grad_norm_clipped" not in out

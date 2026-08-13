@@ -134,7 +134,25 @@ class Env(ABC):
     @abstractmethod
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
         """One group of rewarded trajectories per task. Samples failing
-        fidelity checks are dropped (and counted in info), not trained on."""
+        fidelity checks are dropped (and counted in last_rollout_info), not
+        trained on."""
+
+
+def _validate_predict_results(
+    results: list[list[Sample]], *, requests: int, samples_per_request: int, stage: str
+) -> None:
+    """Enforce Policy.predict's rectangular result contract at env boundaries."""
+    if len(results) != requests:
+        raise RuntimeError(
+            f"{stage} generation returned {len(results)} result groups for "
+            f"{requests} requests"
+        )
+    for i, samples in enumerate(results):
+        if len(samples) != samples_per_request:
+            raise RuntimeError(
+                f"{stage} generation request {i} returned {len(samples)} samples; "
+                f"expected exactly {samples_per_request}"
+            )
 
 
 class SingleTurnEnv(Env):
@@ -149,17 +167,16 @@ class SingleTurnEnv(Env):
     Each rollout() overwrites `last_rollout_records` — one dict per KEPT
     sample (prompt messages, completion, reward, info) — retained for
     transcript export (wandb; the single-turn twin of DebateEnv.last_states).
-    meta is copied without keys in `artifact_private_meta_keys`: `bindings`
-    is already rendered into messages, while verifier-backed subclasses can
-    additionally retain private grading state in memory without exporting it.
+    ``export_meta()`` is the one boundary where task-private grader state is
+    removed.  Consumers must only ever see the already-redacted records.
     """
 
     grade_workers: int = 1
     last_rollout_records: list[dict[str, Any]] = []
-    # Subclasses can keep verifier-only Task.meta fields available to reward()
-    # while excluding them from generic transcript/Docent records. `bindings`
-    # is already-rendered prompt material and has always been omitted.
-    artifact_private_meta_keys: frozenset[str] = frozenset({"bindings"})
+    # Batch-level coverage belongs here rather than on an arbitrary
+    # trajectory: it must remain observable when a group (or the whole batch)
+    # has no fidelity-kept samples.
+    last_rollout_info: dict[str, int | float] = {}
 
     #: Flat overshoot penalty. A sample longer than `soft_token_budget` loses
     #: `overshoot_penalty` from its reward — a constant, NOT scaled by how far
@@ -199,7 +216,29 @@ class SingleTurnEnv(Env):
         reward() see no behavior change."""
         return self.reward(task, sample.text)
 
+    def export_meta(self, task: Task) -> dict[str, Any]:
+        """Return the task metadata safe to retain in transcript records.
+
+        Most single-turn tasks only use ``bindings`` as a large prompt-render
+        payload, so the historical default copies everything except that key.
+        Environments whose metadata also contains private verifier material
+        must override this method with an explicit allowlist.  Keeping the
+        policy here makes ``last_rollout_records`` safe before any Docent or
+        W&B exporter receives it.
+        """
+        return {k: v for k, v in task.meta.items() if k != "bindings"}
+
     def rollout(self, tasks: list[Task], policy: Policy, group_size: int) -> list[list[Trajectory]]:
+        # Clear externally observed state before rendering or generation. If
+        # either fails, callers must not mistake the previous rollout's
+        # records or coverage for this one.
+        self.last_rollout_records = []
+        self.last_rollout_info = {
+            "tasks_requested": len(tasks),
+            "samples_attempted": 0,
+            "samples_kept": 0,
+            "samples_dropped_fidelity": 0,
+        }
         # Split generation from scoring: they are the two halves of a rollout and
         # have completely different cost drivers (GPU token throughput vs CPU
         # subprocess execution), so a combined number hides which one to attack.
@@ -214,15 +253,31 @@ class SingleTurnEnv(Env):
                 [t.messages for t in tasks], n=group_size, limits=self.slot_limits
             )
         _t_generate = time.monotonic() - _t0
+        _validate_predict_results(
+            results,
+            requests=len(tasks),
+            samples_per_request=group_size,
+            stage="single-turn",
+        )
         groups: list[list[Trajectory]] = [[] for _ in tasks]
         kept: list[tuple[int, Sample]] = []
         n_dropped = 0
+        n_attempted = sum(len(samples) for samples in results)
         for gi, samples in enumerate(results):
             for s in samples:
                 if not s.fidelity_ok():
                     n_dropped += 1
                     continue
                 kept.append((gi, s))
+
+        # Overwritten on every rollout, before scoring, so fidelity coverage
+        # remains auditable even when no Trajectory can be constructed.
+        self.last_rollout_info = {
+            "tasks_requested": len(tasks),
+            "samples_attempted": n_attempted,
+            "samples_kept": len(kept),
+            "samples_dropped_fidelity": n_dropped,
+        }
 
         _t1 = time.monotonic()
         workers = max(1, self.grade_workers)
@@ -260,18 +315,19 @@ class SingleTurnEnv(Env):
             # Trajectory and the record are built so both carry the same
             # penalized reward the optimizer sees.
             over = bool(self.soft_token_budget and len(s.tokens) > self.soft_token_budget)
-            info = {**info, "tokens": float(len(s.tokens)), "over_budget": float(over)}
+            info = {
+                **info,
+                "tokens": float(len(s.tokens)),
+                "truncated": float(s.stop_reason == "length"),
+                "over_budget": float(over),
+            }
             if over:
                 reward -= self.overshoot_penalty
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
             records.append(
                 {
                     "task_index": gi,
-                    "meta": {
-                        k: v
-                        for k, v in tasks[gi].meta.items()
-                        if k not in self.artifact_private_meta_keys
-                    },
+                    "meta": self.export_meta(tasks[gi]),
                     "messages": tasks[gi].messages,
                     "completion": s.text,
                     "stop_reason": s.stop_reason,
@@ -280,12 +336,6 @@ class SingleTurnEnv(Env):
                 }
             )
         self.last_rollout_records = records
-        # Deliberately violates the every-branch rule in reward()'s docstring:
-        # a batch-level counter stamped on one sample (and lost when the first
-        # group is empty). Pinned by tests; fixing it means a new channel for
-        # batch info, not spreading the key across trajectories.
-        if n_dropped and groups and groups[0]:
-            groups[0][0].info["samples_dropped_fidelity"] = float(n_dropped)
         return groups
 
 
@@ -350,6 +400,12 @@ def budget_forced_sample(
     p1_cap = min(limits.max_think_tokens or inf, max(1, total - len(close) - 1))
 
     phase1 = sample_fn(prompts, replace(params, max_tokens=p1_cap, stop=[THINK_CLOSE]), n=n)
+    _validate_predict_results(
+        phase1,
+        requests=len(prompts),
+        samples_per_request=n,
+        stage="two-phase phase 1",
+    )
 
     # Flatten, decide per sample, bucket phase-2 continuations by their cap.
     flat: list[dict] = []
@@ -397,6 +453,12 @@ def budget_forced_sample(
     for p2_cap, idxs in buckets.items():
         prefixes = [prompts[flat[j]["pi"]] + flat[j]["p1"].tokens + flat[j]["close"] for j in idxs]
         outs = sample_fn(prefixes, replace(params, max_tokens=p2_cap), n=1)
+        _validate_predict_results(
+            outs,
+            requests=len(prefixes),
+            samples_per_request=1,
+            stage="two-phase phase 2",
+        )
         for j, out in zip(idxs, outs):
             flat[j]["p2"] = out[0]
 

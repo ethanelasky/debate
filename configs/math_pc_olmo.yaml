@@ -380,7 +380,7 @@ aime_pc_olmo32_cispo_os2:
     scoring: continuous
     confidence_source: json
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: aime, seed: 0}
   training:
     backend: verl

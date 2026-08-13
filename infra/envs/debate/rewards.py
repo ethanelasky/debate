@@ -164,9 +164,9 @@ class SlotTokenCounts:
     visible: int
     total: int
     cap_total: Optional[int] = None
-    # env-computed per-slot features (e.g. strict_boxed=1.0 when the solution
-    # slot carried a strictly parseable \boxed answer); read by flag-gated
-    # shaping terms like format_reward.
+    # Env-computed per-slot features (e.g. answer_format_valid=1.0 when the
+    # solution slot yielded the task family's strict answer candidate); read
+    # by flag-gated shaping terms like format_reward.
     flags: dict[str, float] = field(default_factory=dict)
 
 
@@ -217,11 +217,13 @@ class LengthPenalty:
 @dataclass
 class FormatReward:
     """Per-slot bonus gated on an env-computed flag — e.g.
-    {kind: format_reward, coeff: 0.1, slots: [proposal], flag: strict_boxed}
-    pays +0.1 on the proposal datum iff its answer was strictly boxed."""
+    {kind: format_reward, coeff: 0.1, slots: [proposal],
+     flag: answer_format_valid}
+    pays +0.1 on the proposal datum iff the task family's strict answer
+    format was present."""
 
     coeff: float = 0.0
-    flag: str = "strict_boxed"
+    flag: str = "answer_format_valid"
     slots: Optional[list[str]] = None  # None = every trained-seat slot
 
     def apply(self, scored: dict[str, SeatReward], report: RoundTokenReport) -> ShapingDelta:

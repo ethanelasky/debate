@@ -141,15 +141,45 @@ class DebateEnv(Env):
     Task.meta carries {"question"} plus whatever the family's grade() reads
     (any TaskFamily.source() qualifies). `family` (a TaskFamily, duck-typed
     to keep this module import-light) owns everything task-specific:
-    extractor() binds solution slots to positions, grade_batch() scores them
+    parse_answers() supplies candidates for solution-slot position binding,
+    grade_batch() scores them
     (owning the execution shape — pool, batched call, whatever the verifier
-    wants), format_flags() feeds shaping terms."""
+    wants). Strict parse presence is the sole generic format signal."""
+
+    # train() sums rollout counts across dynamic-resampling calls. Rates are
+    # ratios, not additive scalars, so publish their count components
+    # explicitly for recomputation after those calls have been combined.
+    rollout_rate_specs = {
+        "answer_format_valid_rate": (
+            "answer_format_valid_count",
+            "produced_solution_slots",
+        ),
+        "solution_production_rate": (
+            "produced_solution_slots",
+            "expected_solution_slots",
+        ),
+        "extracted_solution_rate": (
+            "extracted_solution_slots",
+            "produced_solution_slots",
+        ),
+        "gradeable_solution_rate": (
+            "gradeable_solution_slots",
+            "extracted_solution_slots",
+        ),
+        "grader_error_rate": ("grade_errors", "grader_requests"),
+    }
 
     def __init__(self, config: DebateEnvConfig, task_source, family, relaxed_extraction: bool = True):
         self.config = config
         self.task_source = task_source
         self.family = family
-        self.solution_extractor = family.extractor(relaxed_extraction)
+        candidate = "relaxed" if relaxed_extraction else "strict"
+
+        def extract_answer(text: str) -> tuple[Any, bool]:
+            parsed = family.parse_answers(text)
+            return getattr(parsed, candidate), parsed.answer_format_valid
+
+        self.answer_extractor = extract_answer
 
         self.protocol = config.protocol
         speakers = self.protocol.speakers
@@ -246,7 +276,7 @@ class DebateEnv(Env):
         # term's bonus, so the names are checked against the protocol and the
         # family here.
         slot_names = {cs.slot.name for cs in self.protocol.compile()}
-        flag_names = set(family.format_flags(""))
+        flag_names = {"answer_format_valid"}
         for term in self.shaping:
             term_slots = getattr(term, "slots", None)
             if term_slots is not None:
@@ -260,7 +290,7 @@ class DebateEnv(Env):
             if term_flag is not None and term_flag not in flag_names:
                 raise ValueError(
                     f"shaping term {type(term).__name__} gates on unknown flag {term_flag!r}; "
-                    f"{type(family).__name__} format flags: {sorted(flag_names) or '(none)'}"
+                    f"generic format flags: {sorted(flag_names)}"
                 )
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
@@ -403,7 +433,7 @@ class DebateEnv(Env):
                 cfg.verdict_retries if cfg.verdict_retries is not None else cfg.judge.retries
             ),
             judge_schema=cfg.judge.schema_name,
-            solution_extractor=self.solution_extractor,
+            answer_extractor=self.answer_extractor,
             fresh_positions=cfg.fresh_positions,
             decision_json_schema=decision_json_schema,
             speech_token_limit=cfg.speech_token_limit,
@@ -416,9 +446,12 @@ class DebateEnv(Env):
         # Grade all solutions up front, deduped and in parallel: codecontests
         # grading is a subprocess with up to a 90s timeout per call, so serial
         # per-state grading of a 32-debate batch can burn tens of minutes for
-        # a metrics-only scalar. _trajectories only looks the results up.
+        # a metrics-only scalar. Include answers from debates that fail later:
+        # their production/format/grade status remains part of the rollout
+        # census and transcript. _trajectories only uses scoreable states.
         grades, grade_errors = self._grade_solutions(states)
         self._attach_labels(states, grades)
+        solution_census = self._solution_census(states, grades, grade_errors)
 
         # one GRPO group per (task, arm, trained seat)
         by_seat_group: dict[tuple[int, str], list[Trajectory]] = {}
@@ -443,7 +476,7 @@ class DebateEnv(Env):
             "debates_failed": n_failed,
             "debates_unscoreable": n_unscoreable,
             "fail_reasons": fail_reasons,
-            "grade_errors": grade_errors,
+            **solution_census,
         }
         self.last_states = states  # retained for transcript export (docent)
         for g in groups:
@@ -466,6 +499,17 @@ class DebateEnv(Env):
                 'without meta["question"]; the TaskFamily contract '
                 "(infra/envs/tasks/base.py) requires every Task.meta to carry "
                 '{"question": str} — it is what DebateEnv binds as the debate TOPIC'
+            )
+        # Keep the raw metadata private for bindings and grading, while
+        # retaining a separate source-owned export projection for transcript
+        # consumers. Synthetic task sources without this SingleTurnEnv seam
+        # fail closed: no task metadata is exported.
+        export_meta = getattr(self.task_source, "export_meta", None)
+        task_export = export_meta(task) if callable(export_meta) else {}
+        if not isinstance(task_export, dict):
+            raise TypeError(
+                f"{type(self.task_source).__name__}.export_meta must return dict, "
+                f"got {type(task_export).__name__}"
             )
         extra = task_bindings(task.meta)
         bindings: dict[str, dict[str, str]] = {}
@@ -529,6 +573,7 @@ class DebateEnv(Env):
         state.meta.update(
             {
                 "task": task.meta,
+                "task_export": dict(task_export),
                 "flipped": flipped,
                 "solo_first_speech": cfg.first_speech_non_debate_aware,
             }
@@ -572,7 +617,11 @@ class DebateEnv(Env):
                 visible = len(r.sample.tokens)
             flags: dict[str, float] = {}
             if r.slot.slot.kind == Kind.SOLUTION:
-                flags.update(self.family.format_flags(r.text))
+                if r.answer_format_valid is None:
+                    raise RuntimeError(
+                        "solution record is missing answer_format_valid from answer extraction"
+                    )
+                flags["answer_format_valid"] = float(r.answer_format_valid)
                 flags["extracted"] = float(r.extracted is not None)
             counts[(r.slot.speaker, r.slot.slot.name)] = SlotTokenCounts(
                 think=think,
@@ -600,17 +649,14 @@ class DebateEnv(Env):
         learned one) and the never-raises contract; this side owns the dedup."""
         pending: dict[tuple[Any, str], tuple[dict[str, Any], Any]] = {}
         for st in states:
-            if st.failed is not None:
-                continue
-            solutions = {
-                r.slot.speaker: r.extracted
-                for r in st.records
-                if r.slot.slot.kind == Kind.SOLUTION
-            }
-            for speaker in self.config.trained_speakers:
-                solution = solutions.get(speaker)
-                if solution is None:
+            for rec in st.records:
+                if (
+                    rec.slot.slot.kind != Kind.SOLUTION
+                    or rec.slot.speaker not in self.config.trained_speakers
+                    or rec.extracted is None
+                ):
                     continue
+                solution = rec.extracted
                 key = self._grade_key(st, solution)
                 if key not in pending:
                     pending[key] = (st.meta.get("task") or {}, solution)
@@ -618,39 +664,76 @@ class DebateEnv(Env):
             return {}, 0
         keys = list(pending)
         results = self.family.grade_batch([pending[k] for k in keys])
+        if len(results) != len(keys):
+            raise RuntimeError(
+                f"{type(self.family).__name__}.grade_batch returned {len(results)} "
+                f"results for {len(keys)} unique grading requests"
+            )
         return dict(zip(keys, results)), int(getattr(self.family, "last_grade_errors", 0))
 
-    def _attach_labels(
-        self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]
-    ) -> None:
-        """Park each solution slot's ground-truth label on the debate it came
-        from, so transcript exports carry it.
+    def _solution_census(
+        self,
+        states: list[DebateState],
+        grades: dict[tuple[Any, str], Optional[bool]],
+        grade_errors: int,
+    ) -> dict[str, float]:
+        """Count trained solution-slot outcomes before debate filtering.
 
-        Judge accuracy is derived from transcripts (winner x side x label),
-        never from aggregated metrics (AGENTS.md), and the label cannot be
-        recovered downstream: math's `gt` survives the export by being a
-        scalar, but codecontests' test cases are deliberately withheld from
-        every export, so re-grading offline would mean rejoining to the source
-        dataset and re-running the same 90s-timeout verifier that already ran
-        here.
-
-        st.meta["grades"][speaker] semantics, distinct on purpose:
-          absent -> never graded (no solution slot, or an untrained seat:
-                    _grade_solutions only grades trained_speakers)
-          None   -> graded and ungradeable (no ground truth, or grade raised)
-          bool   -> the label
+        Expected slots come from the compiled protocol rather than surviving
+        records. A final SlotRecord counts as produced even when its answer is
+        unparseable or a later judge slot fails. Conversely, a generation or
+        fidelity failure has no record and remains missing. Per-record format
+        results are retained for Docent so the census is independently
+        auditable without parsing each answer twice.
         """
+        expected_steps = {
+            cs.index: cs
+            for cs in self.protocol.compile()
+            if cs.slot.kind == Kind.SOLUTION
+            and cs.speaker in self.config.trained_speakers
+        }
+        expected = len(states) * len(expected_steps)
+        produced = valid = extracted = gradeable = 0
+
         for st in states:
-            if st.failed is not None:
-                continue
-            labels: dict[str, Optional[bool]] = {}
-            for r in st.records:
-                if r.slot.slot.kind != Kind.SOLUTION or r.extracted is None:
+            # Protocol indices identify expected final slots. Keeping the last
+            # record is defensive if retries ever retain intermediate records.
+            final_records = {
+                r.slot.index: r for r in st.records if r.slot.index in expected_steps
+            }
+            format_by_index: dict[str, bool] = {}
+            for index, rec in final_records.items():
+                produced += 1
+                if rec.answer_format_valid is None:
+                    raise RuntimeError(
+                        "solution record is missing answer_format_valid from answer extraction"
+                    )
+                is_valid = rec.answer_format_valid
+                format_by_index[str(index)] = is_valid
+                valid += int(is_valid)
+                if rec.extracted is None:
                     continue
-                key = self._grade_key(st, r.extracted)
-                if key in grades:
-                    labels[r.slot.speaker] = grades[key]
-            st.meta["grades"] = labels
+                extracted += 1
+                result = grades.get(self._grade_key(st, rec.extracted))
+                if isinstance(result, bool):
+                    gradeable += 1
+            st.meta["solution_answer_format_valid"] = format_by_index
+
+        grader_requests = len(grades)
+        return {
+            "grade_errors": float(grade_errors),
+            "grader_requests": float(grader_requests),
+            "expected_solution_slots": float(expected),
+            "produced_solution_slots": float(produced),
+            "answer_format_valid_count": float(valid),
+            "extracted_solution_slots": float(extracted),
+            "gradeable_solution_slots": float(gradeable),
+            "answer_format_valid_rate": float(valid / produced) if produced else 0.0,
+            "solution_production_rate": float(produced / expected) if expected else 0.0,
+            "extracted_solution_rate": float(extracted / produced) if produced else 0.0,
+            "gradeable_solution_rate": float(gradeable / extracted) if extracted else 0.0,
+            "grader_error_rate": float(grade_errors / grader_requests) if grader_requests else 0.0,
+        }
 
     def _attach_labels(
         self, states: list[DebateState], grades: dict[tuple[Any, str], Optional[bool]]
@@ -673,8 +756,6 @@ class DebateEnv(Env):
           bool   -> the label
         """
         for st in states:
-            if st.failed is not None:
-                continue
             labels: dict[str, Optional[bool]] = {}
             for r in st.records:
                 if r.slot.slot.kind != Kind.SOLUTION or r.extracted is None:
