@@ -315,3 +315,110 @@ math_pc_olmo32think_cispo_os3:
         - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
         - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
         - "++actor_rollout_ref.actor.optim.clip_grad=0.5"
+
+# OLMo-32B INSTRUCT debate arm on AIME (Ethan, 2026-08-12): strong instruct
+# debaters + the weak 4B judge — the debate twin of
+# aime_rlvr_olmo32_plan1k_cispo_os3 (the live instruct RLVR arm).
+# STANDALONE like the think arm above (protocol turn lists merge BY INDEX
+# under _extends). Same five-stage shape and per-slot TOTAL budgets as the
+# think arm; the think/visible split disappears because the instruct model
+# has no think channel — it derives inline in the visible speech, which is
+# exactly what the critic attacks.
+#   - debaters: the bf16 volume conversion (the HF repo ships fp32; loading
+#     that under TP2 OOM-kills the rollout workers — see aime_rlvr_olmo32)
+#   - dataset {type: aime}: AimeFamily reuses math.yaml's answer prompt, so
+#     the solo opening is byte-identical to the RLVR twin's answer turn
+#   - eval: plan_tokens 1000 + eval_max_tokens 1000 mirrors the RLVR twin's
+#     direct-eval shape (plan 1k, answer cap inherited 1000)
+#   - THROUGHPUT deviations from the twin (Ethan, 2026-08-13, ~20min/step was
+#     too slow): oversample 2 not 3 (first steps showed 0-6 degenerates per
+#     192 debates — the third draw was waste) and rollout gmu 0.45 not 0.33
+#     (more KV for 192 concurrent debates; the 0.18 judge still colocates on
+#     GPU 0 — if vLLM refuses to boot on the free-memory check, step this
+#     down before touching anything else).
+aime_pc_olmo32_cispo_os2:
+  protocol:
+    turns:
+      - alice: [{name: proposal, kind: solution, max_total_tokens: 1500}]
+      - bob:   [{name: critique, max_total_tokens: 1500}]
+      - alice: [{name: defense, max_total_tokens: 1500}]
+      - bob:   [{name: rebuttal, max_total_tokens: 300}]
+      - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
+                {name: verdict, kind: decision, max_total_tokens: 256}]
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math.yaml
+    entry: math_proposer_critic
+  fresh_positions: true
+  # Solo opening: rendered without any debate context so it shares the RLVR
+  # twin's prompt distribution; debate-awareness enters with the critique.
+  first_speech_non_debate_aware: true
+  plan_tokens: 1000
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: /workspace/models/olmo32-bf16
+        alias: proposer-alice
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: /workspace/models/olmo32-bf16
+        alias: critic-bob
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring:
+    scoring: continuous
+    confidence_source: json
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+  dataset: {type: aime, seed: 0}
+  training:
+    backend: verl
+    eval_max_tokens: 1000
+    wandb_entity: palaestra-research
+    wandb_project: debate-math
+    lora_rank: 32
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    ppo_epochs: 2
+    adv_length_norm: none
+    steps: 100
+    batch_size: 8
+    group_size: 8
+    lr: 1.0e-4
+    kl_coef: 0.02
+    kl_discount_factor: 0.0
+    eval_every: 10
+    eval_n: 93
+    save_every: 10
+    dynamic_sampling_retries: 0
+    oversample_factor: 2
+    kl_mechanism: loss
+    drop_zero_advantage: false
+    eval_split: dev
+    final_test_eval: true
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
+    verl:
+      n_gpus: 2
+      strategy: fsdp2
+      rollout_tp: 2
+      checkpoint_dir: /workspace/checkpoints
+      gpu_memory_utilization: 0.45
+      prompt_length: 8192
+      response_length: 2048
+      max_token_len_per_gpu: 16384
+      extra_overrides:
+        - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+        - "++actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean"
+        - "++actor_rollout_ref.actor.optim.clip_grad=0.5"

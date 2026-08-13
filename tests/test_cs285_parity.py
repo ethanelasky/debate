@@ -241,6 +241,10 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     debate = load_experiment(path, "cs285_mathhard_debate_cispo")
     validate_experiment(debate)
 
+    # Choice-style blind opening: the trained proposal renders under the task
+    # source's own messages, sharing the RLVR arm's prompt distribution.
+    assert debate["first_speech_non_debate_aware"] is True
+
     same_training = {
         "lora_rank", "loss", "ppo_epochs", "micro_batch", "warmup_steps",
         "adv_length_norm", "adv_population_std", "drop_zero_advantage",
@@ -258,6 +262,9 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     assert {s.model_file_path for s in trained.values()} == {
         "Qwen/Qwen2.5-Math-1.5B-Instruct"
     }
+    # Judge-debater parity (2026-08-12): the frozen judge is the same base
+    # model the debaters train from.
+    assert frozen["judge"].model_file_path == trained["alice"].model_file_path
     assert all(
         s.sampling.train.temperature == 1.0 and s.sampling.train.top_p == 1.0
         for s in trained.values()
@@ -275,9 +282,12 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
         for cs in env.protocol.compile()
         if cs.speaker in trained
     ]
+    # 512 proposal (RLVR answer shape) + 384 later speeches: the full-pool
+    # render scan (2026-08-13) shows 4x512 overflows the 3584 prompt guard on
+    # the longest problems (worst rebuttal 3760; crashed run u7oky38d step 30).
     assert trained_slots == [
         ("alice", "proposal", 512),
-        ("bob", "critique", 512),
-        ("alice", "defense", 512),
-        ("bob", "rebuttal", 512),
+        ("bob", "critique", 384),
+        ("alice", "defense", 384),
+        ("bob", "rebuttal", 384),
     ]
