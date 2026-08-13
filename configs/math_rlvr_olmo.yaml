@@ -4,40 +4,19 @@
 # doesn't move eval, the problem is lr/LoRA capacity, not the debate loop.
 #
 # Run (on the pod): scripts/pod_run.sh rlvr math_rlvr_olmo_l5 --steps 100 --lr 1e-4
+_includes: [_olmo_training.yaml]
 
 math_rlvr_olmo_l5:
+  _extends: _olmo_train_math
   model: allenai/Olmo-3-7B-Instruct-DPO
   max_completion_tokens: 2000
   dataset: {type: math, levels: 5, seed: 0}
   training:
-    backend: verl
     verl:
       n_gpus: 1
-      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
       gpu_memory_utilization: 0.45 # no judge server: rollout can take more than debate's 0.33
       prompt_length: 1024          # system + one MATH problem
       response_length: 2000
-      max_token_len_per_gpu: 16384
-      checkpoint_dir: /workspace/checkpoints
-    # The TEAM, not the api key's personal default entity — without this,
-    # runs land in whoever launched them's own namespace and the rest of
-    # the team cannot see them.
-    wandb_entity: palaestra-research
-    wandb_project: debate-math
-    lora_rank: 32
-    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.2}
-    ppo_epochs: 1
-    adv_length_norm: count
-    steps: 100
-    batch_size: 8
-    group_size: 8      # 8-way groups: tighter GRPO baselines than the debate runs' 4
-    lr: 1.0e-4         # the debate lr that moved the policy (k1 grew) without eval gains
-    kl_coef: 0.02
-    kl_discount_factor: 0.0
-    eval_every: 5
-    eval_n: 256        # +-3.1pp binomial noise
-    eval_max_tokens: 2000
-    save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
 # CoT-discovery arm: the neutral prompt (math_nocot.yaml — no step-by-step
 # ask, no answer-only ban; deletion-only variant, test-pinned). Question: does

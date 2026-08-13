@@ -38,32 +38,16 @@
 #     [-10, 10] (gradient zeroed past delta ~2.6). Compound effect ~1.3-1.9x
 #     their pull — watch loss/kl_loss; drop kl_coef toward 0.032 only if it
 #     runs hot vs the reference curve.
-# The validated optimizer/loop, shared verbatim by every arm in this file
-# (Ethan, 2026-08-13). Extracted so the debate twin cannot drift from the
-# RLVR arms by hand-editing: before this both spelled the same ~22 keys out
-# longhand and only tests/test_cs285_parity.py noticed a divergence.
-#
-# ONLY `training:` lives here, deliberately. The RLVR arms' experiment-level
-# keys (model / temperature / top_p / max_completion_tokens /
-# min_completion_tokens) are NOT hoisted: they are absent from run_debate's
-# EXPERIMENT_KEYS, so a debate arm inheriting them dies in
-# validate_experiment. That rejection is load-bearing — exp-level temperature
-# is what feeds cfg.sampling.temperature, and a non-1.0 value there switches
-# on train.py's tempered re-anchor forward (train.py:495), the seam DebateEnv
-# forbids because trained seats anchor CISPO on RAW sampler logprobs. The
-# runners' disjoint key vocabularies are the guardrail, not an oversight.
-#
-# `loss` stays per-arm: it is this file's independent variable.
-# extra_overrides lives here whole — deep_merge merges lists BY INDEX, so a
-# child redeclaring a shorter list would silently inherit the parent's tail.
+# Shared optimizer/loop for every arm below. Only `training:` — the RLVR
+# experiment-level keys (model / temperature / top_p / max|min_completion_tokens)
+# are absent from run_debate's EXPERIMENT_KEYS and would fail validate_experiment.
+# `loss` stays per-arm.
 _cs285_recipe:
   training:
     backend: verl
     verl:
       # n_gpus / rollout_tp / gpu_memory_utilization come from the topology
-      # entry (configs/topologies.yaml). prompt_length and
-      # max_token_len_per_gpu are per-arm: they follow the rendered context,
-      # which is what the environment changes.
+      # entry (configs/topologies.yaml).
       response_length: 512
       checkpoint_dir: /workspace/checkpoints
       extra_overrides:
@@ -185,11 +169,9 @@ cs285_mathhard_dapo:
 #     budget. Judge deliberation 384 for the same window: the parity judge
 #     still overflows on 26/2289 rows (1.1%) at verdict — those debates fail
 #     gracefully and oversample backfills; the direct eval never sees a judge.
-# `training` inherits _cs285_recipe, so it mirrors the validated CISPO arm by
-# construction; only loss, the verl context shapes, and oversampling are set
-# here. tests/test_cs285_parity.py still pins loss equality with the RLVR twin.
-# Run (rbtvzsjz was 1xH200; the RLVR twins ran 1xB200 — topology is a
-# speed-only deviation, see the header):
+# `training` inherits _cs285_recipe; only loss, the verl shapes, and
+# oversampling are set here.
+# Run (1xH200; the RLVR twins ran 1xB200):
 #   CONFIG=configs/cs285_validate.yaml bash scripts/pod_run.sh debate cs285_mathhard_debate_cispo
 cs285_mathhard_debate_cispo:
   _extends: _cs285_recipe
@@ -206,14 +188,10 @@ cs285_mathhard_debate_cispo:
     entry: math_proposer_critic
   fresh_positions: true
   # Blind/solo opening ("choice"-style, matching the MB choice arms and the
-  # olmo think debate arm): slot 0 renders THIS arm's task source messages
-  # verbatim — alice's system prompt and preamble are suppressed there
-  # (prompts.py solo_slot0), so the opening carries no debate framing at all,
-  # and it shares a prompt distribution with this arm's own direct eval. NOT
-  # with cs285_mathhard_cispo: that arm loads math_hw4.yaml and this one loads
-  # math.yaml (see "Intentional differences" above). Debate framing starts at
-  # bob's critique. Note the blind speech is slot 0 only — alice speaks again
-  # at `defense` fully debate-aware, and CISPO trains on both.
+  # olmo think debate arm): slot 0 renders this arm's task source messages
+  # verbatim, with alice's system prompt and preamble suppressed
+  # (prompts.py solo_slot0). Slot 0 only — alice's later `defense` is fully
+  # debate-aware. Debate framing starts at bob's critique.
   first_speech_non_debate_aware: true
   agents:
     alice:
@@ -251,15 +229,11 @@ cs285_mathhard_debate_cispo:
       - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0, prompt_file: infra/prompts/tasks/math.yaml}
   training:
-    # Must match cs285_mathhard_cispo's loss exactly — pinned by
-    # tests/test_cs285_parity.py, which is what makes this a controlled
-    # derivation rather than a lookalike.
+    # must match cs285_mathhard_cispo (pinned by tests/test_cs285_parity.py)
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     verl:
-      # 3584 + 512 = 4096 = max_token_len_per_gpu: the debate context is the
-      # binding constraint, so verl's dynamic batcher fits exactly ONE
-      # worst-case sequence per forward/backward pass. That is why this arm's
-      # optim phase runs ~3x the RLVR twin's despite an identical recipe.
+      # 3584 + 512 = 4096 = max_token_len_per_gpu: one worst-case sequence per
+      # forward/backward pass.
       prompt_length: 3584
       max_token_len_per_gpu: 4096
     # Backfill degenerate debates (unparseable opening answer) instead of
