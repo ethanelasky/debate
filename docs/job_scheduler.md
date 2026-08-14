@@ -141,7 +141,9 @@ applies only to stop-capable profiles.
   duplicate. Approval item 13 is the explicit exception: emergency-killed unknown work permanently fails.
 - **APPROVED:** stopped reuse for stop-capable workers with 24-hour paid, 6-hour ephemeral, and `never` explicit-free
   retention.
-- **APPROVED:** RunPod and Vast are completion scope. Live tests require explicit opt-in.
+- **APPROVED:** RunPod and Vast are completion scope. Paid live integration execution is governed by the standing
+  authorization and provider-specific blockers in the dated approval record; destructive live tests remain separately
+  gated.
 - **APPROVED SAFETY CONSTRAINT:** GC never targets independently managed persistent/network-volume resources, history,
   snapshots, or SQLite.
 
@@ -393,8 +395,11 @@ dollar-budget engine. These exclusions are explicit rather than described as an 
 A profile displays one resolved policy before mutation. Missing caps, ambiguous storage, or incompatible lifecycle
 fails closed. Exact file format is not an approval decision.
 
-The current RunPod paid smoke is only environment-gated and **must not be enabled**. The first test-revision action is
-to hard-skip it until it is rewritten with price/storage checks, coherent emergency deadline, and actual service path.
+The original RunPod paid smoke was only environment-gated and is now hard-skipped. It **must not be enabled** until it
+is rewritten with price/storage checks, a coherent provider-enforced emergency deadline on
+the create call itself, and the actual service path. After those requirements are implemented and the missing
+`runpod-safe` seam is proven, the rewritten nondestructive smoke may run under the dated standing paid-integration
+authorization and its ceiling; this does not authorize any improvised create path around that seam.
 
 ## Worked workflows
 
@@ -484,7 +489,9 @@ production scheduler work, revise the tests to require:
 
 Before all other scheduler test revision, make the RunPod paid test unconditionally skip; no environment variable may
 enable it. Its future implementation remains behind the unresolved RunPod seam/backstop decision, and its execution
-requires a later separate authorization.
+is allowed only after that decision proves a provider-enforced termination deadline on create and only within the
+dated standing paid-integration authorization. It does not require another per-run approval when those conditions and
+the standing ceiling are satisfied.
 Provider audits must traverse the actual service path and use independent
 provider and volume inventory; the current harness is insufficient.
 
@@ -507,14 +514,15 @@ flowchart TD
     L --> RI[Implement gated RunPod stop capable smoke]
     RB --> RI
     RC --> RI
-    RI --> RP[Explicitly authorized RunPod stop capable smoke passes]
+    RI --> RP[Standing-authorized RunPod stop capable smoke passes]
     L --> RNI[Implement gated RunPod network volume lifecycle smoke]
     RB --> RNI
     RC --> RNI
-    RNI --> RNP[Explicitly authorized capability smoke passes]
+    RNI --> RNP[Capability smoke passes under its applicable action gate]
     L --> G[Generic local GC safety]
-    L --> VP[Explicitly authorized Vast paid smoke passes]
-    VB --> VP
+    L --> VI[Implement Vast paid service path smoke]
+    VB --> VI
+    VI --> VP[Standing authorized Vast smoke passes within 30m one GPU under 5 dollars and records actual cost]
     G --> RD[Implement gated RunPod destructive GC smoke]
     RP --> RD
     RD --> RDP[Explicitly authorized RunPod destroy smoke passes]
@@ -563,15 +571,21 @@ Implementation arc:
 4. Land the approved namespace contract and focused tests in Debate as a standalone commit.
 5. Revise all remaining scheduler tests. Read-only Vast discovery may run in this phase as a non-conformance probe.
    Resolve the RunPod seam provenance and item-11 backstop decision before implementing any RunPod lifecycle smoke; if
-   a replacement is needed, its explicit specification requires separate approval. Execution authorization is a
-   later, distinct gate. No RunPod adapter or lifecycle-smoke implementation begins until both that decision and the
+   a replacement is needed, its explicit specification requires separate approval. No paid create may occur unless
+   that path proves a provider-enforced termination deadline on the create call itself. No RunPod adapter or
+   lifecycle-smoke implementation begins until both that decision and the
    item-18 credential-source decision are approved; neither credential option is selected by this plan.
 6. Implement parallel local core/service and wrapper/transfer tracks, then real local composition and restart/fence
    smoke.
 7. After the seam/backstop decision, implement the RunPod service-path stop-capable and network-volume capability
-   smokes; run each only with separate authorization.
-8. After a second approval of a proven independent backstop, implement the Vast paid smoke; run it only with separate
-   authorization.
+   smokes. Their nondestructive paid CREATE/RESUME/RUN/STOP/COLLECT paths may run under the dated standing authorization
+   and ceiling; terminate/destroy paths remain separately gated.
+8. After a second approval of a proven independent backstop, implement the Vast paid service-path smoke. Before that
+   proof and approval, paid Vast execution stays blocked despite the available credential; read-only discovery remains
+   allowed. Afterward, its nondestructive CREATE/RESUME/RUN/STOP/COLLECT path may run under the standing ceiling of a
+   provider-side TTL no longer than 30 minutes, one GPU, and estimated cost strictly below $5, and must record actual
+   cost against the estimate. Only the passing service-path result feeds Vast shadow; terminate/destroy remain
+   separately gated.
 9. Implement generic local GC gates, then separately implement gated RunPod and Vast exact-worker destructive smokes.
    Auto-destroy remains disabled per provider until its smoke is explicitly authorized, passes, and receives immutable
    signoff.
@@ -683,9 +697,36 @@ The prerequisite order is mandatory:
 4. Land the standalone Debate launch-namespace fix, with its focused tests, as its own commit.
 5. Only then revise all remaining scheduler tests or begin other scheduler work.
 
-Paid or destructive provider execution remains unauthorized. The Vast backstop remains unauthorized and requires a
-separate approval. No approval here authorizes a paid/destructive smoke.
+### 2026-08-14 paid-integration authorization correction
 
-Approving the design permits implementation of gated paid/destructive smokes, but **does not authorize running one**.
-Each execution needs a separate explicit opt-in with the exact owned target or unique creation nonce, provider/profile,
-price and storage ceilings, runtime/deadline, evacuation proof, and confirmation that no independent volume is deleted.
+This correction is normative and supersedes earlier blanket statements that paid provider execution is unauthorized
+or requires a new per-run opt-in. It does not amend the preceding design decisions, blockers, prerequisite order, or
+destructive-action gates.
+
+- **Standing paid-only authorization:** real paid integration `CREATE`, `RESUME`, `RUN`, `STOP`, and `COLLECT` are
+  authorized without returning for per-run approval when every condition below is satisfied. `TERMINATE`, `DESTROY`,
+  auto-destroy enablement, the RunPod destructive GC smokes RD/RDP, and the Vast destructive GC smokes VD/VDP remain
+  separately gated. Approval item 17's auto-destroy authority is not activated by this correction.
+- **Absolute non-targeting constraint:** no authorized execution may target independently managed persistent or
+  network-volume resources, history, snapshots, or SQLite. The missing volume-identity audits are an additional reason
+  destructive execution remains closed.
+- **Hard per-run ceiling:** every paid run must use at most one GPU, a provider-side TTL of no more than 30 minutes,
+  and an estimated cost strictly below $5. Record actual cost against the estimate for every run. A smoke needing a
+  longer deadline, more GPUs, or a higher estimate requires a new explicit approval with those numbers before it runs.
+- **No create without a provider-enforced deadline:** a paid create is authorized only when a provider-enforced
+  termination deadline is proven on the create call itself. A scheduler, Mac, or worker-local timer is insufficient.
+  Because `runpod-safe` is missing, paid RunPod create remains blocked. Do not bypass or improvise around the missing
+  seam. First determine whether the original tool exists elsewhere and restore/verify it if found; if it is genuinely
+  gone, the separately approved replacement-spec process in items 10/11 governs.
+- **Current RunPod smoke remains hard-skipped:** `RUNPOD_PAID_INTEGRATION=1` must remain inert until the test is
+  rewritten with price and storage checks, a coherent provider-enforced emergency deadline, and traversal through the
+  actual scheduler service path. Once those requirements and the RunPod seam proof are satisfied, its nondestructive
+  paid path may run within the standing ceiling without another per-run approval.
+- **Paid Vast remains technically blocked:** `VAST_API_KEY` exists in `~/code/.env`, but paid Vast execution is not
+  authorized until approval item 12's independent bounded mechanism is proven and separately approved. Read-only Vast
+  discovery proceeds. The presence of an executable credential does not lift this blocker.
+
+Destructive execution continues to require a separate explicit opt-in with the exact owned target or unique creation
+nonce, provider/profile, price and storage ceilings, runtime/deadline, evacuation proof, independent volume-identity
+audit, and confirmation that no independent volume is deleted. Auto-destroy remains disabled until the applicable
+destructive smoke is separately authorized, passes, and receives immutable signoff.
