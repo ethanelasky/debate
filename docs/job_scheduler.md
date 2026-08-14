@@ -30,6 +30,12 @@ profile: runpod:h200x1
 argv: ["bash", "scripts/train_one.sh", "configs/smoke.yaml"]
 inputs: ["scripts/train_one.sh", "configs/smoke.yaml"]
 outputs: ["outputs/result.json", "checkpoints/final"]
+checkpoint_destination:
+  kind: bucket
+  endpoint: https://s3api-example.runpod.io
+  region: example-region
+  bucket: example-bucket
+  prefix: checkpoints
 max_attempts: 3
 max_runtime: 6h
 ```
@@ -76,26 +82,29 @@ the original recommendation text where they conflict.
 8. **Idle:** `idle_stop_after: 0` for paid/ephemeral stop-capable profiles and `never` for explicitly free profiles.
    Recommended to avoid paid running-compute waste while retaining free capacity. Stopping clears RunPod container
    disk, restart capacity is not guaranteed, and stopped storage may still bill.
-9. **RunPod network-volume lifecycle:** current official pages are inconsistent about stop support, so resolve it from
-   a read-only capability probe plus an integration smoke for the exact profile. If stop is supported, use normal
-   stop/reuse and retention. If not, run any compatible queued job first, then after verified evacuation terminate the
-   scheduler-owned Pod only when its Pod-local storage is lifetime-disposable, and later create another against the
-   same independent volume. Never guess or silently substitute termination.
-10. **AMENDED/OPEN — RunPod launch seam:** preserve the repository's `pod_create.sh`/`runpod-safe` ownership receipt,
-    readiness, and deadline boundary; extend that seam rather than bypassing it. This original recommendation is not
-    operative until the dated approval record's provenance/replacement decision is resolved.
-11. **AMENDED/OPEN — RunPod crash backstop:** use `--stop-after` for stop-capable profiles; use irreversible
-    `--terminate-after` only for scheduler-owned profiles whose worker-local storage is disposable or independently
-    persistent. Deadline-aware admission—including every hot or stopped reuse—must prove a live deadline with runtime
-    plus evacuation margin; otherwise create fresh capacity or block. This original mechanism is not approved; the
-    dated approval record governs and blocks it pending the RunPod seam/backstop decision.
+9. **AMENDED — RunPod network-volume lifecycle:** current official pages are inconsistent about stop support, and the
+   ratified replacement seam grants neither `terminateAfter` nor resume. Initial RunPod support therefore refuses all
+   network-volume profiles. Read-only capability discovery may continue, but enabling any such profile requires a
+   later explicit decision; never guess or silently substitute termination.
+10. **AMENDED — RunPod launch seam:** the missing `runpod-safe` implementation cannot be preserved or inferred from
+    guarantee-only documentation. The six ratified replacement-seam answers in the dated record govern the proposed
+    v3 seam. Its draft specification must be reconciled with those answers and independently reviewed before
+    implementation; clauses beyond those exact answers remain unapproved.
+11. **AMENDED — RunPod crash backstop:** a live-certified provider `stopAfter` on create is the accepted
+    compute-stopping backstop for an initially supported, stop-capable non-network-volume profile. There is no
+    `terminateAfter` carveout, and resume remains blocked because no inspected start/update surface can install or
+    read back a fresh deadline. All RunPod creates remain blocked except the one exact ratified bootstrap proof until
+    certification and the reconciled v3 seam exist. Even that bootstrap may run only through the reconciled,
+    independently reviewed minimal v3 seam after installing and digest-pinning a verified upstream driver—never via
+    ad hoc GraphQL or direct `runpodctl`. The dated record supplies the complete limits.
 12. **Vast crash backstop:** implement read-only discovery now; keep paid Vast blocked until an independent bounded
     mechanism is proven and brought back for a second approval. A worker-local watchdog with a provider key is not
     equivalent and adds credential/liveness risk.
-13. **APPROVED — Unknown-work emergency behavior:** let the hard deadline fire even when start intent has no terminal
-    record. Uncollected local data may be lost and the job permanently fails without retry even after provider absence
-    is confirmed. The unbounded-spend alternative is rejected. This semantic branch is approved; its RunPod mechanism
-    remains blocked with item 11.
+13. **APPROVED — Unknown-work outcome semantics only:** if a separately authorized provider backstop ends compute when
+    start intent has no terminal record, uncollected local data may be lost and the job permanently fails without retry
+    even after provider absence is confirmed. The unbounded-spend outcome alternative is rejected. This item grants no
+    STOP, TERMINATE, or DESTROY verb authority; the RunPod `stopAfter` mechanism remains gated by item 11's
+    reconciliation and live-certification requirements.
 14. **Secrets:** v0 never transports job secret values. Prepared images/volumes or provider-managed injection supply
    them; jobs declare names only. Recommended for isolation, at the cost of worker preparation.
 15. **Capacity caps:** global and per-profile `max_workers`; every scheduler-enrolled/controlled worker and unresolved
@@ -105,13 +114,16 @@ the original recommendation text where they conflict.
     Use the worst applicable running/stopped storage rate. Display bandwidth or other uncapped provider charges
     explicitly. This is not a cumulative per-job/day/account spend cap: independent volumes and nondisposable stopped
     storage can bill indefinitely.
-17. **Normal GC auto-destroy authority:** only workers created and durably receipted by this scheduler, with
-    lifetime-disposable local storage and verified evacuation, may be auto-destroyed. Recommended; manual/foreign
-    workers never qualify. Approval items 11 and 13 separately govern a crash deadline that may terminate before
-    evacuation and permanently fail the attempt.
-18. **AMENDED/OPEN — Provider credentials:** load only adapter-declared provider credentials service-side, never source
-    a credential file wholesale; use dedicated least-privilege keys where the provider supports them and acknowledge
-    unavoidable residual account authority. The exact RunPod source awaits Ethan's choice in the dated approval record.
+17. **OPEN — proposed normal-GC auto-destroy eligibility, not authority:** if Ethan later authorizes auto-destroy for a
+    provider, only workers created and durably receipted by this scheduler, with lifetime-disposable local storage and
+    verified evacuation, could qualify; manual/foreign workers never qualify. A separately authorized destructive
+    smoke and immutable signoff are prerequisites, not authorization. Auto-destroy remains disabled until Ethan gives
+    a further explicit provider-specific authorization after that signoff. Item 13 governs only the recorded outcome
+    if an independently authorized crash backstop ends compute; it grants no STOP, TERMINATE, or DESTROY verb authority.
+18. **APPROVED — Provider credentials:** load only adapter-declared provider credentials service-side, never source a
+    credential file wholesale; use dedicated least-privilege keys where the provider supports them and acknowledge
+    unavoidable residual account authority. For RunPod, the adapter/wrapper parses only the `apikey` field from
+    `~/.runpod/config.toml`, uses an isolated `HOME`, scrubs the inherited environment, and pins provider endpoints.
 19. **Provisioning authority:** within approved profile caps, the scheduler may automatically create and resume workers;
     provider selection and environment/bootstrap preparation remain explicit profile/operator inputs. Recommended to
     remove the agent/script sequencing loop; alternative manual-only capacity gives up unattended routing.
@@ -138,7 +150,8 @@ applies only to stop-capable profiles.
   logs/partials and record unavailable evidence.
 - **APPROVED:** verified terminal nonzero may retry on the same healthy worker. Lost acknowledgement is ambiguous.
   Only confirmed worker loss resolves ordinary ambiguous worker loss and allows retry elsewhere; suspicion allows no
-  duplicate. Approval item 13 is the explicit exception: emergency-killed unknown work permanently fails.
+  duplicate. Approval item 13 is the outcome exception: unknown work ended by a separately authorized backstop
+  permanently fails.
 - **APPROVED:** stopped reuse for stop-capable workers with 24-hour paid, 6-hour ephemeral, and `never` explicit-free
   retention.
 - **APPROVED:** RunPod and Vast are completion scope. Paid live integration execution is governed by the standing
@@ -147,8 +160,9 @@ applies only to stop-capable profiles.
 - **APPROVED SAFETY CONSTRAINT:** GC never targets independently managed persistent/network-volume resources, history,
   snapshots, or SQLite.
 
-Approval item 17 is the approved irreversible normal-GC authority boundary. Auto-destroy remains disabled per provider
-until its separately authorized smoke passes and receives immutable signoff.
+Item 17 records a proposed irreversible normal-GC eligibility boundary, not approved authority. Auto-destroy remains
+disabled even after a separately authorized destructive smoke passes and receives immutable signoff; enabling it
+requires a subsequent explicit provider-specific authorization from Ethan.
 
 The user-facing specification ends here except that the dated approval record below is normative and amends both the
 checklist and appendix where they conflict. Everything else below is the implementation, safety, test, and migration
@@ -225,13 +239,14 @@ flowchart LR
     C -->|yes and erased layers disposable| S[Stop and retain]
     S --> F{Retention finite}
     F -->|yes| X[Wait until retention expires]
-    X -->|normal GC approved| D[Persist destroy intent]
+    X -->|destructive action separately authorized| D[Persist destroy intent]
     F -->|no| K[Keep stopped]
-    C -->|no| N[Keep running or gated terminate]
-    B[Crash billing backstop] --> E[Emergency stop or terminate]
+    C -->|no| N[Block lifecycle action]
+    B[Crash billing backstop] --> E[Provider compute stop]
 ```
 
-The backstop is an emergency cost path, not a create/normal-GC path. Its artifact tradeoff is approval items 11–13.
+The initial RunPod backstop is certified `stopAfter`, which stops compute. Any TERMINATE mechanism or action remains
+separately gated. Item 13 defines the attempt outcome if an authorized backstop fires; it grants no provider verb.
 
 ## Internal responsibilities
 
@@ -247,7 +262,8 @@ The single process owns seven responsibilities, not seven services or a required
 
 Launchd runs while the Mac is available. Machine off means no dispatch/reconciliation/GC; provider emergency handling
 is the only backstop. Provider authentication is available only service/adapter-side and never enters a cleared job
-environment, argv, SQLite, artifacts, or logs. The exact RunPod credential source remains open under approval item 18.
+environment, argv, SQLite, artifacts, or logs. Under approval item 18, the RunPod adapter/wrapper reads only `apikey`
+from `~/.runpod/config.toml`; it does not source that file or expose its contents to a job process.
 
 ## State and reconciliation
 
@@ -264,8 +280,9 @@ Rules:
   only authoritative evidence resolves it.
 - Readiness/staging failure before proven start consumes no attempt. Proven start does. Collection never reruns compute.
 - Exit zero needs verified collection. Collected terminal nonzero may retry; `max_attempts` exhaustion fails.
-- A hard provider deadline that resolves unknown work is not ordinary confirmed loss: the job permanently fails and
-  its missing evidence is recorded. It never retries.
+- If a separately authorized provider backstop resolves unknown work by ending compute, that outcome is not ordinary
+  confirmed loss: the job permanently fails, its missing evidence is recorded, and it never retries. This state rule
+  grants no provider verb authority.
 - V0 has no cancel. Break-glass uses fenced recovery, not a hidden cancellation state.
 
 Before create, store fresh inventory, a cryptographic nonce, and the full requested spec. After lost acknowledgement,
@@ -293,12 +310,108 @@ injection; inherit no local/other provider secrets. Profiles may add required no
 V0 never transports job secret values. Prepared images/volumes or provider-managed injection supply them. Readiness
 checks names without echoing values. Service provider auth follows approval item 18, never argv.
 
-Every attempt has one immutable launch namespace assigned before any sink is constructed. A scheduler attempt uses its
-durable attempt namespace; a manual launch falls back to a newly generated UUID. The identical namespace flows through
+Every attempt has one immutable `DEBATE_LAUNCH_NAMESPACE`, resolved before any sink is constructed. A scheduler attempt
+uses its durable attempt namespace; a manual launch generates one UUID and exports/reuses that same value throughout
+the process. The value is validated as one strict path-safe component of 1–128 characters. It flows unchanged through
 checkpoint, eval, Docent/local transcript, W&B metadata and artifact paths, output declarations, and checkpoint sync.
-Every sink preserves it and refuses an existing/conflicting destination rather than overwriting. The standalone Debate
-change must preserve `run_identity_suffix` exactly. Moving `_docent_launch_id` away from `pid-N` orphans existing
-`docent/<run>/pid-N/` directories; its commit records that compatibility consequence.
+
+The approved sink contracts are:
+
+1. `run_eval --artifact-root ROOT` atomically reserves `<root>/<namespace>/` before work and refuses an existing target.
+   Its fixed local outputs are `results.jsonl`, `summary.json`, and `docent.jsonl` in that directory.
+2. Checkpoint sync receives an exact checkpoint directory, the namespace, and an explicit destination frozen with the
+   run submission; it performs no wildcard/prefix discovery and never infers a destination from ambient credentials.
+   The destination is either `local`, with one exact absolute directory, or `bucket`, with endpoint, region, bucket,
+   and key prefix all supplied by the submitted config. Credentials remain ambient and service-side rather than part
+   of the destination. An absent, unknown, incomplete, or unparseable destination fails closed. A local destination
+   that is the volume already containing the exact checkpoint directory is a legitimate no-op. Bucket objects use
+   `<configured-prefix>/{run}/{namespace}/{step}/{relative-path}`. The namespace layout, reservation marker,
+   conditional `IfNoneMatch: "*"` no-overwrite boundary, final prefix-listing verification, and no-retry/no-adoption
+   semantics remain unchanged. Only LoRA adapters are synced: the backend forces `save_lora_only=True` whenever
+   `lora_rank > 0`, so conditional single PUT is the supported bucket path. Files over 5 GiB are refused and multipart
+   upload is not implemented.
+3. W&B display `run_name`, `run_identity_suffix`, and protocol/scientific identity remain unchanged. W&B config keeps
+   append-only `launch_namespaces` history, and transcript artifacts carry the scalar namespace and namespaced internal
+   path. The namespace is launch provenance, not protocol identity. The concurrency mechanism is governed outside
+   these Ethan-approved sink contracts by the separately recorded Claude-delegated W&B decision below; Ethan has not
+   reviewed its substance.
+4. Every namespaced sink refuses an existing/conflicting destination rather than overwriting. Because a manual launch
+   normally generates a fresh UUID, this refusal is essentially future-facing protection for scheduler-supplied
+   attempt namespaces rather than protection the current manual path is likely to exercise.
+
+### Checkpoint destination before and after
+
+The retired checkpoint path selected its destination from ambient credentials and mixed that choice with legacy
+source discovery and layout:
+
+```mermaid
+flowchart TD
+    A[Checkpoint save]
+    B[Wildcard run prefix discovery]
+    C{Ambient AWS access key present}
+    D[Hardcoded S3 endpoint region and bucket]
+    E[Private Hugging Face repository]
+    F[Legacy non namespaced run and step path]
+    A --> B
+    B --> C
+    C -->|yes| D
+    C -->|no| E
+    D --> F
+    E --> F
+```
+
+The approved destination architecture freezes the choice with the submission and binds successful sync state to that
+exact destination:
+
+```mermaid
+flowchart TD
+    A[Submitted run config]
+    B{Destination parses}
+    X[Refuse before sync]
+    L[Local exact absolute directory]
+    N[Checkpoint already durable locally so no op]
+    U[Configured bucket endpoint region bucket and prefix]
+    P[Safe run namespace and step prefix]
+    R[Conditional reservation marker]
+    Z{LoRA adapter file at most 5 GiB}
+    I[Conditional single PUT]
+    G[GET object and verify SHA256]
+    F[Verify exact final prefix listing]
+    S[Durable sync state bound to destination]
+    Q[Fail closed and preserve evidence with no retry or adoption]
+    A --> B
+    B -->|invalid| X
+    B -->|local| L
+    L --> N
+    N --> S
+    B -->|bucket| U
+    U --> P
+    P --> R
+    R --> Z
+    Z -->|yes| I
+    Z -->|no| Q
+    I --> G
+    G --> F
+    F --> S
+    R -->|conflict or error| Q
+    I -->|conflict or error| Q
+    G -->|mismatch or error| Q
+    F -->|mismatch or error| Q
+```
+
+Hugging Face has no branch in the approved architecture. Its existing repositories remain untouched and unread. The
+diagram begins only after a checkpoint is eligible for sync: the writer-ready and live-source stabilization boundary
+remains a pending adjacent decision and is not approved by this destination contract.
+
+Checkpoint synchronization's process/coordination redesign, PID/lock publication semantics, and partial-prefix
+continuation or quarantine policy remain pending recommendations, not approved decisions. The writer-ready and
+live-source stabilization boundary likewise remains pending and unapproved.
+
+The standalone Debate commit records, without deleting or migrating old data, that changing Docent launch paths leaves
+existing `docent/<run>/pid-N/` directories orphaned but readable and untouched. Likewise, existing bucket
+`checkpoints/{run}/{step}/` keys become unreachable through the new namespaced layout; they remain orphaned and
+untouched. Hugging Face is retired as a checkpoint destination: existing `ethanelasky/ckpt-{run}` repositories are
+left in place, untouched and unread. The commit preserves `run_identity_suffix` exactly.
 
 Attempt evidence is immutable after verification:
 
@@ -313,18 +426,20 @@ Attempt evidence is immutable after verification:
 ```
 
 Terminal state, stdout, stderr, and every declared output are always required attempt evidence. Debate declares eval
-results and a checkpoint manifest by default. Large checkpoint bytes remain on independently managed volumes; the Mac
-receives a verified manifest with hashes and the provider-qualified volume identity. Missing declared outputs prevent
-success; failure partials remain evidence. For analyzed workloads, local transcript/Docent output is declared and
-success-gating. Docent and W&B uploads are best-effort external provenance, use the immutable per-attempt namespace,
-and record confirmed receipts; an ambiguous upload is not automatically repeated. The scheduler never deletes stale
-namespaces or content on independent volumes: retention there is operator-owned. Approval items 5–6 govern other
+results and a checkpoint manifest by default. LoRA adapter checkpoint bytes remain at the submitted exact local
+directory or S3-compatible bucket destination; the Mac receives a verified manifest with hashes and the qualified
+destination identity. Missing declared outputs prevent success; failure partials remain evidence. For analyzed
+workloads, local transcript/Docent output is declared and success-gating. Docent and W&B uploads are best-effort
+external provenance, carry the immutable per-attempt namespace, and record confirmed receipts; an ambiguous upload is
+not automatically repeated. External Docent collection identity is governed only by the separately recorded
+Claude-delegated decision below, whose substance Ethan has not reviewed. The scheduler never deletes stale namespaces
+or checkpoint content at configured destinations: retention there is operator-owned. Approval items 5–6 govern other
 undeclared files and worker-lifetime disposal authority.
 
 ## Enrollment, handoff, and provider authority
 
 Account inventory grants observation, not authority. Normal agents/operators **must not** provider-mutate; this is
-policy until credential isolation is approved, not a claim that they cannot.
+policy until the approved credential isolation is implemented and verified, not a claim that they cannot.
 
 A manual worker needs exact-ID/profile registration, exclusive dedication, no unmanaged workload, storage attestation,
 and watchdog handoff. Otherwise it is observe-only/no auto-stop. Enrollment never grants auto-destroy.
@@ -342,8 +457,9 @@ Explicit free means stopped retention `never`, not a claim about provider price.
 Paid stopped retention is 24 hours; ephemeral is 6. Finite retention does not authorize deletion. Before any normal
 scheduler STOP, TERMINATE, or DESTROY, the adapter states which storage layers the action erases; each erased layer
 must be lifetime-disposable and its obtainable declared evidence evacuated. Otherwise the action is blocked and
-billing may continue until operator resolution. Approval item 13 is the explicit emergency exception: its hard
-deadline may fire without evacuation, permanently fail the job, and record missing evidence.
+billing may continue until operator resolution. Item 13 defines outcome semantics only: if a separately authorized
+provider backstop ends compute without evacuation, the job permanently fails and records missing evidence. It does not
+authorize STOP, TERMINATE, or DESTROY.
 
 GC order:
 
@@ -364,10 +480,8 @@ destroy-erased worker-local layer marked disposable plus finite retention; other
 
 RunPod documents: container disk is wiped on stop; volume disk persists on stop and is deleted with the Pod; network
 volumes persist independently. Its live and cached official pages currently disagree about stopping a Pod with a
-network volume. Under approval item 9, the adapter therefore proves the exact profile capability. Supported profiles
-use stop/reuse and normal retention; unsupported profiles evacuate and terminate the owned Pod while leaving the
-independent network-volume resource intact, then later create a new Pod attached to it. The latter is storage reuse,
-not stopped-worker reuse, and has no stopped-retention state.
+network volume. Read-only capability discovery may record facts for a later decision, but initial RunPod support
+refuses every network-volume profile. It neither resumes one nor falls back to `terminateAfter` or terminate/recreate.
 See [RunPod storage types](https://docs.runpod.io/pods/storage/types) and
 [Pod lifecycle](https://docs.runpod.io/pods/manage-pods).
 
@@ -396,27 +510,29 @@ A profile displays one resolved policy before mutation. Missing caps, ambiguous 
 fails closed. Exact file format is not an approval decision.
 
 The original RunPod paid smoke was only environment-gated and is now hard-skipped. It **must not be enabled** until it
-is rewritten with price/storage checks, a coherent provider-enforced emergency deadline on
-the create call itself, and the actual service path. After those requirements are implemented and the missing
+is rewritten with price/storage checks, a live-certified provider `stopAfter` compute-stopping deadline on the create
+call itself, and the actual service path. After those requirements are implemented and the reconciled v3
 `runpod-safe` seam is proven, the rewritten nondestructive smoke may run under the dated standing paid-integration
-authorization and its ceiling; this does not authorize any improvised create path around that seam.
+authorization and its ceiling; this does not authorize any improvised create path around that seam or RunPod resume.
 
 ## Worked workflows
 
 ### Paid worker reuse
 
-Two FIFO jobs request a stop-capable `runpod:h200x1` profile. A stopped worker resumes for A; after collection B takes it immediately. When
-no match remains, zero idle delay stops it. Confirmed stop begins 24-hour retention; all GC gates still apply.
+Two FIFO jobs request a stop-capable provider/profile whose resume route can install and prove the required
+compute-stopping deadline. A stopped worker resumes for A; after collection B takes it immediately. When no match
+remains, zero idle delay stops it. Confirmed stop begins 24-hour retention; all GC gates still apply. This workflow is
+generic scheduler behavior, not a currently executable RunPod resume path.
 
-A RunPod network-volume profile first follows its proven capability. If stopping is supported, it follows the normal
-reuse path. Otherwise it runs queued work first, verifies evacuation, terminates the owned Pod, and later creates
-another against the unchanged independent network volume.
+RunPod initially admits only stop-capable non-network-volume profiles and does not resume them. RunPod network-volume
+profiles are refused; there is no fallback to `terminateAfter` or terminate/recreate under the ratified seam answers.
 
 ### Failure versus ambiguity
 
 Attempt 1 exits 23; logs/partials collect, then attempt 2 may reuse the worker. Three starts exhaust the default.
-Ordinary confirmed loss retries elsewhere; suspected loss stays unknown with no replacement. If the approved hard
-deadline finally kills that unknown attempt, the job permanently fails rather than retrying without its evidence.
+Ordinary confirmed loss retries elsewhere; suspected loss stays unknown with no replacement. If a separately
+authorized provider backstop ends compute for that unknown attempt, item 13 makes the job permanently fail rather than
+retrying without its evidence; item 13 does not authorize the provider action.
 
 ### Manual worker
 
@@ -464,10 +580,18 @@ production scheduler work, revise the tests to require:
 - one immutable per-attempt launch namespace across checkpoint, eval, Docent/local transcript, W&B metadata/artifact
   paths, declarations, and checkpoint sync; manual UUID fallback, collision refusal/no overwrite, and unchanged
   `run_identity_suffix` behavior;
+- under the separately recorded Claude-delegated decisions, a concurrent second resume of the same W&B run waits or
+  fails before that second operation performs the config read-modify-write; external Docent collection names contain
+  the launch namespace, exactly one collection is selected per attempt, and adding collection identity leaves the
+  scientific `AgentRun` payload bytes unchanged;
+- an explicit checkpoint destination frozen with each submission, never inferred from ambient credentials: either an
+  exact absolute local directory or an S3-compatible bucket endpoint/region/bucket/prefix; bucket reservation,
+  conditional single-PUT no-overwrite, final listing verification, no retry/adoption, and over-5-GiB refusal; absent,
+  unknown, incomplete, and unparseable destinations fail closed;
 - always-required terminal/stdout/stderr/declared outputs; Debate's eval-result and checkpoint-manifest defaults;
-  verified checkpoint hashes plus qualified independent-volume identity; analyzed-workload transcript/Docent success
-  gating; namespaced best-effort upload receipts and ambiguous-upload no-repeat; operator-owned independent-volume
-  retention;
+  verified checkpoint hashes plus qualified configured-destination identity; analyzed-workload transcript/Docent
+  success gating; namespaced best-effort upload receipts and ambiguous-upload no-repeat; operator-owned checkpoint
+  destination retention;
 - exact cwd and cleared/allowlisted environment, including secret-name-only
   readiness;
 - fresh-process service restart, single-owner lock, durable pause/drain, and
@@ -484,14 +608,23 @@ production scheduler work, revise the tests to require:
 - explicit unready-worker evidence and emergency-deadline behavior;
 - global/profile caps and fresh price/storage checks under pending and ambiguous create, independently compared with
   the actual allocation;
-- separate RunPod network-volume capability outcomes—stop/reuse when proven, terminate/recreate when stop is
-  unsupported—with exact Pod ownership and independent volume-resource identity/configuration audits.
+- for the initial RunPod path, a verified upstream `runpodctl` binary with pinned digest, a fresh v3 journal with no v2
+  import, live-certified `stopAfter` on every create, per-profile disk-GB cap and worst-case monthly leaked-stopped-Pod
+  cost, and hard refusal of resume and `terminateAfter`; the one bootstrap proof is at most 30 minutes and one GPU,
+  estimates strictly below $5, records actual cost against that estimate, and is callable only through the reconciled,
+  independently reviewed minimal v3 seam after the verified upstream driver is installed and digest-pinned—never via
+  ad hoc GraphQL or direct `runpodctl`;
+- refusal of RunPod network-volume profiles in the initial implementation, with no fallback to `terminateAfter` or
+  terminate/recreate; independently managed volume resources remain outside every authorized target set.
 
 Before all other scheduler test revision, make the RunPod paid test unconditionally skip; no environment variable may
-enable it. Its future implementation remains behind the unresolved RunPod seam/backstop decision, and its execution
-is allowed only after that decision proves a provider-enforced termination deadline on create and only within the
-dated standing paid-integration authorization. It does not require another per-run approval when those conditions and
-the standing ceiling are satisfied.
+enable it. Its future implementation remains behind reconciliation and proof of the ratified RunPod seam/backstop
+answers. Apart from the exact one-off bootstrap, execution is allowed only after a live provider `stopAfter`
+compute-stopping deadline is certified on create and only within the dated standing paid-integration authorization.
+It does not require another per-run approval when those conditions and the standing ceiling are satisfied. Resume and
+all terminate/destroy paths remain blocked. The bootstrap itself may run only through the reconciled, independently
+reviewed minimal v3 seam after a verified upstream driver is installed and digest-pinned, never through ad hoc GraphQL
+or direct `runpodctl`.
 Provider audits must traverse the actual service path and use independent
 provider and volume inventory; the current harness is insufficient.
 
@@ -509,27 +642,26 @@ flowchart TD
     T --> L
     R --> V0[Vast read-only discovery probe]
     V0 --> VB[Prove and separately approve Vast backstop]
-    R --> RB[Resolve RunPod seam and backstop decision]
-    R --> RC[Resolve RunPod credential source decision]
+    R --> RB[Reconcile ratified RunPod seam answers into v3 spec]
+    R --> RC[Apply approved RunPod credential isolation]
     L --> RI[Implement gated RunPod stop capable smoke]
     RB --> RI
     RC --> RI
     RI --> RP[Standing-authorized RunPod stop capable smoke passes]
-    L --> RNI[Implement gated RunPod network volume lifecycle smoke]
-    RB --> RNI
-    RC --> RNI
-    RNI --> RNP[Capability smoke passes under its applicable action gate]
+    R --> RNB[Refuse RunPod network volume profiles initially]
     L --> G[Generic local GC safety]
     L --> VI[Implement Vast paid service path smoke]
     VB --> VI
     VI --> VP[Standing authorized Vast smoke passes within 30m one GPU under 5 dollars and records actual cost]
     G --> RD[Implement gated RunPod destructive GC smoke]
     RP --> RD
-    RD --> RDP[Explicitly authorized RunPod destroy smoke passes]
+    RD --> RDA[Explicit Ethan authorization for exact RunPod destructive smoke]
+    RDA --> RDP[RunPod destroy smoke passes]
     G --> VD[Implement gated Vast destructive GC smoke]
     VP --> VD
     VB --> VD
-    VD --> VDP[Explicitly authorized Vast destroy smoke passes]
+    VD --> VDA[Explicit Ethan authorization for exact Vast destructive smoke]
+    VDA --> VDP[Vast destroy smoke passes]
     RP --> SHR[RunPod shadow with auto destroy off]
     G --> SHR
     VP --> SHV[Vast shadow with auto destroy off]
@@ -541,17 +673,16 @@ flowchart TD
     SHV --> SV[Immutable Vast whole system signoff]
     W --> SV
     SV --> DMV[Vast default migration]
-    RNP --> SN[Immutable network volume profile signoff]
-    W --> SN
-    SN --> NW[Enable capability resolved network volume profiles]
     RDP --> SDR[Immutable RunPod destroy signoff]
     SHR --> SDR
     W --> SDR
-    SDR --> AD[Enable RunPod auto destroy]
+    SDR --> EAR[Explicit Ethan authorization for RunPod auto destroy]
+    EAR --> AD[Enable RunPod auto destroy]
     VDP --> SDV[Immutable Vast destroy signoff]
     SHV --> SDV
     W --> SDV
-    SDV --> AV[Enable Vast auto destroy]
+    SDV --> EAV[Explicit Ethan authorization for Vast auto destroy]
+    EAV --> AV[Enable Vast auto destroy]
 ```
 
 Phase 0 follows the mandatory dependency chain exactly: commit or stash the tracked dirty changes in
@@ -570,16 +701,19 @@ Implementation arc:
 3. Hard-skip the paid RunPod smoke unconditionally, so no environment variable can enable it.
 4. Land the approved namespace contract and focused tests in Debate as a standalone commit.
 5. Revise all remaining scheduler tests. Read-only Vast discovery may run in this phase as a non-conformance probe.
-   Resolve the RunPod seam provenance and item-11 backstop decision before implementing any RunPod lifecycle smoke; if
-   a replacement is needed, its explicit specification requires separate approval. No paid create may occur unless
-   that path proves a provider-enforced termination deadline on the create call itself. No RunPod adapter or
-   lifecycle-smoke implementation begins until both that decision and the
-   item-18 credential-source decision are approved; neither credential option is selected by this plan.
+   Reconcile the draft replacement specification with all six ratified seam answers before implementing any RunPod
+   lifecycle smoke. The exact authorized bootstrap may run only through the reconciled, independently reviewed minimal
+   v3 seam after the verified upstream driver is installed and digest-pinned—never through ad hoc GraphQL or direct
+   `runpodctl`. All other paid creates remain blocked until that path live-certifies a provider `stopAfter`
+   compute-stopping deadline on create. No RunPod adapter or lifecycle-smoke implementation begins until the spec is
+   reconciled and the remaining proposed contracts receive their required review. Item 18's credential source is
+   approved: the adapter/wrapper parses only `apikey` from `~/.runpod/config.toml` under the isolation rules above.
 6. Implement parallel local core/service and wrapper/transfer tracks, then real local composition and restart/fence
    smoke.
-7. After the seam/backstop decision, implement the RunPod service-path stop-capable and network-volume capability
-   smokes. Their nondestructive paid CREATE/RESUME/RUN/STOP/COLLECT paths may run under the dated standing authorization
-   and ceiling; terminate/destroy paths remain separately gated.
+7. After reconciliation and live certification, implement the RunPod service-path smoke only for stop-capable,
+   non-network-volume profiles. Its paid `CREATE`, `RUN`, `STOP`, and `COLLECT` path may run under the dated standing
+   authorization and ceiling. RunPod `RESUME`, network-volume profiles, `terminateAfter`, terminate, and destroy remain
+   blocked.
 8. After a second approval of a proven independent backstop, implement the Vast paid service-path smoke. Before that
    proof and approval, paid Vast execution stays blocked despite the available credential; read-only discovery remains
    allowed. Afterward, its nondestructive CREATE/RESUME/RUN/STOP/COLLECT path may run under the standing ceiling of a
@@ -587,8 +721,10 @@ Implementation arc:
    cost against the estimate. Only the passing service-path result feeds Vast shadow; terminate/destroy remain
    separately gated.
 9. Implement generic local GC gates, then separately implement gated RunPod and Vast exact-worker destructive smokes.
-   Auto-destroy remains disabled per provider until its smoke is explicitly authorized, passes, and receives immutable
-   signoff.
+   Keep each destructive smoke disabled until Ethan explicitly authorizes that exact provider execution; RD/RDP and
+   VD/VDP are not currently authorized. Auto-destroy remains disabled per provider after an authorized smoke passes
+   and receives immutable signoff. That signoff still grants no enablement authority: return to Ethan for a subsequent
+   explicit provider-specific auto-destroy authorization before enabling it.
 10. Run shadow jobs with auto-destroy off, clear concurrent namespaces, review the immutable candidate, then migrate
     each provider/profile family by its own gated path.
 
@@ -614,18 +750,39 @@ approved.
   never reruns compute.
 - One immutable namespace identifies an attempt at every sink; manual launches use a UUID; conflicts refuse rather than
   overwrite; `run_identity_suffix` remains unchanged.
+- Every submission freezes an explicit checkpoint destination: one exact absolute local directory or one fully
+  configured S3-compatible bucket destination. Ambient credentials never select the destination, and an absent,
+  unknown, incomplete, or unparseable destination fails closed. Bucket sync uses the namespaced key, reservation
+  marker, conditional single PUT, final prefix-listing verification, and no retry/adoption; it refuses files over
+  5 GiB and implements no multipart upload.
 - Terminal state, stdout, stderr, and every declared output are present and verified. Debate's default eval-result and
-  checkpoint-manifest declarations work; independently stored large checkpoints have verified hashes and qualified
-  volume identity; analyzed workloads cannot succeed without local transcript/Docent evidence.
-- Best-effort Docent/W&B uploads are per-attempt namespaced, confirmed receipts are recorded, ambiguous uploads are not
-  automatically repeated, and scheduler GC leaves independent-volume namespaces/content untouched.
+  checkpoint-manifest declarations work; independently stored LoRA adapters have verified hashes and qualified
+  destination identity; analyzed workloads cannot succeed without local transcript/Docent evidence.
+- Best-effort Docent/W&B uploads carry immutable per-attempt namespace provenance, confirmed receipts are recorded,
+  ambiguous uploads are not automatically repeated, and scheduler GC leaves configured-destination content untouched.
+- Under the separately recorded Claude-delegated decisions, a concurrent second resume of the same W&B run waits or
+  fails before that second operation performs the config read-modify-write. Each external Docent collection name
+  contains the launch namespace, exactly one collection is selected per attempt, and the scientific `AgentRun` payload
+  bytes are unchanged by collection selection.
 - Pre-create inventory/nonce/full-spec and receipts prevent duplicate create;
   every unresolved resource binds global and profile caps.
 - Fresh price/storage/cap checks happen before every paid create, resume, and job admission/hot reuse; actual-allocation
   checks follow every provider state change that can affect them.
+- The initial RunPod path refuses resume and network-volume profiles, accepts neither `terminateAfter` nor a
+  terminate/recreate fallback, and creates only with a live-certified `stopAfter`. Each profile proves its disk-GB cap
+  and worst-case monthly leaked-stopped-Pod cost. The seam uses a verified upstream `runpodctl` release whose binary
+  digest is pinned, and starts with an empty fresh v3 journal rather than importing nonexistent v2 records. The single
+  bootstrap proof stays at or below 30 minutes and one GPU, estimates strictly below $5, and records actual cost against
+  that estimate. It runs only through the reconciled, independently reviewed minimal v3 seam after that driver is
+  installed and pinned, never through ad hoc GraphQL or direct `runpodctl`.
 - Stop requires acknowledgement/observation; destroy requires write-ahead
   intent and authoritative absence. Unready cleanup preserves obtainable
   evidence without deadlocking on unavailable logs.
+- RD/RDP and VD/VDP destructive provider smokes do not execute without Ethan's separate explicit authorization for the
+  exact smoke and target; no current plan approval supplies it.
+- Auto-destroy remains disabled after destructive-smoke passage and immutable signoff unless Ethan then gives an
+  explicit provider-specific authorization. Item 17's proposed eligibility conditions and a passing smoke never grant
+  that authority by themselves.
 - Config resolution proves 24-hour, 6-hour, and `never` policies; immediate
   idle stop; storage disposal; and stop-capability compatibility.
 - Independent before/after worker and volume audits prove manual/foreign
@@ -634,36 +791,80 @@ approved.
   changes are separately path-scoped and hash-audited.
 - Actual RunPod and Vast smokes traverse CLI, socket, service, SQLite, adapter,
   transfer, wrapper, and artifact root—not a parallel integration harness.
-- Machine-off behavior, emergency deadline, watchdog exclusive handoff, and
+- Machine-off behavior, separately authorized backstop outcome, watchdog exclusive handoff, and
   accepted irreversible actions are documented in the operator runbook.
 
 ## Approval record
 
 ### 2026-08-14 approval and amendments
 
-This dated record is normative and governs the checklist and appendix where they conflict. Ethan approved checklist
-items 1–21 except for the following amendments and open decisions:
+This dated record is normative and governs the checklist and appendix where they conflict. Decision provenance is
+part of the record and attaches to the individual decisions rather than to the document as a whole:
 
-- **Items 10 and 11 are amended and blocked.** `runpod-safe` is absent from this machine: the expected Homebrew
-  binary and its local share/state directories do not exist. The repository documents `--ttl-minutes`, not the
-  proposed `--stop-after` or `--terminate-after` verbs. Before scheduler work depends on this seam, determine whether
-  the original tool still exists on another machine, in a private repository, or as a lost installation. If it does,
-  reinstall and verify it before preserving or extending it. If it is genuinely gone, do not reconstruct it from
-  `docs/runpod_launch.md`: a replacement requires a separate explicit proposal and approval covering its receipt
-  schema, deadline-to-verb mapping, delete-authorization rule, and audit contract. The bundled replacement proposal
-  is rejected pending that decision.
-- **Item 18 is amended and blocked pending Ethan's choice.** `~/code/.env` currently contains `VAST_API_KEY` but no
-  `RUNPOD_API_KEY`; this machine's RunPod authentication is in `~/.runpod/config.toml`. Present, without choosing,
-  the two options: add `RUNPOD_API_KEY` to `~/code/.env`, or have the adapter read the runpodctl config. For each
-  option, explain how item 20's cleared execution environment prevents provider credentials from entering job
-  processes while still making the credential available only to the adapter.
+- The original namespace contracts 1–4 were authored by Codex and approved by Ethan.
+- Item 18 Option B, replacement-seam decisions 1–6, the two amendments to namespace contract 3, and the contract-4
+  vacuity note were recommended by Claude, then reviewed and ratified by Ethan.
+- The checkpoint-destination decision—retire Hugging Face, store only LoRA adapters locally or in an S3-compatible
+  bucket, and freeze the selected destination in submitted run config—was Ethan's own direct, unprompted instruction.
+
+Subject to that decision-specific provenance, Ethan approved checklist items 1–21 except for the following amendments
+and open decisions:
+
+- **Items 10 and 11 are amended.** `runpod-safe` is absent from this machine: the expected Homebrew binary and its
+  local share/state directories do not exist. The old seam was not reconstructed from `docs/runpod_launch.md`; a
+  standalone v3 replacement specification was drafted instead. Ethan later ratified exactly the six decision answers
+  recorded below. Those answers supersede the earlier claim that all replacement decisions remain open, but they do
+  not approve the draft's other proposed contracts. The draft must be reconciled and independently reviewed before
+  implementation.
+- **Item 18 is amended and approved as Option B.** **Provenance:** Claude recommended Option B; Ethan reviewed and
+  ratified it. The RunPod adapter/wrapper parses only the `apikey` field from
+  `~/.runpod/config.toml`; it never sources or copies the config wholesale. It scrubs inherited environment, operates
+  with an isolated `HOME`, pins provider endpoints, and keeps the parsed credential service/adapter-side so item 20's
+  cleared job environment cannot inherit it. Option A referred only to `/Users/ethanelasky/code/.env`, never the
+  repository-local `/Users/ethanelasky/code/debate/.env`, which existing scripts load wholesale into `os.environ`.
+  Before implementation, `/Users/ethanelasky/.runpod/config.toml` and `/Users/ethanelasky/code/.env` were both changed
+  from mode `0644` to `0600`; this records file-mode metadata only, not secret values.
 - **Approved evidence policy (amended bundle item 7):** terminal state, stdout, stderr, and every declared output are
-  always required. Debate defaults to declaring eval results and a checkpoint manifest. Large checkpoint bytes stay
-  on independently managed volumes while the Mac receives verified hashes and qualified volume identity. Local
-  transcript/Docent output is declared and success-gating for analyzed workloads. Docent/W&B uploads remain
-  best-effort external provenance; they are per-attempt namespaced, confirmed receipts are recorded, and ambiguous
-  uploads are not automatically repeated. Scheduler GC never deletes stale namespaces or content on independent
-  volumes; their retention is operator-owned.
+  always required. Debate defaults to declaring eval results and a checkpoint manifest. LoRA adapter checkpoint bytes
+  stay at the submission's configured exact local directory or S3-compatible bucket while the Mac receives verified
+  hashes and qualified destination identity. Local transcript/Docent output is declared and success-gating for
+  analyzed workloads. Docent/W&B uploads remain best-effort external provenance; they carry the immutable per-attempt
+  namespace, confirmed receipts are recorded, and ambiguous uploads are not automatically repeated. External Docent
+  collection identity is governed outside Ethan's approval by the separately recorded Claude-delegated decision.
+  Scheduler GC never deletes stale namespaces or checkpoint content at configured destinations; their retention is
+  operator-owned.
+
+#### Ratified RunPod replacement-seam answers
+
+**Provenance:** Claude recommended these six answers; Ethan reviewed and ratified them. This is a record of those
+answers only, not approval of broader clauses in the draft replacement specification.
+
+1. A live-certified provider `stopAfter` is accepted as the create-time compute-stopping deadline. There is no
+   `terminateAfter` carveout. Every eligible profile has a finite disk-GB cap and records the worst-case monthly cost
+   if its stopped Pod leaks indefinitely. RunPod initially supports only stop-capable, non-network-volume profiles;
+   the stop-unsupported network-volume row is refused.
+2. Exactly one otherwise-blocked paid `stopAfter` proof create is authorized to bootstrap live certification. It is
+   limited to one GPU, a provider-side deadline no more than 30 minutes after create, and an estimated cost strictly
+   below $5; actual cost must be recorded against the estimate. It may run only through the reconciled, independently
+   reviewed minimal v3 seam after a verified upstream driver is installed and digest-pinned, never through ad hoc
+   GraphQL or direct `runpodctl`. No `terminateAfter` bootstrap is authorized.
+3. RunPod resume remains blocked. The inspected upstream v2.9.0 start and update surfaces cannot install a fresh
+   deadline, so standing nondestructive authorization does not make resume executable.
+4. Binding the safety property to GraphQL create is accepted only after replacing the installed vendor-tap
+   `runpodctl` 2.3.0 binary, which reports `vcs.modified=true`, with a verified upstream release and pinning that
+   replacement binary's digest. The unverified installed bytes are not an acceptable driver dependency.
+5. The replacement starts a fresh v3 journal. No v2 import exists or is needed because the expected v2 share/state
+   records are absent; retained historical digests are not treated as journal records.
+6. Source, schemas, tests, and packaging live in the independent `ethanelasky/job-scheduler` repository. The accepted
+   user-level versioned install is
+   `~/.local/lib/boring-job-scheduler/<release>/bin/runpod-safe`, exposed through
+   `~/.local/bin/runpod-safe`, with fresh state under `~/.local/state/runpod-safe-v3/`.
+
+These answers do not authorize any broader still-unapproved replacement-spec clause, RunPod resume, `terminateAfter`,
+terminate, destroy, auto-destroy, or paid create beyond the exact bootstrap in answer 2. The current untracked
+`docs/runpod_safe_replacement_spec.md` still labels these questions open and contains superseded blocker language; it
+must be reconciled with this record before implementation. The checkpoint coordination recommendations and the
+writer-ready/live-source boundary remain pending and are not affected by these RunPod decisions.
 
 The following associated decisions are approved:
 
@@ -677,16 +878,40 @@ The following associated decisions are approved:
   from Debate without later approval. Publish only after the test-revision gate; the first pushed commit must not be a
   broken red-test sketch. Repository creation and collaborator invitations for `fnakasako` (Frank) and `CanKucukkurt`
   (Can) are authorized on that ordering.
-- Item 9 means: run any compatible queued job first, require exact scheduler ownership and durable intent, verify
-  evacuation and storage disposability, and leave independent volumes untouched before termination. One nonterminal
-  job per worker permits multiple workers to run in parallel.
-- The immutable launch-namespace fix lands first as a standalone Debate change before any scheduler implementation.
-  One immutable per-attempt namespace, with a UUID fallback for manual launches, crosses checkpoint, eval, Docent/local
-  transcript, W&B metadata and artifact paths, declarations, and checkpoint sync. Every sink preserves it and refuses
-  conflicts/overwrites. Preserve `run_identity_suffix` exactly. Moving `_docent_launch_id` away from `pid-N` will
-  orphan existing `docent/<run>/pid-N/` directories; record that compatibility consequence in the standalone commit.
-- The recommended item-13 hard-deadline branch is approved: unknown work killed by the hard deadline permanently fails
-  without retry and records missing evidence. The RunPod mechanism remains blocked with item 11.
+- Item 9's earlier terminate/recreate route is superseded for initial RunPod support: network-volume profiles are
+  refused, and no `terminateAfter` or termination fallback is authorized. One nonterminal job per worker permits
+  multiple workers to run in parallel.
+- **Namespace contracts 1–4. Provenance:** Codex authored the original four contracts and Ethan approved them. Claude
+  recommended the two contract-3 amendments and the contract-4 vacuity note; Ethan reviewed and ratified those
+  recommendations. The later checkpoint-destination instruction came directly and unprompted from Ethan and
+  supersedes the earlier Hugging Face checkpoint-destination discussion. The immutable launch-namespace fix lands first
+  as a standalone Debate change before any scheduler implementation.
+  One immutable, strictly path-safe 1–128 character `DEBATE_LAUNCH_NAMESPACE`, with one generated UUID fallback for a
+  manual launch, crosses checkpoint, eval, Docent/local transcript, W&B metadata and artifact paths, declarations, and
+  checkpoint sync. `run_eval --artifact-root ROOT` reserves `<root>/<namespace>/` before work and writes only its fixed
+  `results.jsonl`, `summary.json`, and `docent.jsonl` outputs there. Checkpoint sync receives an exact checkpoint
+  directory plus namespace, performs no wildcard discovery, and requires an explicit destination frozen with the run
+  submission rather than inferred from ambient credentials. A `local` destination is one exact absolute directory; a
+  `bucket` destination supplies its S3-compatible endpoint, region, bucket, and key prefix, and uses
+  `<configured-prefix>/{run}/{namespace}/{step}/...`. Credentials remain ambient and service-side. A volume-backed
+  local destination may no-op. An absent, unknown, incomplete, or unparseable destination fails closed. Bucket sync
+  retains its reservation marker, conditional `IfNoneMatch: "*"`
+  single-PUT no-overwrite boundary, final prefix-listing verification, and no-retry/no-adoption behavior. Because the
+  backend produces only LoRA adapters (`save_lora_only=True` whenever `lora_rank > 0`), multipart is not implemented
+  and files over 5 GiB are refused. W&B retains unchanged display `run_name`, `run_identity_suffix`, and
+  protocol/scientific identity while adding append-only `launch_namespaces` provenance and scalar
+  namespace/namespaced internal transcript artifact metadata. The enforcement mechanism for concurrent resumes is
+  governed outside this Ethan-approved section by the separately recorded Claude-delegated decision. Every sink
+  preserves the namespace and refuses conflicts/overwrites; because manual UUIDs almost never
+  collide, this guard is primarily future-facing protection for scheduler attempts. The standalone commit must record
+  that existing
+  `docent/<run>/pid-N/` directories and bucket `checkpoints/{run}/{step}/` keys become orphaned/unreachable under the
+  new layouts while remaining readable and untouched. Hugging Face is retired as a checkpoint destination; existing
+  `ethanelasky/ckpt-{run}` repositories remain in place, untouched and unread. Preserve `run_identity_suffix` exactly.
+- The recommended item-13 outcome branch is approved: if a separately authorized backstop ends unknown work, the job
+  permanently fails without retry and records missing evidence. Item 13 grants no provider verb authority. The RunPod
+  `stopAfter` mechanism remains gated by item 11's reconciliation and live-certification requirements; every TERMINATE
+  mechanism or action remains separately gated.
 
 The prerequisite order is mandatory:
 
@@ -697,6 +922,45 @@ The prerequisite order is mandatory:
 4. Land the standalone Debate launch-namespace fix, with its focused tests, as its own commit.
 5. Only then revise all remaining scheduler tests or begin other scheduler work.
 
+### 2026-08-14 delegated namespace decisions
+
+These decisions are recorded separately from Ethan's approval-and-amendments section because their authority and
+review history are different.
+
+#### W&B resumed-run serialization
+
+**Provenance:** Decided by Claude under authority Ethan delegated for exactly this W&B item. Ethan has not reviewed
+the substance. The decision is reversible when Ethan reviews it, without the usual re-approval ceremony.
+
+Before the scheduler resumes an existing W&B run, it must hold an exclusive lease for that W&B run ID while it reads,
+extends, and writes the run's `launch_namespaces` history. A second resume of the same W&B run must wait or fail instead
+of updating that history concurrently. This protects the link between metrics already stored in W&B and the launch
+that produced them; it does not change the run's scientific or protocol identity.
+
+For example, W&B run `xyz789` starts with `launch_namespaces` equal to `["run-A"]`. Two resumes start one second apart
+and, without a lease, both read `["run-A"]`. The first writes `["run-A", "run-B"]`; the second then writes
+`["run-A", "run-C"]`. The final stored history has silently lost `run-B`, even though `run-B` wrote training metrics
+into that same W&B run. With the lease, the second resume of `xyz789` waits or fails instead of racing the first.
+
+The lease is not yet enforced by any implementation: only the scheduler can hold it, and the scheduler does not exist
+yet. Until it does, concurrent manual `--wandb-resume` of one W&B run is unsupported. Avoiding that race is a convention,
+not a mechanism, and the append-only `launch_namespaces` guarantee is aspirational in the interim.
+
+#### External Docent collection identity
+
+**Provenance:** Decided by Claude under authority Ethan delegated for exactly this external-Docent item. Ethan has not
+reviewed the substance. The decision is reversible when Ethan reviews it, without the usual re-approval ceremony.
+
+Each launch attempt uploads to a separate external Docent collection whose name includes that attempt's launch
+namespace. The launch namespace selects and names the collection only. The scientific `AgentRun` payload is
+byte-for-byte unchanged, so the namespace remains launch provenance and never becomes part of protocol identity.
+
+For example, suppose experiment `math-pc-rl` is launched three times. Today all three uploads can land in one collection
+named `math-pc-rl`, so a relaunch after a mid-run crash silently mixes a partial attempt's transcripts with a complete
+attempt and Docent does not reliably separate them. Under this decision, each attempt has its own collection, with its
+namespace in the collection name, and that collection holds exactly that attempt's transcripts. Ten launches of one
+experiment therefore produce ten collections instead of one; the higher collection count is the explicit tradeoff.
+
 ### 2026-08-14 paid-integration authorization correction
 
 This correction is normative and supersedes earlier blanket statements that paid provider execution is unauthorized
@@ -706,27 +970,33 @@ destructive-action gates.
 - **Standing paid-only authorization:** real paid integration `CREATE`, `RESUME`, `RUN`, `STOP`, and `COLLECT` are
   authorized without returning for per-run approval when every condition below is satisfied. `TERMINATE`, `DESTROY`,
   auto-destroy enablement, the RunPod destructive GC smokes RD/RDP, and the Vast destructive GC smokes VD/VDP remain
-  separately gated. Approval item 17's auto-destroy authority is not activated by this correction.
+  separately gated. This standing category does not override provider-specific blockers: RunPod resume remains
+  blocked, as do initial RunPod network-volume profiles. Item 17 grants no auto-destroy authority, and this correction
+  does not supply it.
 - **Absolute non-targeting constraint:** no authorized execution may target independently managed persistent or
   network-volume resources, history, snapshots, or SQLite. The missing volume-identity audits are an additional reason
   destructive execution remains closed.
 - **Hard per-run ceiling:** every paid run must use at most one GPU, a provider-side TTL of no more than 30 minutes,
   and an estimated cost strictly below $5. Record actual cost against the estimate for every run. A smoke needing a
   longer deadline, more GPUs, or a higher estimate requires a new explicit approval with those numbers before it runs.
-- **No create without a provider-enforced deadline:** a paid create is authorized only when a provider-enforced
-  termination deadline is proven on the create call itself. A scheduler, Mac, or worker-local timer is insufficient.
-  Because `runpod-safe` is missing, paid RunPod create remains blocked. Do not bypass or improvise around the missing
-  seam. First determine whether the original tool exists elsewhere and restore/verify it if found; if it is genuinely
-  gone, the separately approved replacement-spec process in items 10/11 governs.
+- **No create without a provider-enforced compute-stopping deadline:** a paid create is authorized only when the create
+  call itself carries the applicable provider-enforced compute-stopping deadline. A scheduler, Mac, or worker-local
+  timer is insufficient. For RunPod this means a live-certified `stopAfter`. Exactly one otherwise-blocked proof create
+  is authorized to bootstrap that certificate under the six ratified answers; all other paid RunPod creates remain
+  blocked until the reconciled v3 seam and certificate exist. The bootstrap may run only through the reconciled,
+  independently reviewed minimal v3 seam after a verified upstream driver is installed and digest-pinned, never via ad
+  hoc GraphQL or direct `runpodctl`. Do not bypass or improvise around the missing seam.
 - **Current RunPod smoke remains hard-skipped:** `RUNPOD_PAID_INTEGRATION=1` must remain inert until the test is
-  rewritten with price and storage checks, a coherent provider-enforced emergency deadline, and traversal through the
-  actual scheduler service path. Once those requirements and the RunPod seam proof are satisfied, its nondestructive
-  paid path may run within the standing ceiling without another per-run approval.
+  rewritten with price and storage checks, a live-certified provider `stopAfter`, and traversal through the actual
+  scheduler service path. Once those requirements and the reconciled RunPod v3 seam are satisfied, its nondestructive
+  paid create/run/stop/collect path may run within the standing ceiling without another per-run approval. Resume,
+  network-volume profiles, `terminateAfter`, terminate, and destroy remain blocked.
 - **Paid Vast remains technically blocked:** `VAST_API_KEY` exists in `~/code/.env`, but paid Vast execution is not
   authorized until approval item 12's independent bounded mechanism is proven and separately approved. Read-only Vast
   discovery proceeds. The presence of an executable credential does not lift this blocker.
 
-Destructive execution continues to require a separate explicit opt-in with the exact owned target or unique creation
-nonce, provider/profile, price and storage ceilings, runtime/deadline, evacuation proof, independent volume-identity
-audit, and confirmation that no independent volume is deleted. Auto-destroy remains disabled until the applicable
-destructive smoke is separately authorized, passes, and receives immutable signoff.
+Destructive execution continues to require a separate explicit opt-in from Ethan with the exact owned target or unique
+creation nonce, provider/profile, price and storage ceilings, runtime/deadline, evacuation proof, independent
+volume-identity audit, and confirmation that no independent volume is deleted. Auto-destroy remains disabled until the
+applicable destructive smoke is separately authorized, passes, receives immutable signoff, and Ethan then gives a
+separate explicit provider-specific auto-destroy authorization.
