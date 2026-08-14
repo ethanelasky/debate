@@ -21,6 +21,20 @@
   rollout_tp: 1
   gpu_memory_utilization: 0.42
 
+# Validated: cs285 gspo/dapo arms (2026-08-13).
+1xH100:
+  n_gpus: 1
+  rollout_tp: 1
+  gpu_memory_utilization: 0.42
+
+# UNVALIDATED: smoke on first launch (plan1k-dapo bring-up, 2026-08-14).
+2xH100:
+  n_gpus: 2
+  rollout_tp: 2
+  gpu_memory_utilization: 0.42
+  extra_overrides:
+    - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+
 # Validated: the whole AIME 32B campaign (2026-08-08..10).
 2xB200:
   n_gpus: 2

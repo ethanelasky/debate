@@ -117,3 +117,26 @@ def test_logger_is_noop_without_wandb_run(tmp_path, monkeypatch):
     env.rollout(env.tasks(1), _policy(["a"]), group_size=1)
     log_rollout_transcripts(0, env, "train")
     assert not (tmp_path / "transcripts").exists()
+
+
+def test_transcript_every_gates_upload_never_local_write(monkeypatch):
+    import infra.train as train_mod
+    import infra.transcript_log as tl
+
+    calls = []
+    monkeypatch.setattr(
+        tl, "log_rollout_transcripts",
+        lambda step, env, split, run_name=None, upload=True: calls.append((step, split, upload)),
+    )
+    cfg = train_mod.Config(wandb_project="p", transcript_every=10, run_name="r")
+    for s in (1, 10, 20):
+        train_mod._log_transcripts(cfg, s, env=None, split="train")
+    train_mod._log_transcripts(cfg, 7, env=None, split="eval")
+    # every round reaches the writer (local persistence); upload is the only
+    # thing the cadence gates
+    assert calls == [(1, "train", False), (10, "train", True), (20, "train", True), (7, "eval", True)]
+
+    calls.clear()
+    nowandb = train_mod.Config(wandb_project=None, transcript_every=10, run_name="r")
+    train_mod._log_transcripts(nowandb, 3, env=None, split="train")
+    assert calls == [(3, "train", False)]  # no wandb: local write still happens

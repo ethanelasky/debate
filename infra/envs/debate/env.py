@@ -818,6 +818,8 @@ class DebateEnv(Env):
                 "verdict_ok": float(verdict.ok),
                 "flipped": float(st.meta.get("flipped", False)),
             }
+            if verdict.ok and verdict.winner is not None:
+                info["won"] = float(verdict.winner == display)
             for src in ("json", "logit"):
                 conf = verdict.confidence.get(display)
                 if conf is not None:

@@ -267,6 +267,14 @@ aime_rlvr_olmo32_plan1k_cispo_os3:
   training:
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
 
+aime_rlvr_olmo32_plan1k_dapo:
+  _extends: aime_rlvr_olmo32_plan1k_cispo_os3
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.0
+    dynamic_sampling_retries: 5
+    oversample_factor: 1.0
+
 # GRPO twin of the validated-recipe arm (Ethan, 2026-08-11): only the loss
 # differs — the production-scale algorithm comparison, mirroring the CS285
 # GRPO-vs-CISPO pair.

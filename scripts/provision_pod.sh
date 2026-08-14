@@ -31,6 +31,16 @@ SYMBOLIC_DEPS=(
   "latex2sympy2-extended==1.11.0"
   "sympy==1.14.0"
   "antlr4-python3-runtime==4.13.2"
+  # antlr 4.13.2 excludes every stable hydra (they pin antlr 4.9.*); without
+  # these dev pins the resolver backtracks to hydra 0.11/omegaconf 1.4, which
+  # verl cannot import (no omegaconf.MISSING).
+  "omegaconf==2.4.0.dev3"
+  "hydra-core==1.4.0.dev1"
+  # GDN models (Qwen3.5) die at EngineCore init on unpinned cutlass; the trio
+  # must move together — unpinned libs-cu13 pulls 4.7.0 against dsl 4.5.2.
+  "nvidia-cutlass-dsl==4.5.2"
+  "nvidia-cutlass-dsl-libs-base==4.5.2"
+  "nvidia-cutlass-dsl-libs-cu13==4.5.2"
 )
 VOL="${VOL:-/workspace}"
 ENV_DIR="$VOL/envs/verl-sm90"

@@ -1,0 +1,58 @@
+# Qwen3.5-4B on MATH level-5: DAPO vs CISPO, 200 steps each.
+# Pool fit (2026-08-14, scripts/hmmt_pass_eval.py): L5 pass@1 .558 / pass@8
+# .867 at uncapped think; AIME-2026 and HMMT sit far below the 20-85 band.
+
+_qwen35_l5:
+  model: Qwen/Qwen3.5-4B
+  enable_thinking: true
+  think_tokens: 4000
+  max_completion_tokens: 1024
+  dataset: {type: math, levels: 5, seed: 0, think_overshoot_penalty: 0.1, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 1
+      gpu_memory_utilization: 0.45
+      # budget-forced resubmission: prompt side sees base + think_tokens
+      prompt_length: 6144
+      response_length: 5120
+      max_token_len_per_gpu: 12288
+      checkpoint_dir: /workspace/checkpoints
+    wandb_entity: palaestra-research
+    wandb_project: debate-math
+    lora_rank: 32
+    lr: 1.0e-4
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
+    steps: 200
+    batch_size: 8
+    group_size: 8
+    eval_every: 10
+    eval_n: 256
+    eval_max_tokens: 5120
+    eval_split: dev
+    save_every: 10
+
+mathl5_qwen35_cispo:
+  _extends: _qwen35_l5
+  training:
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.02
+
+mathl5_qwen35_dapo:
+  _extends: _qwen35_l5
+  training:
+    loss: {kind: ppo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.0
+    kl_mechanism: advantage
+    dynamic_sampling_retries: 5
+
+mathl5_qwen35_smoke:
+  _extends: mathl5_qwen35_cispo
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0

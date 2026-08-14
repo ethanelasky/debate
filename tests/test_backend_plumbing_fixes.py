@@ -344,3 +344,23 @@ def test_grad_norm_metrics_post_clip_and_nonfinite():
         out = _grad_norm_metrics(bad, 0.5)
         assert out["optim/nonfinite_grad_step"] == 1.0
         assert "optim/grad_norm_clipped" not in out
+
+
+def test_visible_text_strips_specials_keeps_think_markers():
+    from infra.backend.verl import visible_text
+
+    class Tok:
+        all_special_tokens = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+
+        def decode(self, tokens):
+            return "answer is \\boxed{4}<|im_end|>"
+
+    assert visible_text(Tok(), [1, 2]) == "answer is \\boxed{4}"
+
+    class ThinkTok:
+        all_special_tokens = ["<|im_end|>", "<think>", "</think>"]
+
+        def decode(self, tokens):
+            return "<think>hmm</think>final<|im_end|>"
+
+    assert visible_text(ThinkTok(), [1]) == "<think>hmm</think>final"

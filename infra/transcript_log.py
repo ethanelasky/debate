@@ -105,21 +105,21 @@ def _write_singleturn_jsonl(records: list[dict], path: str) -> int:
         return len(records)
 
 
-def log_rollout_transcripts(step: int, env, split: str) -> None:
-    """Log env's most recent rollout to wandb. No-op without an active run.
-
-    `split` is "train" or "eval"; it selects the artifact collection and the
-    table key. Never raises past itself into the train loop — the caller
-    wraps, but keep failures here cheap anyway.
+def log_rollout_transcripts(step: int, env, split: str, run_name: str | None = None, upload: bool = True) -> None:
+    """Persist env's most recent rollout: local JSONL ALWAYS (insufficient
+    logs are unacceptable — Ethan, 2026-08-14), wandb artifact + table only
+    when `upload` and a run is active. Never raises past itself into the
+    train loop — the caller wraps, but keep failures here cheap anyway.
     """
     import wandb
 
-    if wandb.run is None:
-        return
+    if run_name is None:
+        if wandb.run is None:
+            return
+        run_name = wandb.run.name or wandb.run.id
     states = getattr(env, "last_states", None)
     records = getattr(env, "last_rollout_records", None)
 
-    run_name = wandb.run.name or wandb.run.id
     out_dir = os.path.join("transcripts", run_name)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{split}-step-{step:05d}.jsonl")
@@ -135,6 +135,9 @@ def log_rollout_transcripts(step: int, env, split: str) -> None:
         n_rows = _write_singleturn_jsonl(records, path)
         rows = singleturn_sample_rows(records, step)
     else:
+        return
+
+    if not (upload and wandb.run is not None):
         return
 
     artifact = wandb.Artifact(

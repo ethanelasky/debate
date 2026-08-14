@@ -97,6 +97,7 @@ class Config:
     # team cannot see. Set it explicitly in the experiment config.
     wandb_entity: str | None = None
     log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
+    transcript_every: int = 10  # train-transcript upload cadence (1 = every step)
     # Where this run's checkpoints actually landed. Recorded because the
     # directory carries a per-launch run_id that the wandb run name does not, so
     # without it the mapping from a run back to its checkpoints is guesswork.
@@ -139,7 +140,7 @@ def _aggregate(trajs: list[Trajectory], prefix: str) -> dict[str, float]:
     for seat in sorted(s for s in seats if s):
         seat_trajs = [t for t in trajs if t.info.get("seat") == seat]
         out[f"{prefix}/{seat}/reward_mean"] = sum(t.reward for t in seat_trajs) / len(seat_trajs)
-        for k in ("judge_conf_json", "judge_conf_logit", "solution_correct"):
+        for k in ("judge_conf_json", "judge_conf_logit", "solution_correct", "won"):
             vals = [t.info[k] for t in seat_trajs if isinstance(t.info.get(k), (int, float))]
             if vals:
                 out[f"{prefix}/{seat}/{k}"] = sum(vals) / len(vals)
@@ -208,12 +209,17 @@ class _RolloutInfoAccumulator:
 
 def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
     """Transcript capture must never kill training (same stance as on_rollout)."""
-    if not (cfg.log_transcripts and cfg.wandb_project):
+    if not cfg.log_transcripts:
         return
+    # Local JSONL is written EVERY round; only the wandb upload obeys the
+    # transcript_every cadence. Lost rollout data is unrecoverable.
+    upload = bool(cfg.wandb_project) and not (
+        split == "train" and cfg.transcript_every > 1 and step % cfg.transcript_every != 0
+    )
     try:
         from infra.transcript_log import log_rollout_transcripts
 
-        log_rollout_transcripts(step, env, split)
+        log_rollout_transcripts(step, env, split, run_name=cfg.run_name, upload=upload)
     except Exception as e:
         print(f"[transcripts] {type(e).__name__}: {e}")
 

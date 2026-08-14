@@ -230,6 +230,21 @@ def _reject_over_length_prompts(prompts: list[Tokens], prompt_length: int) -> No
             )
 
 
+THINK_MARKERS = ("<think>", "</think>")
+
+
+def visible_text(tokenizer, tokens: list[int]) -> str:
+    """Decode for TEXT consumers (speech splicing, transcripts). Special-token
+    strings must not survive into text that re-enters a chat template — they
+    re-tokenize into real turn boundaries mid-message. Think markers stay:
+    round.py splits on them."""
+    text = tokenizer.decode(tokens)
+    for special in getattr(tokenizer, "all_special_tokens", ()):
+        if special not in THINK_MARKERS:
+            text = text.replace(special, "")
+    return text
+
+
 def _token_weighted_loss_means(per_micro: list[tuple[dict, int]]) -> dict[str, float]:
     """(metrics, n_completion_tokens) per micro-batch -> loss/* means weighted
     by token count. The engine's metrics are token-means WITHIN a micro-batch,
@@ -418,7 +433,7 @@ class VerlBackend(Backend):
                     Sample(
                         tokens=tokens,
                         logprobs=list(out.log_probs) if out.log_probs is not None else [],
-                        text=self.tokenizer.decode(tokens),
+                        text=visible_text(self.tokenizer, tokens),
                         stop_reason="length" if truncated else "stop",
                     )
                 )
