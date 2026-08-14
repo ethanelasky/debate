@@ -816,6 +816,10 @@ and open decisions:
   recorded below. Those answers supersede the earlier claim that all replacement decisions remain open, but they do
   not approve the draft's other proposed contracts. The draft must be reconciled and independently reviewed before
   implementation.
+- **Item 17 is OPEN and not approved.** It records eligibility conditions only and grants no destructive or
+  auto-destroy authority. Running a destructive provider smoke requires Ethan's separate explicit authorization for
+  that exact smoke and target. Even after an authorized smoke passes and receives immutable signoff, enabling
+  auto-destroy requires a later, separate provider-specific authorization from Ethan.
 - **Item 18 is amended and approved as Option B.** **Provenance:** Claude recommended Option B; Ethan reviewed and
   ratified it. The RunPod adapter/wrapper parses only the `apikey` field from
   `~/.runpod/config.toml`; it never sources or copies the config wholesale. It scrubs inherited environment, operates
