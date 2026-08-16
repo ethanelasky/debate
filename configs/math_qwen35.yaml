@@ -8,6 +8,9 @@ _qwen35_l5:
   think_tokens: 4000
   max_completion_tokens: 1024
   dataset: {type: math, levels: 5, seed: 0, think_overshoot_penalty: 0.1, prompt_file: infra/prompts/tasks/math_nocot.yaml}
+  # dev/test read the AMC pool (83 problems, base .422 greedy): L5 dev
+  # saturates ~.97 by step 20 while AMC discriminates (2026-08-14 fit check).
+  eval_dataset: {type: amc, prompt_file: infra/prompts/tasks/math_nocot.yaml, think_overshoot_penalty: 0.1}
   training:
     backend: verl
     verl:

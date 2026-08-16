@@ -75,6 +75,11 @@ EXPERIMENT_KEYS = {
     "plan_tokens",
     "think_tokens",
     "dataset",
+    # Separate eval pool: dev/test evals read this env while training keeps
+    # `dataset` (added for AMC dev on L5-trained arms, 2026-08-15). Same
+    # schema as `dataset` ({type: ..., ...}); train-split reads stay on the
+    # training env.
+    "eval_dataset",
     "training",
     # Rollout sampling profile (CS285-hw4 validation arms sample at 0.8/0.95
     # like the reference implementation). Default 1.0/1.0 — the debate arms'
@@ -519,6 +524,13 @@ def _main_after_resume_frontier(
     cleanups.append(family.close)
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
     env = family.source(ds)
+
+    eval_env = None
+    eval_ds = dict(exp.get("eval_dataset") or {})
+    if eval_ds:
+        eval_family = get_family(eval_ds.pop("type", None))
+        cleanups.append(eval_family.close)
+        eval_env = eval_family.source(eval_ds)
     topology = resolve_topology()
     protocol_identity = rlvr_protocol_identity(
         exp, dataset_type, family, args=args, topology=topology
@@ -567,6 +579,11 @@ def _main_after_resume_frontier(
         source_env.slot_limits = SlotLimits(
             max_think_tokens=int(think_tokens), max_total_tokens=total_budget
         )
+        if eval_env is not None:
+            # Same budget-forced think closure on the eval pool: a hard cap
+            # without forcing truncates mid-think and reads as wrong answers
+            # (the 2026-08-14 greedy@5120 artifact).
+            eval_env.slot_limits = source_env.slot_limits
         gen_budgets["think_tokens + max_completion_tokens"] = total_budget
 
     backend = build_backend(
@@ -638,7 +655,7 @@ def _main_after_resume_frontier(
         )
 
     cfg.on_rollout = _export_docent
-    train(env, backend, cfg)
+    train(env, backend, cfg, eval_env=eval_env)
 
 
 def main() -> None:
