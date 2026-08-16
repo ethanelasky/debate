@@ -642,7 +642,7 @@ def test_rlvr_resolves_topology_once_and_reuses_same_value(
     monkeypatch.setattr(
         run_rlvr,
         "train",
-        lambda env, backend, cfg: (
+        lambda env, backend, cfg, eval_env=None: (
             launch_namespaces.append(cfg.launch_namespace),
             captured_configs.append(cfg),
         ),
@@ -1455,7 +1455,7 @@ def test_supported_train_entrypoint_records_identity_and_closes_family(monkeypat
     monkeypatch.setattr(
         train_mod,
         "train",
-        lambda env, backend, cfg: trained.append(dict(cfg.protocol_identity)),
+        lambda env, backend, cfg, eval_env=None: trained.append(dict(cfg.protocol_identity)),
     )
 
     train_mod.main()

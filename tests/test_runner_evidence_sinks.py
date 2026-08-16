@@ -65,7 +65,7 @@ def _capture_rlvr_config(monkeypatch, tmp_path, namespace):
     monkeypatch.setattr(run_rlvr, "rlvr_protocol_identity", lambda *args, **kwargs: {})
     monkeypatch.setattr(run_rlvr, "build_backend", lambda *args, **kwargs: backend)
     monkeypatch.setattr(
-        run_rlvr, "train", lambda env, backend, cfg: captured.append(cfg)
+        run_rlvr, "train", lambda env, backend, cfg, eval_env=None: captured.append(cfg)
     )
 
     run_rlvr._main([])
