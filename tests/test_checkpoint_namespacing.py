@@ -8,7 +8,7 @@ a crash, or a second sweep arm — so the namespace carries the sweep suffix too
 and a fresh run refuses to start on top of an existing lineage.
 """
 
-import re
+import uuid
 
 import pytest
 
@@ -29,24 +29,28 @@ def _training(ckpt_root: str) -> dict:
     }
 
 
-def test_checkpoint_dir_is_namespaced_by_experiment(tmp_path, monkeypatch):
+def test_checkpoint_dir_is_namespaced_by_run_and_exact_launch(tmp_path, monkeypatch):
     built = {}
 
     class _FakeBackend:
         def __init__(self, config):
+            assert (tmp_path / "math_pc_olmo_smoke" / "attempt-7").is_dir()
             built["config"] = config
 
     import infra.backend.verl as verl_mod
 
     monkeypatch.setattr(verl_mod, "VerlBackend", _FakeBackend)
-    build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_smoke")
+    build_backend(
+        _training(str(tmp_path)),
+        "some/model",
+        "math_pc_olmo_smoke",
+        launch_namespace="attempt-7",
+    )
 
-    # <root>/<run name>-<run id>: the run id makes the directory unique per
-    # LAUNCH, so two people running this experiment on the shared volume cannot
-    # be handed the same path.
+    # The scheduler/manual launch namespace is a separate exact component,
+    # shared byte-for-byte with every other sink.
     got = built["config"].checkpoint_dir
-    assert got.startswith(str(tmp_path / "math_pc_olmo_smoke") + "-")
-    assert re.fullmatch(r"\d{8}T\d{6}Z", got.rsplit("-", 1)[1])
+    assert got == str(tmp_path / "math_pc_olmo_smoke" / "attempt-7")
 
 
 def test_legacy_unnamespaced_checkpoints_raise(tmp_path):
@@ -58,6 +62,8 @@ def test_legacy_unnamespaced_checkpoints_raise(tmp_path):
     message = str(excinfo.value)
     assert "final" in message and "step-00025" in message
     assert str(tmp_path / "math_pc_olmo") in message
+    assert "moving these into the future launch path" in message
+    assert "different empty root" in message
 
 
 def test_namespaced_subdirectories_are_not_mistaken_for_legacy(tmp_path):
@@ -81,11 +87,12 @@ def test_fresh_run_over_an_earlier_attempt_raises(tmp_path):
     assert "--load" in message
 
 
-def test_fresh_run_guard_stands_down_when_load_was_given(tmp_path):
+def test_load_never_authorizes_adopting_existing_launch_leaf(tmp_path):
     run_dir = tmp_path / "math_pc_olmo_l5"
     (run_dir / "step-00025").mkdir(parents=True)
 
-    check_fresh_run_over_existing_checkpoints(str(run_dir), load_given=True)
+    with pytest.raises(RuntimeError, match="does not authorize this destination"):
+        check_fresh_run_over_existing_checkpoints(str(run_dir), load_given=True)
 
 
 def test_fresh_run_guard_silent_on_empty_or_missing_dir(tmp_path):
@@ -102,28 +109,104 @@ def test_fresh_run_guard_ignores_unrelated_entries(tmp_path):
 
 
 def test_build_backend_fires_the_fresh_run_guard(tmp_path, monkeypatch):
-    (tmp_path / "math_pc_olmo_l5" / "final").mkdir(parents=True)
+    existing = tmp_path / "math_pc_olmo_l5" / "attempt-existing"
+    (existing / "final").mkdir(parents=True)
 
     import infra.backend.verl as verl_mod
 
     monkeypatch.setattr(verl_mod, "VerlBackend", lambda config: config)
-    # The guard fires on the DIRECTORY, which is what it has always done. What
-    # changed is that build_backend can no longer hand it a colliding one: the
-    # run id makes every launch's path new, so a rerun lands somewhere fresh
-    # instead of being refused. The guard still protects a hand-configured
-    # fixed checkpoint_dir, which is the only way to collide now.
+    # The low-level guard remains useful for explicit paths.
     fixed = tmp_path / "hand_set_dir"
     (fixed / "step-00025").mkdir(parents=True)
     with pytest.raises(RuntimeError, match="--load"):
         check_fresh_run_over_existing_checkpoints(str(fixed), load_given=False)
 
-    # ...and stands down once --load names a checkpoint deliberately.
-    check_fresh_run_over_existing_checkpoints(str(fixed), load_given=True)
+    # --load is only a read source and never weakens destination refusal.
+    with pytest.raises(RuntimeError, match="does not authorize this destination"):
+        check_fresh_run_over_existing_checkpoints(str(fixed), load_given=True)
 
-    # A rerun of the same experiment no longer collides at all.
-    a = build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5")
-    b = build_backend(_training(str(tmp_path)), "some/model", "math_pc_olmo_l5")
-    assert a.checkpoint_dir != b.checkpoint_dir or True  # same second is possible
+    # A scheduler-supplied attempt namespace is a reservation: reuse refuses,
+    # even when --load was supplied. Manual UUID fallback makes this rare on
+    # the manual path; it is future-facing protection for scheduler attempts.
+    with pytest.raises(RuntimeError, match="does not authorize this destination"):
+        build_backend(
+            _training(str(tmp_path)),
+            "some/model",
+            "math_pc_olmo_l5",
+            load_given=True,
+            launch_namespace="attempt-existing",
+        )
+
+
+def test_compat_backend_and_config_share_one_generated_namespace(
+    tmp_path, monkeypatch
+):
+    import infra.backend.verl as verl_mod
+    from infra.train import Config, train
+
+    class _FakeBackend:
+        tokenizer = None
+
+        def __init__(self, config):
+            self.config = config
+            self.saved = []
+
+        def save(self, name):
+            self.saved.append(name)
+
+    monkeypatch.setattr(verl_mod, "VerlBackend", _FakeBackend)
+    backend = build_backend(_training(str(tmp_path)), "some/model", "run")
+    cfg = Config(
+        steps=0,
+        eval_every=0,
+        save_every=0,
+        log_transcripts=False,
+        launch_namespace=None,
+    )
+
+    train(object(), backend, cfg)
+
+    namespace = backend.config.launch_namespace
+    parsed = uuid.UUID(namespace)
+    assert parsed.version == 4 and str(parsed) == namespace
+    assert cfg.launch_namespace == namespace
+    assert backend.config.checkpoint_dir == str(tmp_path / "run" / namespace)
+    assert backend.saved == ["final"]
+
+
+def test_compat_backend_config_namespace_mismatch_refuses(tmp_path, monkeypatch):
+    import infra.backend.verl as verl_mod
+    from infra.train import Config, train
+
+    class _FakeBackend:
+        tokenizer = None
+
+        def __init__(self, config):
+            self.config = config
+
+        def save(self, name):
+            raise AssertionError("mismatch must refuse before training")
+
+    monkeypatch.setattr(verl_mod, "VerlBackend", _FakeBackend)
+    backend = build_backend(
+        _training(str(tmp_path)),
+        "some/model",
+        "run",
+        launch_namespace="backend-attempt",
+    )
+
+    with pytest.raises(ValueError, match="different launch namespaces"):
+        train(
+            object(),
+            backend,
+            Config(
+                steps=0,
+                eval_every=0,
+                save_every=0,
+                log_transcripts=False,
+                launch_namespace="config-attempt",
+            ),
+        )
 
 
 def test_run_identity_suffix_matches_the_wandb_run_name_format():
@@ -141,9 +224,30 @@ def test_sweep_arms_get_disjoint_checkpoint_dirs(tmp_path, monkeypatch):
     dirs = []
     for lr in (1e-5, 3e-5):
         run_name = "math_rlvr_olmo_l5" + run_identity_suffix(lr, None, None, None)
-        cfg = build_backend(_training(str(tmp_path)), "some/model", run_name, lr_override=lr)
+        cfg = build_backend(
+            _training(str(tmp_path)),
+            "some/model",
+            run_name,
+            lr_override=lr,
+            launch_namespace=f"attempt-{lr}",
+        )
         dirs.append(cfg.checkpoint_dir)
 
     assert dirs[0] != dirs[1]
     for lr, d in zip(("1e-05", "3e-05"), dirs):
-        assert d.startswith(str(tmp_path / f"math_rlvr_olmo_l5-lr{lr}") + "-")
+        assert d.startswith(str(tmp_path / f"math_rlvr_olmo_l5-lr{lr}"))
+
+
+def test_same_run_gets_disjoint_scheduler_attempt_directories(tmp_path, monkeypatch):
+    import infra.backend.verl as verl_mod
+
+    monkeypatch.setattr(verl_mod, "VerlBackend", lambda config: config)
+    first = build_backend(
+        _training(str(tmp_path)), "some/model", "run", launch_namespace="attempt-a"
+    )
+    second = build_backend(
+        _training(str(tmp_path)), "some/model", "run", launch_namespace="attempt-b"
+    )
+
+    assert first.checkpoint_dir == str(tmp_path / "run" / "attempt-a")
+    assert second.checkpoint_dir == str(tmp_path / "run" / "attempt-b")

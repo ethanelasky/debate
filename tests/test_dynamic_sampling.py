@@ -124,6 +124,9 @@ def _run(scripted, *, retries: int, steps: int = 1, rollout_infos=None):
         dynamic_sampling_retries=retries,
         eval_every=0,
         save_every=0,
+        # ScriptEnv tests retry/group selection only and deliberately has no
+        # production last_states/last_rollout_records analysis boundary.
+        log_transcripts=False,
     )
     logged: list[dict] = []
     with mock.patch.object(
@@ -345,6 +348,9 @@ def _run_oversampled(
         oversample_factor=factor,
         eval_every=0,
         save_every=0,
+        # The scripted rollout contains Trajectory objects only; it is not an
+        # analyzed workload with retained transcript records.
+        log_transcripts=False,
     )
     logged: list[dict] = []
     with mock.patch.object(

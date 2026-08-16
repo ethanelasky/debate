@@ -3,18 +3,64 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
+import importlib.metadata
 import math
 import os
+import pwd
 import re
+import stat
 import sys
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from infra.backend.base import Backend, LossSpec, OptimParams, SamplingParams
 from infra.envs.base import Env, Policy, Trajectory
+from infra.launch_namespace import (
+    claim_directory,
+    require_claimed_directory,
+    resolve_launch_namespace,
+    safe_path_component,
+    validate_launch_namespace,
+)
 from infra.rl.datums import grpo_pack
+
+
+_WANDB_RESUME_CAPABILITY_ISSUER = object()
+_WANDB_RESUME_HANDOFF_ISSUER = object()
+_WANDB_RESUME_SDK_VERSION = "0.28.1"
+
+
+class _WandbResumeRunningCapability:
+    """Opaque runner-issued policy receipt for one exact W&B run ID.
+
+    This prevents ordinary YAML, environment, or direct ``Config`` plumbing
+    from enabling the human escape hatch. It is intentionally not described
+    as cryptographic authentication: Python code in this process can import
+    private names and subvert policy if it deliberately chooses to do so.
+    """
+
+    __slots__ = ("run_id", "_issuer")
+
+    def __init__(self, run_id: str, issuer: object):
+        if issuer is not _WANDB_RESUME_CAPABILITY_ISSUER:
+            raise TypeError("W&B resume capability may only be runner-issued")
+        self.run_id = run_id
+        self._issuer = issuer
+
+
+def _issue_wandb_resume_running_capability(
+    run_id: str,
+) -> _WandbResumeRunningCapability:
+    if not isinstance(run_id, str):
+        raise ValueError("cannot issue W&B resume capability for a non-string run ID")
+    return _WandbResumeRunningCapability(
+        run_id, _WANDB_RESUME_CAPABILITY_ISSUER
+    )
 
 
 @dataclass
@@ -91,30 +137,52 @@ class Config:
     # single read of the held-out set under the 3-way protocol.
     final_test_eval: bool = False
     save_every: int = 50
-    wandb_project: str | None = None  # None = no wandb
+    # Optional external provenance. Fresh init/log/finish are best-effort;
+    # resume identity validation, init, and namespace-history append gate a
+    # continuation because otherwise its lineage cannot be verified.
+    wandb_project: str | None = None  # None = no W&B
     # wandb entity (team). None falls back to the API key's DEFAULT entity,
     # which is a personal namespace — runs then land somewhere the rest of the
     # team cannot see. Set it explicitly in the experiment config.
     wandb_entity: str | None = None
-    log_transcripts: bool = True  # rollout transcripts -> wandb (needs wandb on)
-    transcript_every: int = 10  # train-transcript upload cadence (1 = every step)
+    log_transcripts: bool = True  # required local rollout evidence; W&B is optional
+    transcript_every: int = 10  # best-effort W&B upload cadence (local is every step)
     # Where this run's checkpoints actually landed. Recorded because the
-    # directory carries a per-launch run_id that the wandb run name does not, so
-    # without it the mapping from a run back to its checkpoints is guesswork.
+    # directory carries the launch namespace that the W&B display name does
+    # not, so the mapping from a run back to checkpoints stays explicit.
     checkpoint_dir: str | None = None
     run_name: str | None = None
+    # Operational identity of this process launch. It is provenance, not part
+    # of protocol_identity or the W&B display name.
+    launch_namespace: str | None = None
+    # Claimed once before training, then reused by every transcript step.
+    transcript_dir: str | None = None
     # Continuation plumbing: start_step makes the loop run [start_step, steps)
     # so step indices, save names, and eval cadence continue the original
     # lineage; wandb_run_id appends to that existing wandb run (resume="must")
     # instead of starting a new one at x=0.
     start_step: int = 0
     wandb_run_id: str | None = None
+    # Private operational receipt issued after the shared runner validates an
+    # explicit CLI escape hatch. init=False keeps it outside public Config
+    # construction (including YAML-derived kwargs). Accepted uses are recorded
+    # by launch namespace in ``wandb_resume_running_overrides``.
+    _wandb_resume_running_capability: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    # Runner-only ownership transfer for an already-held same-host resume
+    # lease. Direct train callers leave this absent and acquire in _make_logger.
+    _wandb_resume_lease_handoff: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     # Immutable scientific identity of the task population and grading
     # protocol. Runners resolve this only after TaskFamily.source() has loaded
     # its cohort; resumed W&B runs must match it exactly before mutable config
     # is updated.
     protocol_identity: dict[str, str] = field(default_factory=dict)
-    on_rollout: object | None = None  # callback(step, env) after each train rollout
+    # Runner-owned local Docent persistence after each train rollout. Failures
+    # propagate because missing analysis evidence invalidates the workload.
+    on_rollout: object | None = None
     seed: int = 0
 
 
@@ -208,20 +276,28 @@ class _RolloutInfoAccumulator:
 
 
 def _log_transcripts(cfg: "Config", step: int, env: Env, split: str) -> None:
-    """Transcript capture must never kill training (same stance as on_rollout)."""
+    """Persist required local evidence; external upload stays best-effort."""
     if not cfg.log_transcripts:
         return
+    transcript_run_name = getattr(cfg, "_transcript_run_name", None)
     # Local JSONL is written EVERY round; only the wandb upload obeys the
     # transcript_every cadence. Lost rollout data is unrecoverable.
     upload = bool(cfg.wandb_project) and not (
         split == "train" and cfg.transcript_every > 1 and step % cfg.transcript_every != 0
     )
-    try:
-        from infra.transcript_log import log_rollout_transcripts
+    if transcript_run_name is None or cfg.transcript_dir is None:
+        raise RuntimeError("transcript sink was not claimed before training")
+    from infra.transcript_log import log_rollout_transcripts
 
-        log_rollout_transcripts(step, env, split, run_name=cfg.run_name, upload=upload)
-    except Exception as e:
-        print(f"[transcripts] {type(e).__name__}: {e}")
+    log_rollout_transcripts(
+        step,
+        env,
+        split,
+        run_name=transcript_run_name,
+        launch_namespace=cfg.launch_namespace,
+        output_dir=cfg.transcript_dir,
+        upload=upload,
+    )
 
 
 def _eval_policy(policy: Policy, cfg: "Config") -> Policy:
@@ -364,6 +440,7 @@ def _validate_train_config(backend: Backend, cfg: Config) -> None:
             "kl_mechanism 'loss' needs a backend exposing ref_logprobs "
             "(verl + LoRA); this backend does not."
         )
+    _validate_wandb_resume_override(cfg)
 
 
 def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) -> None:
@@ -373,11 +450,67 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
     training with plain-RLVR MathEnv evals). None evaluates on ``env``.
     """
     _validate_train_config(backend, cfg)
-    logger = _make_logger(cfg)
+    if getattr(cfg, "_transcript_sink_used", False):
+        raise FileExistsError(
+            "refusing to reuse a Config whose transcript launch destination "
+            "was already consumed"
+        )
+    backend_namespace = getattr(
+        getattr(backend, "config", None), "launch_namespace", None
+    )
+    if backend_namespace is not None:
+        backend_namespace = validate_launch_namespace(backend_namespace)
+    if cfg.launch_namespace is None:
+        cfg.launch_namespace = (
+            backend_namespace
+            if backend_namespace is not None
+            else resolve_launch_namespace()
+        )
+    else:
+        cfg.launch_namespace = validate_launch_namespace(cfg.launch_namespace)
+        if (
+            backend_namespace is not None
+            and cfg.launch_namespace != backend_namespace
+        ):
+            raise ValueError(
+                "backend and Config carry different launch namespaces: "
+                f"backend={backend_namespace!r}, config={cfg.launch_namespace!r}"
+            )
+    # Production runners reserve this before constructing their backend.
+    # Compatibility callers use the deterministic "run" component when they
+    # have no display run name; the immutable namespace remains the provenance
+    # discriminator. In every case reservation precedes W&B initialization.
+    if not cfg.log_transcripts and cfg.transcript_dir is not None:
+        raise ValueError("transcript_dir cannot be set when log_transcripts is false")
+    transcript_run_name: str | None = None
+    if cfg.log_transcripts:
+        transcript_run_name = str(cfg.run_name or "run")
+        expected_transcript_dir = os.path.join(
+            "transcripts",
+            safe_path_component(transcript_run_name, fallback="run"),
+            cfg.launch_namespace,
+        )
+        if cfg.transcript_dir is None:
+            cfg.transcript_dir = str(claim_directory(expected_transcript_dir))
+        else:
+            if os.path.normpath(cfg.transcript_dir) != os.path.normpath(
+                expected_transcript_dir
+            ):
+                raise ValueError(
+                    "transcript_dir must be the preclaimed directory derived from "
+                    "the operational run component and launch namespace: "
+                    f"expected {expected_transcript_dir}, got {cfg.transcript_dir}"
+                )
+            require_claimed_directory(cfg.transcript_dir)
+    logger: _RunLogger | None = None
     try:
+        logger = _make_logger(cfg)
+        if transcript_run_name is not None:
+            cfg._transcript_run_name = transcript_run_name
+            cfg._transcript_sink_used = True
         _train_with_logger(env, backend, cfg, eval_env, logger)
     finally:
-        close = getattr(logger, "close", None)
+        close = getattr(logger, "close", None) if logger is not None else None
         if close is not None:
             close()
 
@@ -468,10 +601,10 @@ def _train_with_logger(
         # records. Acceptable; merging capture states across rounds is out of
         # scope.
         if cfg.on_rollout is not None:
-            try:
-                cfg.on_rollout(step, env)
-            except Exception as e:  # transcript capture must never kill training
-                print(f"[on_rollout] {type(e).__name__}: {e}")
+            # Runner callbacks persist the second required local analysis view
+            # (Docent JSONL). A missing file invalidates the workload, so local
+            # write failures propagate instead of becoming a successful run.
+            cfg.on_rollout(step, env)
         metrics = _aggregate([t for g in groups for t in g], "train")
         metrics.update(rollout_info.metrics())
         metrics.update(ds_metrics)  # keys only when the toggle is on; 0.0 otherwise
@@ -554,10 +687,18 @@ def _train_with_logger(
         # its own point — N/K intervals means N/K + 1 evals, the +1 at
         # x = steps, paired with the `final` checkpoint below.
         prefix = "dev" if cfg.eval_split == "dev" else "eval"
-        logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, cfg.eval_split, prefix))
+        final_env = eval_env or env
+        metrics = evaluate(
+            final_env, final_policy, cfg.eval_n, cfg.eval_split, prefix
+        )
+        _log_transcripts(cfg, cfg.steps, final_env, prefix)
+        logger(cfg.steps, metrics)
     if cfg.final_test_eval:
         # The 3-way protocol's single read of the held-out test split.
-        logger(cfg.steps, evaluate(eval_env or env, final_policy, cfg.eval_n, "test", "test"))
+        final_env = eval_env or env
+        metrics = evaluate(final_env, final_policy, cfg.eval_n, "test", "test")
+        _log_transcripts(cfg, cfg.steps, final_env, "test")
+        logger(cfg.steps, metrics)
 
     backend.save("final")
 
@@ -621,16 +762,460 @@ def _save_dirty_patch(run) -> None:
         print(f"[wandb] dirty-patch capture skipped: {type(e).__name__}: {e}")
 
 
-class _RunLogger:
-    """Callable metric logger that exclusively owns its W&B run, if any."""
+_ACTIVE_WANDB_RESUME_LOCKS: weakref.WeakSet["_WandbResumeLock"] = weakref.WeakSet()
 
-    def __init__(self, run=None):
+
+def _close_wandb_resume_locks_after_fork() -> None:
+    """A child must not prolong a resume lease acquired by its parent.
+
+    ``flock`` follows the inherited open-file description across ``fork``.
+    Merely marking the descriptor close-on-exec therefore leaves a fork-only
+    child capable of keeping the lock alive after the trainer exits. Close all
+    inherited lease descriptors in the child before it can run Python code.
+    """
+    for lease in tuple(_ACTIVE_WANDB_RESUME_LOCKS):
+        lease._close_after_fork()
+    _ACTIVE_WANDB_RESUME_LOCKS.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_wandb_resume_locks_after_fork)
+
+
+class _WandbResumeLock:
+    """One retained, non-blocking local lease for an exact W&B run ID."""
+
+    def __init__(self, fd: int, path: str):
+        self._fd = fd
+        self.path = path
+        self._released = False
+        _ACTIVE_WANDB_RESUME_LOCKS.add(self)
+
+    def __del__(self) -> None:
+        # CPython may discard a just-returned temporary before the caller can
+        # store it when control flow arrives at that boundary. Keep the kernel
+        # descriptor owned by the object itself as a last-resort cleanup.
+        try:
+            self.release()
+        except BaseException:
+            pass
+
+    def _close_after_fork(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        _ACTIVE_WANDB_RESUME_LOCKS.discard(self)
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    @property
+    def held(self) -> bool:
+        return not self._released and self._fd >= 0
+
+
+def _wandb_resume_lock_root() -> str:
+    """Persistent per-account state, independent of caller-controlled HOME."""
+    return os.path.join(
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        ".local",
+        "state",
+        "debate",
+        "wandb-resume-locks",
+    )
+
+
+def _open_wandb_resume_lock_root(state_root: str | None = None) -> tuple[int, str]:
+    root = os.path.abspath(state_root or _wandb_resume_lock_root())
+    parent = os.path.dirname(root)
+    os.makedirs(parent, exist_ok=True)
+    created = False
+    try:
+        os.mkdir(root, 0o700)
+        created = True
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as exc:
+        raise RuntimeError(
+            f"unsafe W&B resume lock directory {root!r}: {exc.strerror or exc}"
+        ) from exc
+    try:
+        if created:
+            os.fchmod(root_fd, 0o700)
+        info = os.fstat(root_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"W&B resume lock root is not a directory: {root}")
+        if info.st_uid != os.geteuid():
+            raise RuntimeError(
+                f"W&B resume lock root is not owned by uid {os.geteuid()}: {root}"
+            )
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise RuntimeError(
+                f"W&B resume lock root must have mode 0700: {root}"
+            )
+        return root_fd, root
+    except BaseException:
+        os.close(root_fd)
+        raise
+
+
+def _acquire_wandb_resume_lock(
+    run_id: str, *, state_root: str | None = None
+) -> _WandbResumeLock:
+    """Acquire a fail-fast process lease without trusting the run ID as a path.
+
+    This protects ordinary concurrent launches by the same account. It is not
+    claimed as a security boundary against another malicious process running
+    as that same uid, which can manipulate the account's own state directory.
+    """
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("W&B resume run ID must be a nonempty string")
+    basename = hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".lock"
+    root_fd, root = _open_wandb_resume_lock_root(state_root)
+    fd = -1
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        try:
+            fd = os.open(
+                basename,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=root_fd,
+            )
+            created = True
+        except FileExistsError:
+            fd = os.open(basename, flags, dir_fd=root_fd)
+        if created:
+            os.fchmod(fd, 0o600)
+        info = os.fstat(fd)
+        path = os.path.join(root, basename)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"W&B resume lock is not a regular file: {path}")
+        if info.st_uid != os.geteuid():
+            raise RuntimeError(
+                f"W&B resume lock is not owned by uid {os.geteuid()}: {path}"
+            )
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError(f"W&B resume lock must have mode 0600: {path}")
+        if info.st_nlink != 1:
+            raise RuntimeError(
+                f"W&B resume lock must have exactly one hard link: {path}"
+            )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"another local process is already resuming W&B run {run_id!r}"
+            ) from exc
+        lease: _WandbResumeLock | None = None
+        try:
+            lease = _WandbResumeLock(fd, path)
+            fd = -1
+            return lease
+        except BaseException:
+            # Until RETURN_VALUE completes there is no caller that can own
+            # the lease. In particular, an asynchronous control-flow
+            # exception can land after ``fd`` moved into the object but before
+            # the return. Close that object here; otherwise the outer finally
+            # sees fd == -1 and cannot recover the kernel lock.
+            if lease is not None:
+                fd = -1
+                try:
+                    lease.release()
+                except BaseException:
+                    pass
+            raise
+    except OSError as exc:
+        raise RuntimeError(
+            f"unsafe W&B resume lock for run {run_id!r}: {exc.strerror or exc}"
+        ) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(root_fd)
+
+
+class _WandbResumeLeaseHandoff:
+    """One-shot transfer of an early runner lease into one exact Config."""
+
+    __slots__ = (
+        "run_id",
+        "_lease",
+        "_config_ref",
+        "_consumed",
+        "_issuer",
+    )
+
+    def __init__(
+        self,
+        run_id: str,
+        lease: _WandbResumeLock,
+        issuer: object,
+    ):
+        if issuer is not _WANDB_RESUME_HANDOFF_ISSUER:
+            raise TypeError("W&B resume lease handoff may only be runner-issued")
+        self.run_id = run_id
+        self._lease: _WandbResumeLock | None = lease
+        self._config_ref: weakref.ReferenceType[Config] | None = None
+        self._consumed = False
+        self._issuer = issuer
+
+    def __del__(self) -> None:
+        # See _WandbResumeLock.__del__: a temporary handoff can be lost after
+        # its factory returns but before the caller stores the result.
+        try:
+            self.release()
+        except BaseException:
+            pass
+
+    def bind(self, cfg: Config, raw_run_id: Any) -> None:
+        if self._issuer is not _WANDB_RESUME_HANDOFF_ISSUER:
+            raise ValueError("invalid W&B resume lease handoff issuer")
+        if self._consumed or self._lease is None or not self._lease.held:
+            raise ValueError("W&B resume lease handoff is no longer live")
+        if self._config_ref is not None:
+            raise ValueError("W&B resume lease handoff was already bound")
+        if cfg.wandb_run_id != raw_run_id:
+            raise ValueError(
+                "runner Config W&B run ID does not match the validated CLI run ID"
+            )
+        if cfg._wandb_resume_lease_handoff is not None:
+            raise ValueError("runner Config already carries a W&B resume lease")
+        cfg.wandb_run_id = self.run_id
+        self._config_ref = weakref.ref(cfg)
+        cfg._wandb_resume_lease_handoff = self
+
+    def take(self, cfg: Config, run_id: str) -> _WandbResumeLock:
+        if (
+            self._issuer is not _WANDB_RESUME_HANDOFF_ISSUER
+            or self._consumed
+            or self._lease is None
+            or not self._lease.held
+            or self.run_id != run_id
+            or self._config_ref is None
+            or self._config_ref() is not cfg
+            or cfg._wandb_resume_lease_handoff is not self
+        ):
+            raise ValueError(
+                "invalid, stale, reused, or mismatched W&B resume lease handoff"
+            )
+        lease = self._lease
+        try:
+            self._lease = None
+            self._consumed = True
+            cfg._wandb_resume_lease_handoff = None
+            return lease
+        except BaseException:
+            # The caller does not own the lease until the return completes.
+            # Abort the one-shot transfer and close it if control flow lands
+            # after it left ``self`` but before it reached the caller.
+            self._lease = None
+            self._consumed = True
+            try:
+                if cfg._wandb_resume_lease_handoff is self:
+                    cfg._wandb_resume_lease_handoff = None
+            except BaseException:
+                pass
+            try:
+                lease.release()
+            except BaseException:
+                pass
+            raise
+
+    def release(self) -> None:
+        if self._lease is not None:
+            self._lease.release()
+            self._lease = None
+        cfg = self._config_ref() if self._config_ref is not None else None
+        if cfg is not None and cfg._wandb_resume_lease_handoff is self:
+            cfg._wandb_resume_lease_handoff = None
+
+
+def _acquire_wandb_resume_lease_handoff(
+    raw_run_id: Any,
+) -> _WandbResumeLeaseHandoff:
+    """Validate and lock at the runner frontier without constructing an API."""
+    import wandb
+
+    run_id = _validate_wandb_resume_sdk_contract(wandb, raw_run_id)
+    lease = _acquire_wandb_resume_lock(run_id)
+    handoff: _WandbResumeLeaseHandoff | None = None
+    try:
+        handoff = _WandbResumeLeaseHandoff(
+            run_id, lease, _WANDB_RESUME_HANDOFF_ISSUER
+        )
+        return handoff
+    except BaseException:
+        # Until the return completes, this factory still owns the lock. The
+        # handoff finalizer covers loss of the temporary after the return but
+        # before the CPython caller stores it.
+        try:
+            (handoff or lease).release()
+        except BaseException:
+            pass
+        raise
+
+
+def _validate_wandb_resume_override(cfg: Config) -> bool:
+    # Refuse the retired public bit even when attached dynamically after
+    # dataclass construction. A plain bool/object is not a runner receipt.
+    if "wandb_resume_running_override" in vars(cfg):
+        raise ValueError(
+            "wandb_resume_running_override is not a public Config field; use "
+            "the explicit shared-runner CLI flag"
+        )
+    if cfg.wandb_run_id is not None and not cfg.wandb_project:
+        raise ValueError(
+            "wandb_run_id requires W&B logging to be enabled with a project"
+        )
+    capability = getattr(cfg, "_wandb_resume_running_capability", None)
+    if capability is None:
+        return False
+    if (
+        type(capability) is not _WandbResumeRunningCapability
+        or capability._issuer is not _WANDB_RESUME_CAPABILITY_ISSUER
+        or capability.run_id != cfg.wandb_run_id
+    ):
+        raise ValueError(
+            "invalid or mismatched W&B running-resume capability; use the "
+            "explicit shared-runner CLI flag for this exact run ID"
+        )
+    if not cfg.wandb_project:
+        raise ValueError(
+            "W&B running-resume capability requires logging to be enabled"
+        )
+    return True
+
+
+def _validate_wandb_resume_sdk_contract(wandb_module: Any, run_id: Any) -> str:
+    """Validate version and raw run ID with the pinned SDK, without I/O.
+
+    ``wandb.Settings(run_id=...)`` is the 0.28.1 validation authority used by
+    ``wandb.init`` itself. Keeping that object as the oracle avoids maintaining
+    a subtly different local character/type/whitespace contract.
+    """
+    module_version = getattr(wandb_module, "__version__", None)
+    try:
+        distribution_version = importlib.metadata.version("wandb")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "W&B resume requires installed wandb=="
+            f"{_WANDB_RESUME_SDK_VERSION}; distribution metadata is missing"
+        ) from exc
+    if (
+        module_version != _WANDB_RESUME_SDK_VERSION
+        or distribution_version != _WANDB_RESUME_SDK_VERSION
+    ):
+        raise RuntimeError(
+            "W&B resume requires exact SDK version "
+            f"{_WANDB_RESUME_SDK_VERSION}; loaded={module_version!r}, "
+            f"installed={distribution_version!r}"
+        )
+    try:
+        validated = wandb_module.Settings(run_id=run_id).run_id
+    except Exception as exc:
+        raise ValueError(
+            "invalid W&B resume run ID under wandb "
+            f"{_WANDB_RESUME_SDK_VERSION}: {exc}"
+        ) from exc
+    if not isinstance(validated, str):
+        raise RuntimeError(
+            "pinned W&B SDK returned a non-string run ID after validation"
+        )
+    return validated
+
+
+def _wandb_config_payload(cfg: Config) -> dict[str, Any]:
+    """Config fields safe for ordinary W&B publication.
+
+    The private runner capability is never published. Accepted uses have their
+    own append-only namespace history instead. The retired public key is also
+    stripped defensively, though validation refuses a Config carrying it.
+    """
+    payload = vars(cfg).copy()
+    payload.pop("_wandb_resume_running_capability", None)
+    payload.pop("_wandb_resume_lease_handoff", None)
+    payload.pop("wandb_resume_running_override", None)
+    return payload
+
+
+def _validated_namespace_history(stored: dict[str, Any], key: str) -> list[str]:
+    history = stored.get(key, [])
+    try:
+        if not isinstance(history, list):
+            raise ValueError
+        validated = [validate_launch_namespace(item) for item in history]
+        if len(set(validated)) != len(validated):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"refusing to resume W&B run with malformed {key} history: {history!r}"
+        ) from None
+    return validated
+
+
+def _require_ordered_namespace_subset(
+    subset: list[str], history: list[str], *, subset_name: str
+) -> None:
+    """Require every audit entry to occur in launch history in the same order."""
+    history_index = 0
+    for namespace in subset:
+        while (
+            history_index < len(history)
+            and history[history_index] != namespace
+        ):
+            history_index += 1
+        if history_index == len(history):
+            raise ValueError(
+                f"refusing to resume W&B run because {subset_name} is not an "
+                "order-consistent subset of launch_namespaces"
+            )
+        history_index += 1
+
+
+class _RunLogger:
+    """Best-effort W&B telemetry after any gating resume handshake.
+
+    Fresh-run initialization, metric logging, and finish are external
+    provenance only: ordinary network/client failures are reported without
+    invalidating locally evidenced training. Resume identity verification,
+    resume initialization, and namespace-history append happen before this
+    logger is returned and remain fail-closed in ``_make_logger``.
+    """
+
+    def __init__(self, run=None, resume_lock: _WandbResumeLock | None = None):
         self.run = run
+        self._resume_lock = resume_lock
         self._closed = False
 
     def __call__(self, step: int, metrics: dict[str, Any]) -> None:
         if self.run is not None:
-            self.run.log(metrics, step=step)
+            try:
+                self.run.log(metrics, step=step)
+            except Exception as exc:
+                print(
+                    f"[wandb] metric log failed: {type(exc).__name__}; "
+                    "local training continues",
+                    file=sys.stderr,
+                )
         shown = {k: round(v, 4) for k, v in sorted(metrics.items()) if isinstance(v, float)}
         print(f"[step {step}] {shown}")
 
@@ -639,64 +1224,253 @@ class _RunLogger:
         if self._closed:
             return
         self._closed = True
-        if self.run is not None:
-            self.run.finish()
+        try:
+            if self.run is not None:
+                try:
+                    self.run.finish()
+                except Exception as exc:
+                    print(
+                        f"[wandb] finish failed: {type(exc).__name__}; "
+                        "local training remains authoritative",
+                        file=sys.stderr,
+                    )
+        finally:
+            if self._resume_lock is not None:
+                self._resume_lock.release()
+                self._resume_lock = None
 
 
 def _make_logger(cfg: Config) -> _RunLogger:
+    """Open W&B with a fail-closed resume handshake and best-effort fresh run."""
+    running_override = _validate_wandb_resume_override(cfg)
+    cfg.launch_namespace = (
+        resolve_launch_namespace()
+        if cfg.launch_namespace is None
+        else validate_launch_namespace(cfg.launch_namespace)
+    )
     logger = _RunLogger()
     if cfg.wandb_project:
-        import wandb
+        if cfg.wandb_run_id is not None:
+            # The client itself is part of the explicit resume handshake; if
+            # it cannot be imported, the continuation cannot be verified.
+            import wandb
 
-        if cfg.wandb_run_id:
-            # resume="must": appending to the named run is the entire point; a
-            # silent fallback to a fresh run would re-split the x-axis.
-            # Preflight through the READ-ONLY public API. Even opening the run
-            # with wandb.init mutates its resume state, so an incompatible
-            # continuation must be rejected before init is called at all.
-            api = wandb.Api()
-            run_path = (
-                f"{cfg.wandb_entity}/{cfg.wandb_project}/{cfg.wandb_run_id}"
-                if cfg.wandb_entity
-                else f"{cfg.wandb_project}/{cfg.wandb_run_id}"
+            run_id = _validate_wandb_resume_sdk_contract(
+                wandb, cfg.wandb_run_id
             )
-            stored_identity = dict(api.run(run_path).config).get("protocol_identity")
-            current_identity = dict(cfg.protocol_identity)
-            if stored_identity != current_identity:
-                raise ValueError(
-                    "refusing to resume W&B run with a different or missing "
-                    f"protocol_identity: stored={stored_identity!r}, "
-                    f"current={current_identity!r}"
-                )
-            run = wandb.init(
-                project=cfg.wandb_project, entity=cfg.wandb_entity, id=cfg.wandb_run_id,
-                resume="must",
-            )
-            logger = _RunLogger(run)
-            # Continuations may intentionally change operational knobs such as
-            # lr or steps. Update those only after identity equality, and omit
-            # the identity key so the immutable stored value is never rewritten.
-            mutable_config = vars(cfg).copy()
-            mutable_config.pop("protocol_identity")
+            # Preserve the pinned SDK's own accepted normalization (for
+            # example, its bytes-to-string coercion) in subsequent provenance
+            # config as well as the lock and API path.
+            cfg.wandb_run_id = run_id
+            # The local lease fires immediately for the common duplicate-launch
+            # case and stays live through run.finish(). It precedes every W&B
+            # API operation, including the single public-run fetch below.
+            handoff = getattr(cfg, "_wandb_resume_lease_handoff", None)
+            if handoff is None:
+                # Direct train callers have no runner frontier; preserve their
+                # behavior by acquiring at the earliest point available here.
+                resume_lock = _acquire_wandb_resume_lock(run_id)
+            elif type(handoff) is _WandbResumeLeaseHandoff:
+                resume_lock = handoff.take(cfg, run_id)
+            else:
+                raise ValueError("invalid W&B resume lease handoff on Config")
+            run = None
             try:
-                run.config.update(mutable_config | _env_identity(), allow_val_change=True)
+                # resume="must": appending to the named run is the entire
+                # point; a silent fresh run would re-split the x-axis. The
+                # public object supplies BOTH state and config so the remote
+                # guard adds no second API fetch.
+                api = wandb.Api()
+                run_path = (
+                    f"{cfg.wandb_entity}/{cfg.wandb_project}/{run_id}"
+                    if cfg.wandb_entity
+                    else f"{cfg.wandb_project}/{run_id}"
+                )
+                public_run = api.run(run_path)
+                try:
+                    public_state = public_run.state
+                except Exception as exc:
+                    raise RuntimeError(
+                        "refusing to resume W&B run because its remote state "
+                        f"could not be read: {type(exc).__name__}: {exc}"
+                    ) from exc
+                terminal_states = {"finished", "crashed", "failed", "killed"}
+                if not isinstance(public_state, str) or public_state not in (
+                    terminal_states | {"running"}
+                ):
+                    raise RuntimeError(
+                        "refusing to resume W&B run with unknown or missing "
+                        f"remote state: {public_state!r}"
+                    )
+                if public_state == "running":
+                    if not running_override:
+                        raise RuntimeError(
+                            "refusing to resume W&B run while its remote state "
+                            "is 'running'; after confirming the old process is "
+                            "dead, retry with --wandb-resume-running-override"
+                        )
+                    override_used = True
+                else:
+                    if running_override:
+                        raise ValueError(
+                            "--wandb-resume-running-override is unnecessary: "
+                            f"W&B run state is already terminal ({public_state!r})"
+                        )
+                    override_used = False
+
+                stored_config = dict(public_run.config)
+                stored_identity = stored_config.get("protocol_identity")
+                current_identity = dict(cfg.protocol_identity)
+                if stored_identity != current_identity:
+                    raise ValueError(
+                        "refusing to resume W&B run with a different or missing "
+                        f"protocol_identity: stored={stored_identity!r}, "
+                        f"current={current_identity!r}"
+                    )
+                stored_namespaces = _validated_namespace_history(
+                    stored_config, "launch_namespaces"
+                )
+                override_namespaces = _validated_namespace_history(
+                    stored_config, "wandb_resume_running_overrides"
+                )
+                _require_ordered_namespace_subset(
+                    override_namespaces,
+                    stored_namespaces,
+                    subset_name="wandb_resume_running_overrides",
+                )
+                if cfg.launch_namespace in stored_namespaces:
+                    raise ValueError(
+                        "refusing to reuse launch namespace already recorded by "
+                        f"this W&B run: {cfg.launch_namespace}"
+                    )
+                launch_namespaces = [*stored_namespaces, cfg.launch_namespace]
+                if override_used:
+                    if cfg.launch_namespace in override_namespaces:
+                        raise ValueError(
+                            "refusing to duplicate a W&B running-state override "
+                            f"record for launch namespace {cfg.launch_namespace}"
+                        )
+                    override_namespaces = [
+                        *override_namespaces,
+                        cfg.launch_namespace,
+                    ]
+                    print(
+                        "[wandb] explicit running-state resume override accepted "
+                        f"for run {run_id!r}, launch namespace "
+                        f"{cfg.launch_namespace!r}",
+                        file=sys.stderr,
+                    )
+                run = wandb.init(
+                    project=cfg.wandb_project,
+                    entity=cfg.wandb_entity,
+                    id=run_id,
+                    resume="must",
+                    # An inherited WANDB_MODE=offline/disabled would otherwise
+                    # make resume semantics inapplicable. Explicit call
+                    # settings take precedence in the pinned SDK.
+                    mode="online",
+                )
+                try:
+                    run_finish = run.finish
+                    run_config_update = run.config.update
+                except Exception as exc:
+                    raise RuntimeError(
+                        "W&B resume initialization returned an invalid run "
+                        f"object: {type(exc).__name__}: {exc}"
+                    ) from exc
+                if not callable(run_finish) or not callable(run_config_update):
+                    raise RuntimeError(
+                        "W&B resume initialization returned an invalid run "
+                        "object without callable finish/config.update"
+                    )
+                logger = _RunLogger(run, resume_lock=resume_lock)
+                resume_lock = None
+                # Continuations may intentionally change operational knobs such
+                # as lr or steps. Update those only after identity equality,
+                # and omit identity so its immutable value is not rewritten.
+                mutable_config = _wandb_config_payload(cfg)
+                mutable_config.pop("protocol_identity")
+                run.config.update(
+                    mutable_config
+                    | _env_identity()
+                    | {
+                        "launch_namespaces": launch_namespaces,
+                        "wandb_resume_running_overrides": override_namespaces,
+                    },
+                    allow_val_change=True,
+                )
             except BaseException:
-                logger.close()
+                if run is not None and logger.run is run:
+                    try:
+                        logger.close()
+                    except BaseException:
+                        pass
+                else:
+                    # wandb.init may have created a remote running attempt
+                    # before an interrupt prevented _RunLogger from owning it.
+                    # Finish that independently tracked object before dropping
+                    # the local lease so it does not remain remotely running
+                    # without its namespace-history update.
+                    if run is not None:
+                        try:
+                            finish = getattr(run, "finish", None)
+                            if callable(finish):
+                                finish()
+                        except BaseException:
+                            pass
+                    if resume_lock is not None:
+                        try:
+                            resume_lock.release()
+                        except BaseException:
+                            pass
                 raise
         else:
-            run = wandb.init(
-                project=cfg.wandb_project,
-                entity=cfg.wandb_entity,   # None -> wandb's default entity
-                name=cfg.run_name,
-                config=vars(cfg) | _env_identity(),
-            )
+            try:
+                import wandb
+            except Exception as exc:
+                print(
+                    f"[wandb] fresh client unavailable: {type(exc).__name__}; "
+                    "continuing with local evidence only",
+                    file=sys.stderr,
+                )
+                return logger
+            try:
+                run = wandb.init(
+                    project=cfg.wandb_project,
+                    entity=cfg.wandb_entity,   # None -> wandb's default entity
+                    name=cfg.run_name,
+                    config=_wandb_config_payload(cfg)
+                    | _env_identity()
+                    | {"launch_namespaces": [cfg.launch_namespace]},
+                )
+            except Exception as exc:
+                print(
+                    f"[wandb] fresh init failed: {type(exc).__name__}; "
+                    "continuing with local evidence only",
+                    file=sys.stderr,
+                )
+                return logger
             logger = _RunLogger(run)
         try:
             if run is not None and dict(run.config).get("env/git_dirty") == "yes":
                 _save_dirty_patch(run)
-        except BaseException:
-            logger.close()
-            raise
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                print(
+                    f"[wandb] post-init provenance check failed: "
+                    f"{type(exc).__name__}; local training continues",
+                    file=sys.stderr,
+                )
+            else:
+                # The resume lease has already moved into ``logger``, but
+                # train() has not received it yet and therefore cannot close
+                # it in its own finally block. Release here while preserving
+                # the original control-flow exception even if finish fails.
+                try:
+                    logger.close()
+                except BaseException:
+                    pass
+                raise
     return logger
 
 
@@ -758,7 +1532,13 @@ def validate_resume_args(args: Any) -> None:
             f"step-{checkpoint_step:05d}"
         )
 
-    if not getattr(args, "wandb_resume", None):
+    wandb_resume = getattr(args, "wandb_resume", None)
+    running_override = getattr(args, "wandb_resume_running_override", False)
+    if running_override and wandb_resume is None:
+        raise ValueError(
+            "--wandb-resume-running-override requires --wandb-resume RUN_ID"
+        )
+    if wandb_resume is None:
         return
     if getattr(args, "no_wandb", False):
         raise ValueError("--wandb-resume cannot be combined with --no-wandb")

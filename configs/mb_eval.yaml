@@ -9,7 +9,8 @@
 # bash agent trajectories. Ground truth is meta["label"]; seating is NOT
 # fixed — alice's blind choice decides which seat argues "attack".
 #
-# Run: python -m infra.run_eval --experiment-file configs/mb_eval.yaml --experiment <name>
+# Run: python -m infra.run_eval --experiment-file configs/mb_eval.yaml --experiment <name> \
+#        --artifact-root <root>
 #
 # SAFETY: data/monitoringbench/*.jsonl contain red-team attack trajectories.
 # Never print/log record contents; work by id/label/count only.

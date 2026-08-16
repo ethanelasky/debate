@@ -145,7 +145,7 @@ P="$ENV_DIR/bin/python"
 # told which one wins. Rationale for why the override is safe lives in
 # provision_pod.sh; nothing about it is arch-dependent.
 OVERRIDE="$VOL/verl-transformers-override.txt"
-printf 'transformers>=5.13,<6\n' > "$OVERRIDE"
+printf 'transformers==5.14.1\n' > "$OVERRIDE"
 
 # uv HARDLINKS installed files into the shared $UV_CACHE_DIR by default, and
 # the in-place source patches below write THROUGH those links: a patched
@@ -158,10 +158,10 @@ printf 'transformers>=5.13,<6\n' > "$OVERRIDE"
 log "vllm ($VLLM_PIN) + verl @ ${VERL_PIN:0:7} (joint resolve, transformers override)"
 timeout -k 30s 3600 uv pip install -p "$P" --link-mode=copy --override "$OVERRIDE" "$VLLM_PIN" \
   "verl @ git+https://github.com/volcengine/verl@${VERL_PIN}" \
-  "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb>=0.18" jinja2 codetiming \
-  backoff "docent-python>=0.1.74" "pydantic>=2.0" "openai>=1.0" pyyaml ninja \
+  "tensordict>=0.8.0,<=0.10.0,!=0.9.0" "datasets>=3.1" "wandb==0.28.1" jinja2 codetiming \
+  backoff "docent-python==0.1.77" "pydantic>=2.0" "openai>=1.0" pyyaml ninja \
   "${SYMBOLIC_DEPS[@]}" \
-  "transformers>=5.13,<6" || {
+  "transformers==5.14.1" || {
   echo "FATAL: joint vllm+verl resolve failed or exceeded 3600s (git clone of verl hanging, or NFS-stalled \$UV_CACHE_DIR=$UV_CACHE_DIR)" >&2; exit 1; }
 # transformers >=5.13 is a HARD floor: 5.10-5.12 misapply OLMo-3's YaRN factor
 # to sliding-attention layers (HF regression #39847, fixed in #46911), which

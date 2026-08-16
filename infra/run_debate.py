@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,12 +42,21 @@ from infra.envs.debate.protocol import Protocol
 from infra.envs.tasks import get_family
 from infra.models.base import ModelSettings, ModelType, resolved_sampling_profile
 from infra.models.factory import instantiate_model
+from infra.launch_namespace import (
+    claim_directory,
+    resolve_launch_namespace,
+    safe_path_component,
+    validate_launch_namespace,
+)
 from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
+    acquire_wandb_resume_cli_lease,
+    apply_wandb_resume_cli_authorization,
     apply_topology,
     build_backend,
     resolve_topology,
+    release_wandb_resume_cli_lease,
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
@@ -72,37 +80,18 @@ EXPERIMENT_KEYS = {
 AGENT_KEYS = {"trained", "model_settings"}
 
 
-def _safe_docent_component(value: str, *, fallback: str) -> str:
-    """Return a readable, traversal-safe component without slug collisions."""
-    if (
-        len(value.encode("utf-8")) <= 128
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
-    ):
-        return value
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("._-")[:80]
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-    return f"{slug or fallback}-{digest}"
-
-
-def _docent_launch_id(pid: int | None = None) -> str:
-    """Return an auditable identifier unique to a simultaneous process launch."""
-    return f"pid-{os.getpid() if pid is None else pid}"
-
-
-def _docent_run_dir(run_name: str, *, launch_id: str | None = None) -> str:
-    """Return a stable Docent directory for one process launch of one run.
+def _docent_run_dir(run_name: str, *, launch_namespace: str) -> str:
+    """Return the Docent directory for one immutable launch of one run.
 
     Sweep arms share a working directory, so the run name must namespace their
     rollout files.  Unsafe or overlong names get a readable slug plus a digest:
-    the digest prevents distinct names that sanitize alike from colliding.  A
-    launch component prevents simultaneous commands with the same run name
-    from overwriting identically numbered steps.
+    the digest prevents distinct names that sanitize alike from colliding. The
+    already-validated launch namespace is preserved byte-for-byte.
     """
-    launch_id = _docent_launch_id() if launch_id is None else launch_id
     return os.path.join(
         "docent",
-        _safe_docent_component(run_name, fallback="run"),
-        _safe_docent_component(launch_id, fallback="launch"),
+        safe_path_component(run_name, fallback="run"),
+        validate_launch_namespace(launch_namespace),
     )
 
 
@@ -555,6 +544,22 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
 def _main(cleanups: list) -> None:
     args = runner_parser(__doc__).parse_args()
     validate_resume_args(args)
+    launch_namespace = resolve_launch_namespace()
+    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
+    try:
+        _main_after_resume_frontier(
+            cleanups, args, launch_namespace, resume_lease_handoff
+        )
+    finally:
+        release_wandb_resume_cli_lease(resume_lease_handoff)
+
+
+def _main_after_resume_frontier(
+    cleanups: list,
+    args,
+    launch_namespace: str,
+    resume_lease_handoff,
+) -> None:
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
@@ -566,6 +571,26 @@ def _main(cleanups: list) -> None:
     trained_settings = list(trained.values())
     tr = exp.get("training") or {}
     validate_trained_seats(trained, tr)
+    run_name = args.experiment + run_identity_suffix(
+        args.lr, args.levels, args.group_size, args.batch_size
+    )
+    config_kwargs = training_config_kwargs(tr, args)
+    docent_dir = str(
+        claim_directory(
+            _docent_run_dir(run_name, launch_namespace=launch_namespace)
+        )
+    )
+    transcript_dir = None
+    if config_kwargs.get("log_transcripts", Config.log_transcripts):
+        transcript_dir = str(
+            claim_directory(
+                os.path.join(
+                    "transcripts",
+                    safe_path_component(run_name, fallback="run"),
+                    launch_namespace,
+                )
+            )
+        )
 
     dataset_type = (exp.get("dataset") or {}).get("type")
     env = build_env(exp, trained, frozen)
@@ -576,9 +601,6 @@ def _main(cleanups: list) -> None:
     )
     lead = trained_settings[0]
 
-    run_name = args.experiment + run_identity_suffix(
-        args.lr, args.levels, args.group_size, args.batch_size
-    )
     backend = build_backend(
         tr,
         lead.model_file_path,
@@ -587,6 +609,7 @@ def _main(cleanups: list) -> None:
         load_given=bool(args.load),
         gen_budgets=debate_gen_budgets(env.protocol, trained, tr),
         topology=topology,
+        launch_namespace=launch_namespace,
     )
     if args.load:
         backend.load(args.load)
@@ -609,24 +632,34 @@ def _main(cleanups: list) -> None:
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
         run_name=run_name,
+        launch_namespace=launch_namespace,
+        transcript_dir=transcript_dir,
         protocol_identity=protocol_identity,
         chat_template_kwargs=(
             {"enable_thinking": bool(lead.enable_thinking)} if lead.enable_thinking is not None else None
         ),
-        **training_config_kwargs(tr, args),
+        **config_kwargs,
+    )
+    apply_wandb_resume_cli_authorization(
+        cfg, args, resume_lease_handoff=resume_lease_handoff
     )
     # Comprehensive docent capture: every training rollout's debates -> JSONL.
     # The run-specific directory prevents concurrent sweep arms from overwriting
     # one another's identically numbered steps.
-    launch_id = _docent_launch_id()
-    docent_dir = _docent_run_dir(run_name, launch_id=launch_id)
-
     def _export_docent(step: int, env_) -> None:
-        from infra.envs.debate.docent_export import agent_runs, export_jsonl
+        from infra.envs.debate.docent_export import agent_runs, export_jsonl_claimed
 
-        os.makedirs(docent_dir, exist_ok=True)
-        path = os.path.join(docent_dir, f"step-{step:05d}.jsonl")
-        export_jsonl(agent_runs(env_), path)
+        states = getattr(env_, "last_states", None)
+        if not states:
+            raise RuntimeError(
+                "requested debate rollout retained no states; refusing missing "
+                "local Docent evidence"
+            )
+        export_jsonl_claimed(
+            agent_runs(env_, states=states),
+            docent_dir,
+            f"step-{step:05d}.jsonl",
+        )
 
     cfg.on_rollout = _export_docent
 

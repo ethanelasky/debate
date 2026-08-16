@@ -1,17 +1,19 @@
-"""Rollout transcripts -> wandb: a forever-collection plus per-step samples.
+"""Rollout transcripts -> required local JSONL plus best-effort W&B copies.
 
-Whenever a wandb run is active (Config.log_transcripts, default true), every
-training rollout and every eval pass is captured (Ethan, 2026-08-05):
+With ``Config.log_transcripts`` (default true), every training rollout and
+every eval pass is captured (Ethan, 2026-08-05):
 
-  - FULL transcripts land in wandb Artifacts under two STABLE collection
-    names — ``train-transcripts`` and ``eval-transcripts`` (type
-    ``transcripts``). Stable names are the point: every run of the project
-    appends versions to the same two collections, so the archive accumulates
-    across runs indefinitely. Files inside are namespaced
-    ``{run_name}/{split}-step-NNNNN.jsonl``; artifact metadata carries run,
-    step, and row count. The jsonl is also left on local disk under
-    ``transcripts/`` (best-effort scratch; wandb is the durable copy — pod
-    container disks are wiped on stop).
+  - FULL transcripts are success-gating local evidence under
+    ``transcripts/{safe_run_name}/{launch_namespace}/``. When W&B is active,
+    best-effort copies land in Artifacts under a STABLE collection name per
+    split — ``{split}-transcripts`` (type ``transcripts``), including the
+    train/dev/test/eval split names used by callers. Stable names are the
+    point: every run of the project appends versions to the corresponding
+    split collection, so the archive accumulates across runs indefinitely.
+    Files inside are namespaced
+    ``{safe_run_name}/{launch_namespace}/{split}-step-NNNNN.jsonl``; artifact
+    metadata carries the scalar launch namespace, run, step, and row count.
+    The same namespaced jsonl is also left on local disk under ``transcripts/``.
 
   - N samples per log point go to a ``wandb.Table`` under
     ``{split}/transcript_samples`` for eyeballing in the UI. Sample text is
@@ -26,13 +28,30 @@ sample.
 MB note: prompts embed the (HF-released) red-team trajectories, so transcript
 artifacts belong in a PRIVATE wandb project. The no-trajectory-on-stdout rule
 is untouched — nothing here prints content.
+
+Filesystem boundary: local creation uses a retained directory descriptor and
+never follows a replacement pathname. W&B's public Artifact API accepts only a
+pathname, however, so configured transcript roots must remain owner-trusted and
+stable through ``artifact.add_file``. The immediately preceding identity check
+detects an observed replacement; it is not authority against a hostile rename
+after that check.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
+
+from infra.launch_namespace import (
+    claim_directory,
+    open_claimed_text_file,
+    require_claimed_directory,
+    resolve_launch_namespace,
+    safe_path_component,
+    validate_launch_namespace,
+)
 
 SAMPLE_ROWS = 4
 SAMPLE_CHARS = 25_000  # per-cell truncation for the sample table only
@@ -86,67 +105,130 @@ def debate_sample_rows(states: list, step: int) -> list[list[Any]]:
     return rows
 
 
-def _write_singleturn_jsonl(records: list[dict], path: str) -> int:
+def _write_jsonl_lines(output_dir: str, filename: str, lines: list[str]) -> None:
+    with open_claimed_text_file(output_dir, filename) as f:
+        for line in lines:
+            f.write(line + "\n")
+
+
+def _write_singleturn_jsonl(
+    records: list[dict], output_dir: str, filename: str
+) -> int:
     """Docent-format AgentRuns, matching the debate path: RLVR transcripts
     belong in docent too (Ethan, 2026-08-06), and one artifact format means
     one ingest path. Falls back to raw records only if the docent build fails
     — a lost analysis view is acceptable, a lost archive is not."""
-    from infra.envs.debate.docent_export import export_jsonl
     from infra.envs.singleturn_docent import agent_runs
 
     try:
-        export_jsonl(agent_runs(records), path)
-        return len(records)
+        lines = [run.model_dump_json() for run in agent_runs(records)]
     except Exception as e:
         print(f"[transcripts] single-turn docent build failed ({type(e).__name__}: {e}); writing raw records")
-        with open(path, "w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, default=str) + "\n")
-        return len(records)
+        lines = [json.dumps(record, default=str) for record in records]
+    _write_jsonl_lines(output_dir, filename, lines)
+    return len(records)
 
 
-def log_rollout_transcripts(step: int, env, split: str, run_name: str | None = None, upload: bool = True) -> None:
-    """Persist env's most recent rollout: local JSONL ALWAYS (insufficient
-    logs are unacceptable — Ethan, 2026-08-14), wandb artifact + table only
-    when `upload` and a run is active. Never raises past itself into the
-    train loop — the caller wraps, but keep failures here cheap anyway.
+def log_rollout_transcripts(
+    step: int,
+    env,
+    split: str,
+    run_name: str | None = None,
+    launch_namespace: str | None = None,
+    output_dir: str | None = None,
+    upload: bool = True,
+) -> None:
+    """Persist env's most recent rollout to its required local JSONL.
+
+    Local serialization, reservation and write failures propagate so an
+    analyzed workload cannot report success without transcript evidence.
+    W&B artifact/table work is a separate best-effort phase: it is attempted
+    only after the local file and directory authority are verified.
     """
-    import wandb
-
+    wandb_module = None
     if run_name is None:
-        if wandb.run is None:
+        # Low-level compatibility path only. Production callers always pass
+        # the pre-resolved operational run component explicitly.
+        import wandb as wandb_module
+
+        if wandb_module.run is None:
             return
-        run_name = wandb.run.name or wandb.run.id
+        run_name = wandb_module.run.name or wandb_module.run.id
+    namespace = (
+        resolve_launch_namespace()
+        if launch_namespace is None
+        else validate_launch_namespace(launch_namespace)
+    )
     states = getattr(env, "last_states", None)
     records = getattr(env, "last_rollout_records", None)
+    if not states and not records:
+        raise RuntimeError(
+            "requested rollout retained no transcript records; refusing an "
+            "analyzed workload with missing local evidence"
+        )
 
-    out_dir = os.path.join("transcripts", run_name)
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{split}-step-{step:05d}.jsonl")
+    safe_run_name = safe_path_component(run_name, fallback="run")
+    expected_dir = os.path.join("transcripts", safe_run_name, namespace)
+    if output_dir is None:
+        out_dir = str(claim_directory(expected_dir))
+    else:
+        if os.path.normpath(output_dir) != os.path.normpath(expected_dir):
+            raise ValueError(
+                "transcript output_dir does not match run_name and "
+                f"launch_namespace: expected {expected_dir}, got {output_dir}"
+            )
+        out_dir = output_dir
+    filename = f"{split}-step-{step:05d}.jsonl"
+    path = os.path.join(out_dir, filename)
 
     if states:
         # Full fidelity via the docent export (omniscient + per-speaker views).
-        from infra.envs.debate.docent_export import agent_runs, export_jsonl
+        from infra.envs.debate.docent_export import agent_runs
 
-        export_jsonl(agent_runs(env), path)
+        lines = [run.model_dump_json() for run in agent_runs(env)]
+        _write_jsonl_lines(out_dir, filename, lines)
         n_rows = len(states)
         rows = debate_sample_rows(states, step)
     elif records:
-        n_rows = _write_singleturn_jsonl(records, path)
+        n_rows = _write_singleturn_jsonl(records, out_dir, filename)
         rows = singleturn_sample_rows(records, step)
-    else:
+    # W&B still consumes a pathname. Refuse an already-observed replacement
+    # before handing it off; local creation itself used retained dirfd authority.
+    # The configured artifact root's trusted-stability contract extends through
+    # add_file because the W&B API has no descriptor-based ingestion boundary.
+    require_claimed_directory(out_dir)
+    if not upload:
         return
+    try:
+        if wandb_module is None:
+            import wandb as wandb_module
+        if wandb_module.run is None:
+            return
+        artifact = wandb_module.Artifact(
+            f"{split}-transcripts",
+            type="transcripts",
+            metadata={
+                "run": run_name,
+                "launch_namespace": namespace,
+                "step": step,
+                "rows": n_rows,
+                "kind": "debate" if states else "single_turn",
+            },
+        )
+        artifact.add_file(
+            path,
+            name=f"{safe_run_name}/{namespace}/{os.path.basename(path)}",
+        )
+        wandb_module.run.log_artifact(artifact)
 
-    if not (upload and wandb.run is not None):
-        return
-
-    artifact = wandb.Artifact(
-        f"{split}-transcripts",
-        type="transcripts",
-        metadata={"run": run_name, "step": step, "rows": n_rows, "kind": "debate" if states else "single_turn"},
-    )
-    artifact.add_file(path, name=f"{run_name}/{os.path.basename(path)}")
-    wandb.run.log_artifact(artifact)
-
-    table = wandb.Table(columns=["step", "task", "reward", "info", "transcript"], data=rows)
-    wandb.run.log({f"{split}/transcript_samples": table}, step=step)
+        table = wandb_module.Table(
+            columns=["step", "task", "reward", "info", "transcript"],
+            data=rows,
+        )
+        wandb_module.run.log({f"{split}/transcript_samples": table}, step=step)
+    except Exception as exc:
+        print(
+            f"[transcripts] W&B upload failed: {type(exc).__name__}; "
+            "local JSONL remains authoritative",
+            file=sys.stderr,
+        )

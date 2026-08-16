@@ -48,12 +48,20 @@ from urllib.parse import urlsplit
 from infra.backend.base import LossSpec, OptimParams, SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
+from infra.launch_namespace import (
+    claim_directory,
+    resolve_launch_namespace,
+    safe_path_component,
+)
 from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
+    acquire_wandb_resume_cli_lease,
+    apply_wandb_resume_cli_authorization,
     apply_topology,
     build_backend,
     resolve_topology,
+    release_wandb_resume_cli_lease,
     run_identity_suffix,
     runner_parser,
     training_config_kwargs,
@@ -454,11 +462,54 @@ def validate_experiment(exp: dict) -> None:
 def _main(cleanups: list) -> None:
     args = runner_parser(__doc__).parse_args()
     validate_resume_args(args)
+    launch_namespace = resolve_launch_namespace()
+    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
+    try:
+        _main_after_resume_frontier(
+            cleanups, args, launch_namespace, resume_lease_handoff
+        )
+    finally:
+        release_wandb_resume_cli_lease(resume_lease_handoff)
+
+
+def _main_after_resume_frontier(
+    cleanups: list,
+    args,
+    launch_namespace: str,
+    resume_lease_handoff,
+) -> None:
 
     exp = load_experiment(args.experiment_file, args.experiment)
     validate_experiment(exp)
     if args.levels is not None:
         exp.setdefault("dataset", {})["levels"] = args.levels
+
+    tr = exp.get("training") or {}
+    model_path = str(exp["model"])
+    run_name = args.experiment + run_identity_suffix(
+        args.lr, args.levels, args.group_size, args.batch_size
+    )
+    config_kwargs = training_config_kwargs(tr, args)
+    docent_dir = str(
+        claim_directory(
+            os.path.join(
+                "docent",
+                safe_path_component(run_name, fallback="run"),
+                launch_namespace,
+            )
+        )
+    )
+    transcript_dir = None
+    if config_kwargs.get("log_transcripts", Config.log_transcripts):
+        transcript_dir = str(
+            claim_directory(
+                os.path.join(
+                    "transcripts",
+                    safe_path_component(run_name, fallback="run"),
+                    launch_namespace,
+                )
+            )
+        )
 
     ds = dict(exp.get("dataset") or {})
     dataset_type = ds.pop("type", None)
@@ -477,12 +528,6 @@ def _main(cleanups: list) -> None:
     # env, one rollout path), matching the debate arm's pre-solution scratchpad
     # slot. See infra/envs/planned.py.
     plan_tokens = exp.get("plan_tokens")
-
-    tr = exp.get("training") or {}
-    model_path = str(exp["model"])
-    run_name = args.experiment + run_identity_suffix(
-        args.lr, args.levels, args.group_size, args.batch_size
-    )
 
     max_tokens = exp.get("max_completion_tokens")
     if max_tokens is None:
@@ -532,6 +577,7 @@ def _main(cleanups: list) -> None:
         load_given=bool(args.load),
         gen_budgets=gen_budgets,
         topology=topology,
+        launch_namespace=launch_namespace,
     )
     if args.load:
         backend.load(args.load)
@@ -565,27 +611,31 @@ def _main(cleanups: list) -> None:
             None if args.no_wandb else args.wandb_project or tr.get("wandb_project") or "debate"
         ),
         run_name=run_name,
+        launch_namespace=launch_namespace,
+        transcript_dir=transcript_dir,
         protocol_identity=protocol_identity,
-        **training_config_kwargs(tr, args),
+        **config_kwargs,
+    )
+    apply_wandb_resume_cli_authorization(
+        cfg, args, resume_lease_handoff=resume_lease_handoff
     )
 
     # Comprehensive docent capture, single-turn twin of run_debate's: every
-    # training rollout's kept samples -> docent/<run>/step-NNNNN.jsonl. The run
-    # name carries the sweep suffix, for the same reason checkpoints do: arms of
-    # one sweep run concurrently from the same working directory, and a shared
-    # docent/step-NNNNN.jsonl would have them overwrite each other's rollouts
-    # step for step, leaving one file per step drawn from whichever arm wrote last.
-    docent_dir = os.path.join("docent", run_name)
-
+    # training rollout's kept samples lands under the same immutable launch
+    # namespace used by checkpoints, transcripts and W&B provenance.
     def _export_docent(step: int, env_) -> None:
-        from infra.envs.debate.docent_export import export_jsonl
+        from infra.envs.debate.docent_export import export_jsonl_claimed
         from infra.envs.singleturn_docent import agent_runs
 
         records = getattr(env_, "last_rollout_records", None)
         if not records:
-            return
-        os.makedirs(docent_dir, exist_ok=True)
-        export_jsonl(agent_runs(records), os.path.join(docent_dir, f"step-{step:05d}.jsonl"))
+            raise RuntimeError(
+                "requested RLVR rollout retained no records (including an "
+                "all-fidelity-dropped rollout); refusing missing local Docent evidence"
+            )
+        export_jsonl_claimed(
+            agent_runs(records), docent_dir, f"step-{step:05d}.jsonl"
+        )
 
     cfg.on_rollout = _export_docent
     train(env, backend, cfg)

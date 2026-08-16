@@ -49,7 +49,7 @@ separately (never folded into a predicted class).
 Usage:
     python -m infra.run_eval --experiment-file configs/mb_eval.yaml \
         --experiment mb_debate [--task-ids a,b | --task-ids-file f] [--limit N]
-        [--out PATH] [--docent-jsonl PATH]
+        --artifact-root ROOT
         [--docent-collection NAME --allow-trajectory-upload]
         [--dry-run] [--seed S] [--matched-fpr F] [--max-failure-rate R]
 """
@@ -59,7 +59,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -71,6 +70,11 @@ from infra.envs.debate.rewards import ScoringConfig
 from infra.envs.debate.round import DebateState, SlotRecord
 from infra.envs.debate.protocol import Kind, Protocol
 from infra.models.factory import instantiate_model
+from infra.launch_namespace import (
+    claim_directory,
+    open_claimed_text_file,
+    resolve_launch_namespace,
+)
 from infra.run_debate import split_agents
 
 #: Solo deepseek-v4-flash baseline FPR on the matched pool (MB_DEBATE_PLAN.md).
@@ -543,14 +547,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ids.add_argument("--task-ids-file", default=None, help="file with one task id per line")
     parser.add_argument("--limit", type=int, default=None, help="run at most N tasks (default: whole pool)")
     parser.add_argument(
-        "--out",
-        default=None,
-        help="results jsonl path (default outputs/<experiment>_<timestamp>.results.jsonl); "
-        "the summary lands alongside as *.summary.json",
+        "--artifact-root",
+        required=True,
+        help="root for fixed <launch-namespace>/{results.jsonl,summary.json,docent.jsonl} outputs",
     )
-    parser.add_argument("--docent-jsonl", default=None, help="also export Docent AgentRun jsonl here (offline)")
     parser.add_argument(
-        "--docent-collection", default=None, help="upload AgentRuns to this Docent collection (needs DOCENT_API_KEY)"
+        "--docent-collection",
+        default=None,
+        help=(
+            "base name for a new per-launch Docent collection; the exact launch "
+            "namespace is appended automatically (needs DOCENT_API_KEY)"
+        ),
     )
     parser.add_argument(
         "--allow-trajectory-upload",
@@ -632,25 +639,59 @@ def _dry_run(args: argparse.Namespace, exp: dict, task_source) -> None:
     )
 
 
-def main(argv: Optional[list[str]] = None, task_source=None) -> None:
+def _write_result_rows(artifact_dir: Path, rows: list[dict[str, Any]]) -> Path:
+    """Exclusively persist fixed ``results.jsonl`` through claimed authority."""
+    with open_claimed_text_file(artifact_dir, "results.jsonl") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return artifact_dir / "results.jsonl"
+
+
+def _write_summary(artifact_dir: Path, summary: dict[str, Any]) -> Path:
+    """Exclusively persist fixed ``summary.json`` through claimed authority."""
+    with open_claimed_text_file(artifact_dir, "summary.json") as f:
+        f.write(json.dumps(summary, indent=2) + "\n")
+    return artifact_dir / "summary.json"
+
+
+def _main_impl(argv: Optional[list[str]] = None, task_source=None):
     """task_source is an injection point for offline tests; when given, CLI
     --task-ids/--seed are not re-applied to it."""
     args = parse_args(argv)
-    if args.docent_collection and not args.allow_trajectory_upload:
-        raise SystemExit(
-            "--docent-collection uploads FULL trajectory content (red-team attack "
-            "transcripts, speeches, verdicts) to the external Docent service. Pass "
-            "--allow-trajectory-upload to acknowledge this, or use --docent-jsonl to "
-            "export locally instead."
-        )
+    if args.docent_collection is not None:
+        if not args.allow_trajectory_upload:
+            raise SystemExit(
+                "--docent-collection uploads FULL trajectory content (red-team attack "
+                "transcripts, speeches, verdicts) to the external Docent service. Pass "
+                "--allow-trajectory-upload to acknowledge this. A local docent.jsonl is "
+                "always written under --artifact-root without external upload."
+            )
+        # Validate the user-supplied base before loading an experiment, claiming
+        # output paths, constructing models, or evaluating any tasks.  Only an
+        # omitted option (None) disables the external upload path.
+        from infra.envs.debate.docent_export import validate_base_collection_name
+
+        validate_base_collection_name(args.docent_collection)
     exp = load_experiment(args.experiment_file, args.experiment)
-    if task_source is None:
-        task_source = build_task_source(exp, _read_task_ids(args), args.seed)
     if args.dry_run:
+        if task_source is None:
+            task_source = build_task_source(exp, _read_task_ids(args), args.seed)
         _dry_run(args, exp, task_source)
         return
 
+    # A manual run gets a fresh UUID, so this collision guard is principally
+    # future-facing protection for scheduler attempts that restore a durable
+    # namespace. Resolve exactly once, then claim the whole fixed output set
+    # atomically before task/model construction or rollout.
+    launch_namespace = resolve_launch_namespace()
+    artifact_dir = claim_directory(Path(args.artifact_root) / launch_namespace)
+    out = artifact_dir / "results.jsonl"
+    summary_path = artifact_dir / "summary.json"
+
+    if task_source is None:
+        task_source = build_task_source(exp, _read_task_ids(args), args.seed)
     env = build_eval_env(exp, task_source)
+    pending_docent_control_flow = None
     try:
         tasks = env.tasks(args.limit if args.limit is not None else 10**9, split="test")
         if not tasks:
@@ -659,26 +700,101 @@ def main(argv: Optional[list[str]] = None, task_source=None) -> None:
         rows = result_rows(env)
         summary = {"experiment": args.experiment, **summarize(rows, args.matched_fpr)}
 
-        out = (
-            Path(args.out)
-            if args.out
-            else Path("outputs") / f"{args.experiment}_{datetime.now():%Y%m%d_%H%M%S}.results.jsonl"
+        _write_result_rows(artifact_dir, rows)
+        _write_summary(artifact_dir, summary)
+
+        from infra.envs.debate.docent_export import (
+            DocentUploadControlFlow,
+            DocentUploadFailure,
+            _sanitized_error_type,
+            agent_runs,
+            export_jsonl_claimed,
         )
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w") as f:
-            for row in rows:
-                f.write(json.dumps(row) + "\n")
-        summary_path = out.with_suffix(".summary.json")
-        summary_path.write_text(json.dumps(summary, indent=2) + "\n")
 
-        if args.docent_jsonl or args.docent_collection:
-            from infra.envs.debate.docent_export import agent_runs, export_jsonl, upload
+        runs = agent_runs(env)
+        export_jsonl_claimed(runs, artifact_dir, "docent.jsonl")
+        if args.docent_collection is not None:
+            collection_name = (
+                f"{args.docent_collection}--launch-{launch_namespace}"
+            )
+            try:
+                from infra.envs.debate.docent_export import (
+                    collection_name_for_launch,
+                    upload,
+                )
 
-            runs = agent_runs(env)
-            if args.docent_jsonl:
-                export_jsonl(runs, args.docent_jsonl)
-            if args.docent_collection:
-                upload(runs, collection_name=args.docent_collection)
+                collection_name = collection_name_for_launch(
+                    args.docent_collection, launch_namespace
+                )
+                upload_result = upload(
+                    runs,
+                    base_collection_name=args.docent_collection,
+                    launch_namespace=launch_namespace,
+                )
+                control_flow = (
+                    upload_result
+                    if isinstance(upload_result, DocentUploadControlFlow)
+                    else None
+                )
+                # Preserve operator control flow before any receipt formatting
+                # or stderr I/O.  A broken pipe/writer must not replace the
+                # original KeyboardInterrupt/SystemExit.
+                if control_flow is not None:
+                    pending_docent_control_flow = control_flow
+                receipt_result = (
+                    control_flow.failure if control_flow is not None else upload_result
+                )
+                if isinstance(receipt_result, DocentUploadFailure):
+                    receipt = {
+                        "event": "docent_upload_receipt",
+                        "status": "ambiguous_or_unconfirmed",
+                        "collection_name": receipt_result.collection_name,
+                        "launch_namespace": receipt_result.launch_namespace,
+                        "collection_id": receipt_result.collection_id,
+                        "error_type": receipt_result.error_type,
+                    }
+                else:
+                    receipt = {
+                        "event": "docent_upload_receipt",
+                        "status": "confirmed",
+                        "collection_name": receipt_result.collection_name,
+                        "launch_namespace": receipt_result.launch_namespace,
+                        "collection_id": receipt_result.collection_id,
+                    }
+                if control_flow is not None:
+                    try:
+                        print(
+                            json.dumps(receipt, sort_keys=True),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except BaseException:
+                        # The receipt is best effort when preserving an
+                        # already-requested operator interrupt.  The fresh
+                        # re-raise below remains authoritative.
+                        pass
+                    return control_flow
+                print(
+                    json.dumps(receipt, sort_keys=True),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "event": "docent_upload_receipt",
+                            "status": "ambiguous_or_unconfirmed",
+                            "collection_name": collection_name,
+                            "launch_namespace": launch_namespace,
+                            "collection_id": None,
+                            "error_type": _sanitized_error_type(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         if summary["n_failed"]:
             print(
@@ -701,7 +817,30 @@ def main(argv: Optional[list[str]] = None, task_source=None) -> None:
             )
             raise SystemExit(1)
     finally:
-        env.family.close()
+        try:
+            env.family.close()
+        except BaseException:
+            if pending_docent_control_flow is None:
+                raise
+
+
+def _raise_fresh_docent_control_flow(control_flow) -> None:
+    """Raise from a frame containing sanitized carrier fields only."""
+    if control_flow.kind == "KeyboardInterrupt":
+        raise KeyboardInterrupt()
+    if control_flow.kind == "SystemExit":
+        raise SystemExit(control_flow.exit_code)
+    raise RuntimeError("unknown sanitized Docent control-flow carrier")
+
+
+def main(argv: Optional[list[str]] = None, task_source=None) -> None:
+    control_flow = _main_impl(argv, task_source)
+    # A fresh control-flow traceback must not retain argv or an injected task
+    # source that may own transcript payloads.
+    argv = None
+    task_source = None
+    if control_flow is not None:
+        _raise_fresh_docent_control_flow(control_flow)
 
 
 if __name__ == "__main__":

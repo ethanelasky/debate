@@ -112,8 +112,10 @@ class NullBackend:
 def _run_split(**cfg_kwargs):
     env = SplitRecordingEnv()
     logged: list[tuple[int, dict]] = []
+    # SplitRecordingEnv records split routing only; it intentionally does not
+    # emulate production transcript retention.
     cfg = Config(steps=2, batch_size=1, group_size=2, eval_every=1, eval_n=2,
-                 save_every=0, **cfg_kwargs)
+                 save_every=0, log_transcripts=False, **cfg_kwargs)
     with mock.patch.object(
         train_mod, "_make_logger", lambda cfg: lambda step, m: logged.append((step, m))
     ):
@@ -150,6 +152,8 @@ def test_final_test_eval_uses_the_direct_eval_env():
         final_test_eval=True,
         eval_n=2,
         save_every=0,
+        # This test isolates eval-env routing with a synthetic non-analysis env.
+        log_transcripts=False,
     )
     with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, metrics: None):
         train(train_env, NullBackend(), cfg, eval_env=direct_eval_env)

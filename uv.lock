@@ -665,7 +665,7 @@ requires-dist = [
     { name = "antlr4-python3-runtime", specifier = "==4.13.2" },
     { name = "backoff", specifier = ">=2.0" },
     { name = "datasets", specifier = ">=2.19" },
-    { name = "docent-python", specifier = ">=0.1.74" },
+    { name = "docent-python", specifier = "==0.1.77" },
     { name = "fastapi", marker = "extra == 'viewer'", specifier = ">=0.110" },
     { name = "google-genai", marker = "extra == 'providers'", specifier = ">=1.0" },
     { name = "jinja2", specifier = ">=3.1" },
@@ -679,8 +679,8 @@ requires-dist = [
     { name = "tinker", specifier = ">=0.21.0" },
     { name = "transformers", specifier = ">=4.44" },
     { name = "uvicorn", marker = "extra == 'viewer'", specifier = ">=0.29" },
-    { name = "wandb", specifier = ">=0.18" },
-    { name = "wandb", marker = "extra == 'logging'" },
+    { name = "wandb", specifier = "==0.28.1" },
+    { name = "wandb", marker = "extra == 'logging'", specifier = "==0.28.1" },
 ]
 provides-extras = ["providers", "logging", "viewer"]
 

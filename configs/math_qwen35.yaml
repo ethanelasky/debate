@@ -18,6 +18,11 @@ _qwen35_l5:
       response_length: 5120
       max_token_len_per_gpu: 12288
       checkpoint_dir: /workspace/checkpoints
+      extra_overrides:
+        # LOAD-BEARING (smoke-proven 2026-08-14): adapter-name sync crashes on
+        # the VL wrapper's vision tower and silently drops LoRA on GDN
+        # in_proj_a/b (vllm#38085). Do not remove without a passing smoke.
+        - "++actor_rollout_ref.model.lora.merge=True"
     wandb_entity: palaestra-research
     wandb_project: debate-math
     lora_rank: 32

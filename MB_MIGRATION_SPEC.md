@@ -95,8 +95,9 @@ Ground truth is `meta["label"]`.
 3. **Wire `judge_config.retries`** into `DebateEnvConfig.verdict_retries` in the new run_eval
    (and the same one-liner fix in `run_debate.build_env` — it's a live bug there; flag in report).
 4. **`infra/run_eval.py`** — eval-only runner:
-   - CLI: `--experiment-file --experiment [--task-ids id,... | --task-ids-file] [--limit N]
-     [--out PATH] [--docent-jsonl PATH] [--docent-collection NAME] [--dry-run] [--seed]`
+   - Current CLI: `--experiment-file --experiment [--task-ids id,... | --task-ids-file]
+     [--limit N] --artifact-root ROOT [--docent-collection NAME --allow-trajectory-upload]
+     [--dry-run] [--seed]`
    - Reuse `infra.config.load_experiment` + `run_debate.split_agents`; require zero trained
      agents; build all-frozen `DebateEnv` (`trained_speakers=[]`), rollout with `policy=None`,
      `group_size=1`.

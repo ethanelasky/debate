@@ -9,7 +9,8 @@ DebateEnv._attach_labels parked on the state and docent_export carried out.
 Deliberately free of docent/torch/dataset imports: this has to run on a laptop
 against a directory of JSONL pulled off a pod.
 
-    python -m infra.envs.debate.judge_accuracy docent/step-*.jsonl
+    python -m infra.envs.debate.judge_accuracy \
+        docent/<safe-run>/<launch-namespace>/step-*.jsonl
 """
 
 from __future__ import annotations
@@ -119,7 +120,8 @@ def tally(metas: Iterable[dict[str, Any]]) -> JudgeAccuracy:
 
 def metas_from_jsonl(path: str) -> list[dict[str, Any]]:
     """One exported AgentRun per line; the debate's metadata is under
-    "metadata" (docent_export.export_jsonl writes run.model_dump_json())."""
+    "metadata" (the claimed local Docent writer preserves the exact
+    ``run.model_dump_json()`` representation)."""
     metas = []
     with open(path) as f:
         for line in f:
@@ -140,7 +142,14 @@ def from_jsonl(paths: str | Iterable[str]) -> JudgeAccuracy:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="+", help="exported debate JSONL (docent/step-*.jsonl)")
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help=(
+            "exported debate JSONL "
+            "(docent/<safe-run>/<launch-namespace>/step-*.jsonl)"
+        ),
+    )
     parser.add_argument("--per-file", action="store_true", help="also break down by file")
     args = parser.parse_args()
 

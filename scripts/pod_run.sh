@@ -8,7 +8,8 @@
 # meanings; read them against this script only):
 #   1  a required argument is missing — bash's own exit status for the
 #      ${var:?message} expansions below, not a code this script chooses
-#   2  unknown mode, unresolvable judge config, or legacy checkpoint layout
+#   2  unknown mode, invalid launch namespace, unresolvable judge config, or
+#      legacy checkpoint layout
 #   3  judge vLLM failed to start, serve, or free its port
 #   4  editable pip install/dependency preflight failed or timed out
 #   5  a trainer is already running, another pod_run.sh holds the launch lock,
@@ -22,6 +23,29 @@ set -euo pipefail
 
 MODE="${1:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
 EXP="${2:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
+
+# One immutable namespace crosses every sink in this launch. A scheduler sets
+# it from the durable attempt before invoking us; a manual launch gets exactly
+# one UUID4 here. Treat an explicitly empty value as an invalid supplied value,
+# not as permission to silently replace the scheduler's identity.
+if [ "${DEBATE_LAUNCH_NAMESPACE+x}" != x ]; then
+  DEBATE_LAUNCH_NAMESPACE="$(python3 - <<'PYEOF'
+import uuid
+
+print(uuid.uuid4())
+PYEOF
+)" || {
+    echo "FATAL: could not generate DEBATE_LAUNCH_NAMESPACE UUID4" >&2
+    exit 2
+  }
+fi
+if [ "${#DEBATE_LAUNCH_NAMESPACE}" -lt 1 ] \
+  || [ "${#DEBATE_LAUNCH_NAMESPACE}" -gt 128 ] \
+  || [[ ! "$DEBATE_LAUNCH_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "FATAL: DEBATE_LAUNCH_NAMESPACE must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}" >&2
+  exit 2
+fi
+export DEBATE_LAUNCH_NAMESPACE
 
 # Launch-phase mutual exclusion. The trainer guard below cannot separate two
 # pod_run.sh invocations racing here: neither has exec'd its trainer yet, so

@@ -1,6 +1,7 @@
 """Plumbing shared by the train runners (run_debate, run_rlvr): the
-training-block key contract, backend construction with checkpoint
-namespacing, the sweep-suffix run identity, and the common CLI.
+training-block key contract, backend construction under the exact checkpoint
+layout ``<root>/<safe-run>/<namespace>``, the sweep-suffix run identity, and
+the common CLI.
 
 This module exists so the dependency points the right way: run_rlvr is the
 judge-free control arm and must not import from run_debate (the treatment)
@@ -11,11 +12,16 @@ or task families.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import os
 import re
 
 from infra.backend.base import LossSpec
+from infra.launch_namespace import (
+    claim_directory,
+    resolve_launch_namespace,
+    safe_path_component,
+    validate_launch_namespace,
+)
 
 
 # Every key the runners actually read out of `training:` — the union of
@@ -234,6 +240,13 @@ def runner_parser(description: str | None) -> argparse.ArgumentParser:
         "starting a new one — for continuations via --load",
     )
     parser.add_argument(
+        "--wandb-resume-running-override",
+        action="store_true",
+        help="explicitly resume a W&B run still reported as 'running' after "
+        "confirming its prior process is dead; the launch namespace is "
+        "recorded in the run's override history",
+    )
+    parser.add_argument(
         "--start-step",
         type=int,
         default=None,
@@ -270,27 +283,68 @@ def training_config_kwargs(tr: dict, args: argparse.Namespace) -> dict:
     start = resolved_start_step(args)
     if start:
         kw["start_step"] = start
-    if getattr(args, "wandb_resume", None):
+    if getattr(args, "wandb_resume", None) is not None:
         kw["wandb_run_id"] = args.wandb_resume
     return kw
 
 
-def run_id() -> str:
-    """A per-LAUNCH id, so two runs can never share a checkpoint directory.
+def acquire_wandb_resume_cli_lease(args: argparse.Namespace):
+    """Take the same-host resume lease before runner construction begins."""
+    from infra.train import (
+        _acquire_wandb_resume_lease_handoff,
+        validate_resume_args,
+    )
 
-    $VOL is shared across the team, and run_name alone is not unique: two people
-    launching the same experiment get the same path. The existing guard
-    (check_fresh_run_over_existing_checkpoints) refuses to start fresh over
-    someone else's checkpoints, but it is check-then-act -- two launches inside
-    the same minute both see an empty directory and both proceed, and concurrent
-    writers to one .pt file produce a TORN file rather than a lost one: it looks
-    valid and fails at --load, possibly days later.
+    validate_resume_args(args)
+    run_id = getattr(args, "wandb_resume", None)
+    if run_id is None:
+        return None
+    return _acquire_wandb_resume_lease_handoff(run_id)
 
-    UTC to the second, so it sorts chronologically and is legible in a listing.
-    Deliberately carries no owner or hostname: the id answers "which launch",
-    and identity belongs in the run's own metadata, not in a path.
+
+def release_wandb_resume_cli_lease(handoff) -> None:
+    """Release an unconsumed runner lease; adopted leases are already detached."""
+    if handoff is not None:
+        handoff.release()
+
+
+def apply_wandb_resume_cli_authorization(
+    cfg, args: argparse.Namespace, *, resume_lease_handoff=None
+) -> None:
+    """Apply the explicit CLI-only stale-running escape hatch to ``cfg``.
+
+    Argument validation is deliberately repeated here: runners validate early
+    before building expensive state, while capability issuance happens only
+    after Config construction. The receipt is a same-process Python policy
+    boundary, not cryptographic proof that a human typed the flag.
     """
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    from infra.train import (
+        Config,
+        _issue_wandb_resume_running_capability,
+        validate_resume_args,
+    )
+
+    validate_resume_args(args)
+    if not isinstance(cfg, Config):
+        raise TypeError("W&B resume CLI authorization requires a Config")
+    cli_run_id = getattr(args, "wandb_resume", None)
+    if cfg.wandb_run_id != cli_run_id:
+        raise ValueError(
+            "runner Config W&B run ID does not match the validated CLI run ID"
+        )
+    if cli_run_id is None:
+        if resume_lease_handoff is not None:
+            raise ValueError("fresh runner Config received a W&B resume lease")
+    else:
+        if resume_lease_handoff is None:
+            raise ValueError("runner resume Config is missing its early W&B lease")
+        resume_lease_handoff.bind(cfg, cli_run_id)
+    if getattr(args, "wandb_resume_running_override", False):
+        if cfg._wandb_resume_running_capability is not None:
+            raise ValueError("W&B running-resume capability was already set")
+        cfg._wandb_resume_running_capability = (
+            _issue_wandb_resume_running_capability(cli_run_id)
+        )
 
 
 def run_identity_suffix(
@@ -320,10 +374,11 @@ def check_legacy_checkpoint_layout(root: str, namespaced: str) -> None:
 
     Checkpoints used to be written straight into training.verl.checkpoint_dir
     with no experiment in the name, so two arms sharing a volume overwrote each
-    other's `final`. Now every run writes under <root>/<run name>. Leftovers
-    from the old layout are ambiguous — we cannot tell which arm produced them —
-    and leaving them where nothing will ever read them again both strands that
-    work and leaves the next arm free to overwrite it. Fail instead.
+    other's `final`. Now every launch writes under
+    ``<root>/<safe-run>/<namespace>``. Leftovers from the old layout are
+    ambiguous — we cannot tell which arm produced them — and leaving them where
+    nothing will ever read them again both strands that work and leaves the next
+    arm free to overwrite it. Fail instead.
     """
     if not os.path.isdir(root):
         return
@@ -335,25 +390,23 @@ def check_legacy_checkpoint_layout(root: str, namespaced: str) -> None:
     raise RuntimeError(
         f"{root} contains checkpoints from the pre-namespacing layout: "
         f"{', '.join(stale[:5])}{' ...' if len(stale) > 5 else ''}. "
-        "Checkpoints are now written per run, so these would be orphaned where "
-        "nothing reads them and a later arm could overwrite them. Move them "
-        f"into the run subdirectory they belong to (e.g. {namespaced}) or point "
-        "training.verl.checkpoint_dir somewhere else, then rerun."
+        "New launches never adopt an existing destination, so moving these "
+        f"into the future launch path (e.g. {namespaced}) would still refuse. "
+        "Preserve this legacy evidence in place (or migrate it only under a "
+        "separately approved procedure) and point training.verl.checkpoint_dir "
+        "at a different empty root before launching."
     )
 
 
 def check_fresh_run_over_existing_checkpoints(namespaced: str, load_given: bool) -> None:
-    """Refuse to start from scratch on top of a previous attempt's checkpoints.
+    """Refuse every existing checkpoint lineage at a new launch destination.
 
-    There is no auto-resume: resume happens only when the operator passes
-    --load <path>. So the natural crash-recovery instinct — rerun the same
-    command — would train from step 0 and overwrite step-00025, step-00050,
-    final one at a time, leaving a directory whose entries come from two
-    different lineages and which no later --load can disambiguate. With --load
-    the operator has named a checkpoint deliberately, so overwrites are a
-    choice and this guard stands down.
+    ``--load`` identifies a read source; it never authorizes adopting or
+    overwriting the new launch leaf. ``load_given`` remains in this helper's
+    signature for existing low-level callers, but does not weaken refusal.
     """
-    if load_given or not os.path.isdir(namespaced):
+    del load_given
+    if not os.path.isdir(namespaced):
         return
     existing = sorted(
         e for e in os.listdir(namespaced) if e == "final" or e.startswith("step-")
@@ -363,10 +416,9 @@ def check_fresh_run_over_existing_checkpoints(namespaced: str, load_given: bool)
     raise RuntimeError(
         f"{namespaced} already holds checkpoints from an earlier attempt: "
         f"{', '.join(existing[:5])}{' ...' if len(existing) > 5 else ''}. "
-        "Starting fresh here would overwrite them one step at a time and mix "
-        "two lineages in one directory. Either pass --load <path> to continue "
-        "deliberately from an explicit checkpoint, or move/delete that "
-        "directory first, then rerun."
+        "A launch leaf is immutable and may not be adopted or overwritten. "
+        "Choose a fresh launch namespace; --load may name a checkpoint to read "
+        "but does not authorize this destination."
     )
 
 
@@ -378,14 +430,18 @@ def build_backend(
     load_given: bool = False,
     gen_budgets: dict | None = None,
     topology: dict | None = None,
+    launch_namespace: str | None = None,
 ):
     """training block -> Backend. Shared by the debate and RLVR runners.
 
-    `run_name` (experiment + sweep suffix) namespaces the checkpoint directory:
-    a shared network volume would otherwise have a 2-step smoke run's `final`
-    clobber a 100-step run's, and two arms of one sweep clobber each other's.
-    `load_given` says whether the operator passed --load, which is the only
-    form of resume there is; see check_fresh_run_over_existing_checkpoints.
+    `run_name` (experiment + sweep suffix) and `launch_namespace` produce the
+    exact ``<root>/<safe-run>/<namespace>`` checkpoint directory. A shared
+    network volume would otherwise have a 2-step smoke run's `final` clobber a
+    100-step run's, and two simultaneous launches of one sweep arm could race.
+    Compatibility callers that omit the namespace get one manual UUID for this
+    backend construction; that exact value is carried on the backend config so
+    ``train(..., Config(launch_namespace=None))`` adopts it rather than
+    creating a second identity.
 
     `gen_budgets` names each caller-side generation budget ({label: max
     tokens or None}) so the verl branch can cross-check them against
@@ -433,14 +489,16 @@ def build_backend(
 
         v = apply_topology(dict(tr.get("verl") or {}), topology or {})
         ckpt_root = str(v.get("checkpoint_dir", VerlBackendConfig.checkpoint_dir))
-        # run_id makes the directory unique per LAUNCH, so a shared volume
-        # cannot serve two runs the same path. The wandb run keeps the bare
-        # run_name -- wandb ids are already unique, so only the filesystem needs
-        # this -- and the resolved path is logged into the run's config so the
-        # mapping from run name back to checkpoints stays discoverable.
-        ckpt_dir = os.path.join(ckpt_root, f"{run_name}-{run_id()}")
-        check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
-        check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
+        namespace = (
+            resolve_launch_namespace()
+            if launch_namespace is None
+            else validate_launch_namespace(launch_namespace)
+        )
+        ckpt_dir = os.path.join(
+            ckpt_root,
+            safe_path_component(run_name, fallback="run"),
+            namespace,
+        )
         verl_casts: tuple[tuple[str, object], ...] = (
             ("n_gpus", int),
             ("strategy", str),
@@ -476,7 +534,17 @@ def build_backend(
             vkw["loss"] = LossSpec(**tr["loss"])
         if v.get("extra_overrides"):
             vkw["extra_overrides"] = tuple(v["extra_overrides"])
-        return VerlBackend(
-            VerlBackendConfig(model_path=model_path, checkpoint_dir=ckpt_dir, **vkw)
+        check_legacy_checkpoint_layout(ckpt_root, ckpt_dir)
+        check_fresh_run_over_existing_checkpoints(ckpt_dir, load_given)
+        # The leaf mkdir is the reservation: unlike the previous timestamp
+        # check-then-act path, simultaneous launches cannot both succeed.
+        claim_directory(ckpt_dir)
+        backend_config = VerlBackendConfig(
+            model_path=model_path, checkpoint_dir=ckpt_dir, **vkw
         )
+        # Internal composition seam for compatibility callers that construct a
+        # backend and Config separately. Production runners still pass the
+        # explicit resolved namespace to both objects.
+        backend_config.launch_namespace = namespace
+        return VerlBackend(backend_config)
     raise ValueError(f"training.backend must be tinker|verl, got {backend_kind!r}")

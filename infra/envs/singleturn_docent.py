@@ -3,12 +3,14 @@
 The single-turn twin of infra/envs/debate/docent_export.py: one AgentRun per
 kept sample from ``SingleTurnEnv.last_rollout_records`` — the exact prompt
 messages, the completion, and grading metadata. Reuses the debate module's
-``export_jsonl``/``upload`` for output, so RLVR and debate transcripts land in
-docent the same way.
+claimed local Docent writer for success-gating evidence, so RLVR and debate
+transcripts land in the same immutable namespaced layout. External Docent
+upload, when separately requested, remains best-effort.
 
-Usage (mirrors the debate export):
+Standalone serialization usage (production runners use
+``export_jsonl_claimed`` under their preclaimed launch directory):
     runs = agent_runs(env.last_rollout_records)
-    export_jsonl(runs, "docent/step-00042.jsonl")
+    export_jsonl(runs, "docent/<safe-run>/<namespace>/step-00042.jsonl")
 """
 
 from __future__ import annotations

@@ -8,6 +8,7 @@ import pytest
 
 import infra.train as train_mod
 from infra.train import Config, resolve_protocol_identity, validate_resume_args
+from wandb.sdk.wandb_settings import Settings as RealWandbSettings
 
 
 class IdentityFamily:
@@ -159,9 +160,13 @@ class FakeRun:
 
 
 class FakeWandb:
-    def __init__(self, run, stored_config):
+    __version__ = "0.28.1"
+    Settings = RealWandbSettings
+
+    def __init__(self, run, stored_config, stored_state="finished"):
         self.run = run
         self.stored_config = stored_config
+        self.stored_state = stored_state
         self.init_calls = []
         self.api_run_calls = []
 
@@ -171,11 +176,15 @@ class FakeWandb:
         class Api:
             def run(self, path):
                 owner.api_run_calls.append(path)
-                return SimpleNamespace(config=owner.stored_config)
+                return SimpleNamespace(
+                    config=owner.stored_config, state=owner.stored_state
+                )
 
         return Api()
 
     def init(self, **kwargs):
+        if kwargs.get("resume") == "must":
+            assert kwargs.get("mode") == "online"
         self.init_calls.append(kwargs)
         return self.run
 
@@ -518,8 +527,8 @@ def test_arm_verl_values_override_topology_in_both_runner_identities(tmp_path):
     )
 
 
-def _main_args():
-    return SimpleNamespace(
+def _main_args(**overrides):
+    values = dict(
         experiment_file="unused.yaml",
         experiment="experiment",
         levels=None,
@@ -533,20 +542,48 @@ def _main_args():
         start_step=None,
         wandb_entity=None,
         wandb_project=None,
+        wandb_resume_running_override=False,
     )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
-def test_rlvr_resolves_topology_once_and_reuses_same_value(monkeypatch):
+class _LocalSinkLoopBackend:
+    tokenizer = object()
+
+    def __init__(self):
+        self.saved = []
+
+    def sync_sampler(self):
+        pass
+
+    def save(self, name):
+        self.saved.append(name)
+
+
+@pytest.mark.parametrize("cli_override", [False, True])
+def test_rlvr_resolves_topology_once_and_reuses_same_value(
+    monkeypatch, tmp_path, cli_override
+):
     import infra.run_rlvr as run_rlvr
+    from infra.run_common import runner_parser as shared_runner_parser
 
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        train_mod, "_wandb_resume_lock_root", lambda: str(tmp_path / "locks")
+    )
     marker = {"n_gpus": 2, "rollout_tp": 2}
     seen = []
+    launch_namespaces = []
+    captured_configs = []
     family = SimpleNamespace(
         source=lambda ds: SimpleNamespace(),
         close=lambda: None,
     )
     backend = SimpleNamespace(
-        config=SimpleNamespace(checkpoint_dir=None), tokenizer=object()
+        config=SimpleNamespace(checkpoint_dir=None),
+        tokenizer=object(),
+        load=lambda path: None,
     )
     exp = {
         "model": "org/model",
@@ -555,11 +592,32 @@ def test_rlvr_resolves_topology_once_and_reuses_same_value(monkeypatch):
         "training": {},
     }
 
+    if cli_override:
+        parsed_args = shared_runner_parser(None).parse_args(
+            [
+                "--experiment-file",
+                "unused.yaml",
+                "--experiment",
+                "experiment",
+                "--load",
+                "/checkpoints/step-00025",
+                "--wandb-resume",
+                "run-id",
+                "--wandb-resume-running-override",
+            ]
+        )
+    else:
+        parsed_args = _main_args()
     monkeypatch.setattr(
-        run_rlvr, "runner_parser", lambda doc: SimpleNamespace(parse_args=_main_args)
+        run_rlvr,
+        "runner_parser",
+        lambda doc: SimpleNamespace(parse_args=lambda: parsed_args),
     )
     monkeypatch.setattr(run_rlvr, "load_experiment", lambda *args: exp)
     monkeypatch.setattr(run_rlvr, "get_family", lambda kind: family)
+    monkeypatch.setattr(
+        run_rlvr, "resolve_launch_namespace", lambda: "scheduler-attempt"
+    )
     monkeypatch.setattr(
         run_rlvr,
         "resolve_topology",
@@ -570,25 +628,61 @@ def test_rlvr_resolves_topology_once_and_reuses_same_value(monkeypatch):
         "rlvr_protocol_identity",
         lambda *args, topology=None, **kwargs: seen.append(("identity", topology)) or {},
     )
+    def fake_build_backend(*args, topology=None, launch_namespace=None, **kwargs):
+        if cli_override:
+            with pytest.raises(RuntimeError, match="another local process"):
+                train_mod._acquire_wandb_resume_lock(
+                    "run-id", state_root=str(tmp_path / "locks")
+                )
+        launch_namespaces.append(launch_namespace)
+        seen.append(("backend", topology))
+        return backend
+
+    monkeypatch.setattr(run_rlvr, "build_backend", fake_build_backend)
     monkeypatch.setattr(
         run_rlvr,
-        "build_backend",
-        lambda *args, topology=None, **kwargs: seen.append(("backend", topology)) or backend,
+        "train",
+        lambda env, backend, cfg: (
+            launch_namespaces.append(cfg.launch_namespace),
+            captured_configs.append(cfg),
+        ),
     )
-    monkeypatch.setattr(run_rlvr, "train", lambda *args, **kwargs: None)
 
     run_rlvr._main([])
 
     assert seen == [("resolve", marker), ("identity", marker), ("backend", marker)]
     assert seen[1][1] is marker and seen[2][1] is marker
+    assert launch_namespaces == ["scheduler-attempt", "scheduler-attempt"]
+    assert (tmp_path / "docent" / "experiment" / "scheduler-attempt").is_dir()
+    assert (tmp_path / "transcripts" / "experiment" / "scheduler-attempt").is_dir()
+    cfg = captured_configs[0]
+    assert cfg.launch_namespace == "scheduler-attempt"
+    assert cfg.transcript_dir == "transcripts/experiment/scheduler-attempt"
+    assert cfg.log_transcripts is True
+    if cli_override:
+        assert cfg.wandb_run_id == "run-id"
+        assert cfg._wandb_resume_running_capability.run_id == "run-id"
+    else:
+        assert cfg._wandb_resume_running_capability is None
+    assert cfg._wandb_resume_lease_handoff is None
 
 
-def test_debate_resolves_topology_once_and_reuses_same_value(monkeypatch):
+@pytest.mark.parametrize("cli_override", [False, True])
+def test_debate_resolves_topology_once_and_reuses_same_value(
+    monkeypatch, tmp_path, cli_override
+):
     import infra.run_debate as run_debate
     from infra.models.base import ModelSettings
+    from infra.run_common import runner_parser as shared_runner_parser
 
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        train_mod, "_wandb_resume_lock_root", lambda: str(tmp_path / "locks")
+    )
     marker = {"n_gpus": 2, "rollout_tp": 2}
     seen = []
+    launch_namespaces = []
+    captured_configs = []
     family = SimpleNamespace(close=lambda: None)
     trained = {
         "alice": ModelSettings(
@@ -600,11 +694,31 @@ def test_debate_resolves_topology_once_and_reuses_same_value(monkeypatch):
         protocol=object(),
         task_source=object(),
     )
-    backend = SimpleNamespace(config=SimpleNamespace(checkpoint_dir=None))
+    backend = SimpleNamespace(
+        config=SimpleNamespace(checkpoint_dir=None), load=lambda path: None
+    )
     exp = {"dataset": {"type": "math"}, "training": {}}
 
+    if cli_override:
+        parsed_args = shared_runner_parser(None).parse_args(
+            [
+                "--experiment-file",
+                "unused.yaml",
+                "--experiment",
+                "experiment",
+                "--load",
+                "/checkpoints/step-00025",
+                "--wandb-resume",
+                "run-id",
+                "--wandb-resume-running-override",
+            ]
+        )
+    else:
+        parsed_args = _main_args()
     monkeypatch.setattr(
-        run_debate, "runner_parser", lambda doc: SimpleNamespace(parse_args=_main_args)
+        run_debate,
+        "runner_parser",
+        lambda doc: SimpleNamespace(parse_args=lambda: parsed_args),
     )
     monkeypatch.setattr(run_debate, "load_experiment", lambda *args: exp)
     monkeypatch.setattr(run_debate, "validate_experiment", lambda exp: None)
@@ -612,6 +726,11 @@ def test_debate_resolves_topology_once_and_reuses_same_value(monkeypatch):
     monkeypatch.setattr(run_debate, "validate_trained_seats", lambda *args: None)
     monkeypatch.setattr(run_debate, "build_env", lambda *args: env)
     monkeypatch.setattr(run_debate, "debate_gen_budgets", lambda *args: {})
+    monkeypatch.setattr(
+        run_debate,
+        "resolve_launch_namespace",
+        lambda value=None: "scheduler-attempt" if value is None else value,
+    )
     monkeypatch.setattr(
         run_debate,
         "resolve_topology",
@@ -622,17 +741,43 @@ def test_debate_resolves_topology_once_and_reuses_same_value(monkeypatch):
         "debate_protocol_identity",
         lambda *args, topology=None, **kwargs: seen.append(("identity", topology)) or {},
     )
+    def fake_build_backend(*args, topology=None, launch_namespace=None, **kwargs):
+        if cli_override:
+            with pytest.raises(RuntimeError, match="another local process"):
+                train_mod._acquire_wandb_resume_lock(
+                    "run-id", state_root=str(tmp_path / "locks")
+                )
+        launch_namespaces.append(launch_namespace)
+        seen.append(("backend", topology))
+        return backend
+
+    monkeypatch.setattr(run_debate, "build_backend", fake_build_backend)
     monkeypatch.setattr(
         run_debate,
-        "build_backend",
-        lambda *args, topology=None, **kwargs: seen.append(("backend", topology)) or backend,
+        "train",
+        lambda env, backend, cfg, eval_env=None: (
+            launch_namespaces.append(cfg.launch_namespace),
+            captured_configs.append(cfg),
+        ),
     )
-    monkeypatch.setattr(run_debate, "train", lambda *args, **kwargs: None)
 
     run_debate._main([])
 
     assert seen == [("resolve", marker), ("identity", marker), ("backend", marker)]
     assert seen[1][1] is marker and seen[2][1] is marker
+    assert launch_namespaces == ["scheduler-attempt", "scheduler-attempt"]
+    assert (tmp_path / "docent" / "experiment" / "scheduler-attempt").is_dir()
+    assert (tmp_path / "transcripts" / "experiment" / "scheduler-attempt").is_dir()
+    cfg = captured_configs[0]
+    assert cfg.launch_namespace == "scheduler-attempt"
+    assert cfg.transcript_dir == "transcripts/experiment/scheduler-attempt"
+    assert cfg.log_transcripts is True
+    if cli_override:
+        assert cfg.wandb_run_id == "run-id"
+        assert cfg._wandb_resume_running_capability.run_id == "run-id"
+    else:
+        assert cfg._wandb_resume_running_capability is None
+    assert cfg._wandb_resume_lease_handoff is None
 
 
 def test_debate_runner_identity_rejects_secret_bearing_base_url(tmp_path):
@@ -651,28 +796,50 @@ def test_new_wandb_run_records_protocol_identity(monkeypatch):
     identity = {"dataset_type": "math", "grading_protocol": "numeric-v1"}
 
     logger = train_mod._make_logger(
-        Config(wandb_project="project", run_name="fresh", protocol_identity=identity)
+        Config(
+            wandb_project="project",
+            run_name="fresh",
+            launch_namespace="attempt-new",
+            protocol_identity=identity,
+        )
     )
 
     assert wandb.init_calls[0]["config"]["protocol_identity"] == identity
+    assert wandb.init_calls[0]["config"]["launch_namespace"] == "attempt-new"
+    assert wandb.init_calls[0]["config"]["launch_namespaces"] == ["attempt-new"]
+    assert wandb.init_calls[0]["name"] == "fresh"
     logger.close()
 
 
 def test_resume_checks_identity_before_mutable_config_update(monkeypatch):
     identity = {"dataset_type": "math_symbolic", "grading_protocol": "symbolic-v1"}
-    wandb, run = _install_fake_wandb(monkeypatch, {"protocol_identity": identity, "steps": 10})
+    wandb, run = _install_fake_wandb(
+        monkeypatch,
+        {
+            "protocol_identity": identity,
+            "steps": 10,
+            "launch_namespaces": ["attempt-original"],
+        },
+    )
 
     logger = train_mod._make_logger(
         Config(
             wandb_project="project",
             wandb_run_id="run-id",
             steps=20,
+            launch_namespace="attempt-continuation",
             protocol_identity=identity,
         )
     )
 
     assert wandb.init_calls == [
-        {"project": "project", "entity": None, "id": "run-id", "resume": "must"}
+        {
+            "project": "project",
+            "entity": None,
+            "id": "run-id",
+            "resume": "must",
+            "mode": "online",
+        }
     ]
     assert wandb.api_run_calls == ["project/run-id"]
     assert len(run.config.updates) == 1
@@ -681,6 +848,10 @@ def test_resume_checks_identity_before_mutable_config_update(monkeypatch):
     assert mutable["steps"] == 20
     assert "protocol_identity" not in mutable
     assert run.config["protocol_identity"] == identity
+    assert mutable["launch_namespaces"] == [
+        "attempt-original",
+        "attempt-continuation",
+    ]
     logger.close()
 
 
@@ -697,6 +868,54 @@ def test_resume_api_path_includes_explicit_entity(monkeypatch):
     )
     assert wandb.api_run_calls == ["team/project/run-id"]
     logger.close()
+
+
+def test_resume_refuses_reusing_recorded_launch_namespace_before_init(monkeypatch):
+    identity = {"dataset_type": "math"}
+    wandb, run = _install_fake_wandb(
+        monkeypatch,
+        {
+            "protocol_identity": identity,
+            "launch_namespaces": ["attempt-used"],
+        },
+    )
+
+    with pytest.raises(ValueError, match="reuse launch namespace"):
+        train_mod._make_logger(
+            Config(
+                wandb_project="project",
+                wandb_run_id="run-id",
+                launch_namespace="attempt-used",
+                protocol_identity=identity,
+            )
+        )
+
+    assert wandb.init_calls == []
+    assert run.config.updates == []
+
+
+@pytest.mark.parametrize(
+    "history",
+    ["attempt", ["valid", 3], ["../escape"], ["duplicate", "duplicate"]],
+)
+def test_resume_refuses_malformed_launch_namespace_history(monkeypatch, history):
+    identity = {"dataset_type": "math"}
+    wandb, _ = _install_fake_wandb(
+        monkeypatch,
+        {"protocol_identity": identity, "launch_namespaces": history},
+    )
+
+    with pytest.raises(ValueError, match="malformed launch_namespaces"):
+        train_mod._make_logger(
+            Config(
+                wandb_project="project",
+                wandb_run_id="run-id",
+                launch_namespace="attempt-new",
+                protocol_identity=identity,
+            )
+        )
+
+    assert wandb.init_calls == []
 
 
 @pytest.mark.parametrize("stored", [None, {"dataset_type": "math"}])
@@ -730,6 +949,7 @@ class LifecycleBackend:
 
 
 def _zero_step_config(**kwargs):
+    kwargs.setdefault("log_transcripts", False)
     return Config(steps=0, eval_every=0, save_every=0, **kwargs)
 
 
@@ -748,6 +968,141 @@ def test_train_finishes_wandb_run_once_on_exception(monkeypatch):
             _zero_step_config(wandb_project="project"),
         )
     assert run.finish_calls == 1
+
+
+def test_metric_log_failure_is_best_effort_on_real_train_path(
+    monkeypatch, capsys
+):
+    from infra.envs.base import Trajectory
+
+    _, run = _install_fake_wandb(monkeypatch, {})
+
+    def fail_log(metrics, step):
+        raise RuntimeError("metric service unavailable")
+
+    run.log = fail_log
+    env = SimpleNamespace(
+        last_rollout_info={},
+        tasks=lambda n, split="train": [object()],
+        rollout=lambda tasks, policy, group_size: [
+            [Trajectory(datums=[], reward=1.0)]
+        ],
+    )
+    backend = _LocalSinkLoopBackend()
+
+    train_mod.train(
+        env,
+        backend,
+        Config(
+            steps=1,
+            batch_size=1,
+            group_size=1,
+            eval_every=0,
+            save_every=0,
+            log_transcripts=False,
+            wandb_project="project",
+            launch_namespace="metric-outage",
+        ),
+    )
+
+    assert backend.saved == ["final"]
+    assert run.finish_calls == 1
+    assert "metric log failed: RuntimeError" in capsys.readouterr().err
+
+
+def test_finish_failure_is_best_effort_on_real_train_path(monkeypatch, capsys):
+    _, run = _install_fake_wandb(monkeypatch, {})
+
+    def fail_finish():
+        raise RuntimeError("finish service unavailable")
+
+    run.finish = fail_finish
+    backend = _LocalSinkLoopBackend()
+
+    train_mod.train(
+        object(),
+        backend,
+        _zero_step_config(
+            wandb_project="project",
+            launch_namespace="finish-outage",
+        ),
+    )
+
+    assert backend.saved == ["final"]
+    assert "finish failed: RuntimeError" in capsys.readouterr().err
+
+
+def test_resume_init_failure_remains_gating(monkeypatch):
+    identity = {"dataset_type": "math"}
+    wandb, _ = _install_fake_wandb(
+        monkeypatch,
+        {"protocol_identity": identity, "launch_namespaces": []},
+    )
+
+    def fail_init(**kwargs):
+        raise RuntimeError("resume handshake unavailable")
+
+    wandb.init = fail_init
+
+    with pytest.raises(RuntimeError, match="resume handshake unavailable"):
+        train_mod._make_logger(
+            _zero_step_config(
+                wandb_project="project",
+                wandb_run_id="run-id",
+                launch_namespace="resume-attempt",
+                protocol_identity=identity,
+            )
+        )
+
+    assert wandb.api_run_calls == ["project/run-id"]
+
+
+def _make_wandb_import_fail(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+    monkeypatch.delitem(sys.modules, "wandb", raising=False)
+
+    def fail_wandb_import(name, *args, **kwargs):
+        if name == "wandb":
+            raise ImportError("W&B client unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_wandb_import)
+
+
+def test_fresh_wandb_import_failure_is_best_effort_on_train_path(
+    monkeypatch, capsys
+):
+    _make_wandb_import_fail(monkeypatch)
+    monkeypatch.setattr(train_mod, "_env_identity", lambda: {})
+    backend = _LocalSinkLoopBackend()
+
+    train_mod.train(
+        object(),
+        backend,
+        _zero_step_config(
+            wandb_project="project",
+            launch_namespace="fresh-import-outage",
+        ),
+    )
+
+    assert backend.saved == ["final"]
+    assert "fresh client unavailable: ImportError" in capsys.readouterr().err
+
+
+def test_resume_wandb_import_failure_remains_gating(monkeypatch):
+    _make_wandb_import_fail(monkeypatch)
+
+    with pytest.raises(ImportError, match="W&B client unavailable"):
+        train_mod._make_logger(
+            _zero_step_config(
+                wandb_project="project",
+                wandb_run_id="run-id",
+                launch_namespace="resume-import-outage",
+                protocol_identity={"dataset_type": "math"},
+            )
+        )
 
 
 def test_logger_finishes_run_when_resume_config_update_fails(monkeypatch):
@@ -944,9 +1299,10 @@ def test_resume_accepts_explicit_step_for_final_or_opaque_checkpoint(load):
     )
 
 
-def test_rlvr_closes_family_when_source_construction_fails(monkeypatch):
+def test_rlvr_closes_family_when_source_construction_fails(monkeypatch, tmp_path):
     import infra.run_rlvr as run_rlvr
 
+    monkeypatch.chdir(tmp_path)
     closed = []
 
     class Family:
@@ -961,13 +1317,26 @@ def test_rlvr_closes_family_when_source_construction_fails(monkeypatch):
         experiment="unused",
         levels=None,
         wandb_resume=None,
-        no_wandb=False,
-        load=None,
-    )
+            no_wandb=False,
+            load=None,
+            lr=None,
+            group_size=None,
+            batch_size=None,
+            steps=None,
+            start_step=None,
+        )
     monkeypatch.setattr(
         run_rlvr, "runner_parser", lambda description: SimpleNamespace(parse_args=lambda: args)
     )
-    monkeypatch.setattr(run_rlvr, "load_experiment", lambda *args: {})
+    monkeypatch.setattr(
+        run_rlvr,
+        "load_experiment",
+        lambda *args: {
+            "model": "org/model",
+            "dataset": {"type": "math"},
+            "training": {},
+        },
+    )
     monkeypatch.setattr(run_rlvr, "validate_experiment", lambda exp: None)
     monkeypatch.setattr(run_rlvr, "get_family", lambda dataset_type: Family())
 

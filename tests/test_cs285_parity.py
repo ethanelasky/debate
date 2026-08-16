@@ -73,7 +73,17 @@ class RecordingBackend:
 def _run(cfg_kwargs, steps=3):
     env = OneStepEnv()
     backend = RecordingBackend()
-    cfg = Config(steps=steps, batch_size=2, group_size=2, eval_every=0, save_every=0, **cfg_kwargs)
+    # This synthetic Env exists only to expose optimizer/datums behavior and
+    # intentionally implements neither production transcript-retention shape.
+    cfg = Config(
+        steps=steps,
+        batch_size=2,
+        group_size=2,
+        eval_every=0,
+        save_every=0,
+        log_transcripts=False,
+        **cfg_kwargs,
+    )
     logged: list[dict] = []
     with mock.patch.object(
         train_mod, "_make_logger", lambda cfg: lambda step, m: logged.append(m)
@@ -138,6 +148,7 @@ def test_tempered_reanchor_rebinds_not_mutates():
     backend = RecordingBackend()
     cfg = Config(
         steps=1, batch_size=2, group_size=2, eval_every=0, save_every=0,
+        log_transcripts=False,
         sampling=SamplingParams(max_tokens=8, temperature=0.8),
     )
     with mock.patch.object(train_mod, "_make_logger", lambda cfg: lambda step, m: None):

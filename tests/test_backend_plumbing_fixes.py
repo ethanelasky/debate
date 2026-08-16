@@ -115,10 +115,13 @@ def test_budget_at_or_below_response_length_passes(tmp_path, fake_verl_backend):
 def test_omitted_budgets_leave_build_backend_unchanged(tmp_path, fake_verl_backend):
     # gen_budgets is optional; a caller that omits it (or a future runner that
     # has no budgets to declare) must get the unchecked legacy behavior.
-    cfg = build_backend(_verl_training(str(tmp_path)), "some/model", "run")
-    # <root>/<run name>-<run id>; the run id is per launch, so the assertion is
-    # on the prefix rather than the whole path.
-    assert cfg.checkpoint_dir.startswith(str(tmp_path / "run") + "-")
+    cfg = build_backend(
+        _verl_training(str(tmp_path)),
+        "some/model",
+        "run",
+        launch_namespace="attempt-budget-omitted",
+    )
+    assert cfg.checkpoint_dir == str(tmp_path / "run" / "attempt-budget-omitted")
 
 
 # ----------------------------------------------------- clip override emission

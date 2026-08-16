@@ -332,9 +332,9 @@ The approved sink contracts are:
    upload is not implemented.
 3. W&B display `run_name`, `run_identity_suffix`, and protocol/scientific identity remain unchanged. W&B config keeps
    append-only `launch_namespaces` history, and transcript artifacts carry the scalar namespace and namespaced internal
-   path. The namespace is launch provenance, not protocol identity. The concurrency mechanism is governed outside
-   these Ethan-approved sink contracts by the separately recorded Claude-delegated W&B decision below; Ethan has not
-   reviewed its substance.
+   path. The namespace is launch provenance, not protocol identity. The direct resume-rejection mechanism and its
+   residual race are governed outside these Ethan-approved sink contracts by the separately recorded decision below,
+   with its decision-specific provenance.
 4. Every namespaced sink refuses an existing/conflicting destination rather than overwriting. Because a manual launch
    normally generates a fresh UUID, this refusal is essentially future-facing protection for scheduler-supplied
    attempt namespaces rather than protection the current manual path is likely to exercise.
@@ -431,10 +431,11 @@ directory or S3-compatible bucket destination; the Mac receives a verified manif
 destination identity. Missing declared outputs prevent success; failure partials remain evidence. For analyzed
 workloads, local transcript/Docent output is declared and success-gating. Docent and W&B uploads are best-effort
 external provenance, carry the immutable per-attempt namespace, and record confirmed receipts; an ambiguous upload is
-not automatically repeated. External Docent collection identity is governed only by the separately recorded
-Claude-delegated decision below, whose substance Ethan has not reviewed. The scheduler never deletes stale namespaces
-or checkpoint content at configured destinations: retention there is operator-owned. Approval items 5–6 govern other
-undeclared files and worker-lifetime disposal authority.
+not automatically repeated. External Docent collection identity is governed by the separately recorded namespace
+decision below: Claude made the original decision under delegated authority, and Ethan subsequently reviewed its
+worked example and approved the described behavior. The scheduler never deletes stale namespaces or checkpoint
+content at configured destinations: retention there is operator-owned. Approval items 5–6 govern other undeclared
+files and worker-lifetime disposal authority.
 
 ## Enrollment, handoff, and provider authority
 
@@ -580,10 +581,44 @@ production scheduler work, revise the tests to require:
 - one immutable per-attempt launch namespace across checkpoint, eval, Docent/local transcript, W&B metadata/artifact
   paths, declarations, and checkpoint sync; manual UUID fallback, collision refusal/no overwrite, and unchanged
   `run_identity_suffix` behavior;
-- under the separately recorded Claude-delegated decisions, a concurrent second resume of the same W&B run waits or
-  fails before that second operation performs the config read-modify-write; external Docent collection names contain
-  the launch namespace, exactly one collection is selected per attempt, and adding collection identity leaves the
-  scientific `AgentRun` payload bytes unchanged;
+- under the separately recorded namespace decisions, a resume validates its W&B run ID, takes a same-machine
+  non-blocking lock before every W&B API operation, then fetches the remote run and refuses a `running`, missing-state,
+  or unknown-state target before the config read-modify-write;
+  finished, crashed, failed, and killed targets are resumable; the ordinary override interface is one literal CLI flag,
+  absent from Config/YAML/environment, and its runner-issued capability is bound to the exact run ID; arbitrary CLI
+  automation could pass the flag, but automation and future scheduler use are forbidden by policy and always
+  visible/audited; it bypasses only `running` and remains subject to the local lock; tests require the exact
+  `wandb==0.28.1` pin and runtime guard, reject an invalid run ID before any API call, cover exact exclusion between
+  cooperating same-effective-UID processes, prove resumed `wandb.init` forces online mode, preserve `KeyboardInterrupt`
+  and `SystemExit` through state access and atomic lock-ownership transfer while releasing the lock, and preserve the
+  residual two-host terminal-state/read-to-`wandb.init` race without presenting the CLI policy boundary as cryptographic
+  human proof; every install surface pins `docent-python==0.1.77` and a runtime guard refuses before constructing the
+  client on a version mismatch; empty run lists refuse before collection creation; external Docent collection names
+  contain the launch namespace, exactly one collection is selected per attempt, and adding collection identity leaves
+  the scientific `AgentRun` payload bytes unchanged; SDK automatic POST retry is disabled and HTTP redirects are refused
+  for collection creation and agent batches, so each POST is sent once, every mutation must return 2xx, and an ambiguous
+  failure is neither repeated nor adopted; a confirmed collection ID is validated as one bounded URL-safe path component
+  before the first batch POST;
+  every nonempty batch must return its own unique nonempty `job_id` and be awaited to confirmed success; each polling
+  POST is also one-send/no-redirect/2xx-only, polls at most 100 IDs per request, and its response must cover exactly the
+  requested slice of pending IDs once each;
+  only `pending` and `running` remain pending, while `completed` confirms and removes an ID; canceled, failed, unknown,
+  malformed, missing, extra, or duplicate rows are immediate partial failures rather than loops; every Docent HTTP call,
+  including authentication, uses a 10-second connect and 120-second read timeout, within one five-minute upload budget
+  measured from before authentication through the final poll; tests require a true preemptive wall-clock guard that
+  refuses before client construction when `SIGALRM` is masked or pending, another live Python thread could race the
+  process-wide timer, or an active timer conflicts; interrupts trickling and never-returning calls rather than checking
+  elapsed time only after return; consumes its own pending alarm and restores prior signal state on teardown; and makes
+  collection-ID validation/retention interrupt-safe; injected `KeyboardInterrupt` and `SystemExit` after a possible
+  mutation must emit the sanitized ambiguous receipt, with the confirmed collection ID when available, before being
+  re-raised; the future scheduler uses `min(5 minutes, remaining attempt deadline - separate 5-minute
+  evidence/shutdown reserve)`, proves the reserve remains intact, and skips upload when insufficient time remains;
+  confirmed, ambiguous, timed-out, and skipped outcomes emit sanitized structured stderr receipts retained as durable
+  attempt evidence, and any later failure includes the confirmed `collection_id` when creation succeeded while a
+  pre-create failure explicitly has no collection ID; timeout remains no-retry/no-adoption and never fails the local run,
+  and fake legitimately slow and multi-GB uploads demonstrate the accepted permanently-ambiguous tradeoff; test comments
+  may record the pinned SDK's roughly 100 MiB pre-gzip batch threshold as implementation context, but no oracle treats it
+  as a size or timing promise;
 - an explicit checkpoint destination frozen with each submission, never inferred from ambient credentials: either an
   exact absolute local directory or an S3-compatible bucket endpoint/region/bucket/prefix; bucket reservation,
   conditional single-PUT no-overwrite, final listing verification, no retry/adoption, and over-5-GiB refusal; absent,
@@ -760,10 +795,56 @@ approved.
   destination identity; analyzed workloads cannot succeed without local transcript/Docent evidence.
 - Best-effort Docent/W&B uploads carry immutable per-attempt namespace provenance, confirmed receipts are recorded,
   ambiguous uploads are not automatically repeated, and scheduler GC leaves configured-destination content untouched.
-- Under the separately recorded Claude-delegated decisions, a concurrent second resume of the same W&B run waits or
-  fails before that second operation performs the config read-modify-write. Each external Docent collection name
-  contains the launch namespace, exactly one collection is selected per attempt, and the scientific `AgentRun` payload
-  bytes are unchanged by collection selection.
+- Under the separately recorded namespace decisions, a resume validates its W&B run ID, acquires a non-blocking local
+  lock keyed by that ID before every W&B API operation, and holds it for the whole run. Only then does it fetch one W&B
+  public-run object and reuse that object's state and config. It refuses `running`, missing, and unknown states; permits
+  finished, crashed, failed, and killed states; and provides an explicit human override that bypasses
+  only exact `running` and never bypasses the local lock or another refusal. The override is accepted only from the
+  literal CLI flag on the human-facing command; the runner issues a private process-local capability bound to the exact
+  target run ID, and the capability is absent from the Config constructor, YAML, and environment paths. Software cannot
+  prove that a human typed the flag, and arbitrary CLI automation could pass it; scheduler and other automation use is
+  forbidden by policy and always produces the same visible/audited record. This is a process-interface/policy boundary,
+  not cryptographic human proof. It always emits an operator-visible notice, and its audit entry is tied to the same
+  namespace and config mutation as the `launch_namespaces` append. The dependency is pinned exactly to
+  `wandb==0.28.1`; a runtime version guard and W&B run-ID validation both refuse before any API operation. Resumed
+  `wandb.init` forces online mode so ambient settings or an
+  offline mode cannot ignore the resume or its provenance update. Tests inject `KeyboardInterrupt` and `SystemExit`
+  during remote state/config access and at lock-ownership transfer, require the original control flow to be re-raised
+  after lock release, and prove a later process can acquire the lock. A test proves exact lock exclusion between
+  cooperating processes under one effective Unix user without claiming a security boundary against malicious same-UID
+  coordination-path replacement. A synchronized two-host test preserves the honest residual: both hosts can observe a
+  terminal state in the milliseconds before either calls `wandb.init`, so the append-only history is strongly protected
+  but not absolutely serialized. Each external Docent collection name contains the launch namespace, exactly one
+  collection is selected per attempt, and the scientific `AgentRun` payload bytes are unchanged by collection
+  selection. Every install surface pins exactly `docent-python==0.1.77`, and its runtime guard refuses before client
+  construction unless that exact version is loaded. An empty run list refuses before collection creation. SDK automatic
+  POST retry is disabled and HTTP redirects are refused for both collection creation and agent-batch POSTs: every POST
+  gets one send, every mutation response must be 2xx, and an ambiguous failure is never repeated or adopted. A confirmed
+  collection ID must validate as one bounded URL-safe path component before the first batch POST. Every nonempty batch
+  must return a unique nonempty `job_id`, distinct from every other batch in the upload, and be awaited to confirmed
+  success. Every polling POST follows the same one-send/no-redirect rule, requires 2xx, and requests at most 100 pending
+  IDs, the installed API limit; each sliced response contains exactly one row for every requested ID and no missing,
+  extra, or duplicate rows, preserving an exact census across all slices. Only `pending` and `running` keep an ID pending;
+  `completed` confirms and removes it. Canceled, failed, unknown, or malformed statuses or rows, a polling error, and
+  missing/extra/duplicate rows are immediate partial failures rather than loops. Every Docent HTTP call, authentication
+  included, has a 10-second connect and 120-second read timeout. One five-minute total budget runs from before
+  authentication through the final poll. A true preemptive wall-clock guard interrupts a trickling or never-returning
+  HTTP call at the budget boundary; a post-hoc elapsed-time check is insufficient. Before client construction it refuses
+  if `SIGALRM` is masked or pending, an active process timer conflicts, or another live Python thread could race the
+  process-wide timer. Teardown consumes any guard-owned pending alarm and restores the prior signal handler, mask, and
+  timer state. Tests prove those refusals happen before construction, restoration leaves no latent guard alarm, and
+  collection-ID validation and retention cannot be interrupted into losing a known ID. They inject `KeyboardInterrupt`
+  and `SystemExit` after possible remote mutation and require a sanitized ambiguous receipt with the confirmed
+  collection ID when available before the original control flow is re-raised. The future scheduler sets the preemptive
+  guard to `min(5 minutes, remaining attempt deadline - separate 5-minute evidence/shutdown reserve)` and proves the
+  reserve is still available; if insufficient budget remains, it does not start the upload and emits a sanitized
+  unconfirmed receipt. Confirmed, ambiguous, timeout, and skipped
+  receipts are retained on stderr as durable evidence. A timeout after collection creation includes the confirmed
+  `collection_id`; a pre-create timeout has none. Timeout is never
+  retried or adopted and cannot fail the locally evidenced run; a legitimately slow or multi-GB upload may therefore
+  remain permanently ambiguous even if the service eventually completes it. Acceptance does not rely on the pinned
+  SDK's roughly 100 MiB pre-gzip batch threshold; it is factual implementation context, not a promise about upload size,
+  duration, or completion.
 - Pre-create inventory/nonce/full-spec and receipts prevent duplicate create;
   every unresolved resource binds global and profile caps.
 - Fresh price/storage/cap checks happen before every paid create, resume, and job admission/hot reuse; actual-allocation
@@ -834,7 +915,8 @@ and open decisions:
   hashes and qualified destination identity. Local transcript/Docent output is declared and success-gating for
   analyzed workloads. Docent/W&B uploads remain best-effort external provenance; they carry the immutable per-attempt
   namespace, confirmed receipts are recorded, and ambiguous uploads are not automatically repeated. External Docent
-  collection identity is governed outside Ethan's approval by the separately recorded Claude-delegated decision.
+  collection identity is governed outside this original approval by the separately recorded decision: Claude made the
+  decision under delegated authority, then Ethan reviewed its worked example and approved the described behavior.
   Scheduler GC never deletes stale namespaces or checkpoint content at configured destinations; their retention is
   operator-owned.
 
@@ -904,8 +986,9 @@ The following associated decisions are approved:
   backend produces only LoRA adapters (`save_lora_only=True` whenever `lora_rank > 0`), multipart is not implemented
   and files over 5 GiB are refused. W&B retains unchanged display `run_name`, `run_identity_suffix`, and
   protocol/scientific identity while adding append-only `launch_namespaces` provenance and scalar
-  namespace/namespaced internal transcript artifact metadata. The enforcement mechanism for concurrent resumes is
-  governed outside this Ethan-approved section by the separately recorded Claude-delegated decision. Every sink
+  namespace/namespaced internal transcript artifact metadata. The strongly protective but non-absolute enforcement
+  mechanism for concurrent resumes is governed outside this Ethan-approved section by the separately recorded
+  decision and its split provenance. Every sink
   preserves the namespace and refuses conflicts/overwrites; because manual UUIDs almost never
   collide, this guard is primarily future-facing protection for scheduler attempts. The standalone commit must record
   that existing
@@ -926,38 +1009,150 @@ The prerequisite order is mandatory:
 4. Land the standalone Debate launch-namespace fix, with its focused tests, as its own commit.
 5. Only then revise all remaining scheduler tests or begin other scheduler work.
 
-### 2026-08-14 delegated namespace decisions
+### 2026-08-14 separately recorded namespace decisions
 
 These decisions are recorded separately from Ethan's approval-and-amendments section because their authority and
 review history are different.
 
-#### W&B resumed-run serialization
+#### W&B resumed-run rejection
 
-**Provenance:** Decided by Claude under authority Ethan delegated for exactly this W&B item. Ethan has not reviewed
-the substance. The decision is reversible when Ethan reviews it, without the usual re-approval ceremony.
+**Provenance:** Ethan directly chose immediate rejection rather than Claude's earlier scheduler-lease recommendation.
+Claude decided the remaining detailed mechanism under authority Ethan delegated for the W&B question; Ethan has not
+reviewed that remaining substance. The Claude-decided portion is reversible when Ethan reviews it, without the usual
+re-approval ceremony. This split applies to this decision only.
 
-Before the scheduler resumes an existing W&B run, it must hold an exclusive lease for that W&B run ID while it reads,
-extends, and writes the run's `launch_namespaces` history. A second resume of the same W&B run must wait or fail instead
-of updating that history concurrently. This protects the link between metrics already stored in W&B and the launch
-that produced them; it does not change the run's scientific or protocol identity.
+The runtime dependency is pinned exactly to `wandb==0.28.1`. Every resume validates the supplied W&B run ID before
+constructing an API path, taking a run-ID-keyed lock, or making any W&B API call; invalid input refuses without remote
+contact. After import, a runtime guard likewise refuses before any API operation unless the client reports exactly
+version `0.28.1`.
+
+Every resume then performs two independent checks that work without the scheduler, in this order. First, the process
+takes a non-blocking local `flock` on a file keyed by the validated W&B run ID, matching the existing
+launcher/checkpoint-sync flock pattern. It acquires that lock before every W&B API operation and holds it for the whole
+training run. If another process on the same host holds the lock, the new resume fails immediately without contacting
+W&B. Second, while holding the lock, `infra/train.py` fetches one public W&B run object, reads both stored config and
+`state` from that same object, and makes no additional state API call. It refuses the resume when the state is `running`.
+It permits only the settled states `finished`, `crashed`, `failed`, and `killed`; a missing or unknown state refuses
+mutation. These checks protect the link between metrics stored in W&B and the launch that produced them; they do not
+change the run's scientific or protocol identity.
+
+Lock ownership remains with the acquiring scope until it transfers atomically to the live run logger. A
+`KeyboardInterrupt` or `SystemExit` during public-run state/config access, initialization, or that ownership handoff is
+never converted to an ordinary best-effort W&B error and never swallowed: the original control flow is preserved and
+re-raised after the current owner releases the lock.
+
+The local flock gives exact mutual exclusion to cooperating processes running under the same effective Unix user. It
+is not a security boundary against a malicious same-UID process replacing or manipulating the coordination path. The
+remote state check is the guard for other Unix users and other machines: once one launch has made the W&B run
+`running`, those other launchers refuse it, subject to the residual timing window described below.
 
 For example, W&B run `xyz789` starts with `launch_namespaces` equal to `["run-A"]`. Two resumes start one second apart
-and, without a lease, both read `["run-A"]`. The first writes `["run-A", "run-B"]`; the second then writes
+and, without these checks, both can read `["run-A"]`. The first writes `["run-A", "run-B"]`; the second then writes
 `["run-A", "run-C"]`. The final stored history has silently lost `run-B`, even though `run-B` wrote training metrics
-into that same W&B run. With the lease, the second resume of `xyz789` waits or fails instead of racing the first.
+into that same W&B run. With the checks, a second same-host resume fails immediately on the local lock. A realistic
+cross-machine second resume sees `xyz789` as `running` after the first calls `wandb.init` and is refused before it can
+perform the config read-modify-write.
 
-The lease is not yet enforced by any implementation: only the scheduler can hold it, and the scheduler does not exist
-yet. Until it does, concurrent manual `--wandb-resume` of one W&B run is unsupported. Avoiding that race is a convention,
-not a mechanism, and the append-only `launch_namespaces` guarantee is aspirational in the interim.
+W&B can leave a hard-crashed run in `running` until its heartbeat expires. For that exact stale-heartbeat case, the
+manual resume command has an explicit human-facing, CLI-only override flag. This literal flag is the ordinary interface:
+the CLI runner converts it into a private process-local capability bound to the exact target W&B run ID. The capability
+is not a Config constructor field and cannot be supplied through YAML or environment. Software cannot prove that a
+human typed a CLI flag, and arbitrary CLI automation could pass it. The future scheduler and other automation are
+forbidden by policy from doing so, and any use still produces the same unconditional visible/audited record. This is a
+process-interface and policy boundary, not cryptographic proof of a human action.
+The capability bypasses only the exact remote `running` refusal: it cannot bypass the same-host lock or turn a missing,
+unknown, or otherwise refused state into permission. Its operator-visible notice is unconditional. The target W&B run
+records an override audit entry tied to the same launch namespace and written in the same config mutation as the
+`launch_namespaces` append; the resume refuses to proceed unless both records can be made consistently. The command
+refuses any combination that would suppress the notice or prevent that provenance record.
+
+Every resumed `wandb.init` explicitly forces online mode. Ambient W&B settings, an inherited offline environment, or a
+local offline default therefore cannot silently ignore the requested remote resume or its namespace and override
+provenance updates.
+
+This is a real mechanism now, not a convention waiting for the scheduler. It catches realistic duplicate manual
+launches and scheduler retries and shrinks the cross-machine race window from the potentially hours-long duration of a
+training run to the milliseconds between reading a terminal remote state and calling `wandb.init`. It is not a remote
+lock: W&B exposes no compare-and-swap and deliberately permits multiple distributed-training writers. Two processes on
+different machines can still read a settled state at the same instant and both proceed. The append-only
+`launch_namespaces` history is therefore strongly protected, not absolute. When the scheduler exists, its own
+exclusion layers on as defense in depth; these direct checks remain.
 
 #### External Docent collection identity
 
-**Provenance:** Decided by Claude under authority Ethan delegated for exactly this external-Docent item. Ethan has not
-reviewed the substance. The decision is reversible when Ethan reviews it, without the usual re-approval ceremony.
+**Provenance:** Claude originally decided this external-Docent item under authority Ethan delegated for exactly this
+question. Ethan subsequently reviewed the worked example below and approved the described after behavior as written.
+
+**Timeout provenance:** Ethan directly approved the 10-second connect/120-second read timeouts, total budget,
+future-scheduler clamp and separate five-minute evidence/shutdown reserve, timeout/skip receipt behavior, local-success
+and no-retry/no-adoption semantics, and slow-upload ambiguity tradeoff below on 2026-08-14 after they were recommended
+to him. He then directly amended the total budget from 15 minutes to five minutes because a 15-minute hang is too costly.
+He expected typical uploads likely would not be multi-GB while explicitly leaving open that they may be; that uncertain
+expectation motivated the choice but is not an artifact-size or transfer-duration guarantee. The five-minute contract
+below supersedes both the earlier 15-minute value and the still-earlier statement that no separate Docent timeout was
+approved.
+
+**Polling-slice provenance:** The 100-ID maximum is an implementation constraint of the pinned Docent 0.1.77 status
+API, not substance Ethan directly approved in the timeout decision.
 
 Each launch attempt uploads to a separate external Docent collection whose name includes that attempt's launch
 namespace. The launch namespace selects and names the collection only. The scientific `AgentRun` payload is
 byte-for-byte unchanged, so the namespace remains launch provenance and never becomes part of protocol identity.
+Every install surface pins the client dependency exactly to `docent-python==0.1.77`. A runtime version guard executes
+before constructing the Docent client and refuses unless the installed package reports that exact version. An empty
+`AgentRun` list refuses before collection creation, so an empty attempt cannot leave a remote collection.
+
+Every Docent HTTP call, including authentication, uses a 10-second connect timeout and a 120-second read timeout. A
+single fixed five-minute total upload budget begins before authentication and covers authentication, collection
+creation, all agent-batch sends, and every status poll through final confirmation. A manual upload receives that fixed
+budget. When the scheduler exists, its effective upload budget is
+`min(5 minutes, remaining attempt deadline - separate 5-minute evidence/shutdown reserve)`. If insufficient budget
+remains after preserving that reserve, it does not begin external upload and emits a sanitized unconfirmed receipt
+instead.
+The total budget is enforced by a true preemptive wall-clock guard independent of socket progress: it interrupts a
+trickling or never-returning HTTP call at the budget boundary rather than discovering the overrun after the call returns.
+The scheduler clamp applies to that same preemptive guard, so external upload cannot consume the five-minute reserve.
+Because this guard uses the process-wide `SIGALRM`/real-time timer, it fails closed before constructing the Docent client
+when `SIGALRM` is masked or already pending, another live Python thread could race that timer, or an active timer would
+conflict. On teardown it consumes any pending alarm owned by this guard and restores the prior signal handler, signal
+mask, and timer state rather than leaving a latent alarm for later code.
+
+Automatic SDK retry is disabled for both collection-creation and agent-batch POSTs. Collection creation and each agent
+batch each receive exactly one POST send; an ambiguous failure is recorded and is never repeated or adopted as a
+successful upload. HTTP redirects are refused for both kinds of POST, so a redirect cannot turn the one-send boundary
+into a second request at another location. Every mutation response must be 2xx. The confirmed collection ID is
+validated as one bounded URL-safe path component before it is used in an agent-batch POST. Every nonempty agent batch
+must return a unique nonempty `job_id`, distinct from all earlier batches in that upload, and the uploader awaits each
+job to confirmed success.
+
+The handoff from a successful collection-creation response to validation and retention of its collection ID is
+interrupt-safe: once a valid ID is knowable, an interrupt cannot create a receipt that loses it. If `KeyboardInterrupt`
+or `SystemExit` arrives after any possible remote mutation, the uploader first emits a sanitized ambiguous receipt with
+the confirmed collection ID when available, then re-raises the original exception. Operator control flow is preserved;
+these exceptions are not swallowed as ordinary best-effort upload failures.
+
+The pending acknowledgement set begins with those unique job IDs. Status polling slices that set into requests of at
+most 100 IDs, the installed API limit. Each sliced response contains exactly one status row for every ID requested in
+that slice, with no missing, extra, or duplicate row, so the complete set still receives an exact census. `pending` and
+`running` are the only nonterminal statuses and leave the ID pending; `completed` confirms the job and removes its ID.
+A canceled, failed, unknown, or malformed status or row, a missing/extra/duplicate row, or any polling error is an
+immediate partial upload failure rather than a loop. Automatic retry remains disabled for each polling POST, redirects
+are refused, each polling POST gets exactly one transport send, and every polling response must be 2xx.
+
+Both confirmed and ambiguous outcomes emit a sanitized structured receipt on stderr; collected stderr makes that
+receipt durable attempt evidence without exposing credentials or response bodies. When collection creation has
+succeeded, every later failed or ambiguous agent-batch receipt includes that confirmed `collection_id`, so the partial
+remote mutation remains identifiable. A failure before confirmed collection creation has no collection ID and says so
+explicitly. A per-call or total-budget timeout produces a sanitized ambiguous/unconfirmed receipt, including the
+confirmed `collection_id` when creation already succeeded. A pre-create timeout has no collection ID. Timeout, skipped
+upload, and every other ambiguous outcome remain no-retry/no-adoption, and external-upload failure does not prevent the
+locally evidenced run from succeeding. The explicit tradeoff is that a legitimately slow or multi-GB upload can become
+permanently ambiguous even if the service eventually completes it; local evidence remains authoritative.
+
+The pinned SDK's roughly 100 MiB pre-gzip batch threshold is the only factual size context recorded here. Ethan expected
+typical uploads likely would not be multi-GB while explicitly leaving open that they may be. That expectation is budget
+rationale, not a promise about artifact size, wire size, transfer duration, or successful completion within five
+minutes.
 
 For example, suppose experiment `math-pc-rl` is launched three times. Today all three uploads can land in one collection
 named `math-pc-rl`, so a relaunch after a mid-run crash silently mixes a partial attempt's transcripts with a complete

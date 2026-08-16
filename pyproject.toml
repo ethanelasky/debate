@@ -13,8 +13,8 @@ dependencies = [
     "openai>=1.0",
     "tiktoken>=0.5",
     "backoff>=2.0",
-    "wandb>=0.18",
-    "docent-python>=0.1.74",
+    "wandb==0.28.1",
+    "docent-python==0.1.77",
     "math-verify[antlr4_13_2]==0.9.0",
     "latex2sympy2-extended==1.11.0",
     "sympy==1.14.0",
@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 providers = ["anthropic>=0.30", "google-genai>=1.0"]
-logging = ["wandb"]
+logging = ["wandb==0.28.1"]
 viewer = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
