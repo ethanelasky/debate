@@ -1092,6 +1092,11 @@ expectation motivated the choice but is not an artifact-size or transfer-duratio
 below supersedes both the earlier 15-minute value and the still-earlier statement that no separate Docent timeout was
 approved.
 
+**Hard-deadline mechanism provenance (2026-08-16):** Ethan directly approved retaining the alarm-based Docent
+hard-deadline mechanism only on the main Python thread, with no other live Python thread, no active `ITIMER_REAL`, and
+`SIGALRM` neither blocked nor pending. If any precondition fails, external upload is skipped with a sanitized receipt and
+local evidence remains authoritative.
+
 **Polling-slice provenance:** The 100-ID maximum is an implementation constraint of the pinned Docent 0.1.77 status
 API, not substance Ethan directly approved in the timeout decision.
 
