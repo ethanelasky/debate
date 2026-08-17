@@ -306,6 +306,36 @@ assert all(callable(f) for f in fns), fns
 print("attention_utils dispatch ok:", sorted({getattr(f, "__module__", "?") for f in fns}))
 PYEOF
 
+# transformers >=5.13 renamed the Qwen3.5 GDN hybrid's per-layer layer_type
+# attribute to block_type, so verl's decoder-layer forward AttributeErrors at
+# the attention branch. Branch on structure instead (only GDN layers carry a
+# linear_attn submodule), which works under either naming.
+log "patching verl qwen3_5.py layer_type branch"
+timeout -k 30s 600 "$P" - <<'PYEOF' || { echo "FATAL: verl qwen3_5.py layer_type patch failed or exceeded 600s" >&2; exit 1; }
+import verl.models.transformers.qwen3_5 as m
+path = m.__file__.replace(".pyc", ".py")
+SENTINEL = "# debate-fsdp-layertype"
+ANCHOR = '    if self.layer_type == "linear_attention":'
+PATCH = f'''    {SENTINEL}
+    _lt = getattr(self, "layer_type", None)
+    if _lt is None:
+        _lt = "linear_attention" if hasattr(self, "linear_attn") else "full_attention"
+
+    if _lt == "linear_attention":'''
+ELIF_OLD = '    elif self.layer_type == "full_attention":'
+ELIF_NEW = '    elif _lt == "full_attention":'
+src = open(path).read()
+if SENTINEL in src:
+    print("already patched")
+elif ANCHOR in src and ELIF_OLD in src:
+    src = src.replace(ANCHOR, PATCH, 1).replace(ELIF_OLD, ELIF_NEW, 1)
+    open(path, "w").write(src)
+    compile(src, path, "exec")
+    print("patched", path)
+else:
+    raise SystemExit(f"FATAL: layer_type branch not found in {path} — verl changed, re-check")
+PYEOF
+
 # ---------------------------------------------------------------- flash-attn
 # The sm100 divergence. Three exits, and the one taken is announced in a form
 # grep can find later ("flash-attn PATH:"):

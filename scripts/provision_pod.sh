@@ -280,19 +280,53 @@ else:
     raise SystemExit(f"FATAL: fsdp2 load anchor not found in {path} — verl changed, re-check")
 PYEOF
 
+# transformers >=5.13 renamed the Qwen3.5 GDN hybrid's per-layer layer_type
+# attribute to block_type, so verl's decoder-layer forward AttributeErrors at
+# the attention branch. Branch on structure instead (only GDN layers carry a
+# linear_attn submodule), which works under either naming.
+log "patching verl qwen3_5.py layer_type branch"
+timeout -k 30s 600 "$P" - <<'PYEOF' || { echo "FATAL: verl qwen3_5.py layer_type patch failed or exceeded 600s" >&2; exit 1; }
+import verl.models.transformers.qwen3_5 as m
+path = m.__file__.replace(".pyc", ".py")
+SENTINEL = "# debate-fsdp-layertype"
+ANCHOR = '    if self.layer_type == "linear_attention":'
+PATCH = f'''    {SENTINEL}
+    _lt = getattr(self, "layer_type", None)
+    if _lt is None:
+        _lt = "linear_attention" if hasattr(self, "linear_attn") else "full_attention"
+
+    if _lt == "linear_attention":'''
+ELIF_OLD = '    elif self.layer_type == "full_attention":'
+ELIF_NEW = '    elif _lt == "full_attention":'
+src = open(path).read()
+if SENTINEL in src:
+    print("already patched")
+elif ANCHOR in src and ELIF_OLD in src:
+    src = src.replace(ANCHOR, PATCH, 1).replace(ELIF_OLD, ELIF_NEW, 1)
+    open(path, "w").write(src)
+    compile(src, path, "exec")
+    print("patched", path)
+else:
+    raise SystemExit(f"FATAL: layer_type branch not found in {path} — verl changed, re-check")
+PYEOF
+
 # Captured in its own statement: inside $(...) a hung/failed nvcc is invisible
 # because `log` itself succeeds.
 NVCC_VER="$(timeout -k 5s 30 nvcc --version | grep -o 'release [0-9.]*')" || {
   echo "FATAL: nvcc --version failed or hung >30s just before the flash-attn build (CUDA_HOME=$CUDA_HOME)" >&2; exit 1; }
 # A prebuilt wheel skips a ~45min source build entirely. There is no published
 # wheel for torch 2.11+cu130 (the matrix stops at 2.10), so the only source of
-# one is a previous pod: after a successful provision, copy
-#   $UV_CACHE_DIR/sdists-v9/pypi/flash-attn/*/*/flash_attn-*.whl
-# off the pod and pass it back here on the next one:
-#   FLASH_ATTN_WHEEL=/root/flash_attn-...whl bash scripts/provision_pod.sh
-# The wheel is tied to the exact python/torch/CUDA of the pod that built it, so
-# a mismatched one fails loudly at import rather than silently misbehaving —
-# which is why this verifies the import before continuing.
+# one is a previous pod. An explicit FLASH_ATTN_WHEEL is trusted and mismatch
+# is fatal; with none given, the newest wheel a previous pod exported to
+# $VOL/wheels is tried first — the verify import is the arbiter, and a failed
+# auto-pick (different python/torch/CUDA, or an sm100-built wheel on a shared
+# volume) is uninstalled and falls through to the source build.
+FA_WHEEL_EXPLICIT="${FLASH_ATTN_WHEEL:+1}"
+if [ -z "${FLASH_ATTN_WHEEL:-}" ]; then
+  FLASH_ATTN_WHEEL="$(ls -t "$VOL"/wheels/flash_attn-*.whl 2>/dev/null | head -1 || true)"
+  [ -n "$FLASH_ATTN_WHEEL" ] && log "flash-attn: found exported wheel $FLASH_ATTN_WHEEL in $VOL/wheels"
+fi
+FA_INSTALLED=""
 if [ -n "${FLASH_ATTN_WHEEL:-}" ]; then
   [ -f "$FLASH_ATTN_WHEEL" ] || { echo "FATAL: FLASH_ATTN_WHEEL=$FLASH_ATTN_WHEEL not found" >&2; exit 1; }
   log "flash-attn from prebuilt wheel ($FLASH_ATTN_WHEEL) — skipping the source build"
@@ -301,10 +335,20 @@ if [ -n "${FLASH_ATTN_WHEEL:-}" ]; then
   # torch FIRST: flash_attn_2_cuda links against libc10.so, which only lands on
   # the loader path once torch is imported. Testing the extension alone reports
   # a bogus "wheel built for a different torch".
-  timeout -k 10s 180 "$P" -c "import torch, flash_attn, flash_attn_2_cuda" || {
-    echo "FATAL: $FLASH_ATTN_WHEEL installed but its CUDA extension will not import — wheel was built for a different python/torch/CUDA. Unset FLASH_ATTN_WHEEL to build from source." >&2; exit 1; }
-  log "flash-attn wheel verified"
-else
+  if timeout -k 10s 180 "$P" -c "import torch, flash_attn, flash_attn_2_cuda"; then
+    log "flash-attn wheel verified"
+    FA_INSTALLED=1
+  elif [ -n "$FA_WHEEL_EXPLICIT" ]; then
+    echo "FATAL: $FLASH_ATTN_WHEEL installed but its CUDA extension will not import — wheel was built for a different python/torch/CUDA. Unset FLASH_ATTN_WHEEL to build from source." >&2; exit 1
+  else
+    # A half-working extension left on the path WILL be auto-selected by
+    # transformers/vllm and die at runtime — remove before the source build.
+    log "flash-attn: exported wheel $FLASH_ATTN_WHEEL will not import here — uninstalling and building from source"
+    timeout -k 30s 300 uv pip uninstall -p "$P" flash-attn || {
+      echo "FATAL: could not uninstall the broken flash-attn wheel install" >&2; exit 1; }
+  fi
+fi
+if [ -z "$FA_INSTALLED" ]; then
 
 log "flash-attn (source build; wheel cached in \$UV_CACHE_DIR for later pods; nvcc: $NVCC_VER"
 timeout -k 30s 600 uv pip install -p "$P" ninja packaging || {
