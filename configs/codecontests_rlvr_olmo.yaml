@@ -481,6 +481,23 @@ codecontests_rlvr_olmo31_32b_cap1024_b200x2_smoke1:
     eval_every: 0
     save_every: 0
 
+# Capacity fallback for a single 192 GB B200. This changes hardware sharding
+# only and must pass the real-shape smoke before the long arm is launched.
+codecontests_rlvr_olmo31_32b_cap1024_b200x1_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_long
+  training:
+    verl:
+      n_gpus: 1
+      rollout_tp: 1
+      gpu_memory_utilization: 0.42
+
+codecontests_rlvr_olmo31_32b_cap1024_b200x1_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_b200x1_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.
 codecontests_rlvr_olmo31_32b_smoke:
