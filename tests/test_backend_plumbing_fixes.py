@@ -205,6 +205,26 @@ def test_sample_rejects_over_length_prompts_before_touching_the_engine():
         VerlBackend.sample(dummy, [[1] * 5], SamplingParams(max_tokens=16))
 
 
+def test_save_sleeps_rollout_before_serializing_checkpoint(tmp_path):
+    events: list[str] = []
+
+    class WorkerGroup:
+        def save_checkpoint(self, path, global_step):
+            events.append(f"save:{path}:{global_step}")
+
+    dummy = types.SimpleNamespace(
+        config=types.SimpleNamespace(checkpoint_dir=str(tmp_path)),
+        wg=WorkerGroup(),
+        _global_step=7,
+        _sleep_rollout=lambda: events.append("sleep"),
+    )
+
+    path = VerlBackend.save(dummy, "step-00007")
+
+    assert path == str(tmp_path / "step-00007")
+    assert events == ["sleep", f"save:{tmp_path / 'step-00007'}:7"]
+
+
 # ------------------------------------------------------------- exposed knobs
 
 

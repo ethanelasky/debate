@@ -109,6 +109,41 @@ class NullBackend:
         pass
 
 
+class CheckpointRecordingBackend(NullBackend):
+    def __init__(self, events):
+        self.events = events
+        self.version = 0
+        self.saved = []
+
+    def sync_sampler(self):
+        self.events.append(("sync", self.version))
+
+    def optim_step(self, optim):
+        self.version += 1
+        return {}
+
+    def save(self, name):
+        record = (name, self.version)
+        self.saved.append(record)
+        self.events.append(("save", *record))
+
+
+class FailingEvalEnv(SplitRecordingEnv):
+    def __init__(self, backend, events, *, fail_version):
+        super().__init__()
+        self.backend = backend
+        self.events = events
+        self.fail_version = fail_version
+
+    def rollout(self, tasks, policy, group_size):
+        split = tasks[0].messages[0]["content"].rstrip("0123456789")
+        if split != "train":
+            self.events.append(("eval", self.backend.version))
+            if self.backend.version == self.fail_version:
+                raise RuntimeError("synthetic verifier outage")
+        return super().rollout(tasks, policy, group_size)
+
+
 def _run_split(**cfg_kwargs):
     env = SplitRecordingEnv()
     logged: list[tuple[int, dict]] = []
@@ -160,3 +195,74 @@ def test_final_test_eval_uses_the_direct_eval_env():
 
     assert direct_eval_env.eval_splits == ["test"]
     assert train_env.eval_splits == []
+
+
+def test_periodic_eval_failure_preserves_all_prior_updates_in_checkpoint():
+    events = []
+    backend = CheckpointRecordingBackend(events)
+    env = FailingEvalEnv(backend, events, fail_version=10)
+    cfg = Config(
+        steps=11,
+        batch_size=1,
+        group_size=2,
+        eval_every=10,
+        eval_n=1,
+        save_every=25,
+        log_transcripts=False,
+    )
+
+    with pytest.raises(RuntimeError, match="verifier outage"):
+        train_mod._train_with_logger(env, backend, cfg, None, lambda step, metrics: None)
+
+    assert backend.saved == [("step-00010", 10)]
+    assert events[-3:] == [
+        ("save", "step-00010", 10),
+        ("sync", 10),
+        ("eval", 10),
+    ]
+
+
+def test_continuation_start_eval_uses_loaded_checkpoint_without_resaving():
+    events = []
+    backend = CheckpointRecordingBackend(events)
+    backend.version = 10
+    env = FailingEvalEnv(backend, events, fail_version=10)
+    cfg = Config(
+        start_step=10,
+        steps=11,
+        eval_every=10,
+        eval_n=1,
+        save_every=25,
+        log_transcripts=False,
+    )
+
+    with pytest.raises(RuntimeError, match="verifier outage"):
+        train_mod._train_with_logger(env, backend, cfg, None, lambda step, metrics: None)
+
+    assert backend.saved == []
+    assert events == [("sync", 10), ("eval", 10)]
+
+
+def test_final_eval_failure_preserves_final_checkpoint_before_evaluation():
+    events = []
+    backend = CheckpointRecordingBackend(events)
+    env = FailingEvalEnv(backend, events, fail_version=1)
+    cfg = Config(
+        steps=1,
+        batch_size=1,
+        group_size=2,
+        eval_every=1,
+        eval_n=1,
+        save_every=25,
+        log_transcripts=False,
+    )
+
+    with pytest.raises(RuntimeError, match="verifier outage"):
+        train_mod._train_with_logger(env, backend, cfg, None, lambda step, metrics: None)
+
+    assert backend.saved == [("final", 1)]
+    assert events[-3:] == [
+        ("save", "final", 1),
+        ("sync", 1),
+        ("eval", 1),
+    ]

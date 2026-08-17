@@ -540,16 +540,31 @@ def _train_with_logger(
         optim = base_optim if scale == 1.0 else replace(base_optim, lr=base_optim.lr * scale)
         t0 = time.monotonic()
         ph = _Phases()
+        eval_due = bool(cfg.eval_every and step % cfg.eval_every == 0)
+        # Persist the current policy before an infrastructure-dependent eval.
+        # With checkpointing enabled, every eval boundary is a recovery point
+        # even when it falls between the coarser save_every intervals.  Do not
+        # re-save a continuation's first step: that checkpoint is the loaded
+        # source and already contains these weights.
+        save_due = bool(
+            cfg.save_every
+            and step > cfg.start_step
+            and (step % cfg.save_every == 0 or eval_due)
+        )
+        eval_metrics: dict[str, float] = {}
+        if save_due:
+            eval_metrics["checkpoint_saved"] = 1.0
+            with ph("save"):
+                backend.save(f"step-{step:05d}")
         with ph("sync_sampler"):
             backend.sync_sampler()
-        # Eval and save at the TOP of the step (Ethan, 2026-08-12): label N
+        # Eval at the TOP of the step (Ethan, 2026-08-12): label N
         # means the policy after EXACTLY N updates — step 0 is a true
         # pre-training baseline, checkpoints carry the same meaning as their
         # matching eval points, and N/K intervals yield N/K + 1 evals with
         # the last one at x = steps (after the loop). The engine was just
         # synced, so the eval serves the current weights.
-        eval_metrics: dict[str, float] = {}
-        if cfg.eval_every and step % cfg.eval_every == 0:
+        if eval_due:
             eval_policy = _eval_policy(policy, cfg)
             with ph("evaluate"):
                 prefix = "dev" if cfg.eval_split == "dev" else "eval"
@@ -557,14 +572,6 @@ def _train_with_logger(
                     evaluate(eval_env or env, eval_policy, cfg.eval_n, cfg.eval_split, prefix)
                 )
                 _log_transcripts(cfg, step, eval_env or env, prefix)
-        # `step > cfg.start_step`, not `> 0`: a continuation's first step index
-        # can hit the save cadence (start 25, save_every 25) and would re-save
-        # step-00025 — overwriting the very checkpoint it just loaded with a
-        # one-step-newer lineage under the same name.
-        if cfg.save_every and step > cfg.start_step and step % cfg.save_every == 0:
-            eval_metrics["checkpoint_saved"] = 1.0
-            with ph("save"):
-                backend.save(f"step-{step:05d}")
         with ph("rollout"):
             ds_metrics: dict[str, float] = {}
             rollout_info = _RolloutInfoAccumulator(env, "train")
@@ -678,6 +685,10 @@ def _train_with_logger(
         metrics.update(ph.metrics(metrics["step_seconds"]))
         logger(step, metrics)
 
+    # The final evaluation is another infrastructure-dependent boundary. Save
+    # the exact final weights first so an evaluator/verifier outage invalidates
+    # only the score, not the completed training work.
+    backend.save("final")
     if cfg.eval_every or cfg.final_test_eval:
         backend.sync_sampler()
         final_policy = _eval_policy(policy, cfg)
@@ -685,7 +696,7 @@ def _train_with_logger(
         # Fencepost (Ethan, 2026-08-12): in-loop evals run at the TOP of each
         # step (label N = after exactly N updates), so the final policy needs
         # its own point — N/K intervals means N/K + 1 evals, the +1 at
-        # x = steps, paired with the `final` checkpoint below.
+        # x = steps, paired with the `final` checkpoint written above.
         prefix = "dev" if cfg.eval_split == "dev" else "eval"
         final_env = eval_env or env
         metrics = evaluate(
@@ -699,8 +710,6 @@ def _train_with_logger(
         metrics = evaluate(final_env, final_policy, cfg.eval_n, "test", "test")
         _log_transcripts(cfg, cfg.steps, final_env, "test")
         logger(cfg.steps, metrics)
-
-    backend.save("final")
 
 
 def _env_identity() -> dict[str, str]:

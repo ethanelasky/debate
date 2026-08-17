@@ -42,6 +42,10 @@
   gpu_memory_utilization: 0.42
   extra_overrides:
     - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+    # Preload the immutable base checkpoint in vLLM, then sync only LoRA.
+    # Dummy-load previously exhausted host RAM before the first update.
+    - "actor_rollout_ref.rollout.load_format=safetensors"
+    - "actor_rollout_ref.rollout.layered_summon=true"
 
 # UNVALIDATED — planned scale-up (2 TP2 engine replicas, FSDP over 4).
 # Smoke before first paid use; per-GPU numbers copied from 2xB200.
@@ -60,3 +64,5 @@
   gpu_memory_utilization: 0.42
   extra_overrides:
     - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
+    - "actor_rollout_ref.rollout.load_format=safetensors"
+    - "actor_rollout_ref.rollout.layered_summon=true"

@@ -126,12 +126,20 @@ def test_loop_range_runs_remaining_steps_only():
 
 
 def test_continuation_first_step_does_not_resave_loaded_checkpoint():
-    """start 25, save_every 25: step 25 must NOT save (it would clobber the
-    loaded step-00025); steps 50/75 must."""
+    """Step 25 must not clobber the loaded checkpoint; later save- and
+    eval-cadence boundaries remain recovery points."""
     cfg = Config(start_step=25, steps=100, save_every=25)
-    saves = [s for s in range(cfg.start_step, cfg.steps)
-             if cfg.save_every and s > cfg.start_step and s % cfg.save_every == 0]
-    assert saves == [50, 75]
+    saves = [
+        step
+        for step in range(cfg.start_step, cfg.steps)
+        if cfg.save_every
+        and step > cfg.start_step
+        and (
+            step % cfg.save_every == 0
+            or (cfg.eval_every and step % cfg.eval_every == 0)
+        )
+    ]
+    assert saves == [40, 50, 60, 75, 80]
 
 
 def test_lora_rank_reaches_config():

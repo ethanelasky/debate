@@ -493,7 +493,7 @@ def test_final_periodic_and_final_test_evals_persist_distinct_transcripts(
     ("eval_every", "final_test_eval", "eval_split", "prefix"),
     [(1, False, "dev", "dev"), (0, True, "test", "test")],
 )
-def test_final_eval_transcript_failure_prevents_metric_log_and_final_save(
+def test_final_eval_transcript_failure_preserves_checkpoint_but_prevents_metric_log(
     tmp_path,
     monkeypatch,
     eval_every,
@@ -539,7 +539,7 @@ def test_final_eval_transcript_failure_prevents_metric_log_and_final_save(
 
     assert existing.read_bytes() == original
     assert logged == []
-    assert backend.saved == []
+    assert backend.saved == ["final"]
 
 
 def test_real_train_loop_fails_closed_on_empty_retained_rollout(

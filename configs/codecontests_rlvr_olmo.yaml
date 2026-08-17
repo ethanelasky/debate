@@ -127,7 +127,10 @@ codecontests_rlvr_olmo_long:
 # completions came from, so the short budget's evidence does not apply here.
 codecontests_rlvr_olmo31_32b:
   _extends: codecontests_rlvr_olmo
-  model: allenai/Olmo-3.1-32B-Instruct-DPO
+  # Run-proven no-think OLMo-3.1-32B-Instruct-DPO at revision fc84a4f,
+  # converted to BF16. The bare HF repository stores roughly 121 GB of FP32
+  # weights and OOM-killed TP2 workers; this audited artifact is ~64.5 GB.
+  model: /workspace/models/olmo32-bf16-legacy-audited-fc84a4f
   max_completion_tokens: 8192
   dataset:
     soft_token_budget: 4096
@@ -345,6 +348,12 @@ codecontests_rlvr_olmo31_32b_cap2048:
   max_completion_tokens: 2048
   dataset:
     soft_token_budget: 1024
+    # Both cap arms use the same isolated execution protocol. The pod must
+    # establish this loopback SSH forward and pass smoke_piston_verifier.py
+    # before model loading.
+    verifier: piston
+    piston_url: http://127.0.0.1:2000
+    piston_python_version: 3.12.0
   training:
     verl:
       n_gpus: 4
@@ -377,6 +386,11 @@ codecontests_rlvr_olmo31_32b_cap2048_long:
     eval_every: 10
     eval_n: 256
     save_every: 25
+    # Match the current OLMo RL recipe: warm up to 1e-4 over ten updates,
+    # then cosine-decay to 0.2x peak at the end of the 100-step run.
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
 
 # The 1024 arm at the same length as cap2048_long, so the two are overlayable.
 # The 10-step version looked dead — eval pinned at 1/32 for its whole run — but
@@ -401,6 +415,11 @@ codecontests_rlvr_olmo31_32b_cap1024_long:
     eval_every: 10
     eval_n: 256
     save_every: 25
+    # Keep optimizer semantics identical to the 2048 arm so only the token
+    # cap differs in the paired experiment.
+    warmup_steps: 10
+    lr_schedule: cosine
+    min_lr_ratio: 0.2
 
 codecontests_rlvr_olmo31_32b_cap1024:
   _extends: codecontests_rlvr_olmo31_32b_cap2048
@@ -411,6 +430,56 @@ codecontests_rlvr_olmo31_32b_cap1024:
     verl:
       response_length: 1024
     eval_max_tokens: 1024
+
+# Paid-compute boundary checks for the two long arms. They preserve the real
+# 8-problem x 8-sample rollout shape and all cap/reward/optimizer settings;
+# only run length and periodic eval/save cadence are disabled.
+codecontests_rlvr_olmo31_32b_cap2048_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
+codecontests_rlvr_olmo31_32b_cap1024_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
+# Capacity fallback for the run-validated 2xB200 and 2xH200 TP2 profiles.
+# These variants change hardware sharding only; science and cadence inherit
+# from the corresponding long/smoke arm.
+codecontests_rlvr_olmo31_32b_cap2048_b200x2_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_long
+  training:
+    verl:
+      n_gpus: 2
+      rollout_tp: 2
+      gpu_memory_utilization: 0.42
+
+codecontests_rlvr_olmo31_32b_cap1024_b200x2_long:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_long
+  training:
+    verl:
+      n_gpus: 2
+      rollout_tp: 2
+      gpu_memory_utilization: 0.42
+
+codecontests_rlvr_olmo31_32b_cap2048_b200x2_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap2048_b200x2_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
+
+codecontests_rlvr_olmo31_32b_cap1024_b200x2_smoke1:
+  _extends: codecontests_rlvr_olmo31_32b_cap1024_b200x2_long
+  training:
+    steps: 1
+    eval_every: 0
+    save_every: 0
 
 # 1-step plumbing check for the 32B path: proves the weights load, shard across
 # 8 GPUs, and produce a graded rollout, without committing to a 100-step run.

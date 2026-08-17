@@ -635,6 +635,10 @@ class VerlBackend(Backend):
     # ------------------------------------------------------------ lifecycle
 
     def save(self, name: str) -> str:
+        # Checkpoints serialize the FSDP-side state.  A prior zero-datum step
+        # can leave the colocated rollout replica awake, so always quiesce it
+        # before checkpointing instead of relying on forward_backward().
+        self._sleep_rollout()
         path = os.path.abspath(os.path.join(self.config.checkpoint_dir, name))
         self.wg.save_checkpoint(path, global_step=self._global_step)
         return path
