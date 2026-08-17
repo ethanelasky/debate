@@ -3,8 +3,8 @@ running the candidate program against stdin/stdout test cases.
 
 Ported from the old repo (ai_debate/data_loader/codecontests_loader.py and
 ai_debate/experiments/verifiers/codecontests_verifier.py), slimmed: rows are
-held in memory (no lazy-JSONL dict) and there is no container sandbox — the
-runner is a plain subprocess.
+held in memory (no lazy-JSONL dict). The default local runner is a plain
+subprocess; datasets may instead select a remote Piston execution service.
 
 ===========================================================================
 HOW THE TWO ARMS USE THIS FILE
@@ -95,13 +95,16 @@ suites use the same <=10-case, 500 KB/case, 2 MB/problem caps.
 HOW THE VERIFIER WORKS
 ===========================================================================
 
-run_stdin_tests() is the trusted supervisor. It launches a fresh isolated
-Python subprocess for EVERY case, gives it only the solution and that case's
-stdin, captures output in bounded regular files, and compares the output in
-the parent. Expected outputs and verifier results never enter the candidate
-process. Each process has a fresh namespace; a timeout kills its whole process
-group. AS/CPU/file-size/process/fd/core limits are applied best-effort by a
-small bootstrap before it execs the candidate.
+run_stdin_tests() is the trusted supervisor. It executes a fresh Python process
+for EVERY case, gives it only the solution and that case's stdin, and compares
+the output in the parent. Expected outputs and verifier results never enter
+the candidate process. The default local backend captures output in bounded
+regular files, kills the whole process group on timeout, and applies
+AS/CPU/file-size/process/fd/core limits best-effort before executing the
+candidate. The optional Piston backend replaces only that per-case execution
+call; validation, the shared deadline, comparison, and verdicts stay here.
+Piston receives the source directly, so unlike the local bootstrap it cannot
+distinguish ``os._exit(0)`` from an ordinary top-level return.
 
 This is process isolation for grading integrity, not a malicious-host sandbox.
 A same-UID process can still attack its parent or host; hostile candidates need
@@ -174,6 +177,7 @@ from typing import Any, Optional
 
 from infra.envs.base import Env, SingleTurnEnv, Task
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
+from infra.envs.tasks import piston
 from infra.envs.tasks.base import (
     AnswerParse,
     GraderInfrastructureError,
@@ -200,6 +204,23 @@ logger = logging.getLogger(__name__)
 # fan-out cannot finish before its slowest item.
 _MAX_CONCURRENT_VERIFIERS = int(os.environ.get("MAX_CONCURRENT_VERIFIERS", "32"))
 _verifier_semaphore = threading.Semaphore(_MAX_CONCURRENT_VERIFIERS)
+
+# Piston queues above its own capacity without charging that queue time to the
+# candidate's run limit or cancelling jobs whose HTTP clients disconnect. Keep
+# requests out of that hidden queue. The default matches deploy/piston; if
+# several trainer processes share one service, their configured totals must not
+# exceed the service's PISTON_MAX_CONCURRENT_JOBS.
+_MAX_CONCURRENT_PISTON_VERIFIERS = int(
+    os.environ.get("MAX_CONCURRENT_PISTON_VERIFIERS", "4")
+)
+if not 1 <= _MAX_CONCURRENT_PISTON_VERIFIERS <= piston.MAX_CONCURRENT_JOBS:
+    raise ValueError(
+        "MAX_CONCURRENT_PISTON_VERIFIERS must be between 1 and "
+        f"{piston.MAX_CONCURRENT_JOBS} for {piston.PROTOCOL_ID}"
+    )
+_piston_verifier_semaphore = threading.Semaphore(
+    _MAX_CONCURRENT_PISTON_VERIFIERS
+)
 
 # Descriptions containing these admit multiple valid outputs, which exact
 # output comparison would mis-grade. Ported verbatim from the old loader.
@@ -260,6 +281,50 @@ CPP_STRONG_ANCHORS = [
 PYTHON_CODE_BLOCK_PATTERN = re.compile(r"```python\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 GENERIC_BLOCK_PATTERN = re.compile(r"```\s*(.*?)```", re.DOTALL)
 _OPEN_FENCE_PATTERN = re.compile(r"```[ \t]*(?:python)?[ \t]*\r?\n", re.IGNORECASE)
+_EXACT_PISTON_PYTHON_VERSION_PATTERN = re.compile(
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+    r"(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+)
+
+
+def _validate_verifier_settings(
+    verifier: str,
+    piston_url: Optional[str],
+    piston_python_version: Optional[str],
+) -> None:
+    if not isinstance(verifier, str) or verifier not in {"local", "piston"}:
+        raise ValueError(
+            f"codecontests verifier must be 'local' or 'piston' (got {verifier!r})"
+        )
+    if verifier == "local":
+        if piston_url is not None or piston_python_version is not None:
+            raise ValueError(
+                "codecontests local verifier does not accept Piston-only settings"
+            )
+        return
+    if not isinstance(piston_url, str) or not piston_url.strip():
+        raise ValueError(
+            "codecontests verifier='piston' requires a nonempty piston_url"
+        )
+    if (
+        not isinstance(piston_python_version, str)
+        or not _EXACT_PISTON_PYTHON_VERSION_PATTERN.fullmatch(
+            piston_python_version
+        )
+    ):
+        raise ValueError(
+            "codecontests verifier='piston' requires an exact semantic "
+            "piston_python_version (for example '3.10.0'); wildcards and "
+            "version ranges are not allowed"
+        )
+    try:
+        piston.validate_settings(
+            base_url=piston_url,
+            runtime_version=piston_python_version,
+        )
+    except GraderInfrastructureError as exc:
+        raise ValueError(f"invalid CodeContests Piston settings: {exc}") from exc
 
 
 def is_cpp_code(code: str, threshold: int = 2) -> bool:
@@ -358,6 +423,10 @@ def run_stdin_tests(
     inputs: list[str],
     outputs: list[str],
     timeout: int = 90,
+    *,
+    verifier: str = "local",
+    piston_url: Optional[str] = None,
+    piston_python_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run cases in fresh candidate processes under one solution deadline.
 
@@ -383,31 +452,42 @@ def run_stdin_tests(
             raise GraderInfrastructureError(
                 "codecontests verifier cases must be strings"
             )
+        _validate_verifier_settings(verifier, piston_url, piston_python_version)
 
-        # Compile the exact UTF-8 bytes the child will read. SyntaxError and
-        # its IndentationError/TabError subclasses are candidate failures,
-        # classified here by trusted Python state rather than by grepping a
-        # runtime traceback (which would misclassify ``raise SyntaxError``).
-        try:
-            compile(solution_code.encode("utf-8"), "solution.py", "exec")
-        except SyntaxError as exc:
-            return {
-                "status": "candidate_error",
-                "passed": False,
-                "tests_passed": 0,
-                "tests_total": len(inputs),
-                "timeout": False,
-                "first_failure": {
-                    "test_idx": 0,
-                    "expected": "",
-                    "actual": "",
-                    "stderr": f"{type(exc).__name__}: {exc}",
-                },
-                "execution_time_seconds": time.perf_counter() - t0,
-            }
+        if verifier == "local":
+            # Compile with the same interpreter that executes the local
+            # candidate. SyntaxError and its IndentationError/TabError
+            # subclasses are candidate failures, classified here by trusted
+            # Python state rather than by grepping a runtime traceback (which
+            # would misclassify ``raise SyntaxError``). Piston source must be
+            # parsed by its configured runtime instead: the trainer and judge
+            # Python versions need not match.
+            try:
+                compile(solution_code.encode("utf-8"), "solution.py", "exec")
+            except SyntaxError as exc:
+                return {
+                    "status": "candidate_error",
+                    "passed": False,
+                    "tests_passed": 0,
+                    "tests_total": len(inputs),
+                    "timeout": False,
+                    "first_failure": {
+                        "test_idx": 0,
+                        "expected": "",
+                        "actual": "",
+                        "stderr": f"{type(exc).__name__}: {exc}",
+                    },
+                    "execution_time_seconds": time.perf_counter() - t0,
+                }
 
-        tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
-        _verifier_semaphore.acquire()
+        if verifier == "local":
+            tmpdir = tempfile.mkdtemp(prefix="codecontests_test_")
+        verifier_semaphore = (
+            _piston_verifier_semaphore
+            if verifier == "piston"
+            else _verifier_semaphore
+        )
+        verifier_semaphore.acquire()
         acquired = True
         # The deadline covers all cases for this solution. Semaphore queueing
         # and trusted setup are not candidate execution and must not consume
@@ -429,12 +509,21 @@ def run_stdin_tests(
                     "stderr": "Total solution execution timed out.",
                 }
             else:
-                case = _run_candidate_case(
-                    solution_code=solution_code,
-                    test_input=test_input,
-                    remaining=remaining,
-                    tmpdir=tmpdir,
-                )
+                if verifier == "piston":
+                    case = piston.run_python_case(
+                        base_url=piston_url,
+                        runtime_version=piston_python_version,
+                        solution_code=solution_code,
+                        test_input=test_input,
+                        remaining_seconds=remaining,
+                    )
+                else:
+                    case = _run_candidate_case(
+                        solution_code=solution_code,
+                        test_input=test_input,
+                        remaining=remaining,
+                        tmpdir=tmpdir,
+                    )
             _validate_case_result(case)
 
             actual = _normalize_output(case["stdout"])
@@ -496,7 +585,7 @@ def run_stdin_tests(
         ) from exc
     finally:
         if acquired:
-            _verifier_semaphore.release()
+            verifier_semaphore.release()
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -945,7 +1034,11 @@ class CodeContestsEnv(SingleTurnEnv):
         overshoot_penalty: float = 0.0,
         min_cf_rating: Optional[int] = None,
         max_cf_rating: Optional[int] = None,
+        verifier: str = "local",
+        piston_url: Optional[str] = None,
+        piston_python_version: Optional[str] = None,
     ):
+        _validate_verifier_settings(verifier, piston_url, piston_python_version)
         if (
             min_cf_rating is not None
             and max_cf_rating is not None
@@ -964,6 +1057,14 @@ class CodeContestsEnv(SingleTurnEnv):
         self.timeout_seconds = timeout_seconds
         self.correct_reward = correct_reward
         self.format_reward = format_reward
+        self.verifier = verifier
+        self.piston_url = piston_url
+        self.piston_python_version = piston_python_version
+        self.grade_workers = (
+            _MAX_CONCURRENT_PISTON_VERIFIERS
+            if verifier == "piston"
+            else _MAX_CONCURRENT_VERIFIERS
+        )
 
         loaded_train_rows = _load_rows(path)
         self.train_rows = _filter_cf_rating(
@@ -1098,10 +1199,19 @@ class CodeContestsEnv(SingleTurnEnv):
             info["cpp_code"] = 1.0
             return self.format_reward, info
 
+        verifier_kwargs: dict[str, Any] = {}
+        if self.verifier == "piston":
+            verifier_kwargs = {
+                "verifier": self.verifier,
+                "piston_url": self.piston_url,
+                "piston_python_version": self.piston_python_version,
+            }
+
         if has_cco:
             cco = run_stdin_tests(
                 code, task.meta["cco_inputs"], task.meta["cco_outputs"],
                 timeout=self.timeout_seconds,
+                **verifier_kwargs,
             )
             cco_total = cco.get("tests_total") or len(task.meta["cco_inputs"])
             info["cco_correct"] = float(bool(cco.get("passed")))
@@ -1114,6 +1224,7 @@ class CodeContestsEnv(SingleTurnEnv):
         result = run_stdin_tests(
             code, gdm_inputs, gdm_outputs,
             timeout=self.timeout_seconds,
+            **verifier_kwargs,
         )
         total = result.get("tests_total") or len(gdm_inputs)
         gdm_correct = float(bool(result.get("passed")))
@@ -1135,10 +1246,22 @@ class CodeContestsEnv(SingleTurnEnv):
 
 
 class CodeContestsFamily(TaskFamily):
-    def __init__(self, timeout_seconds: int = 90):
+    def __init__(
+        self,
+        timeout_seconds: int = 90,
+        verifier: str = "local",
+        piston_url: Optional[str] = None,
+        piston_python_version: Optional[str] = None,
+    ):
+        _validate_verifier_settings(verifier, piston_url, piston_python_version)
         # grade() is called by DebateEnv with only meta, so the per-problem
-        # timeout has to live on the family instance.
+        # verifier settings have to live on the family instance.
         self.timeout_seconds = timeout_seconds
+        self.verifier = verifier
+        self.piston_url = piston_url
+        self.piston_python_version = piston_python_version
+        if verifier == "piston":
+            self.grade_workers = _MAX_CONCURRENT_PISTON_VERIFIERS
         self._protocol_identity: dict[str, str] = {}
 
     def source(self, ds: dict) -> Env:
@@ -1159,6 +1282,9 @@ class CodeContestsFamily(TaskFamily):
                 "overshoot_penalty",
                 "min_cf_rating",
                 "max_cf_rating",
+                "verifier",
+                "piston_url",
+                "piston_python_version",
             },
             "codecontests",
         )
@@ -1170,6 +1296,20 @@ class CodeContestsFamily(TaskFamily):
                 "ai_debate/data/codecontests/{train,test}.jsonl"
             )
         self.timeout_seconds = int(ds.get("timeout_seconds", self.timeout_seconds))
+        verifier = ds.get("verifier", self.verifier)
+        piston_url = ds.get("piston_url", self.piston_url)
+        piston_python_version = ds.get(
+            "piston_python_version", self.piston_python_version
+        )
+        _validate_verifier_settings(verifier, piston_url, piston_python_version)
+        self.verifier = verifier
+        self.piston_url = piston_url
+        self.piston_python_version = piston_python_version
+        self.grade_workers = (
+            _MAX_CONCURRENT_PISTON_VERIFIERS
+            if verifier == "piston"
+            else TaskFamily.grade_workers
+        )
         env = CodeContestsEnv(
             path=str(path),
             test_path=(str(ds["test_path"]) if ds.get("test_path") else None),
@@ -1195,6 +1335,9 @@ class CodeContestsFamily(TaskFamily):
             max_cf_rating=(
                 int(ds["max_cf_rating"]) if ds.get("max_cf_rating") is not None else None
             ),
+            verifier=self.verifier,
+            piston_url=self.piston_url,
+            piston_python_version=self.piston_python_version,
         )
         train_path = Path(str(path)).expanduser().resolve()
         if ds.get("paired_test_path"):
@@ -1211,6 +1354,13 @@ class CodeContestsFamily(TaskFamily):
         eval_manifest = _manifest_for(eval_path)
         self._protocol_identity = {
             "grading_protocol": "codecontests_fresh_process_per_case_v3",
+            "verifier": env.verifier,
+            "piston_protocol": (
+                piston.PROTOCOL_ID if env.verifier == "piston" else "none"
+            ),
+            "piston_python_version": (
+                env.piston_python_version if env.verifier == "piston" else "none"
+            ),
             "train_source_path": str(train_path),
             "eval_source_path": str(eval_path),
             "eval_source_kind": eval_source_kind,
@@ -1283,8 +1433,19 @@ class CodeContestsFamily(TaskFamily):
             return None
         if is_cpp_code(solution):
             return False
+        verifier_kwargs: dict[str, Any] = {}
+        if self.verifier == "piston":
+            verifier_kwargs = {
+                "verifier": self.verifier,
+                "piston_url": self.piston_url,
+                "piston_python_version": self.piston_python_version,
+            }
         result = run_stdin_tests(
-            solution, inputs, outputs, timeout=self.timeout_seconds
+            solution,
+            inputs,
+            outputs,
+            timeout=self.timeout_seconds,
+            **verifier_kwargs,
         )
         return bool(result["passed"])
 

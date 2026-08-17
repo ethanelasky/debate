@@ -11,11 +11,16 @@ import concurrent.futures
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Optional
+from threading import Event, Lock
+from typing import Any, Callable, Optional, TypeVar, cast
 
 from infra.backend.base import Backend, Datum, Region, Sample, SamplingParams
 
 Message = dict[str, str]
+
+_PoolInput = TypeVar("_PoolInput")
+_PoolOutput = TypeVar("_PoolOutput")
+_POOL_ABORTED = object()
 
 THINK_CLOSE = "</think>"
 FORCED_CLOSE_TEXT = "</think>\n\n"
@@ -155,6 +160,86 @@ def _validate_predict_results(
             )
 
 
+def _fail_fast_thread_map(
+    fn: Callable[[_PoolInput], _PoolOutput],
+    items: list[_PoolInput],
+    *,
+    max_workers: int,
+) -> list[_PoolOutput]:
+    """Map ``fn`` positionally, aborting queued calls on the first failure.
+
+    ``Future.result()`` in submission order hides a later-position failure
+    behind any earlier slow call.  ThreadPoolExecutor's context manager then
+    drains the queue on exit.  For verifier work that can leave paid compute
+    idle, both behaviours are unsafe.
+
+    The abort flag is set *inside* the failing worker before that thread can
+    take another queued future.  Every wrapper checks it before entering
+    caller code, so futures that race with cancellation become cheap no-ops
+    rather than new verifier calls.  We still join calls that were already
+    running before re-raising the original exception; otherwise they would
+    continue mutating grader state after the batch has returned.
+    """
+    if not items:
+        return []
+
+    abort = Event()
+    failure_lock = Lock()
+    first_failure: list[BaseException] = []
+
+    def _guarded(item: _PoolInput) -> _PoolOutput | object:
+        if abort.is_set():
+            return _POOL_ABORTED
+        try:
+            return fn(item)
+        except BaseException as exc:
+            # Record temporal failure order in the workers themselves.  A
+            # FIRST_EXCEPTION wait reports a set, whose iteration order does
+            # not identify which worker actually failed first.
+            with failure_lock:
+                if not first_failure:
+                    first_failure.append(exc)
+                    abort.set()
+            raise
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures: list[concurrent.futures.Future[_PoolOutput | object]] = []
+    shutdown = False
+    try:
+        for item in items:
+            # A very fast worker can fail while the caller is still
+            # submitting.  Do not manufacture more queued work afterward.
+            if abort.is_set():
+                break
+            futures.append(pool.submit(_guarded, item))
+
+        concurrent.futures.wait(
+            futures,
+            return_when=concurrent.futures.FIRST_EXCEPTION,
+        )
+        if first_failure:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+            shutdown = True
+            raise first_failure[0]
+
+        # FIRST_EXCEPTION only returns without an exception after every
+        # future completes.  No wrapper can have returned the abort sentinel
+        # on this path, because only a worker exception sets the event.
+        results = [cast(_PoolOutput, future.result()) for future in futures]
+        pool.shutdown(wait=True)
+        shutdown = True
+        return results
+    except BaseException:
+        abort.set()
+        for future in futures:
+            future.cancel()
+        if not shutdown:
+            pool.shutdown(wait=True, cancel_futures=True)
+        raise
+
+
 class SingleTurnEnv(Env):
     """One generation per task, scored by reward(): the RLVR rollout shape,
     shared by every task-source env (math, codecontests, ...).
@@ -282,9 +367,13 @@ class SingleTurnEnv(Env):
         _t1 = time.monotonic()
         workers = max(1, self.grade_workers)
         if workers > 1 and kept:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(self.reward_sample, tasks[gi], s) for gi, s in kept]
-                scored = [f.result() for f in futures]
+            scored = _fail_fast_thread_map(
+                lambda kept_sample: self.reward_sample(
+                    tasks[kept_sample[0]], kept_sample[1]
+                ),
+                kept,
+                max_workers=workers,
+            )
         else:
             scored = [self.reward_sample(tasks[gi], s) for gi, s in kept]
 

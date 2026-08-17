@@ -6,9 +6,13 @@ behaviors both of them relied on, so the shared implementation cannot drift:
 group shape, fidelity drops, and pooled == inline results.
 """
 
+import concurrent.futures
+import threading
+
 import pytest
 
 from infra.backend.base import Backend, Sample, SamplingParams
+from infra.envs import base as env_base
 from infra.envs.base import Policy, SingleTurnEnv, Task
 
 
@@ -188,3 +192,103 @@ def test_reward_exceptions_propagate(workers):
     env = ExplodingGrader(workers=workers)
     with pytest.raises(RuntimeError, match="verifier crashed"):
         env.rollout(env.tasks(2), _policy(["a", "boom", "ccc", "dddd"]), group_size=2)
+
+
+def test_pooled_reward_failure_aborts_queued_calls_and_preserves_original_error(
+    monkeypatch,
+):
+    """A later-position failure is observed while the first result blocks.
+
+    The patched event lets the already-running call leave only after the pool
+    has recorded the fatal error.  Any queued wrapper that a freed worker
+    picks up must then decline to enter reward().
+    """
+    abort = threading.Event()
+    running_started = threading.Event()
+    all_submitted = threading.Event()
+    failure = RuntimeError("fatal verifier failure")
+
+    real_executor = concurrent.futures.ThreadPoolExecutor
+
+    class DrainQueuedExecutor(real_executor):
+        """Test pool that drains queued wrappers even when asked to cancel."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.submissions = 0
+
+        def submit(self, fn, /, *args, **kwargs):
+            future = super().submit(fn, *args, **kwargs)
+            self.submissions += 1
+            if self.submissions == 4:
+                all_submitted.set()
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            return super().shutdown(wait=wait, cancel_futures=False)
+
+    class CoordinatedFailure(ScoreByLength):
+        def __init__(self):
+            super().__init__(workers=2)
+            self.entered = []
+
+        def reward(self, task, text):
+            self.entered.append(text)
+            if text == "running":
+                running_started.set()
+                if not abort.wait(timeout=2):
+                    raise TimeoutError("pool never published its abort")
+                return 1.0, {"length": 1.0}
+            if text == "fatal":
+                if not running_started.wait(timeout=2):
+                    raise TimeoutError("the first worker never started")
+                if not all_submitted.wait(timeout=2):
+                    raise TimeoutError("queued work was not submitted")
+                raise failure
+            raise AssertionError(f"queued reward entered after fatal error: {text}")
+
+    # _fail_fast_thread_map creates exactly one cooperative event per batch.
+    monkeypatch.setattr(env_base, "Event", lambda: abort)
+    monkeypatch.setattr(
+        env_base.concurrent.futures,
+        "ThreadPoolExecutor",
+        DrainQueuedExecutor,
+    )
+    # Disable both cancellation paths: queued wrappers must actually execute,
+    # proving their abort check (rather than Future.cancel) blocks reward().
+    monkeypatch.setattr(env_base.concurrent.futures.Future, "cancel", lambda self: False)
+    env = CoordinatedFailure()
+
+    with pytest.raises(RuntimeError, match="fatal verifier failure") as caught:
+        env.rollout(
+            env.tasks(1),
+            _policy(["running", "fatal", "queued-a", "queued-b"]),
+            group_size=4,
+        )
+
+    assert caught.value is failure
+    assert set(env.entered) == {"running", "fatal"}
+
+
+def test_pooled_reward_preserves_submission_order_after_out_of_order_completion():
+    second_finished = threading.Event()
+
+    class ReverseCompletion(ScoreByLength):
+        def __init__(self):
+            super().__init__(workers=2)
+            self.completion_order = []
+
+        def reward(self, task, text):
+            if text == "first":
+                if not second_finished.wait(timeout=2):
+                    raise TimeoutError("second reward never completed")
+            else:
+                second_finished.set()
+            self.completion_order.append(text)
+            return float(len(text)), {"length": float(len(text))}
+
+    env = ReverseCompletion()
+    groups = env.rollout(env.tasks(1), _policy(["first", "second"]), group_size=2)
+
+    assert env.completion_order == ["second", "first"]
+    assert [trajectory.reward for trajectory in groups[0]] == [5.0, 6.0]

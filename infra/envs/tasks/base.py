@@ -17,13 +17,12 @@ feed metrics and transcripts, never a debate reward cell (rewards.py).
 
 from __future__ import annotations
 
-import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from infra.config import reject_unknown_keys as _reject_unknown_keys
-from infra.envs.base import Env
+from infra.envs.base import Env, _fail_fast_thread_map
 from infra.envs.task_prompts import (  # re-exported for family modules
     GenerationPrompts,
     load_generation_prompts,
@@ -119,8 +118,11 @@ class TaskFamily(ABC):
         if len(items) == 1 or self.grade_workers <= 1:
             scored = [_one(item) for item in items]
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.grade_workers) as pool:
-                scored = list(pool.map(_one, items))
+            scored = _fail_fast_thread_map(
+                _one,
+                items,
+                max_workers=self.grade_workers,
+            )
         self.last_grade_errors = sum(err for _, err in scored)
         return [g for g, _ in scored]
 

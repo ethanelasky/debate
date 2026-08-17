@@ -1,0 +1,37 @@
+name: debate-piston
+
+services:
+  piston:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: debate-piston:cc-v1-sha256-2f66b7456189
+    platform: linux/amd64
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PISTON_HOST_PORT:-2000}:2000"
+    volumes:
+      - ./data/piston/packages:/piston/packages
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /var/local/lib/isolate:exec,size=512m,mode=0755
+    environment:
+      PISTON_DISABLE_NETWORKING: "true"
+      # Real expected outputs top out just below 500 KiB. One MiB keeps valid
+      # answers while bounding Piston's duplicated/JSON-escaped response.
+      PISTON_OUTPUT_MAX_SIZE: "1048576"
+      PISTON_MAX_FILE_SIZE: "1048576"
+      PISTON_MAX_PROCESS_COUNT: "64"
+      PISTON_MAX_OPEN_FILES: "64"
+      PISTON_RUN_TIMEOUT: "90000"
+      PISTON_RUN_CPU_TIME: "90000"
+      PISTON_RUN_MEMORY_LIMIT: "4294967296"
+      PISTON_MAX_CONCURRENT_JOBS: "4"
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/libexec/piston-healthcheck.js"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20m
+    stop_grace_period: 15s
