@@ -66,3 +66,15 @@
     - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
     - "actor_rollout_ref.rollout.load_format=safetensors"
     - "actor_rollout_ref.rollout.layered_summon=true"
+
+# Validated by the CodeContests OLMo-3.1-32B cap2048 smoke on 2026-08-13.
+# 0.40 x 80GB leaves room for TP4 weights and KV cache while the FSDP side
+# remains below the observed 42-45GB reserved peak. The cap arms explicitly
+# select 0.40 as well; keeping it here makes auto-detection fail-safe for the
+# same proven hardware profile.
+4xH100:
+  n_gpus: 4
+  rollout_tp: 4
+  gpu_memory_utilization: 0.40
+  extra_overrides:
+    - "++actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true"
