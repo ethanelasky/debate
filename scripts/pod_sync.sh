@@ -60,12 +60,17 @@ diff <(local_sums "$REPO_ROOT") <(remote_sums /root/debate) \
     echo "FATAL: repo mismatch after sync -- first lines:" >&2; head -20 /tmp/pod_sync_repo.diff >&2; exit 3; }
 
 if [ "$WITH_DATA" = "--with-data" ]; then
-  for f in train.jsonl test.jsonl cco_eval.jsonl; do
+  for f in \
+    train.jsonl test.jsonl cco_eval.jsonl paired_test.jsonl \
+    manifest.json cco_eval.manifest.json paired_test.manifest.json; do
     [ -f "$REPO_ROOT/data/codecontests/$f" ] || { echo "FATAL: data/codecontests/$f missing locally" >&2; exit 2; }
   done
   echo "== datasets -> $REMOTE:/root/debate/data/codecontests"
   $SSH "$REMOTE" "mkdir -p /root/debate/data/codecontests"
-  rsync -a --info=progress2 -e "$RSH" \
+  # macOS ships openrsync with the 2.6.9-compatible interface, which does not
+  # implement GNU rsync's --info=progress2. Plain --progress is supported by
+  # both and affects display only; the checksum diff below remains the gate.
+  rsync -a --progress -e "$RSH" \
     "$REPO_ROOT/data/codecontests/" "$REMOTE:/root/debate/data/codecontests/"
 
   echo "== verifying datasets"
