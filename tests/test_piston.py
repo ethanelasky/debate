@@ -119,7 +119,7 @@ def test_success_request_contains_only_candidate_material_and_deadline(monkeypat
     assert request.method == "POST"
     assert request.get_header("Content-type") == "application/json"
     assert request.get_header("Accept") == "application/json"
-    assert transport_timeout == pytest.approx(3.75)
+    assert transport_timeout == pytest.approx(11.75)
     body = json.loads(request.data)
     assert body == {
         "language": "python",
@@ -165,7 +165,7 @@ def test_request_timeout_is_clamped_to_the_protocol_ceiling(monkeypatch):
     body = json.loads(calls[0][0].data)
     assert body["run_timeout"] == piston.MAX_RUN_TIMEOUT_MILLISECONDS
     assert body["run_cpu_time"] == piston.MAX_RUN_TIMEOUT_MILLISECONDS
-    assert calls[0][1] == pytest.approx(92.0)
+    assert calls[0][1] == pytest.approx(100.0)
 
 
 @pytest.mark.parametrize(
@@ -293,7 +293,7 @@ def test_5xx_and_transport_failure_are_retried_with_reduced_budget(
         1000,
         750,
     ]
-    assert [timeout for _, timeout in calls] == pytest.approx([3.0, 2.75])
+    assert [timeout for _, timeout in calls] == pytest.approx([11.0, 10.75])
 
 
 def test_transport_exhaustion_is_fatal_after_two_attempts(monkeypatch):
@@ -315,6 +315,25 @@ def test_retry_cannot_run_past_remaining_solution_deadline(monkeypatch):
     with pytest.raises(GraderInfrastructureError, match="remaining solution deadline"):
         _run(remaining_seconds=1.0)
     assert len(calls) == 1
+
+
+def test_response_timeout_cannot_replay_after_candidate_budget_is_spent(monkeypatch):
+    calls = _install_urlopen(monkeypatch, [TimeoutError("response status stalled")])
+    moments = iter([20.0, 20.0, 30.1])
+    monkeypatch.setattr(piston.time, "perf_counter", lambda: next(moments))
+
+    with pytest.raises(
+        GraderInfrastructureError,
+        match="execution-plus-transport deadline",
+    ):
+        _run(remaining_seconds=10.0)
+
+    assert len(calls) == 1, "an ambiguous full-budget request must not be replayed"
+    request, transport_timeout = calls[0]
+    body = json.loads(request.data)
+    assert body["run_timeout"] == 10_000
+    assert body["run_cpu_time"] == 10_000
+    assert transport_timeout == pytest.approx(20.0)
 
 
 @pytest.mark.parametrize(

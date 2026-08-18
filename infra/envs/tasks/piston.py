@@ -39,7 +39,11 @@ MAX_RUN_TIMEOUT_MILLISECONDS = 90_000
 
 _EXECUTE_PATH = "/api/v2/execute"
 _MAX_ATTEMPTS = 2
-_RESPONSE_GRACE_SECONDS = 2.0
+# Piston enforces the candidate deadline.  This additional trusted-side window
+# only lets isolate cleanup, JSON serialization, and an SSH-forwarded response
+# reach the trainer.  A two-second window proved too tight under sustained
+# four-way production traffic even though Piston completed every sandbox job.
+_RESPONSE_GRACE_SECONDS = 10.0
 _OUTPUT_LIMIT_BYTES = 1024 * 1024
 # Piston returns stdout, stderr, and an interleaved ``output`` copy.  Permit
 # the worst-case six-byte JSON escaping of all four output-limit-sized regions,
@@ -94,10 +98,16 @@ def run_python_case(
     )
     deadline = time.perf_counter() + float(remaining_seconds)
     last_retryable_error: BaseException | None = None
+    last_attempt_timed_out = False
 
     for attempt in range(_MAX_ATTEMPTS):
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
+            if last_attempt_timed_out:
+                raise GraderInfrastructureError(
+                    "Piston did not return a response within the "
+                    "execution-plus-transport deadline"
+                ) from last_retryable_error
             raise GraderInfrastructureError(
                 "Piston transport exhausted the remaining solution deadline"
             ) from last_retryable_error
@@ -170,6 +180,7 @@ def run_python_case(
                         "Piston response exceeded the verifier response limit"
                     )
         except urllib.error.HTTPError as exc:
+            last_attempt_timed_out = False
             if 500 <= exc.code <= 599:
                 last_retryable_error = exc
             else:
@@ -178,14 +189,18 @@ def run_python_case(
                 ) from exc
         except _RetryablePistonError as exc:
             last_retryable_error = exc
+            last_attempt_timed_out = False
+        except TimeoutError as exc:
+            last_retryable_error = exc
+            last_attempt_timed_out = True
         except (
             urllib.error.URLError,
             http.client.HTTPException,
-            TimeoutError,
             ConnectionError,
             OSError,
         ) as exc:
             last_retryable_error = exc
+            last_attempt_timed_out = False
         else:
             return _decode_case_result(raw, runtime_version=runtime_version)
 

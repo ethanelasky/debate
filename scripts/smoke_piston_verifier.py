@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -34,6 +35,8 @@ _LARGE_REQUEST_SOURCE = (
 _EARLY_EXIT_SOURCE = "pass\n"
 _OUTPUT_FLOOD_SOURCE = "import sys\nsys.stdout.write('x' * (2 * 1024 * 1024))\n"
 _FOLLOWER_SOURCE = "print('piston-preflight-follower')\n"
+_EARLY_TIMEOUT_BOUNDARY_SECONDS = 2.5
+_HIDDEN_TWO_WAVE_BOUNDARY_SECONDS = 5.0
 
 Verifier = Callable[..., dict[str, Any]]
 
@@ -98,16 +101,32 @@ def _check_saturation(
                 raise PreflightFailure(
                     "saturation leaders did not start together"
                 ) from exc
+            leader_started = time.perf_counter()
             result = verifier(
                 _TIMEOUT_SOURCE,
                 [""],
                 [""],
                 # With four real slots all leaders finish in three seconds.
-                # A hidden two-slot queue needs two waves (six seconds), past
-                # the client's five-second execution-plus-cleanup window.
+                # A hidden two-slot queue needs two waves (about six seconds).
+                # Measure that directly: the HTTP client has an independent,
+                # deliberately longer response grace for cleanup and transit.
                 timeout=3,
                 **settings,
             )
+            leader_duration = time.perf_counter() - leader_started
+            if leader_duration < _EARLY_TIMEOUT_BOUNDARY_SECONDS:
+                raise PreflightFailure(
+                    f"saturation leader {index} returned after "
+                    f"{leader_duration:.3f}s, before the "
+                    f"{_EARLY_TIMEOUT_BOUNDARY_SECONDS:.1f}s minimum for a "
+                    "three-second candidate timeout"
+                )
+            if leader_duration >= _HIDDEN_TWO_WAVE_BOUNDARY_SECONDS:
+                raise PreflightFailure(
+                    f"saturation leader {index} took {leader_duration:.3f}s, "
+                    f"reaching the {_HIDDEN_TWO_WAVE_BOUNDARY_SECONDS:.1f}s "
+                    "hidden two-wave boundary"
+                )
             _require(
                 f"saturation leader {index}",
                 result,
