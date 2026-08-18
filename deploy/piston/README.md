@@ -5,14 +5,25 @@ to the VM's loopback interface; untrusted programs have networking disabled.
 Piston owns process isolation and execution, while the trainer keeps expected
 outputs and decides the verdict.
 
-This deployment defines executor protocol `codecontests-piston-v1`, which is
-recorded in each experiment's protocol identity. Version 1 means the exact
+This deployment defines executor protocol `codecontests-piston-v2`, which is
+recorded in each experiment's protocol identity. Version 2 means the exact
 base-image digest and Python archive checksum below, byte-exact stdin, a 3 MiB
 request ceiling, 1 MiB output/file ceilings, 90-second wall/CPU ceilings,
 4 GiB per-run memory, 64 processes/files, four server jobs, and candidate
-networking disabled. Any reward-affecting change to that list requires a new
+networking disabled. It also means that the trainer accumulates Piston's
+trusted isolate `wall_time` across a solution's cases, rather than charging
+HTTP/tunnel latency to the candidate runtime budget. Any reward-affecting
+change to that list or accounting rule requires a new
 protocol ID in `infra/envs/tasks/piston.py`; otherwise resume safeguards cannot
 distinguish the two grading protocols.
+
+Normal successful requests never charge transport latency to candidate time.
+After a retryable transport failure, however, the client conservatively lowers
+the retry's execution ceiling by the ambiguous elapsed wall time so it cannot
+silently replay a full-budget execution. A timeout returned at that reduced
+ceiling is an infrastructure failure, never a candidate timeout verdict. A
+successful retry is accepted and only its trusted isolate `wall_time` is
+charged to the cross-case budget.
 
 The base image is the official `ghcr.io/engineer-man/piston` amd64 image pinned
 to immutable manifest digest

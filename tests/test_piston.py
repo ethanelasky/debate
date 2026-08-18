@@ -113,6 +113,7 @@ def test_success_request_contains_only_candidate_material_and_deadline(monkeypat
         "output_limited": False,
         "stdout": "3\n",
         "stderr": "",
+        "candidate_time_seconds": pytest.approx(0.003),
     }
     request, transport_timeout = calls[0]
     assert request.full_url == BASE_URL + "/api/v2/execute"
@@ -168,6 +169,20 @@ def test_request_timeout_is_clamped_to_the_protocol_ceiling(monkeypatch):
     assert calls[0][1] == pytest.approx(100.0)
 
 
+@pytest.mark.parametrize("wall_time", [None, True, -1, float("nan")])
+def test_wall_time_is_required_candidate_budget_telemetry(monkeypatch, wall_time):
+    payload = _piston_response()
+    payload["run"]["wall_time"] = wall_time
+    calls = _install_urlopen(
+        monkeypatch, [_Response(payload), _Response(_piston_response())]
+    )
+
+    with pytest.raises(GraderInfrastructureError, match="wall_time telemetry"):
+        _run()
+
+    assert len(calls) == 1, "invalid trusted telemetry must not be retried"
+
+
 @pytest.mark.parametrize(
     ("status", "code", "piston_signal", "returncode", "timed_out", "limited"),
     [
@@ -211,6 +226,7 @@ def test_candidate_outcomes_stay_ordinary_case_results(
         "output_limited": limited,
         "stdout": "partial",
         "stderr": "candidate stderr",
+        "candidate_time_seconds": pytest.approx(0.003),
     }
 
 
@@ -305,6 +321,33 @@ def test_transport_exhaustion_is_fatal_after_two_attempts(monkeypatch):
     with pytest.raises(GraderInfrastructureError, match="after 2 attempts"):
         _run()
     assert len(calls) == 2
+
+
+def test_retry_reduced_budget_timeout_is_infrastructure_failure(monkeypatch):
+    calls = _install_urlopen(
+        monkeypatch,
+        [
+            urllib.error.URLError("connection reset"),
+            _Response(
+                _piston_response(
+                    code=None,
+                    piston_signal="SIGKILL",
+                    status="TO",
+                )
+            ),
+        ],
+    )
+    moments = iter([10.0, 10.0, 12.0])
+    monkeypatch.setattr(piston.time, "perf_counter", lambda: next(moments))
+
+    with pytest.raises(GraderInfrastructureError, match="reduced-budget timeout"):
+        _run(remaining_seconds=10.0)
+
+    assert len(calls) == 2
+    assert [json.loads(request.data)["run_timeout"] for request, _ in calls] == [
+        10_000,
+        8_000,
+    ]
 
 
 def test_retry_cannot_run_past_remaining_solution_deadline(monkeypatch):

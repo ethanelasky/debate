@@ -162,6 +162,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -489,17 +490,24 @@ def run_stdin_tests(
         )
         verifier_semaphore.acquire()
         acquired = True
-        # The deadline covers all cases for this solution. Semaphore queueing
-        # and trusted setup are not candidate execution and must not consume
-        # the solution's runtime budget.
-        deadline = time.perf_counter() + timeout
+        # One candidate-execution budget covers all cases for this solution.
+        # Local execution is supervised directly against a monotonic deadline.
+        # Piston is a trusted remote supervisor, so its validated isolate wall
+        # time is accumulated instead; HTTP/tunnel latency and trusted server
+        # setup must not consume candidate execution time.
+        deadline = time.perf_counter() + timeout if verifier == "local" else None
+        candidate_seconds_remaining = float(timeout)
         tests_passed = 0
         first_failure: Optional[dict[str, Any]] = None
         saw_candidate_error = False
         timed_out = False
 
         for i, (test_input, expected_output) in enumerate(zip(inputs, outputs)):
-            remaining = deadline - time.perf_counter()
+            remaining = (
+                deadline - time.perf_counter()
+                if deadline is not None
+                else candidate_seconds_remaining
+            )
             if remaining <= 0:
                 case = {
                     "returncode": -signal.SIGKILL,
@@ -508,6 +516,8 @@ def run_stdin_tests(
                     "stdout": "",
                     "stderr": "Total solution execution timed out.",
                 }
+                if verifier == "piston":
+                    case["candidate_time_seconds"] = 0.0
             else:
                 if verifier == "piston":
                     case = piston.run_python_case(
@@ -524,7 +534,17 @@ def run_stdin_tests(
                         remaining=remaining,
                         tmpdir=tmpdir,
                     )
-            _validate_case_result(case)
+            _validate_case_result(
+                case, require_candidate_time=verifier == "piston"
+            )
+            if verifier == "piston":
+                candidate_time = case["candidate_time_seconds"]
+                if not case["timed_out"] and candidate_time > remaining:
+                    raise GraderInfrastructureError(
+                        "Piston reported a non-timeout execution beyond the "
+                        "remaining candidate budget"
+                    )
+                candidate_seconds_remaining -= candidate_time
 
             actual = _normalize_output(case["stdout"])
             expected = _normalize_output(expected_output)
@@ -783,19 +803,24 @@ def _supervise_candidate_process(
     }
 
 
-def _validate_case_result(result: Any) -> None:
+def _validate_case_result(
+    result: Any, *, require_candidate_time: bool = False
+) -> None:
     """Treat a broken trusted-supervisor contract as fatal, never wrong."""
     if not isinstance(result, dict):
         raise GraderInfrastructureError(
             "codecontests verifier supervisor returned a non-object case result"
         )
-    if set(result) != {
+    expected_fields = {
         "returncode",
         "timed_out",
         "output_limited",
         "stdout",
         "stderr",
-    }:
+    }
+    if require_candidate_time:
+        expected_fields.add("candidate_time_seconds")
+    if set(result) != expected_fields:
         raise GraderInfrastructureError(
             "codecontests verifier supervisor returned an invalid case schema"
         )
@@ -810,6 +835,17 @@ def _validate_case_result(result: Any) -> None:
         raise GraderInfrastructureError(
             "codecontests verifier supervisor returned invalid case field types"
         )
+    if require_candidate_time:
+        candidate_time = result["candidate_time_seconds"]
+        if (
+            isinstance(candidate_time, bool)
+            or not isinstance(candidate_time, (int, float))
+            or not math.isfinite(candidate_time)
+            or candidate_time < 0
+        ):
+            raise GraderInfrastructureError(
+                "codecontests verifier supervisor returned invalid candidate time"
+            )
 
 
 # Limits are installed inside the isolated child, avoiding preexec_fn (unsafe

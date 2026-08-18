@@ -29,11 +29,11 @@ from infra.envs.tasks.base import GraderInfrastructureError
 # execution channel, including a loopback SSH forward.
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# Bump whenever the reward-affecting deployment contract changes. Version 1
+# Bump whenever the reward-affecting deployment contract changes. Version 2
 # is defined in deploy/piston/README.md (pinned image/runtime, exact stdin,
-# resource ceilings, and network policy).
-PROTOCOL_ID = "codecontests-piston-v1"
-# Fixed by the v1 deployment contract in deploy/piston/docker-compose.yml.
+# resource ceilings, network policy, and candidate-time accounting).
+PROTOCOL_ID = "codecontests-piston-v2"
+# Fixed by the deployment contract in deploy/piston/docker-compose.yml.
 MAX_CONCURRENT_JOBS = 4
 MAX_RUN_TIMEOUT_MILLISECONDS = 90_000
 
@@ -202,7 +202,16 @@ def run_python_case(
             last_retryable_error = exc
             last_attempt_timed_out = False
         else:
-            return _decode_case_result(raw, runtime_version=runtime_version)
+            result = _decode_case_result(raw, runtime_version=runtime_version)
+            if attempt > 0 and result["timed_out"]:
+                # The retry's run limit was reduced by time spent on an
+                # ambiguous transport failure. A TO at that smaller limit may
+                # be a transport-induced false timeout, so it cannot become an
+                # ordinary candidate verdict.
+                raise GraderInfrastructureError(
+                    "Piston retry returned an ambiguous reduced-budget timeout"
+                )
+            return result
 
         if attempt + 1 == _MAX_ATTEMPTS:
             raise GraderInfrastructureError(
@@ -310,15 +319,22 @@ def _decode_case_result(raw: bytes, *, runtime_version: str) -> dict[str, Any]:
         isinstance(run["memory"], bool) or not isinstance(run["memory"], int)
     ):
         raise GraderInfrastructureError("Piston returned invalid memory telemetry")
-    for name in ("cpu_time", "wall_time"):
-        value = run[name]
-        if value is not None and (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
-            raise GraderInfrastructureError(f"Piston returned invalid {name} telemetry")
+    cpu_time = run["cpu_time"]
+    if cpu_time is not None and (
+        isinstance(cpu_time, bool)
+        or not isinstance(cpu_time, (int, float))
+        or not math.isfinite(cpu_time)
+        or cpu_time < 0
+    ):
+        raise GraderInfrastructureError("Piston returned invalid cpu_time telemetry")
+    wall_time = run["wall_time"]
+    if (
+        isinstance(wall_time, bool)
+        or not isinstance(wall_time, (int, float))
+        or not math.isfinite(wall_time)
+        or wall_time < 0
+    ):
+        raise GraderInfrastructureError("Piston returned invalid wall_time telemetry")
 
     if status == "XX":
         raise GraderInfrastructureError("Piston reported an internal execution failure")
@@ -344,7 +360,13 @@ def _decode_case_result(raw: bytes, *, runtime_version: str) -> dict[str, Any]:
         "output_limited": status in {"OL", "EL"},
         "stdout": run["stdout"],
         "stderr": run["stderr"],
+        # Piston reports trusted isolate wall time in milliseconds.  The
+        # solution-level supervisor uses this value to preserve one candidate
+        # execution budget across cases without charging HTTP/tunnel latency.
+        "candidate_time_seconds": wall_time / 1000.0,
     }
+
+
 def _is_loopback_host(hostname: str) -> bool:
     if hostname.lower() == "localhost":
         return True

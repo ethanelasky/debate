@@ -54,6 +54,17 @@ def _case_result(stdout: str, *, timed_out: bool = False) -> dict[str, object]:
     }
 
 
+def _piston_case_result(
+    stdout: str,
+    *,
+    timed_out: bool = False,
+    candidate_time_seconds: float = 0.1,
+) -> dict[str, object]:
+    result = _case_result(stdout, timed_out=timed_out)
+    result["candidate_time_seconds"] = candidate_time_seconds
+    return result
+
+
 def _piston_kwargs() -> dict[str, str]:
     return {
         "verifier": "piston",
@@ -151,7 +162,7 @@ def test_piston_receives_only_source_stdin_and_remaining_budget(monkeypatch):
 
     def fake_piston(**kwargs):
         calls.append(kwargs)
-        return _case_result(expected_output)
+        return _piston_case_result(expected_output)
 
     def unexpected_local(**kwargs):
         pytest.fail(f"selected Piston verifier called local runner with {kwargs!r}")
@@ -195,6 +206,7 @@ def test_piston_runtime_owns_syntax_validation(monkeypatch):
             "output_limited": False,
             "stdout": "",
             "stderr": "SyntaxError: invalid syntax",
+            "candidate_time_seconds": 0.1,
         }
 
     monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
@@ -216,7 +228,7 @@ def test_reward_and_family_grade_use_configured_piston(tmp_path, monkeypatch):
 
     def fake_piston(**kwargs):
         calls.append(kwargs)
-        return _case_result(kwargs["test_input"])
+        return _piston_case_result(kwargs["test_input"])
 
     monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
     family = CodeContestsFamily()
@@ -260,7 +272,7 @@ def test_reward_and_family_grade_use_configured_piston(tmp_path, monkeypatch):
     assert all(call["runtime_version"] == PYTHON_VERSION for call in calls)
 
 
-def test_piston_cases_share_one_solution_deadline(monkeypatch):
+def test_piston_cases_ignore_transport_time_and_share_candidate_budget(monkeypatch):
     now = [100.0]
     remaining_values = []
 
@@ -268,8 +280,10 @@ def test_piston_cases_share_one_solution_deadline(monkeypatch):
 
     def fake_piston(**kwargs):
         remaining_values.append(kwargs["remaining_seconds"])
-        now[0] += 0.6
-        return _case_result("ok")
+        # The synthetic five-second HTTP round trip is trusted transport, not
+        # candidate execution. Only the reported 0.5 seconds consumes budget.
+        now[0] += 5.0
+        return _piston_case_result("ok", candidate_time_seconds=0.5)
 
     monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
 
@@ -281,12 +295,101 @@ def test_piston_cases_share_one_solution_deadline(monkeypatch):
         **_piston_kwargs(),
     )
 
-    assert remaining_values == pytest.approx([1.0, 0.4])
+    assert remaining_values == pytest.approx([1.0, 0.5])
     assert result["status"] == "timeout"
     assert result["timeout"] is True
     assert result["tests_passed"] == 2
     assert result["tests_total"] == 3
     assert result["first_failure"]["test_idx"] == 2
+
+
+def test_piston_candidate_time_not_transport_time_can_leave_budget(monkeypatch):
+    now = [100.0]
+    remaining_values = []
+
+    monkeypatch.setattr(codecontests_module.time, "perf_counter", lambda: now[0])
+
+    def fake_piston(**kwargs):
+        remaining_values.append(kwargs["remaining_seconds"])
+        now[0] += 20.0
+        return _piston_case_result("ok", candidate_time_seconds=0.25)
+
+    monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
+
+    result = run_stdin_tests(
+        ECHO_SOLUTION,
+        ["one", "two", "three"],
+        ["ok", "ok", "ok"],
+        timeout=1,
+        **_piston_kwargs(),
+    )
+
+    assert remaining_values == pytest.approx([1.0, 0.75, 0.5])
+    assert result["status"] == "passed"
+    assert result["timeout"] is False
+
+
+@pytest.mark.parametrize("candidate_time", [None, True, -1, float("nan")])
+def test_piston_candidate_time_contract_is_fail_closed(monkeypatch, candidate_time):
+    def fake_piston(**kwargs):
+        result = _case_result("ok")
+        if candidate_time is not None:
+            result["candidate_time_seconds"] = candidate_time
+        return result
+
+    monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
+
+    with pytest.raises(GraderInfrastructureError, match="case schema|candidate time"):
+        run_stdin_tests(
+            ECHO_SOLUTION,
+            ["one"],
+            ["ok"],
+            timeout=1,
+            **_piston_kwargs(),
+        )
+
+
+def test_piston_non_timeout_cannot_overspend_final_case(monkeypatch):
+    monkeypatch.setattr(
+        codecontests_module.piston,
+        "run_python_case",
+        lambda **kwargs: _piston_case_result(
+            "ok", candidate_time_seconds=1.5
+        ),
+    )
+
+    with pytest.raises(GraderInfrastructureError, match="beyond.*candidate budget"):
+        run_stdin_tests(
+            ECHO_SOLUTION,
+            ["one"],
+            ["ok"],
+            timeout=1,
+            **_piston_kwargs(),
+        )
+
+
+def test_piston_non_timeout_cannot_overspend_cumulative_budget(monkeypatch):
+    remaining_values = []
+    candidate_times = iter([0.6, 0.5])
+
+    def fake_piston(**kwargs):
+        remaining_values.append(kwargs["remaining_seconds"])
+        return _piston_case_result(
+            "ok", candidate_time_seconds=next(candidate_times)
+        )
+
+    monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
+
+    with pytest.raises(GraderInfrastructureError, match="beyond.*candidate budget"):
+        run_stdin_tests(
+            ECHO_SOLUTION,
+            ["one", "two"],
+            ["ok", "ok"],
+            timeout=1,
+            **_piston_kwargs(),
+        )
+
+    assert remaining_values == pytest.approx([1.0, 0.4])
 
 
 def test_piston_semaphore_is_held_for_the_entire_solution(monkeypatch):
@@ -313,7 +416,7 @@ def test_piston_semaphore_is_held_for_the_entire_solution(monkeypatch):
     def fake_piston(**kwargs):
         assert semaphore.held
         events.append(f"run:{kwargs['test_input']}")
-        return _case_result("ok")
+        return _piston_case_result("ok")
 
     monkeypatch.setattr(codecontests_module.piston, "run_python_case", fake_piston)
 
@@ -397,7 +500,7 @@ def test_protocol_identity_tracks_backend_protocol_version_but_not_endpoint(tmp_
     assert local_identity["piston_protocol"] == "none"
     assert local_identity["piston_python_version"] == "none"
     assert first_piston_identity["verifier"] == "piston"
-    assert first_piston_identity["piston_protocol"] == "codecontests-piston-v1"
+    assert first_piston_identity["piston_protocol"] == "codecontests-piston-v2"
     assert first_piston_identity["piston_python_version"] == PYTHON_VERSION
     assert "piston_url" not in first_piston_identity
     assert PISTON_URL not in first_piston_identity.values()
