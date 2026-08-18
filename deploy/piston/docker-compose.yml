@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: debate-piston:cc-v1-sha256-2f66b7456189
+    image: debate-piston:cc-v2-sha256-2f66b7456189
     platform: linux/amd64
     privileged: true
     restart: unless-stopped

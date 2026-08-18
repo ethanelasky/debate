@@ -86,6 +86,16 @@ class FakeProductionSupervisor:
                 tests_total=1,
             )
 
+        if solution_code == smoke._LARGE_STDIN_TIMEOUT_SOURCE:
+            time.sleep(0.005)
+            return _result(
+                "timeout",
+                passed=False,
+                timed_out=True,
+                tests_passed=0,
+                tests_total=1,
+            )
+
         if solution_code == smoke._FOLLOWER_SOURCE:
             with self.lock:
                 self.follower_active_counts.append(self.active_timeouts)
@@ -258,10 +268,22 @@ def test_preflight_exercises_every_contract_and_starts_leaders_first(
         "line\n",
         "line\r\n",
     ]
-    assert len(verifier.calls[5]["inputs"][0]) == 600 * 1024
-    assert verifier.calls[6]["solution_code"] == smoke._EARLY_EXIT_SOURCE
-    assert len(verifier.calls[6]["inputs"][0]) == 600 * 1024
-    assert "[7/7] 4-slot saturation" in capsys.readouterr().out
+    assert len(verifier.calls[5]["inputs"][0]) == smoke._LARGE_STDIN_BYTES
+    for source in (
+        smoke._EARLY_EXIT_SOURCE,
+        smoke._PARTIAL_READ_SOURCE,
+        smoke._EXPLICIT_STDIN_CLOSE_SOURCE,
+        smoke._LARGE_STDIN_TIMEOUT_SOURCE,
+    ):
+        lifecycle_calls = [
+            call for call in verifier.calls if call["solution_code"] == source
+        ]
+        assert len(lifecycle_calls) == smoke._LARGE_STDIN_LIFECYCLE_REPEATS
+        assert all(
+            len(call["inputs"][0]) == smoke._LARGE_STDIN_BYTES
+            for call in lifecycle_calls
+        )
+    assert "[8/8] 4-slot saturation" in capsys.readouterr().out
 
 
 def test_preflight_saturates_the_effective_two_slot_concurrency(monkeypatch, capsys):
@@ -291,7 +313,7 @@ def test_preflight_saturates_the_effective_two_slot_concurrency(monkeypatch, cap
     assert len(saturation_leaders) == 2
     assert all(call["timeout"] == 3 for call in saturation_leaders)
     assert len(followers) == 28
-    assert "[7/7] 2-slot saturation" in capsys.readouterr().out
+    assert "[8/8] 2-slot saturation" in capsys.readouterr().out
 
 
 def test_saturation_does_not_drain_queued_followers_after_infrastructure_error(

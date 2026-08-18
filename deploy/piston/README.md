@@ -32,8 +32,15 @@ That digest's config identifies `linux/amd64` and was created 2025-02-08. The
 derived image makes three narrow, fail-closed upstream edits: JSON request bodies
 may be up to 3 MiB, enough for CodeContests' roughly 500 KiB cases, and stdin
 is passed byte-for-byte instead of silently gaining a trailing newline or
-being truncated when Node still has buffered bytes. The build deliberately
-fails if any reviewed source shape changes.
+being truncated when Node still has buffered bytes. Buffered stdin completion
+also accepts Node's `close` event, which can be the only lifecycle event when a
+candidate partially consumes its input; otherwise the completed isolate leaks
+an API request and a server slot forever. A two-second post-exit fallback turns
+any other missing stdin lifecycle event into an HTTP 500, allowing the route's
+existing `finally` cleanup to release the slot. The build deliberately fails if
+any reviewed source shape changes. These are infrastructure-liveness
+corrections, not reward-semantic changes, so the executor protocol remains
+version 2; the derived container image revision is tagged `cc-v2`.
 
 ## Bring-up
 
@@ -110,8 +117,10 @@ MAX_CONCURRENT_PISTON_VERIFIERS=4 \
 
 Do not create paid GPU compute unless this prints `PISTON PREFLIGHT PASSED`.
 The preflight checks byte-exact empty, unterminated, LF, and CRLF stdin; exit
-codes 0, 1, and 120; timeout and output-limit classification; 600 KiB requests
-both fully consumed and ignored by an early-exiting child; and an
+codes 0, 1, and 120; timeout and output-limit classification; a fully consumed
+600 KiB request; and repeated concurrent 600 KiB requests whose children read
+zero bytes, read one byte, explicitly close stdin, or time out without reading.
+It then runs an
 effective-width group of timeout leaders followed by 28 successful jobs. It
 rejects an effective concurrency outside one through the
 protocol's four-job service capacity, and saturates exactly the configured

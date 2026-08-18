@@ -46,9 +46,13 @@ RUN set -eu; \
 # The destroy truncates buffered large inputs. Merely deleting it is also
 # unsafe: a candidate that exits without reading a large stdin makes Node emit
 # an unhandled EPIPE and restart the API. Replace the exact reviewed block with
-# one buffered end(data) plus an error listener. A closed candidate pipe is a
-# normal child-process outcome; the candidate's exit/output still determine
-# its verdict.
+# one buffered end(data) plus lifecycle listeners. A closed candidate pipe is
+# a normal child-process outcome; the candidate's exit/output still determine
+# its verdict. In particular, Node may emit close without finish or error when
+# a child only partially consumes a buffered stdin. Waiting for finish/error
+# alone permanently wedges the request after the child has already exited. A
+# two-second post-exit fallback converts any other missing stream event into an
+# HTTP 500 so Piston's existing route finally-block still releases the slot.
 RUN set -eu; \
     target=/piston_api/src/job.js; \
     first='        if (event_bus === null) {'; \
@@ -76,12 +80,14 @@ RUN set -eu; \
             '            stdin_completion = new Promise(resolve => {' \
             "                proc.stdin.once('error', resolve);" \
             "                proc.stdin.once('finish', () => resolve(null));" \
+            "                proc.stdin.once('close', () => resolve(null));" \
             '            });' \
             '            proc.stdin.end(this.stdin);'; \
         tail -n "+$((line + 4))" "$target"; \
     } > "${target}.new"; \
     mv "${target}.new" "$target"; \
     grep -Fqx '            proc.stdin.end(this.stdin);' "$target"; \
+    grep -Fqx "                proc.stdin.once('close', () => resolve(null));" "$target"; \
     ! grep -Fq '            proc.stdin.destroy();' "$target"; \
     marker='        const data = await new Promise((res, rej) => {'; \
     count="$(grep -Fxc "$marker" "$target" || true)"; \
@@ -98,7 +104,17 @@ RUN set -eu; \
         head -n "$((line + 12))" "$target"; \
         printf '%s\n' \
             '' \
-            '        const stdin_error = await stdin_completion;' \
+            '        let stdin_completion_timeout;' \
+            '        const stdin_error = await Promise.race([' \
+            '            stdin_completion,' \
+            '            new Promise(resolve => {' \
+            '                stdin_completion_timeout = setTimeout(' \
+            "                    () => resolve(new Error('Child stdin did not close after process exit'))," \
+            '                    2000' \
+            '                );' \
+            '            }),' \
+            '        ]);' \
+            '        clearTimeout(stdin_completion_timeout);' \
             '        if (' \
             '            stdin_error !== null &&' \
             "            !['EPIPE', 'ERR_STREAM_DESTROYED'].includes(stdin_error.code)" \
@@ -108,6 +124,7 @@ RUN set -eu; \
         tail -n "+$((line + 13))" "$target"; \
     } > "${target}.new"; \
     mv "${target}.new" "$target"; \
-    grep -Fqx '        const stdin_error = await stdin_completion;' "$target"
+    grep -Fqx '        const stdin_error = await Promise.race([' "$target"; \
+    grep -Fqx '        clearTimeout(stdin_completion_timeout);' "$target"
 
 COPY healthcheck.js /usr/local/libexec/piston-healthcheck.js

@@ -33,8 +33,13 @@ _LARGE_REQUEST_SOURCE = (
     "print(len(sys.stdin.buffer.read()))\n"
 )
 _EARLY_EXIT_SOURCE = "pass\n"
+_PARTIAL_READ_SOURCE = "import sys\nsys.stdin.buffer.read(1)\n"
+_EXPLICIT_STDIN_CLOSE_SOURCE = "import sys\nsys.stdin.close()\n"
+_LARGE_STDIN_TIMEOUT_SOURCE = "while True:\n    pass\n# large-stdin-lifecycle\n"
 _OUTPUT_FLOOD_SOURCE = "import sys\nsys.stdout.write('x' * (2 * 1024 * 1024))\n"
 _FOLLOWER_SOURCE = "print('piston-preflight-follower')\n"
+_LARGE_STDIN_BYTES = 600 * 1024
+_LARGE_STDIN_LIFECYCLE_REPEATS = 8
 _EARLY_TIMEOUT_BOUNDARY_SECONDS = 2.5
 _HIDDEN_TWO_WAVE_BOUNDARY_SECONDS = 5.0
 
@@ -161,6 +166,64 @@ def _check_saturation(
     _fail_fast_thread_map(run_job, jobs, max_workers=concurrency)
 
 
+def _check_large_stdin_lifecycle(
+    *,
+    verifier: Verifier,
+    settings: dict[str, str],
+    concurrency: int,
+    large_input: str,
+) -> None:
+    variants = (
+        ("zero-read exit", _EARLY_EXIT_SOURCE, "passed", True, False, 10),
+        ("one-byte read", _PARTIAL_READ_SOURCE, "passed", True, False, 10),
+        (
+            "explicit stdin close",
+            _EXPLICIT_STDIN_CLOSE_SOURCE,
+            "passed",
+            True,
+            False,
+            10,
+        ),
+        (
+            "timeout without read",
+            _LARGE_STDIN_TIMEOUT_SOURCE,
+            "timeout",
+            False,
+            True,
+            1,
+        ),
+    )
+    jobs = [
+        (repeat, *variant)
+        for repeat in range(1, _LARGE_STDIN_LIFECYCLE_REPEATS + 1)
+        for variant in variants
+    ]
+
+    def run_job(job: tuple[int, str, str, str, bool, bool, int]) -> None:
+        repeat, label, source, status, passed, timed_out, timeout = job
+        result = verifier(
+            source,
+            [large_input],
+            [""],
+            timeout=timeout,
+            **settings,
+        )
+        _require(
+            f"large-stdin {label} repeat {repeat}",
+            result,
+            status=status,
+            passed=passed,
+            timed_out=timed_out,
+            tests_passed=0 if timed_out else 1,
+            tests_total=1,
+        )
+
+    # Exercise the same bounded production supervisor used during training.
+    # The risky close paths repeat concurrently because the missing Node
+    # Writable `close` event was a race that a single early-exit probe missed.
+    _fail_fast_thread_map(run_job, jobs, max_workers=concurrency)
+
+
 def run_preflight(
     *,
     url: str,
@@ -182,7 +245,7 @@ def run_preflight(
 
     settings = _settings(url, runtime)
 
-    print("[1/7] byte-exact stdin", flush=True)
+    print("[1/8] byte-exact stdin", flush=True)
     stdin_cases = ["", "unterminated", "line\n", "line\r\n"]
     result = verifier(
         _BYTE_ECHO_SOURCE,
@@ -201,7 +264,7 @@ def run_preflight(
         tests_total=4,
     )
 
-    print("[2/7] normal exit", flush=True)
+    print("[2/8] normal exit", flush=True)
     result = verifier(
         _PASS_SOURCE,
         [""],
@@ -219,7 +282,7 @@ def run_preflight(
         tests_total=1,
     )
 
-    print("[3/7] nonzero exits", flush=True)
+    print("[3/8] nonzero exits", flush=True)
     for exit_code, source in ((1, _EXIT_1_SOURCE), (120, _EXIT_120_SOURCE)):
         result = verifier(
             source,
@@ -238,7 +301,7 @@ def run_preflight(
             tests_total=1,
         )
 
-    print("[4/7] timeout mapping", flush=True)
+    print("[4/8] timeout mapping", flush=True)
     result = verifier(
         _TIMEOUT_SOURCE,
         [""],
@@ -256,8 +319,8 @@ def run_preflight(
         tests_total=1,
     )
 
-    print("[5/7] 600 KiB request", flush=True)
-    large_input = "a" * (600 * 1024)
+    print("[5/8] 600 KiB full-read request", flush=True)
+    large_input = "a" * _LARGE_STDIN_BYTES
     result = verifier(
         _LARGE_REQUEST_SOURCE,
         [large_input],
@@ -275,28 +338,19 @@ def run_preflight(
         tests_total=1,
     )
 
-    # The child may legally finish without consuming stdin. Stock Piston's
-    # pipe handling used to turn this combination into an API-wide EPIPE
-    # crash; keep it adjacent to the full-read probe so both directions are
-    # required by every production preflight.
-    result = verifier(
-        _EARLY_EXIT_SOURCE,
-        [large_input],
-        [""],
-        timeout=10,
-        **settings,
+    print(
+        f"[6/8] 600 KiB close lifecycle "
+        f"({_LARGE_STDIN_LIFECYCLE_REPEATS} repeats)",
+        flush=True,
     )
-    _require(
-        "600 KiB early exit",
-        result,
-        status="passed",
-        passed=True,
-        timed_out=False,
-        tests_passed=1,
-        tests_total=1,
+    _check_large_stdin_lifecycle(
+        verifier=verifier,
+        settings=settings,
+        concurrency=effective,
+        large_input=large_input,
     )
 
-    print("[6/7] 2 MiB output cap", flush=True)
+    print("[7/8] 2 MiB output cap", flush=True)
     result = verifier(
         _OUTPUT_FLOOD_SOURCE,
         [""],
@@ -314,7 +368,7 @@ def run_preflight(
         tests_total=1,
     )
 
-    print(f"[7/7] {effective}-slot saturation", flush=True)
+    print(f"[8/8] {effective}-slot saturation", flush=True)
     _check_saturation(
         verifier=verifier,
         settings=settings,
