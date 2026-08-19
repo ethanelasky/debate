@@ -762,8 +762,22 @@ def test_main_passes_docent_base_and_already_resolved_namespace(
     assert "error_type" not in receipts[0]
 
 
-def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
-    tmp_path, prompt_file, launch_namespace, monkeypatch
+@pytest.mark.parametrize(
+    ("kind", "exit_code", "expected_type", "expected_code"),
+    [
+        ("KeyboardInterrupt", None, KeyboardInterrupt, None),
+        ("SystemExit", 23, SystemExit, 23),
+    ],
+)
+def test_main_broken_receipt_and_family_close_cannot_replace_operator_control_flow(
+    tmp_path,
+    prompt_file,
+    launch_namespace,
+    monkeypatch,
+    kind,
+    exit_code,
+    expected_type,
+    expected_code,
 ):
     import infra.envs.debate.docent_export as docent_export
 
@@ -771,16 +785,22 @@ def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
         collection_name=f"mb-eval--launch-{launch_namespace}",
         launch_namespace=launch_namespace,
         collection_id="confirmed-before-broken-stderr",
-        error_type="KeyboardInterrupt",
+        error_type=kind,
     )
     monkeypatch.setattr(
         docent_export,
         "upload",
         lambda *_args, **_kwargs: docent_export.DocentUploadControlFlow(
             failure=failure,
-            kind="KeyboardInterrupt",
+            kind=kind,
+            exit_code=exit_code,
         ),
     )
+
+    def broken_close(_self):
+        raise RuntimeError("RAW-FAMILY-CLOSE-DETAIL")
+
+    monkeypatch.setattr(MonitoringBenchFamily, "close", broken_close)
 
     class BrokenStderr:
         def write(self, _text):
@@ -792,7 +812,7 @@ def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
     exp_file = write_configs(tmp_path, prompt_file)
     artifact_root = tmp_path / "artifacts"
     monkeypatch.setattr(sys, "stderr", BrokenStderr())
-    with pytest.raises(KeyboardInterrupt) as caught:
+    with pytest.raises(expected_type) as caught:
         run_eval.main(
             _artifact_argv(
                 exp_file,
@@ -804,7 +824,10 @@ def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
             task_source=MBTaskSource(1),
         )
 
-    assert caught.value.args == ()
+    if expected_type is KeyboardInterrupt:
+        assert caught.value.args == ()
+    else:
+        assert caught.value.code == expected_code
     assert sorted(
         path.name for path in (artifact_root / launch_namespace).iterdir()
     ) == ["docent.jsonl", "results.jsonl", "summary.json"]
@@ -813,6 +836,7 @@ def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
         assert traceback_cursor.tb_frame.f_code.co_name != "_main_impl"
         retained = repr(traceback_cursor.tb_frame.f_locals)
         assert "RAW-BROKEN-STDERR-DETAIL" not in retained
+        assert "RAW-FAMILY-CLOSE-DETAIL" not in retained
         assert BACKGROUND not in retained
         traceback_cursor = traceback_cursor.tb_next
 
@@ -860,7 +884,34 @@ def test_main_broken_receipt_emission_is_not_retried_or_made_local_failure(
     assert (artifact_root / launch_namespace / "docent.jsonl").is_file()
 
 
-def test_fresh_system_exit_sanitizes_none_to_integer_one():
+def test_main_family_close_failure_propagates_without_pending_control_flow(
+    tmp_path, prompt_file, launch_namespace, monkeypatch
+):
+    def broken_close(_self):
+        raise RuntimeError("family close wins")
+
+    monkeypatch.setattr(MonitoringBenchFamily, "close", broken_close)
+    exp_file = write_configs(tmp_path, prompt_file)
+    with pytest.raises(RuntimeError, match="family close wins"):
+        run_eval.main(
+            _artifact_argv(exp_file, tmp_path / "artifacts"),
+            task_source=MBTaskSource(1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "exit_code", "expected_type", "expected_code"),
+    [
+        ("KeyboardInterrupt", None, KeyboardInterrupt, None),
+        ("SystemExit", 19, SystemExit, 19),
+        ("SystemExit", None, SystemExit, 1),
+        ("SystemExit", True, SystemExit, 1),
+        ("SystemExit", "payload", SystemExit, 1),
+    ],
+)
+def test_fresh_docent_control_flow_uses_only_sanitized_carrier(
+    kind, exit_code, expected_type, expected_code
+):
     from infra.envs.debate.docent_export import (
         DocentUploadControlFlow,
         DocentUploadFailure,
@@ -871,14 +922,128 @@ def test_fresh_system_exit_sanitizes_none_to_integer_one():
             collection_name="collection--launch-run-A",
             launch_namespace="run-A",
             collection_id=None,
-            error_type="SystemExit",
+            error_type=kind,
         ),
-        kind="SystemExit",
-        exit_code=None,
+        kind=kind,
+        exit_code=exit_code,
     )
-    with pytest.raises(SystemExit) as caught:
+    with pytest.raises(expected_type) as caught:
         run_eval._raise_fresh_docent_control_flow(control)
-    assert caught.value.code == 1
+    if expected_type is KeyboardInterrupt:
+        assert caught.value.args == ()
+    else:
+        assert caught.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("failed", "collection_id"),
+    [(False, "confirmed-id"), (True, None), (True, "last-validated-id")],
+)
+def test_docent_receipt_shape_preserves_id_or_explicit_null(failed, collection_id):
+    from infra.envs.debate.docent_export import DocentUploadFailure, DocentUploadResult
+
+    result = (
+        DocentUploadFailure(
+            collection_name="collection--launch-run-A",
+            launch_namespace="run-A",
+            collection_id=collection_id,
+            error_type="SanitizedFailure",
+        )
+        if failed
+        else DocentUploadResult(
+            collection_name="collection--launch-run-A",
+            launch_namespace="run-A",
+            collection_id=collection_id,
+        )
+    )
+    receipt = run_eval._docent_receipt(result, failed=failed)
+    assert receipt == {
+        "event": "docent_upload_receipt",
+        "status": "ambiguous_or_unconfirmed" if failed else "confirmed",
+        "collection_name": "collection--launch-run-A",
+        "launch_namespace": "run-A",
+        "collection_id": collection_id,
+        **({"error_type": "SanitizedFailure"} if failed else {}),
+    }
+
+
+@pytest.mark.parametrize("pending_kind", [None, "KeyboardInterrupt", "SystemExit"])
+@pytest.mark.parametrize(
+    "writer_outcome",
+    ["success", "OSError", "KeyboardInterrupt", "SystemExit", "SystemExitPayload", "GeneratorExit"],
+)
+def test_docent_receipt_emission_control_flow_cross_product(
+    monkeypatch, pending_kind, writer_outcome
+):
+    import builtins
+    from infra.envs.debate.docent_export import (
+        DocentUploadControlFlow,
+        DocentUploadFailure,
+    )
+
+    receipt = {
+        "event": "docent_upload_receipt",
+        "status": "confirmed",
+        "collection_name": "collection--launch-run-A",
+        "launch_namespace": "run-A",
+        "collection_id": "last-validated-id",
+    }
+    pending = None
+    if pending_kind is not None:
+        pending = DocentUploadControlFlow(
+            failure=DocentUploadFailure(
+                collection_name=receipt["collection_name"],
+                launch_namespace=receipt["launch_namespace"],
+                collection_id=receipt["collection_id"],
+                error_type=pending_kind,
+            ),
+            kind=pending_kind,
+            exit_code=31 if pending_kind == "SystemExit" else None,
+        )
+
+    attempts = 0
+
+    def receipt_writer(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if writer_outcome == "OSError":
+            raise OSError("raw writer detail")
+        if writer_outcome == "KeyboardInterrupt":
+            raise KeyboardInterrupt("raw interrupt payload")
+        if writer_outcome == "SystemExit":
+            raise SystemExit(37)
+        if writer_outcome == "SystemExitPayload":
+            raise SystemExit("raw exit payload")
+        if writer_outcome == "GeneratorExit":
+            raise GeneratorExit("raw generator payload")
+
+    monkeypatch.setattr(builtins, "print", receipt_writer)
+    call = lambda: run_eval._emit_docent_receipt_once(
+        receipt,
+        pending_control_flow=pending,
+        failure_type=DocentUploadFailure,
+        control_flow_type=DocentUploadControlFlow,
+    )
+
+    if writer_outcome == "GeneratorExit" and pending is None:
+        with pytest.raises(GeneratorExit):
+            call()
+    else:
+        result = call()
+        if pending is not None:
+            assert result is pending
+        elif writer_outcome in ("success", "OSError"):
+            assert result is None
+        else:
+            assert result.failure.collection_id == "last-validated-id"
+            assert result.kind in ("KeyboardInterrupt", "SystemExit")
+            if writer_outcome == "KeyboardInterrupt":
+                assert (result.kind, result.exit_code) == ("KeyboardInterrupt", None)
+            elif writer_outcome == "SystemExit":
+                assert (result.kind, result.exit_code) == ("SystemExit", 37)
+            else:
+                assert (result.kind, result.exit_code) == ("SystemExit", 1)
+    assert attempts == 1
 
 
 def test_main_refuses_existing_scheduler_namespace_before_evaluation(

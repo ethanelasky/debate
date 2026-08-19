@@ -93,26 +93,6 @@ def _write_receipt(frame: dict[str, Any]) -> None:
         view = view[written:]
 
 
-def _terminal_frame(
-    *,
-    status: str,
-    collection_name: str,
-    launch_namespace: str,
-    collection_id: str | None,
-    error_type: str | None = None,
-) -> dict[str, Any]:
-    frame: dict[str, Any] = {
-        "event": "terminal",
-        "status": status,
-        "collection_name": collection_name,
-        "launch_namespace": launch_namespace,
-        "collection_id": collection_id,
-    }
-    if error_type is not None:
-        frame["error_type"] = error_type
-    return frame
-
-
 def main() -> int:
     collection_name = "invalid"
     launch_namespace = "invalid"
@@ -142,8 +122,8 @@ def main() -> int:
         from docent.data_models import AgentRun
         from infra.envs.debate.docent_export import (
             _DocentTimeBudget,
-            _sanitized_error_type,
             _upload_in_child_process,
+            DocentUploadFailure,
             collection_name_for_launch,
             validate_launch_namespace,
         )
@@ -167,14 +147,7 @@ def main() -> int:
         def confirmed(value: str) -> None:
             nonlocal collection_id
             collection_id = value
-            _write_receipt(
-                {
-                    "event": "collection_confirmed",
-                    "collection_name": collection_name,
-                    "launch_namespace": launch_namespace,
-                    "collection_id": value,
-                }
-            )
+            _write_receipt({"event": "collection", "id": value})
 
         result = _upload_in_child_process(
             runs,
@@ -189,25 +162,12 @@ def main() -> int:
         )
         if result.collection_id is not None:
             collection_id = result.collection_id
-        if hasattr(result, "error_type"):
+        if isinstance(result, DocentUploadFailure):
             _write_receipt(
-                _terminal_frame(
-                    status="ambiguous_or_unconfirmed",
-                    collection_name=collection_name,
-                    launch_namespace=launch_namespace,
-                    collection_id=collection_id,
-                    error_type=result.error_type,
-                )
+                {"event": "terminal", "ok": False, "error": result.error_type}
             )
             return 2
-        _write_receipt(
-            _terminal_frame(
-                status="confirmed",
-                collection_name=collection_name,
-                launch_namespace=launch_namespace,
-                collection_id=collection_id,
-            )
-        )
+        _write_receipt({"event": "terminal", "ok": True})
         return 0
     except _ChildHardDeadline:
         error_type = "DocentUploadDeadlineError"
@@ -224,15 +184,7 @@ def main() -> int:
         if alarm_installed:
             signal.setitimer(signal.ITIMER_REAL, 0.0, 0.0)
     try:
-        _write_receipt(
-            _terminal_frame(
-                status="ambiguous_or_unconfirmed",
-                collection_name=collection_name,
-                launch_namespace=launch_namespace,
-                collection_id=collection_id,
-                error_type=error_type,
-            )
-        )
+        _write_receipt({"event": "terminal", "ok": False, "error": error_type})
     except BaseException:
         pass
     return 2

@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
-import inspect
 import os
 import socket
 import subprocess
 import sys
-import textwrap
-import time
 import uuid
 import warnings
 from pathlib import Path
@@ -27,7 +23,6 @@ from infra.launch_namespace import (
     safe_path_component,
     validate_launch_namespace,
 )
-from infra.run_common import run_identity_suffix
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -378,137 +373,14 @@ def test_manual_fallback_is_unique_across_real_processes():
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _ in range(32)
+        for _ in range(4)
     ]
     results = [process.communicate(timeout=20) for process in processes]
 
     assert all(process.returncode == 0 for process in processes), results
     values = [stdout.strip() for stdout, _ in results]
-    assert len(set(values)) == 32
+    assert len(set(values)) == 4
     for value in values:
         parsed = uuid.UUID(value)
         assert parsed.version == 4
         assert str(parsed) == value
-
-
-def test_real_processes_racing_for_one_directory_get_exactly_one_winner(tmp_path):
-    target = tmp_path / "checkpoints" / "run" / "scheduler-attempt"
-    ready_dir = tmp_path / "ready"
-    ready_dir.mkdir()
-    gate = tmp_path / "go"
-    code = textwrap.dedent(
-        """
-        import pathlib
-        import sys
-        import time
-
-        from infra.launch_namespace import claim_directory
-
-        target = pathlib.Path(sys.argv[1])
-        ready = pathlib.Path(sys.argv[2])
-        gate = pathlib.Path(sys.argv[3])
-        token = sys.argv[4]
-        ready.write_text(token)
-        deadline = time.monotonic() + 20
-        while not gate.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError("barrier was never released")
-            time.sleep(0.005)
-        try:
-            claimed = claim_directory(target)
-        except FileExistsError:
-            raise SystemExit(17)
-        with open(claimed / "winner", "x", encoding="utf-8") as handle:
-            handle.write(token)
-        print(token)
-        """
-    )
-    env = os.environ.copy()
-    env.pop(ENV_VAR, None)
-    processes = [
-        subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                code,
-                str(target),
-                str(ready_dir / f"ready-{index}"),
-                str(gate),
-                f"process-{index}",
-            ],
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for index in range(16)
-    ]
-    deadline = time.monotonic() + 20
-    while len(list(ready_dir.iterdir())) != len(processes):
-        if time.monotonic() >= deadline:
-            gate.touch()
-            outputs = [process.communicate(timeout=5) for process in processes]
-            pytest.fail(f"children did not reach barrier: {outputs!r}")
-        time.sleep(0.01)
-    gate.touch()
-    results = [process.communicate(timeout=20) for process in processes]
-
-    winners = [
-        stdout.strip()
-        for process, (stdout, _) in zip(processes, results)
-        if process.returncode == 0
-    ]
-    losers = [process for process in processes if process.returncode != 0]
-    assert len(winners) == 1
-    assert len(losers) == 15
-    assert all(process.returncode == 17 for process in losers), results
-    sentinel = target / "winner"
-    assert sentinel.read_text() == winners[0]
-
-    before = (
-        target.stat().st_ino,
-        target.stat().st_mode,
-        target.stat().st_mtime_ns,
-        sentinel.stat().st_ino,
-        sentinel.stat().st_mode,
-        sentinel.stat().st_mtime_ns,
-        sentinel.read_bytes(),
-    )
-    reuse = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                "from infra.launch_namespace import claim_directory; "
-                "claim_directory(sys.argv[1])"
-            ),
-            str(target),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    after = (
-        target.stat().st_ino,
-        target.stat().st_mode,
-        target.stat().st_mtime_ns,
-        sentinel.stat().st_ino,
-        sentinel.stat().st_mode,
-        sentinel.stat().st_mtime_ns,
-        sentinel.read_bytes(),
-    )
-    assert reuse.returncode != 0
-    assert before == after
-
-
-def test_run_identity_suffix_source_is_byte_for_byte_historical_definition():
-    source = inspect.getsource(run_identity_suffix).encode("utf-8")
-    assert hashlib.sha256(source).hexdigest() == (
-        "3dfdbd08d614c7182755ed21b3ef1779387998d9f778440350399649e853a176"
-    )

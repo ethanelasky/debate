@@ -172,6 +172,41 @@ def _existing_directory_identity(path: str | os.PathLike[str]) -> tuple[int, int
             os.close(fd)
 
 
+def _validate_claimed_directory(
+    claimed: Path,
+    *,
+    duplicate_authority: bool,
+) -> int | None:
+    """Validate a process claim and optionally return a caller-owned dirfd."""
+    authority_fd: int | None = None
+    with _CLAIM_LOCK:
+        authority = _PROCESS_CLAIMS.get(_process_claim_key(claimed))
+        if authority is None:
+            raise ValueError(
+                f"directory was not claimed by this process: {claimed}"
+            )
+        if duplicate_authority:
+            authority_fd = os.dup(authority.fd)
+        expected = authority.device, authority.inode
+
+    try:
+        try:
+            actual = _existing_directory_identity(claimed)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"claimed directory is no longer safely reachable: {claimed}"
+            ) from exc
+        if actual != expected:
+            raise ValueError(
+                f"claimed directory identity changed after reservation: {claimed}"
+            )
+        return authority_fd
+    except BaseException:
+        if authority_fd is not None:
+            os.close(authority_fd)
+        raise
+
+
 def claim_directory(path: str | os.PathLike[str]) -> Path:
     """Claim a leaf below a trusted, stable parent without following links.
 
@@ -247,22 +282,7 @@ def claim_directory(path: str | os.PathLike[str]) -> Path:
 def require_claimed_directory(path: str | os.PathLike[str]) -> Path:
     """Accept only a still-stable directory claimed earlier by this process."""
     claimed = Path(path)
-    with _CLAIM_LOCK:
-        expected = _PROCESS_CLAIMS.get(_process_claim_key(claimed))
-    if expected is None:
-        raise ValueError(
-            f"directory was not claimed by this process: {claimed}"
-        )
-    try:
-        actual = _existing_directory_identity(claimed)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(
-            f"claimed directory is no longer safely reachable: {claimed}"
-        ) from exc
-    if actual != (expected.device, expected.inode):
-        raise ValueError(
-            f"claimed directory identity changed after reservation: {claimed}"
-        )
+    _validate_claimed_directory(claimed, duplicate_authority=False)
     return claimed
 
 
@@ -279,25 +299,11 @@ def open_claimed_text_file(
     if not isinstance(filename, str) or _FILE_COMPONENT_RE.fullmatch(filename) is None:
         raise ValueError(f"output filename must be one safe component, got {filename!r}")
     claimed = Path(directory)
-    with _CLAIM_LOCK:
-        authority = _PROCESS_CLAIMS.get(_process_claim_key(claimed))
-        if authority is None:
-            raise ValueError(
-                f"directory was not claimed by this process: {claimed}"
-            )
-        authority_fd = os.dup(authority.fd)
-        expected = authority.device, authority.inode
+    authority_fd = _validate_claimed_directory(
+        claimed, duplicate_authority=True
+    )
+    assert authority_fd is not None
     try:
-        try:
-            actual = _existing_directory_identity(claimed)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError(
-                f"claimed directory is no longer safely reachable: {claimed}"
-            ) from exc
-        if actual != expected:
-            raise ValueError(
-                f"claimed directory identity changed after reservation: {claimed}"
-            )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
             file_fd = os.open(filename, flags, 0o666, dir_fd=authority_fd)
@@ -334,27 +340,12 @@ def open_claimed_read_fd(
             f"input filename must be one safe component, got {filename!r}"
         )
     claimed = Path(directory)
-    with _CLAIM_LOCK:
-        authority = _PROCESS_CLAIMS.get(_process_claim_key(claimed))
-        if authority is None:
-            raise ValueError(
-                f"directory was not claimed by this process: {claimed}"
-            )
-        authority_fd = os.dup(authority.fd)
-        expected = authority.device, authority.inode
+    authority_fd = _validate_claimed_directory(
+        claimed, duplicate_authority=True
+    )
+    assert authority_fd is not None
     file_fd = -1
     try:
-        try:
-            actual = _existing_directory_identity(claimed)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError(
-                f"claimed directory is no longer safely reachable: {claimed}"
-            ) from exc
-        if actual != expected:
-            raise ValueError(
-                f"claimed directory identity changed after reservation: {claimed}"
-            )
-
         flags = (
             os.O_RDONLY
             | os.O_NOFOLLOW

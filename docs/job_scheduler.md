@@ -12,8 +12,8 @@ behavior:
   the complete mapping from immutable source commit `8b95cd7`.
 
 Where an implementation constraint is labeled as such, it is not a user-approved design choice. An open gate grants no
-authority. Current test sketches are not authority; the conformance gate must be satisfied before implementation moves
-past its approved frontier.
+authority. Existing tests are not authority; the conformance gate must be satisfied before implementation moves past
+its approved frontier.
 
 ## One-screen proposal
 
@@ -392,73 +392,59 @@ sees the run as `running` after B initializes and refuses, leaving only the stat
 
 ### DOC-001
 
-**One external Docent collection per launch.** Pin every install surface to `docent-python==0.1.77` and refuse before
-client construction unless the runtime package matches. An empty `AgentRun` list refuses before collection creation.
-The collection name includes the launch namespace and holds exactly that attempt's transcripts. The scientific
-`AgentRun` records receive one canonical scientific JSON serialization. Those exact per-record bytes cross from the
-local JSONL file into child-model reconstruction unchanged. Separately, for the same reconstructed records, the
-uncompressed JSON payload bytes emitted at the pinned SDK's batching/transport-serialization boundary must exactly match
-the pinned pre-boundary SDK. This is not a Python object-identity or wire-envelope claim: the SDK payload may
-Unicode-escape non-ASCII text and therefore need not equal the local newline JSONL, while gzip bytes and HTTP framing may
-vary, including gzip timestamp metadata.
+**One external Docent collection per launch.** Pin every install surface to `docent-python==0.1.77`. Before constructing
+transport or mutating Docent, validate that exact runtime version, the reviewed serializer function source hashes, and its
+100 MiB pre-gzip batching threshold. The upload child uses only the pinned `AgentRun` model and batching serializer from
+the SDK; it owns explicit `requests` transport for authentication, collection creation, agent batches, and status
+polling. Empty input refuses before transport construction or collection creation. The namespace appears in the
+collection name, which holds exactly one attempt.
 
-Every Docent HTTP call, including authentication, uses a 10-second connect and 120-second read timeout. A fixed
-five-minute parent wall-clock budget begins immediately before spawning the upload child and ends only after final
-confirmation or cleanup. It includes child startup, authentication, every mutation and poll, final framing, and a
-bounded internal group-directed `SIGTERM`, receipt drain capped at the current 250 milliseconds, group-directed
-`SIGKILL`, and direct-child reap slice reserved inside the five minutes. There is no separate socket-level network
-cutoff: a process that ignores `SIGTERM` can retain network ability during that bounded drain interval. Cleanup still
-reaches `SIGKILL` and direct-child reap by the absolute five-minute deadline, with no post-deadline grace. Manual upload
-uses the full budget. The future scheduler uses
-`min(5 minutes, remaining attempt deadline - separate 5-minute evidence/shutdown reserve)` and skips external upload
-with a sanitized unconfirmed receipt when insufficient time remains.
+Canonical scientific JSON bytes survive local JSONL-to-child model reconstruction exactly. For the same records, the
+uncompressed JSON payload at the batching/transport-serialization boundary exactly matches the pinned pre-boundary SDK.
+This is not object or wire identity: SDK JSON may Unicode-escape text, so it need not equal newline JSONL, and gzip
+metadata or HTTP framing may vary.
 
-The parent launches and execs a fresh Python interpreter in its own process group, with Torch absent. Under the module's
-spawn lock it snapshots every open inheritable non-stdio file descriptor it can observe and schedules all except the fixed
-JSONL and receipt descriptors for closure; stdin/stdout/stderr are replaced with `/dev/null`, and ordinary Python-created
-descriptors are non-inheritable. This is not a guarantee against an uncooperative same-process thread that races outside
-the module lock to create or mark an inheritable descriptor during spawn. The child's cleared environment contains only
-the explicitly allowlisted Docent key, endpoint, domain, and protocol environment variables. Config-file auto-discovery
-and ambient proxy, custom CA override, `.netrc`, dynamic-loader preload, and `PYTHONPATH` settings are unavailable.
+Every HTTP call, authentication included, uses 10-second connect and 120-second read timeouts. The explicit transport
+has `trust_env` false, zero retries, refuses redirects, sends each auth/create/batch/status request once, and requires
+2xx. A fixed five-minute parent budget starts immediately before child spawn and includes startup, auth, mutations,
+polls, final framing, and cleanup. Manual upload uses it all; the future scheduler uses
+`min(5 minutes, remaining attempt deadline - separate 5-minute evidence/shutdown reserve)` and emits an unconfirmed
+receipt without starting upload if too little remains.
 
-The parent enforces the absolute deadline without using `SIGALRM`; on live-child cleanup paths it uses the bounded
-group-directed `SIGTERM`/drain/`SIGKILL` sequence above, and every path after successful spawn ends with a group-directed
-`SIGKILL` sweep and direct-child reap. Real known descendants and observed process-group members must be absent
-afterward. The contract does not claim a portable authoritative census or control of an arbitrary descendant that
-deliberately escapes the process group. The fresh child normalizes only its own signal handler, mask, pending state, and timer, then installs its own alarm
-for the same absolute deadline only as defense if it becomes orphaned; the child alarm cannot extend the parent deadline.
-Parent signal handler, mask, pending-signal and timer state, live threads, Torch state, and tqdm state neither gate the
-upload nor change because of it. This process boundary improves isolation and reduces operational risk; it does not
-promise fewer lines of code or lower implementation complexity.
+The parent execs a fresh no-Torch Python child in its own process group. Under the module spawn lock it closes every
+observed inheritable non-stdio descriptor except fixed read-only JSONL and write-only receipt descriptors; stdio becomes
+`/dev/null`, and ordinary Python descriptors are non-inheritable. Uncooperative same-process code deliberately racing
+that lock is outside the guarantee. The child receives only allowlisted Docent key, endpoint, domain, and protocol
+variables; it cannot discover config files, ambient proxy/custom CA, `.netrc`, preload, or `PYTHONPATH` settings.
 
-Collection creation, every nonempty agent batch, and every status-poll POST each receive one transport send: SDK and
-adapter retries are disabled, redirects refuse, and every response must be 2xx. A confirmed collection ID validates as
-one bounded URL-safe path component before any batch POST. Each batch returns a unique nonempty `job_id` and is awaited
-to confirmation. Polls request at most 100 pending IDs, an implementation constraint of the pinned SDK, and each response
-contains exactly one row for every requested ID with no missing, extra, or duplicate rows. `pending` and `running` are
-the only nonterminal states; `completed` confirms and removes the ID. Canceled, failed, unknown, malformed, missing,
-extra, duplicate, transport, or acknowledgement failures are immediate partial failures.
+The parent uses no `SIGALRM`. Live-child cleanup reserves, inside five minutes, group `SIGTERM`, at most 250 milliseconds
+of receipt drain, group `SIGKILL`, and direct-child reap; there is no post-deadline grace or socket cutoff, so a
+TERM-ignoring child may retain network access during the drain. Every successful spawn ends with a group-kill sweep and
+reap; known descendants and observed group members must be absent. Deliberately escaped descendants and a portable
+authoritative census are outside the guarantee. The fresh child normalizes only its signal/timer state and installs the
+same absolute deadline as orphan defense. Parent signals, timers, threads, Torch, and tqdm state remain unchanged. This
+boundary improves isolation and reduces operational risk, not necessarily code size or complexity.
 
-The child reports only bounded, sanitized, schema-validated progress frames and at most one final frame. For success,
-skip, spawn/protocol/HTTP failure, timeout, or interruption, the parent alone makes exactly one canonical sanitized
-structured receipt emission attempt on stderr. A broken stderr cannot make delivery reliable, is never retried, and
-cannot mask required control flow. The parent retains the last validated collection ID frame it received; otherwise the
-receipt says `collection_id: null` explicitly. This includes the unavoidable window in which the remote service returns
-2xx but the child is killed before the validated ID reaches the parent. An oversized, malformed, out-of-order, or
-unsanitized frame is a protocol failure: the parent follows the same cleanup path and records the same honest ambiguous
-result, never adoption. On `KeyboardInterrupt`, the parent cleans up and attempts the receipt, then raises a fresh
-argument-free `KeyboardInterrupt`. On `SystemExit`, it raises a fresh `SystemExit` carrying only a sanitized integer exit
-code—preserving an integer code and mapping a non-integer payload to `1`—never the original exception object or payload.
+A confirmed collection ID must be one bounded URL-safe path component before batch POST. Every nonempty batch returns a
+unique nonempty `job_id` and is polled to confirmation. Status requests contain at most 100 pending IDs, the pinned seam's
+constraint, and responses contain exactly one row per requested ID. Only `pending` and `running` continue; `completed`
+confirms. Canceled, failed, unknown, malformed, missing, extra, duplicate, transport, or acknowledgement results fail
+immediately.
 
-No ambiguous or timed-out mutation is retried or adopted. External failure never invalidates authoritative local
-transcript evidence or prevents a locally evidenced run from succeeding. A legitimately slow or multi-GB upload can
-therefore remain permanently ambiguous even if the service later completes it.
+Private child-to-parent IPC is deliberately compact: the only progress frame carries the novel confirmed collection ID,
+followed by one terminal `ok` status or sanitized-error frame. Each bounded, schema-validated frame is checked against the
+actual operating-system pipe `PIPE_BUF` and written atomically. Collection name and namespace stay parent-known and
+appear in the public receipt, so even a long valid name cannot inflate private IPC. Oversized, malformed, unsanitized, or out-of-order frames
+fail the protocol. The parent retains the last validated ID or emits explicit `collection_id: null`, including the
+unavoidable remote-2xx-to-IPC window, and never adopts an ambiguous mutation.
 
-The pinned SDK's roughly 100 MiB pre-gzip batch threshold is factual implementation context only. Ethan expected typical
-uploads likely would not be multi-GB while explicitly leaving open that they may be. Neither statement promises artifact
-size, wire size, duration, memory use, or completion within five minutes. Child model reconstruction and the pinned SDK
-may still eagerly materialize multi-GB scientific data; a child OOM before any remote mutation or in the
-remote-2xx-to-frame window produces the same honest null/last-validated-ID ambiguity and no success guarantee.
+For success, skip, failure, timeout, or interruption, the parent alone makes exactly one sanitized structured stderr
+receipt emission attempt; broken stderr is not retried and cannot mask control flow. After cleanup and that attempt,
+`KeyboardInterrupt` becomes a fresh argument-free instance; `SystemExit` preserves only a sanitized integer code,
+mapping non-integer payloads to `1`. External failure never invalidates authoritative local transcripts or prevents a
+locally evidenced run from succeeding, and no ambiguous or timed-out mutation is retried. Slow, multi-GB, or eagerly
+materialized uploads may remain ambiguous or OOM; the batching threshold and Ethan's expectation that typical uploads
+likely are smaller are not size, duration, memory, or success guarantees.
 
 **Worked example.** Experiment `math-pc-rl` is launched three times. A single collection named `math-pc-rl` would mix a
 partial crashed attempt with a complete relaunch. Under this clause, each attempt receives a collection whose name
@@ -477,8 +463,9 @@ flowchart LR
 ```mermaid
 flowchart LR
     P[Parent starts absolute deadline] --> C[Fresh no Torch child process group]
-    C --> D[Docent SDK and HTTP]
-    C --> F[Bounded sanitized frames]
+    C --> M[Pinned model and batching serializer]
+    C --> D[Explicit one send HTTP transport]
+    C --> F[Compact ID then terminal frames]
     F --> R[Parent attempts one receipt]
     P --> K[Group TERM drain at most 250ms then group KILL and reap]
     K --> C

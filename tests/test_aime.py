@@ -7,30 +7,14 @@ from copy import deepcopy
 import pytest
 
 from infra.envs.tasks import get_family
+from _dataset_tqdm_monitor import dataset_tqdm_monitor_owner
 
 
 @pytest.fixture(scope="module")
 def env():
-    from datasets.utils.tqdm import tqdm as datasets_tqdm
-
-    monitor_before = datasets_tqdm.monitor
-    environment = get_family("aime").source({"seed": 0})
-    fixture_monitor = datasets_tqdm.monitor
-    try:
+    with dataset_tqdm_monitor_owner() as monitor_call:
+        environment = monitor_call(get_family("aime").source, {"seed": 0})
         yield environment
-    finally:
-        # Dataset loading can start tqdm's process-global daemon monitor.  Own
-        # only the monitor this fixture created; preserve any preexisting or
-        # subsequently replaced monitor rather than stopping another caller's
-        # thread.
-        if (
-            monitor_before is None
-            and fixture_monitor is not None
-            and datasets_tqdm.monitor is fixture_monitor
-        ):
-            fixture_monitor.exit()
-            fixture_monitor.join()
-            datasets_tqdm.monitor = None
 
 
 def test_pool_loads_and_splits(env):

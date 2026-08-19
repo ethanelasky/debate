@@ -74,6 +74,7 @@ in [job_scheduler_conformance.md](job_scheduler_conformance.md).
 | ID | Provenance | Decision and authority boundary | Current location | Source |
 |---|---|---|---|---|
 | D-025 | **Codex authored and recommended; Ethan reviewed and approved the dedicated-child direction and the exact trusted boundary** | Codex proposed the dedicated child and authored its detailed mechanics. Ethan first approved the direction—“sure, down to run docent upload in a dedicated child”—and on 2026-08-18 explicitly answered “yes” to the exact boundary presented: no ambient proxy, custom CA, `.netrc`, or Docent-config discovery; group `SIGTERM`, a receipt drain capped at 250 milliseconds, group `SIGKILL`, and direct-child reap inside five minutes with no socket-level cutoff during the drain; same-process code is trusted not to deliberately race inheritable-FD creation outside the module spawn lock; and a process deliberately escaping the child process group is outside the guarantee. These mechanics remain Codex-authored recommendations, now Ethan-reviewed and approved rather than direct Ethan-originated substance. Canonical scientific/pinned-SDK byte behavior remains governed by D-017/D-025, while D-018 timeouts/budget, D-019 polling limit, one-send/census semantics, no retry/adoption, and authoritative local evidence remain unchanged. The boundary remains an isolation/operational-risk choice, not a LOC/complexity or large-upload success promise. | [DOC-001](job_scheduler.md#doc-001) | `post-8b95cd7`, exact 2026-08-18 governing confirmation |
+| D-026 | **Codex/reviewer recommended; Ethan reviewed and explicitly approved both changes** | The child replaces the SDK HTTP client with a direct explicit transport for auth/create/batch/status while retaining the pinned SDK only for the `AgentRun` model and reviewed batching serializer. Private IPC is reduced to a novel collection-ID frame followed by terminal success or sanitized error; parent-known collection name/namespace remain outside it. After their plain-language explanation, Ethan answered “Go for both, these seem fine.” This does not change D-017 scientific bytes, D-018 timeouts/budget, D-019's 100-ID limit, or D-025's trusted process boundary. | [DOC-001](job_scheduler.md#doc-001) | `post-8b95cd7`, exact 2026-08-18 governing confirmation |
 
 ## Historical and superseded statements — non-operative
 
@@ -98,6 +99,7 @@ Every row in this section is historical only. It must not be used to authorize o
 | Typical Docent uploads are guaranteed not to be multi-GB or to finish within five minutes. | Never approved. Only the pinned SDK's roughly 100 MiB pre-gzip batching threshold is factual context; Ethan explicitly left size uncertain. |
 | The 100-ID polling slice was part of Ethan's timeout approval. | Corrected by D-019: it is a pinned-SDK implementation constraint. |
 | The Docent hard deadline must run as a process-wide alarm in the training process and skip when parent signal/thread preconditions are unsafe. | Superseded by D-025: Codex recommended and authored the dedicated-child boundary; Ethan reviewed and approved both its direction and the exact trusted boundary recorded there. The parent now supervises a dedicated child without touching parent signal/thread/tqdm state; only the fresh child carries a same-absolute orphan-defense alarm. |
+| The Docent SDK client owns HTTP and full collection metadata crosses the private child pipe. | Superseded by D-026: the child owns explicit HTTP transport and uses the SDK only for its reviewed model/serializer seam; compact IPC carries only a novel confirmed ID then terminal status. |
 | A finite stopped-retention value authorizes destroy or auto-destroy. | Never approved; D-008 and [AUTH-001](job_scheduler.md#auth-001) keep both separately gated. |
 
 ## Exact open, rejected, and gated items
@@ -162,8 +164,8 @@ identifies proof, not behavior.
 | Ratified RunPod replacement-seam answers, `L923-L951` | [RUNPOD-001](job_scheduler.md#runpod-001) | D-011 and exact-gates table |
 | Associated decisions and mandatory prerequisites, `L952-L1011` | [REPO-001](job_scheduler.md#repo-001), [NS-001](job_scheduler.md#ns-001), [CKPT-001](job_scheduler.md#ckpt-001), [STATE-001](job_scheduler.md#state-001) | D-002 through D-006, D-012/D-012A through D-015; mandatory sequence |
 | Separately recorded namespace decisions / W&B, `L1012-L1080` | [WAND-001](job_scheduler.md#wand-001) | D-016; matrix row WAND-001 |
-| Separately recorded namespace decisions / external Docent, `L1081-L1167` | [DOC-001](job_scheduler.md#doc-001) | D-017 through D-019, superseded D-022, and post-snapshot D-025; matrix row DOC-001 |
+| Separately recorded namespace decisions / external Docent, `L1081-L1167` | [DOC-001](job_scheduler.md#doc-001) | D-017 through D-019, superseded D-022, and post-snapshot D-025/D-026; matrix row DOC-001 |
 | Paid-integration authorization correction, `L1168-L1206` | [AUTH-001](job_scheduler.md#auth-001), [RUNPOD-001](job_scheduler.md#runpod-001), [VAST-001](job_scheduler.md#vast-001) | D-020/D-021; matrix rows AUTH-001/RUNPOD-001/VAST-001 |
 
-No source span is intentionally unmapped. D-023 and D-025 are post-snapshot, while D-024 comes from governing
+No source span is intentionally unmapped. D-023, D-025, and D-026 are post-snapshot, while D-024 comes from governing
 `AGENTS.md`; none has an `8b95cd7` line span.

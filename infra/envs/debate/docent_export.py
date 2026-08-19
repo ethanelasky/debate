@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import json
 import fcntl
+import gzip
+import hashlib
+import inspect
 import os
 import re
 import select
@@ -31,11 +34,11 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
-from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -136,12 +139,6 @@ class DocentUploadControlFlow:
 
 
 @dataclass(slots=True)
-class _DocentPostTracker:
-    agent_batch_posts: int = 0
-    job_ids: list[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
 class _DocentTimeBudget:
     """One monotonic deadline shared by auth, mutations, and polling.
 
@@ -175,11 +172,11 @@ class _DocentTimeBudget:
         return remaining
 
     def request_timeout(self) -> tuple[float, float]:
-        remaining = self.remaining()
-        return (
-            min(_DOCENT_CONNECT_TIMEOUT_SECONDS, remaining),
-            min(_DOCENT_READ_TIMEOUT_SECONDS, remaining),
-        )
+        # The process deadline, not a shortened per-socket value, owns total
+        # wall time. Refuse before send when already expired; otherwise retain
+        # the reviewed exact connect/read tuple for every HTTP call.
+        self.remaining()
+        return (_DOCENT_CONNECT_TIMEOUT_SECONDS, _DOCENT_READ_TIMEOUT_SECONDS)
 
     def sleep(self, seconds: float) -> None:
         remaining = self.remaining()
@@ -416,356 +413,172 @@ def collection_name_for_launch(base_collection_name: str, launch_namespace: str)
     return f"{base_collection_name}--launch-{namespace}"
 
 
-def _validate_docent_sdk_class(client_type: type[Any]) -> None:
-    """Validate pinned class-level seams without constructing a client."""
+_REVIEWED_SERIALIZER_SOURCE_HASHES = {
+    "yield_agent_run_batches_by_size": "2458416e6772651b450e9031dd9ded1629d45b24011b3117cde2d29361d49528",
+    "serialize_agent_run": "89f40619be55da1d7bc4220298f1012851b2937a48078da1454bb6351a2ad43b",
+    "build_agent_runs_payload": "ed020c4bf737881394ca6c6c963e1e02e6e44814c18643b018979320b9f530b2",
+    "validate_no_user_set_ids": "1f6ea131b8000019c8d073932d70bd7d6ca631757e9059e9c0c6b54da38a4391",
+}
+
+
+def _reviewed_docent_serializer() -> tuple[Callable[..., Any], Callable[..., Any], int]:
+    """Return only the pinned model serializer seam, or refuse before HTTP."""
     try:
-        installed_version = version("docent")
-        shim_version = version("docent-python")
-    except PackageNotFoundError as exc:
-        raise RuntimeError("cannot verify the installed Docent SDK") from exc
-    add_impl = getattr(client_type, "add_agent_runs", None)
-    create_impl = getattr(client_type, "create_collection", None)
-    init_impl = getattr(client_type, "__init__", None)
-    login_impl = getattr(client_type, "_login", None)
-    retry_impl = getattr(client_type, "_post_with_retry", None)
-    wait_impl = getattr(client_type, "_wait_for_jobs", None)
-    statuses_impl = getattr(client_type, "get_agent_run_job_statuses", None)
-    add_code = getattr(add_impl, "__code__", None)
-    create_code = getattr(create_impl, "__code__", None)
-    init_code = getattr(init_impl, "__code__", None)
-    login_code = getattr(login_impl, "__code__", None)
-    wait_code = getattr(wait_impl, "__code__", None)
-    statuses_code = getattr(statuses_impl, "__code__", None)
-    add_parameters = (
-        signature(add_impl).parameters if callable(add_impl) else {}
-    )
-    if (
-        installed_version != _REVIEWED_DOCENT_VERSION
-        or shim_version != _REVIEWED_DOCENT_VERSION
-    ):
+        installed = (version("docent"), version("docent-python"))
+        from docent.sdk import _client_util
+    except (ImportError, PackageNotFoundError) as exc:
+        raise RuntimeError("cannot verify the installed Docent serializer") from exc
+    if installed != (_REVIEWED_DOCENT_VERSION, _REVIEWED_DOCENT_VERSION):
         raise RuntimeError(
             "refusing unreviewed Docent SDK version for no-repeat upload: "
             f"expected {_REVIEWED_DOCENT_VERSION}, got "
-            f"docent={installed_version}, docent-python={shim_version}"
+            f"docent={installed[0]}, docent-python={installed[1]}"
         )
-    if (
-        init_code is None
-        or "_login" not in init_code.co_names
-        or "Session" not in init_code.co_names
-        or getattr(init_impl, "__module__", None) != "docent.sdk._base"
-        or login_code is None
-        or "_session" not in login_code.co_names
-        or "get" not in login_code.co_names
-        or "_handle_response_errors" not in login_code.co_names
-        or getattr(login_impl, "__module__", None) != "docent.sdk._base"
-        or tuple(signature(login_impl).parameters) != ("self", "api_key")
-    ):
-        raise RuntimeError(
-            "Docent authentication seam no longer supports the reviewed bounded login"
-        )
-    if (
-        add_code is None
-        or "_post_with_retry" not in add_code.co_names
-        or "_session" in add_code.co_names
-        or "_wait_for_jobs" not in add_code.co_names
-        or getattr(add_impl, "__module__", None) != "docent.sdk._collections"
-        or "wait" not in add_parameters
-        or add_parameters["wait"].default is not True
-        or not callable(retry_impl)
-    ):
-        raise RuntimeError(
-            "Docent add_agent_runs no longer uses only the reviewed retry hook"
-        )
-    if (
-        create_code is None
-        or "_session" not in create_code.co_names
-        or "post" not in create_code.co_names
-        or "_handle_response_errors" not in create_code.co_names
-        or "_post_with_retry" in create_code.co_names
-        or getattr(create_impl, "__module__", None) != "docent.sdk._collections"
-    ):
-        raise RuntimeError(
-            "Docent create_collection no longer uses the reviewed one-POST seam"
-        )
-    retry_parameter = signature(retry_impl).parameters.get("max_retries")
-    if (
-        getattr(retry_impl, "__module__", None) != "docent.sdk._base"
-        or retry_parameter is None
-        or retry_parameter.kind
-        not in {
-            Parameter.POSITIONAL_OR_KEYWORD,
-            Parameter.KEYWORD_ONLY,
-        }
-    ):
-        raise RuntimeError(
-            "Docent retry hook cannot enforce max_retries=0; refusing upload"
-        )
-    wait_parameters = (
-        signature(wait_impl).parameters if callable(wait_impl) else {}
+    for name, expected_hash in _REVIEWED_SERIALIZER_SOURCE_HASHES.items():
+        implementation = getattr(_client_util, name, None)
+        if not callable(implementation):
+            raise RuntimeError("Docent serializer seam is missing")
+        try:
+            source = inspect.getsource(implementation).encode("utf-8")
+        except (OSError, TypeError) as exc:
+            raise RuntimeError("cannot verify the Docent serializer seam") from exc
+        if hashlib.sha256(source).hexdigest() != expected_hash:
+            raise RuntimeError("Docent serializer seam differs from the reviewed SDK")
+    limit = getattr(_client_util, "MAX_AGENT_RUN_PAYLOAD_BYTES", None)
+    if type(limit) is not int or limit != 100 * 1024 * 1024:
+        raise RuntimeError("Docent serializer batch limit differs from the reviewed SDK")
+    return (
+        _client_util.yield_agent_run_batches_by_size,
+        _client_util.validate_no_user_set_ids,
+        limit,
     )
-    statuses_parameters = (
-        signature(statuses_impl).parameters if callable(statuses_impl) else {}
-    )
-    if (
-        wait_code is None
-        or "get_agent_run_job_statuses" not in wait_code.co_names
-        or getattr(wait_impl, "__module__", None) != "docent.sdk._collections"
-        or tuple(wait_parameters) != (
-            "self",
-            "collection_id",
-            "job_ids",
-            "poll_interval",
+
+
+def _docent_api_url() -> str:
+    explicit = os.environ.get("DOCENT_API_URL")
+    if explicit is None:
+        domain = os.environ.get("DOCENT_DOMAIN", "docent.transluce.org")
+        if not domain or any(character in domain for character in "/?#@"):
+            raise ValueError("DOCENT_DOMAIN is invalid")
+        explicit = f"https://api.{domain}"
+    normalized = explicit.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("DOCENT_API_URL is invalid")
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("DOCENT_API_URL may not contain credentials, query, or fragment")
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/rest"):
+        path += "/rest"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+class _DocentHTTPTransport:
+    """Owned one-send transport; the SDK supplies models and serialization only."""
+
+    def __init__(self, api_key: str, budget: _DocentTimeBudget):
+        self.api_url = _docent_api_url()
+        self.budget = budget
+        self.session = requests.Session()
+        self.session.trust_env = False
+        no_retries = Retry(
+            total=0,
+            connect=0,
+            read=0,
+            redirect=0,
+            status=0,
+            other=0,
         )
-        or wait_parameters["poll_interval"].default != 1.0
-    ):
-        raise RuntimeError("Docent ingestion wait seam no longer matches the reviewed SDK")
-    if (
-        statuses_code is None
-        or "_session" not in statuses_code.co_names
-        or "post" not in statuses_code.co_names
-        or "_handle_response_errors" not in statuses_code.co_names
-        or getattr(statuses_impl, "__module__", None) != "docent.sdk._collections"
-        or tuple(statuses_parameters) != ("self", "collection_id", "job_ids")
-    ):
-        raise RuntimeError("Docent ingestion status seam no longer matches the reviewed SDK")
+        self.session.mount("http://", HTTPAdapter(max_retries=no_retries))
+        self.session.mount("https://", HTTPAdapter(max_retries=no_retries))
+        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
 
+    def close(self) -> None:
+        self.session.close()
 
-def _validate_single_send_session(session: Any) -> requests.Session:
-    """Require a real Session whose adapters cannot retry any HTTP method."""
-    if not isinstance(session, requests.Session):
-        raise RuntimeError("Docent SDK no longer uses the reviewed requests.Session")
-    if not session.adapters:
-        raise RuntimeError("Docent requests.Session has no transport adapters")
-    for prefix, adapter in session.adapters.items():
-        adapter_retries = getattr(adapter, "max_retries", None)
-        if (
-            not isinstance(adapter, HTTPAdapter)
-            or not isinstance(adapter_retries, Retry)
-            or adapter_retries.total != 0
-        ):
-            raise RuntimeError(
-                "Docent transport adapter can retry HTTP calls; refusing upload "
-                f"for adapter {prefix!r}"
-            )
-    return session
-
-
-def _bounded_docent_type(client_type: type[Any], budget: _DocentTimeBudget) -> type[Any]:
-    """Override login before the pinned constructor makes its auth request."""
-
-    class BoundedDocent(client_type):
-        def _login(self, api_key: str) -> None:
-            session = _validate_single_send_session(self._session)
-            # The dedicated child has an allowlisted environment, and the
-            # pinned Session additionally refuses ambient proxy/netrc/CA
-            # discovery before its first authentication request.
-            session.trust_env = False
-            session.headers.update({"Authorization": f"Bearer {api_key}"})
-            response = session.get(
-                f"{self._api_url}/api-keys/test",
-                allow_redirects=False,
-                timeout=budget.request_timeout(),
-            )
-            # A per-read socket timeout is not itself a total runtime bound.
-            # Recheck the monotonic budget after the complete response arrives.
-            budget.remaining()
-            if response.status_code in _REDIRECT_STATUS_CODES:
-                raise DocentMutationRedirectError(
-                    "Docent authentication redirect refused after one transport send"
-                )
-            if not 200 <= response.status_code < 300:
-                raise DocentMutationHTTPStatusError(
-                    "Docent authentication returned a non-success status after one send"
-                )
-
-    BoundedDocent.__name__ = "BoundedDocent"
-    BoundedDocent.__qualname__ = "BoundedDocent"
-    return BoundedDocent
-
-
-def _disable_pinned_docent_tqdm_monitor_for_child(client_type: type[Any]) -> None:
-    """Disable the pinned SDK's monitor in the disposable upload child."""
-    add_impl = getattr(client_type, "add_agent_runs", None)
-    add_globals = getattr(add_impl, "__globals__", None)
-    tqdm_type = add_globals.get("tqdm") if isinstance(add_globals, dict) else None
-    if (
-        not isinstance(tqdm_type, type)
-        or getattr(tqdm_type, "__module__", None) != "tqdm.std"
-        or getattr(tqdm_type, "__name__", None) != "tqdm"
-        or not hasattr(tqdm_type, "monitor_interval")
-        or not hasattr(tqdm_type, "monitor")
-    ):
-        raise RuntimeError("Docent tqdm seam no longer matches the reviewed SDK")
-
-    previous_interval = tqdm_type.monitor_interval
-    if (
-        isinstance(previous_interval, bool)
-        or not isinstance(previous_interval, (int, float))
-        or previous_interval < 0
-    ):
-        raise RuntimeError("Docent tqdm monitor interval is not safely controllable")
-    # This process is dedicated to one upload and exits immediately after it,
-    # so no restoration is needed and no monitor thread can outlive the child.
-    tqdm_type.monitor_interval = 0
-
-
-def _bind_single_attempt_mutation_posts(
-    client: Any,
-    *,
-    class_validated: bool = False,
-    _budget: _DocentTimeBudget | None = None,
-) -> _DocentPostTracker:
-    """Make every collection/create and agent-run POST one transport send.
-
-    Docent 0.1.77 routes every ingestion batch through ``_post_with_retry``.
-    Its default repeats ambiguous 5xx responses three times, which can
-    duplicate a persisted batch. Requests also follows POST redirects by
-    default. Bind the reviewed hook to ``max_retries=0``, force
-    ``allow_redirects=False`` on the shared Session, and reject an unreviewed
-    SDK/session seam before creating the collection.
-    """
-    if not class_validated:
-        _validate_docent_sdk_class(type(client))
-
-    budget = _DocentTimeBudget.fixed() if _budget is None else _budget
-    session = _validate_single_send_session(getattr(client, "_session", None))
-
-    original_retry = client._post_with_retry
-    original_session_post = session.post
-    original_statuses = client.get_agent_run_job_statuses
-    tracker = _DocentPostTracker()
-
-    def post_without_redirect(url: str, **kwargs: Any):
-        if kwargs.get("allow_redirects") not in {None, False}:
-            raise RuntimeError("Docent SDK requested mutation redirects; refusing upload")
-        if "timeout" in kwargs:
-            raise RuntimeError("Docent SDK supplied an unexpected HTTP timeout")
-        kwargs["allow_redirects"] = False
-        kwargs["timeout"] = budget.request_timeout()
-        response = original_session_post(url, **kwargs)
+    def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        response = self.session.request(
+            method,
+            f"{self.api_url}{path}",
+            allow_redirects=False,
+            timeout=self.budget.request_timeout(),
+            **kwargs,
+        )
+        self.budget.remaining()
         if response.status_code in _REDIRECT_STATUS_CODES:
             raise DocentMutationRedirectError(
-                "Docent mutation redirect refused after one transport send"
+                "Docent redirect refused after one transport send"
             )
         if not 200 <= response.status_code < 300:
             raise DocentMutationHTTPStatusError(
-                "Docent mutation returned a non-success status after one transport send"
+                "Docent request returned a non-success status after one send"
             )
         return response
 
-    def post_once(url: str, **kwargs: Any):
-        if "max_retries" in kwargs:
-            raise RuntimeError("Docent SDK supplied an unexpected retry override")
-        tracker.agent_batch_posts += 1
-        response = original_retry(url, max_retries=0, **kwargs)
-        budget.remaining()
+    def request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        response = self.request(method, path, **kwargs)
         try:
-            body = response.json()
+            return response.json()
         except Exception:
             raise DocentIngestionAcknowledgementError(
-                "Docent ingestion batch response was not valid JSON"
+                "Docent response was not valid JSON"
             ) from None
+
+    def authenticate(self) -> None:
+        self.request("GET", "/api-keys/test")
+
+    def create_collection(self, collection_name: str) -> str:
+        body = self.request_json(
+            "POST",
+            "/create",
+            json={
+                "collection_id": None,
+                "name": collection_name,
+                "description": None,
+            },
+        )
+        if not isinstance(body, dict):
+            raise DocentCollectionAcknowledgementError(
+                "Docent collection response was not a mapping"
+            )
+        return _validated_collection_id(body.get("collection_id"))
+
+    def enqueue_batch(self, collection_id: str, payload: bytes) -> str:
+        body = self.request_json(
+            "POST",
+            f"/{collection_id}/agent_runs",
+            data=gzip.compress(payload),
+            headers={
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+            },
+        )
         job_id = body.get("job_id") if isinstance(body, dict) else None
-        if (
-            not isinstance(job_id, str)
-            or _JOB_ID_RE.fullmatch(job_id) is None
-            or job_id in tracker.job_ids
-        ):
+        if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
             raise DocentIngestionAcknowledgementError(
-                "Docent ingestion batch returned no unique bounded job identifier"
+                "Docent ingestion batch returned no bounded job identifier"
             )
-        tracker.job_ids.append(job_id)
-        return response
+        return job_id
 
-    def wait_for_jobs(
-        collection_id: str,
-        job_ids: list[str],
-        poll_interval: float = 1.0,
-    ) -> None:
-        """Pinned fail-closed replacement for Docent 0.1.77's wait loop."""
-        if (
-            not isinstance(job_ids, list)
-            or not job_ids
-            or any(
-                not isinstance(job_id, str)
-                or _JOB_ID_RE.fullmatch(job_id) is None
-                for job_id in job_ids
+    def statuses(self, collection_id: str, job_ids: list[str]) -> list[Any]:
+        try:
+            body = self.request_json(
+                "POST",
+                f"/{collection_id}/agent_runs/jobs/batch_status",
+                json={"job_ids": job_ids},
             )
-            or len(set(job_ids)) != len(job_ids)
-        ):
+        except (requests.Timeout, DocentUploadDeadlineError):
+            raise
+        except Exception:
             raise DocentIngestionStatusError(
-                "Docent wait received malformed ingestion job identifiers"
+                "Docent status request did not return a validated census"
+            ) from None
+        rows = body.get("jobs") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            raise DocentIngestionStatusError(
+                "Docent status response did not contain a census"
             )
-
-        pending = set(job_ids)
-        while pending:
-            requested = [job_id for job_id in job_ids if job_id in pending]
-            next_pending: set[str] = set()
-            for offset in range(0, len(requested), _DOCENT_STATUS_CHUNK_SIZE):
-                chunk = requested[offset : offset + _DOCENT_STATUS_CHUNK_SIZE]
-                try:
-                    rows = original_statuses(collection_id, chunk)
-                    budget.remaining()
-                except (requests.Timeout, DocentUploadDeadlineError):
-                    raise
-                except Exception:
-                    raise DocentIngestionStatusError(
-                        "Docent status request did not return a validated census"
-                    ) from None
-                if not isinstance(rows, list) or len(rows) != len(chunk):
-                    raise DocentIngestionStatusError(
-                        "Docent status response did not exactly cover pending jobs"
-                    )
-
-                by_id: dict[str, str] = {}
-                for row in rows:
-                    if not isinstance(row, dict):
-                        raise DocentIngestionStatusError(
-                            "Docent status response contained a malformed row"
-                        )
-                    job_id = row.get("job_id")
-                    status = row.get("status")
-                    if (
-                        not isinstance(job_id, str)
-                        or _JOB_ID_RE.fullmatch(job_id) is None
-                        or not isinstance(status, str)
-                        or job_id in by_id
-                    ):
-                        raise DocentIngestionStatusError(
-                            "Docent status response contained a malformed or duplicate row"
-                        )
-                    by_id[job_id] = status
-
-                if set(by_id) != set(chunk):
-                    raise DocentIngestionStatusError(
-                        "Docent status response had missing or extra job identifiers"
-                    )
-                for job_id in chunk:
-                    status = by_id[job_id]
-                    if status == "completed":
-                        continue
-                    if status in {"pending", "running"}:
-                        next_pending.add(job_id)
-                        continue
-                    # canceled, failed, and every unknown state are terminal
-                    # partial failures. Never leave them spinning in the loop.
-                    raise DocentIngestionStatusError(
-                        "Docent ingestion job did not complete successfully"
-                    )
-            pending = next_pending
-            if pending:
-                # One sleep per complete sweep, never one per 100-job chunk.
-                budget.sleep(poll_interval)
-
-    session.post = post_without_redirect
-    client._post_with_retry = post_once
-    client._wait_for_jobs = wait_for_jobs
-    return tracker
-
-
-# Backward-compatible private alias retained for focused callers/tests written
-# while the no-repeat boundary covered only agent-run POSTs.
-_bind_single_attempt_agent_run_posts = _bind_single_attempt_mutation_posts
+        return rows
 
 
 def _validated_collection_id(value: Any) -> str:
@@ -776,74 +589,57 @@ def _validated_collection_id(value: Any) -> str:
     return value
 
 
-def _create_collection_once(
-    client: Any,
-    collection_name: str,
-    *,
-    on_confirmed: Callable[[str], None] | None = None,
-) -> str:
-    """Create without invoking the SDK's pre-validation raw-ID logging."""
-    response = client._session.post(
-        f"{client._api_url}/create",
-        json={
-            "collection_id": None,
-            "name": collection_name,
-            "description": None,
-        },
-    )
-    try:
-        body = response.json()
-    except Exception:
-        raise DocentCollectionAcknowledgementError(
-            "Docent collection response was not valid JSON"
-        ) from None
-    if not isinstance(body, dict):
-        raise DocentCollectionAcknowledgementError(
-            "Docent collection response was not a mapping"
-        )
-    collection_id = _validated_collection_id(body.get("collection_id"))
-    # The child publishes this identity before the first batch mutation. A
-    # SIGKILL between the 2xx and this callback remains honestly unknowable.
-    if on_confirmed is not None:
-        on_confirmed(collection_id)
-    return collection_id
-
-
-def _validate_ingestion_result(
-    result: Any,
-    *,
-    expected_runs: int,
-    expected_batch_posts: int,
-    expected_job_ids: list[str] | None = None,
+def _wait_for_docent_jobs(
+    transport: _DocentHTTPTransport,
+    collection_id: str,
+    job_ids: list[str],
 ) -> None:
-    if not isinstance(result, dict):
-        raise DocentIngestionAcknowledgementError(
-            "Docent ingestion result is not a confirmed result mapping"
-        )
-    job_ids = result.get("job_ids")
-    valid_job_ids = (
-        isinstance(job_ids, list)
-        and len(job_ids) == expected_batch_posts
-        and len(job_ids) > 0
-        and all(
-            isinstance(job_id, str) and _JOB_ID_RE.fullmatch(job_id) is not None
-            for job_id in job_ids
-        )
-        and len(set(job_ids)) == len(job_ids)
-    )
-    total_runs_added = result.get("total_runs_added")
-    if (
-        result.get("status") != "success"
-        or isinstance(total_runs_added, bool)
-        or not isinstance(total_runs_added, int)
-        or total_runs_added != expected_runs
-        or expected_batch_posts <= 0
-        or not valid_job_ids
-        or (expected_job_ids is not None and job_ids != expected_job_ids)
-    ):
-        raise DocentIngestionAcknowledgementError(
-            "Docent did not confirm and complete every ingestion batch"
-        )
+    pending = set(job_ids)
+    while pending:
+        requested = [job_id for job_id in job_ids if job_id in pending]
+        next_pending: set[str] = set()
+        for offset in range(0, len(requested), _DOCENT_STATUS_CHUNK_SIZE):
+            chunk = requested[offset : offset + _DOCENT_STATUS_CHUNK_SIZE]
+            rows = transport.statuses(collection_id, chunk)
+            if len(rows) != len(chunk):
+                raise DocentIngestionStatusError(
+                    "Docent status response did not exactly cover pending jobs"
+                )
+            by_id: dict[str, str] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise DocentIngestionStatusError(
+                        "Docent status response contained a malformed row"
+                    )
+                job_id = row.get("job_id")
+                status = row.get("status")
+                if (
+                    not isinstance(job_id, str)
+                    or _JOB_ID_RE.fullmatch(job_id) is None
+                    or not isinstance(status, str)
+                    or job_id in by_id
+                ):
+                    raise DocentIngestionStatusError(
+                        "Docent status response contained a malformed or duplicate row"
+                    )
+                by_id[job_id] = status
+            if set(by_id) != set(chunk):
+                raise DocentIngestionStatusError(
+                    "Docent status response had missing or extra job identifiers"
+                )
+            for job_id in chunk:
+                status = by_id[job_id]
+                if status == "completed":
+                    continue
+                if status in {"pending", "running"}:
+                    next_pending.add(job_id)
+                    continue
+                raise DocentIngestionStatusError(
+                    "Docent ingestion job did not complete successfully"
+                )
+        pending = next_pending
+        if pending:
+            transport.budget.sleep(1.0)
 
 
 def _upload_in_child_process(
@@ -854,43 +650,38 @@ def _upload_in_child_process(
     _budget: _DocentTimeBudget,
     on_collection_confirmed: Callable[[str], None],
 ) -> DocentUploadResult | DocentUploadFailure:
-    """Run the reviewed SDK seam inside the disposable dedicated child."""
+    """Upload through owned HTTP while retaining the pinned SDK serializer."""
     if not runs:
         raise ValueError("Docent upload requires at least one AgentRun")
     namespace = validate_launch_namespace(launch_namespace)
     if not isinstance(collection_name, str) or not collection_name:
         raise ValueError("Docent collection name is invalid")
-    budget = _budget
     collection_id: str | None = None
+    transport: _DocentHTTPTransport | None = None
     try:
-        from docent import Docent
-
-        _validate_docent_sdk_class(Docent)
-        _disable_pinned_docent_tqdm_monitor_for_child(Docent)
-        bounded_client_type = _bounded_docent_type(Docent, budget)
-        client = bounded_client_type(
-            api_key=os.environ["DOCENT_API_KEY"],
-            config_file=os.devnull,
-        )
-        tracker = _bind_single_attempt_mutation_posts(
-            client,
-            class_validated=True,
-            _budget=budget,
-        )
-        collection_id = _create_collection_once(
-            client,
-            collection_name,
-            on_confirmed=on_collection_confirmed,
-        )
-        budget.remaining()
-        ingestion_result = client.add_agent_runs(collection_id, runs)
-        _validate_ingestion_result(
-            ingestion_result,
-            expected_runs=len(runs),
-            expected_batch_posts=tracker.agent_batch_posts,
-            expected_job_ids=tracker.job_ids,
-        )
-        budget.remaining()
+        serializer, validate_ids, batch_limit = _reviewed_docent_serializer()
+        validate_ids(runs)
+        batches = serializer(runs, batch_limit)
+        transport = _DocentHTTPTransport(os.environ["DOCENT_API_KEY"], _budget)
+        transport.authenticate()
+        collection_id = transport.create_collection(collection_name)
+        # Publish before the first batch mutation. A SIGKILL between create's
+        # 2xx and this callback remains honestly unknowable to the parent.
+        on_collection_confirmed(collection_id)
+        job_ids: list[str] = []
+        for _run_count, payload in batches:
+            job_id = transport.enqueue_batch(collection_id, payload)
+            if job_id in job_ids:
+                raise DocentIngestionAcknowledgementError(
+                    "Docent ingestion batch returned a duplicate job identifier"
+                )
+            job_ids.append(job_id)
+        if not job_ids:
+            raise DocentIngestionAcknowledgementError(
+                "Docent serializer yielded no ingestion batches"
+            )
+        _wait_for_docent_jobs(transport, collection_id, job_ids)
+        _budget.remaining()
     except Exception as exc:
         return DocentUploadFailure(
             collection_name=collection_name,
@@ -898,6 +689,9 @@ def _upload_in_child_process(
             collection_id=collection_id,
             error_type=_sanitized_error_type(exc),
         )
+    finally:
+        if transport is not None:
+            transport.close()
     assert collection_id is not None
     return DocentUploadResult(
         collection_name=collection_name,
@@ -939,63 +733,36 @@ def _accept_docent_receipt_frame(state: _DocentReceiptState, raw: bytes) -> None
         if not isinstance(frame, dict):
             raise ValueError("receipt frame is not an object")
         event = frame.get("event")
-        if event == "collection_confirmed":
-            if set(frame) != {
-                "event",
-                "collection_name",
-                "launch_namespace",
-                "collection_id",
-            }:
+        if event == "collection":
+            if set(frame) != {"event", "id"}:
                 raise ValueError("collection frame schema invalid")
             if state.collection_id is not None or state.terminal is not None:
                 raise ValueError("collection frame duplicated or late")
-            if (
-                frame["collection_name"] != state.collection_name
-                or frame["launch_namespace"] != state.launch_namespace
-            ):
-                raise ValueError("collection frame identity changed")
-            state.collection_id = _validated_collection_id(frame["collection_id"])
+            state.collection_id = _validated_collection_id(frame["id"])
             return
         if event != "terminal" or state.terminal is not None:
             raise ValueError("terminal frame missing, duplicate, or unknown")
-        status = frame.get("status")
-        if status == "confirmed":
-            if set(frame) != {
-                "event",
-                "status",
-                "collection_name",
-                "launch_namespace",
-                "collection_id",
-            }:
+        ok = frame.get("ok")
+        if ok is True:
+            if set(frame) != {"event", "ok"}:
                 raise ValueError("confirmed terminal schema invalid")
             if state.collection_id is None:
                 raise ValueError("confirmed terminal preceded collection identity")
-            if frame["collection_id"] != state.collection_id:
-                raise ValueError("terminal collection identity changed")
             result: DocentUploadResult | DocentUploadFailure = DocentUploadResult(
                 collection_name=state.collection_name,
                 launch_namespace=state.launch_namespace,
                 collection_id=state.collection_id,
             )
-        elif status == "ambiguous_or_unconfirmed":
-            if set(frame) != {
-                "event",
-                "status",
-                "collection_name",
-                "launch_namespace",
-                "collection_id",
-                "error_type",
-            }:
+        elif ok is False:
+            if set(frame) != {"event", "ok", "error"}:
                 raise ValueError("failure terminal schema invalid")
-            error_type = frame["error_type"]
+            error_type = frame["error"]
             if (
                 not isinstance(error_type, str)
                 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", error_type)
                 is None
             ):
                 raise ValueError("failure type invalid")
-            if frame["collection_id"] != state.collection_id:
-                raise ValueError("failure terminal collection identity changed")
             result = DocentUploadFailure(
                 collection_name=state.collection_name,
                 launch_namespace=state.launch_namespace,
@@ -1003,12 +770,7 @@ def _accept_docent_receipt_frame(state: _DocentReceiptState, raw: bytes) -> None
                 error_type=error_type,
             )
         else:
-            raise ValueError("terminal status invalid")
-        if (
-            frame["collection_name"] != state.collection_name
-            or frame["launch_namespace"] != state.launch_namespace
-        ):
-            raise ValueError("terminal launch identity changed")
+            raise ValueError("terminal outcome invalid")
         state.terminal = result
     except Exception:
         state.protocol_error = "DocentUploadProtocolError"
@@ -1345,8 +1107,6 @@ def upload(
         raise ValueError("Docent JSONL descriptor must be read-only")
     if stat_result.st_size <= 0:
         raise ValueError("Docent upload requires nonempty canonical JSONL")
-    if len(collection_name.encode("utf-8")) > _DOCENT_RECEIPT_MAX_LINE_BYTES // 2:
-        raise ValueError("Docent collection name is too large for the receipt protocol")
     if not hasattr(os, "waitid") and sys.platform != "darwin":
         raise RuntimeError("Docent process-group supervision requires waitid WNOWAIT")
 

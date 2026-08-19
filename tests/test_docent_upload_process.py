@@ -15,7 +15,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-import requests
 
 import infra.envs.debate.docent_export as docent_export
 from infra.envs.debate.docent_export import (
@@ -43,11 +42,9 @@ def raw(data):
 def event(value):
     raw(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
 def confirmed():
-    event({"event":"collection_confirmed","collection_name":name,
-           "launch_namespace":namespace,"collection_id":cid})
+    event({"event":"collection","id":cid})
 def success():
-    event({"event":"terminal","status":"confirmed","collection_name":name,
-           "launch_namespace":namespace,"collection_id":cid})
+    event({"event":"terminal","ok":True})
 if len(sys.argv) != 1 or any("TOP-SECRET" in arg for arg in sys.argv):
     os._exit(91)
 if behavior == "environment":
@@ -118,6 +115,55 @@ os._exit(92)
 '''
 
 
+TRANSPORT_ORACLE_SOURCE = r'''
+import json, os, sys, time
+sys.path.insert(0, __PROJECT_ROOT__)
+from requests.adapters import HTTPAdapter
+from infra.envs.debate.docent_export import (
+    _DocentHTTPTransport, _DocentTimeBudget, _wait_for_docent_jobs,
+)
+W = 199
+def event(value):
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    if len(payload) > os.fpathconf(W, "PC_PIPE_BUF"): os._exit(90)
+    os.write(W, payload)
+deadline = float(os.environ["DEBATE_DOCENT_DEADLINE_MONOTONIC"])
+transport = _DocentHTTPTransport(
+    os.environ["DOCENT_API_KEY"],
+    _DocentTimeBudget(deadline=deadline, clock=time.monotonic, sleeper=time.sleep),
+)
+if transport.session.trust_env is not False: os._exit(91)
+for adapter in transport.session.adapters.values():
+    retries = adapter.max_retries
+    if any(getattr(retries, field) != 0 for field in
+           ("total", "connect", "read", "redirect", "status", "other")):
+        os._exit(92)
+class RecordingAdapter(HTTPAdapter):
+    def send(self, request, **kwargs):
+        request.headers["X-Test-Timeout"] = json.dumps(list(kwargs["timeout"]))
+        return super().send(request, **kwargs)
+for prefix in ("http://", "https://"):
+    previous = transport.session.adapters[prefix]
+    transport.session.mount(prefix, RecordingAdapter(max_retries=previous.max_retries))
+try:
+    transport.authenticate()
+    collection_id = transport.create_collection(
+        os.environ["DEBATE_DOCENT_COLLECTION_NAME"]
+    )
+    event({"event": "collection", "id": collection_id})
+    first = transport.enqueue_batch(collection_id, b'{"agent_runs":[]}')
+    job_ids = [first] + [f"oracle-job-{index}" for index in range(100)]
+    _wait_for_docent_jobs(transport, collection_id, job_ids)
+    event({"event": "terminal", "ok": True})
+except BaseException as exc:
+    name = type(exc).__name__
+    event({"event": "terminal", "ok": False,
+           "error": name if name.isidentifier() and len(name) <= 128 else "UnknownError"})
+finally:
+    transport.close()
+'''
+
+
 def _helper(
     tmp_path: Path,
     behavior: str = "success",
@@ -129,6 +175,15 @@ def _helper(
         "__PID_FILE__", repr(os.fspath(pid_file)) if pid_file is not None else "None"
     ).replace("__SOCKET_ADDRESS__", repr(socket_address))
     path.write_text(source)
+    return path.resolve()
+
+
+def _transport_oracle_helper(tmp_path: Path) -> Path:
+    path = tmp_path / "docent-transport-oracle.py"
+    project_root = os.fspath(Path(__file__).resolve().parents[1])
+    path.write_text(
+        TRANSPORT_ORACLE_SOURCE.replace("__PROJECT_ROOT__", repr(project_root))
+    )
     return path.resolve()
 
 
@@ -343,11 +398,8 @@ def test_no_id_ambiguous_terminal_is_the_only_valid_terminal_without_identity():
         _receipt_bytes(
             {
                 "event": "terminal",
-                "status": "ambiguous_or_unconfirmed",
-                "collection_name": state.collection_name,
-                "launch_namespace": state.launch_namespace,
-                "collection_id": None,
-                "error_type": "RuntimeError",
+                "ok": False,
+                "error": "RuntimeError",
             }
         ),
     )
@@ -364,68 +416,22 @@ def test_no_id_ambiguous_terminal_is_the_only_valid_terminal_without_identity():
     "frames",
     [
         # Confirmed success before the required collection identity.
-        [
-            {
-                "event": "terminal",
-                "status": "confirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": "id-1",
-            }
-        ],
+        [{"event": "terminal", "ok": True}],
         # An ID arriving after any terminal frame is out of order.
         [
-            {
-                "event": "terminal",
-                "status": "ambiguous_or_unconfirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": None,
-                "error_type": "RuntimeError",
-            },
-            {
-                "event": "collection_confirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": "id-1",
-            },
+            {"event": "terminal", "ok": False, "error": "RuntimeError"},
+            {"event": "collection", "id": "id-1"},
         ],
         [{"event": "unknown"}],
         [
-            {
-                "event": "terminal",
-                "status": "ambiguous_or_unconfirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": None,
-                "error_type": "not an identifier",
-            }
+            {"event": "terminal", "ok": False, "error": "not an identifier"}
         ],
         [
-            {
-                "event": "terminal",
-                "status": "ambiguous_or_unconfirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": None,
-                "error_type": "RuntimeError",
-                "extra": True,
-            }
+            {"event": "terminal", "ok": False, "error": "RuntimeError", "extra": True}
         ],
         [
-            {
-                "event": "collection_confirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": "id-1",
-            },
-            {
-                "event": "terminal",
-                "status": "confirmed",
-                "collection_name": "math-pc-rl--launch-run-A",
-                "launch_namespace": "run-A",
-                "collection_id": "id-2",
-            },
+            {"event": "collection", "id": "id-1"},
+            {"event": "terminal", "ok": True, "id": "id-2"},
         ],
     ],
 )
@@ -622,6 +628,13 @@ class _DocentHandler(BaseHTTPRequestHandler):
     batch_trickle_interval = 0.0
     raw_batch_bodies = []
     decoded_batch_bodies = []
+    create_body = None
+    batch_job_ids = None
+    status_responses = None
+    status_requests = []
+    observed_timeouts = []
+    capture_batch_bodies = True
+    batch_count = 0
 
     def log_message(self, _format, *_args):
         pass
@@ -638,6 +651,7 @@ class _DocentHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        type(self).observed_timeouts.append(self.headers.get("X-Test-Timeout"))
         type(self).calls.append(("GET", self.path))
         if self.path == type(self).fail_path:
             self._reply({"error": "redacted"}, status=type(self).fail_status)
@@ -647,18 +661,23 @@ class _DocentHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        type(self).observed_timeouts.append(self.headers.get("X-Test-Timeout"))
         type(self).calls.append(("POST", self.path))
         if self.path == type(self).fail_path:
             self._reply({"error": "redacted"}, status=type(self).fail_status)
             return
         if self.path.endswith("/create"):
+            type(self).create_body = json.loads(body)
             self._reply({"collection_id": type(self).collection_id})
         elif self.path.endswith("/agent_runs"):
-            type(self).raw_batch_bodies.append(body)
-            if self.headers.get("Content-Encoding") == "gzip":
-                body = gzip.decompress(body)
-            type(self).batch_body = body
-            type(self).decoded_batch_bodies.append(body)
+            index = type(self).batch_count
+            type(self).batch_count += 1
+            if type(self).capture_batch_bodies:
+                type(self).raw_batch_bodies.append(body)
+                if self.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
+                type(self).batch_body = body
+                type(self).decoded_batch_bodies.append(body)
             if type(self).batch_started is not None:
                 type(self).batch_started.set()
             if type(self).batch_trickle_interval:
@@ -676,15 +695,218 @@ class _DocentHandler(BaseHTTPRequestHandler):
                 return
             if type(self).batch_delay:
                 time.sleep(type(self).batch_delay)
-            self._reply(
-                {"job_id": "loopback-job"}, status=type(self).batch_status
-            )
+            job_ids = type(self).batch_job_ids
+            job_id = "loopback-job" if job_ids is None else job_ids[index]
+            self._reply({"job_id": job_id}, status=type(self).batch_status)
         elif self.path.endswith("/agent_runs/jobs/batch_status"):
-            self._reply(
-                {"jobs": [{"job_id": "loopback-job", "status": "completed"}]}
-            )
+            request = json.loads(body)
+            type(self).status_requests.append(request["job_ids"])
+            responses = type(self).status_responses
+            if responses is None:
+                rows = [
+                    {"job_id": job_id, "status": "completed"}
+                    for job_id in request["job_ids"]
+                ]
+            else:
+                rows = responses[len(type(self).status_requests) - 1]
+            self._reply({"jobs": rows})
         else:
             self._reply({}, status=404)
+
+
+@pytest.fixture
+def docent_loopback(monkeypatch):
+    _DocentHandler.calls = []
+    _DocentHandler.batch_body = None
+    _DocentHandler.batch_status = 202
+    _DocentHandler.batch_delay = 0.0
+    _DocentHandler.batch_trickle_interval = 0.0
+    _DocentHandler.batch_started = None
+    _DocentHandler.fail_path = None
+    _DocentHandler.collection_id = "loopback-collection"
+    _DocentHandler.create_body = None
+    _DocentHandler.batch_job_ids = None
+    _DocentHandler.status_responses = None
+    _DocentHandler.status_requests = []
+    _DocentHandler.observed_timeouts = []
+    _DocentHandler.capture_batch_bodies = True
+    _DocentHandler.batch_count = 0
+    _DocentHandler.raw_batch_bodies = []
+    _DocentHandler.decoded_batch_bodies = []
+    server = HTTPServer(("127.0.0.1", 0), _DocentHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("DOCENT_API_URL", endpoint)
+    monkeypatch.setenv("DOCENT_FRONTEND_URL", endpoint)
+    try:
+        yield endpoint
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_spawned_worker_requires_immediate_job_id_before_polling(
+    tmp_path, docent_loopback
+):
+    path, _runs = _canonical_path(tmp_path)
+    _DocentHandler.batch_job_ids = [None]
+    result = _invoke(path, helper=docent_export._DOCENT_WORKER_PATH, seconds=2.0)
+    assert result == DocentUploadFailure(
+        collection_name="math-pc-rl--launch-run-A",
+        launch_namespace="run-A",
+        collection_id="loopback-collection",
+        error_type="DocentIngestionAcknowledgementError",
+    )
+    assert _DocentHandler.status_requests == []
+
+
+def test_spawned_worker_rejects_duplicate_batch_id_before_later_send(
+    tmp_path, docent_loopback
+):
+    runs = agent_runs(RECORDS)
+    # The pinned serializer escapes this character to six ASCII bytes. Each
+    # run is therefore >50 MiB but <100 MiB at the reviewed batching boundary:
+    # three runs deterministically make three batches without a giant JSONL.
+    padding = "é" * 9_000_000
+    for run in runs:
+        run.metadata["batch_oracle_padding"] = padding
+    path = tmp_path / "docent.jsonl"
+    export_jsonl(runs, str(path))
+    del padding, runs
+
+    _DocentHandler.capture_batch_bodies = False
+    _DocentHandler.batch_job_ids = ["duplicate-job", "duplicate-job", "later-job"]
+    result = _invoke(path, helper=docent_export._DOCENT_WORKER_PATH, seconds=30.0)
+    assert result == DocentUploadFailure(
+        collection_name="math-pc-rl--launch-run-A",
+        launch_namespace="run-A",
+        collection_id="loopback-collection",
+        error_type="DocentIngestionAcknowledgementError",
+    )
+    assert _DocentHandler.batch_count == 2
+    assert _DocentHandler.status_requests == []
+
+
+def test_spawned_worker_observes_pending_running_then_exact_completed_census(
+    tmp_path, docent_loopback
+):
+    path, _runs = _canonical_path(tmp_path)
+    _DocentHandler.status_responses = [
+        [{"job_id": "loopback-job", "status": "pending"}],
+        [{"job_id": "loopback-job", "status": "running"}],
+        [{"job_id": "loopback-job", "status": "completed"}],
+    ]
+    result = _invoke(path, helper=docent_export._DOCENT_WORKER_PATH, seconds=4.0)
+    assert isinstance(result, DocentUploadResult)
+    assert _DocentHandler.status_requests == [["loopback-job"]] * 3
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [
+            {"job_id": "loopback-job", "status": "completed"},
+            {"job_id": "extra", "status": "completed"},
+        ],
+        [
+            {"job_id": "loopback-job", "status": "completed"},
+            {"job_id": "loopback-job", "status": "completed"},
+        ],
+        [{"job_id": "loopback-job", "status": "failed"}],
+        [{"job_id": "loopback-job", "status": "canceled"}],
+        [{"job_id": "loopback-job", "status": "mystery"}],
+        [{"job_id": None, "status": "completed"}],
+    ],
+)
+def test_spawned_worker_refuses_bad_real_status_census(
+    tmp_path, docent_loopback, rows
+):
+    path, _runs = _canonical_path(tmp_path)
+    _DocentHandler.status_responses = [rows]
+    result = _invoke(path, helper=docent_export._DOCENT_WORKER_PATH, seconds=2.0)
+    assert result == DocentUploadFailure(
+        collection_name="math-pc-rl--launch-run-A",
+        launch_namespace="run-A",
+        collection_id="loopback-collection",
+        error_type="DocentIngestionStatusError",
+    )
+
+
+def test_spawned_explicit_transport_harness_observes_timeouts_and_101_id_slices(
+    tmp_path, docent_loopback
+):
+    # This intentionally exercises the owned production adapter/poller in a
+    # real spawned child, not the JSONL worker: producing 101 genuine batches
+    # through the pinned >50 MiB batching boundary would require >5 GiB.
+    path, _runs = _canonical_path(tmp_path)
+    result = _invoke(path, helper=_transport_oracle_helper(tmp_path), seconds=3.0)
+    assert result == DocentUploadResult(
+        collection_name="math-pc-rl--launch-run-A",
+        launch_namespace="run-A",
+        collection_id="loopback-collection",
+    )
+    assert _DocentHandler.observed_timeouts == ["[10.0, 120.0]"] * 5
+    assert [len(chunk) for chunk in _DocentHandler.status_requests] == [100, 1]
+    requested = [
+        item for chunk in _DocentHandler.status_requests for item in chunk
+    ]
+    assert requested == ["loopback-job"] + [
+        f"oracle-job-{index}" for index in range(100)
+    ]
+
+
+def test_near_deadline_request_still_uses_exact_reviewed_socket_tuple():
+    budget = docent_export._DocentTimeBudget(
+        deadline=10.0,
+        clock=lambda: 9.999999,
+        sleeper=lambda _seconds: None,
+    )
+    assert budget.request_timeout() == (10.0, 120.0)
+
+
+def test_owned_transport_dynamically_blocks_ambient_proxy_and_has_zero_retries(
+    docent_loopback, monkeypatch
+):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    budget = docent_export._DocentTimeBudget(
+        deadline=time.monotonic() + 10.0,
+        clock=time.monotonic,
+        sleeper=lambda _seconds: None,
+    )
+    transport = docent_export._DocentHTTPTransport("explicit-key", budget)
+    try:
+        assert transport.session.trust_env is False
+        for adapter in transport.session.adapters.values():
+            retries = adapter.max_retries
+            assert {
+                field: getattr(retries, field)
+                for field in (
+                    "total",
+                    "connect",
+                    "read",
+                    "redirect",
+                    "status",
+                    "other",
+                )
+            } == {
+                "total": 0,
+                "connect": 0,
+                "read": 0,
+                "redirect": 0,
+                "status": 0,
+                "other": 0,
+            }
+        # This real loopback request would attempt the seeded dead proxy if
+        # Requests were allowed to merge ambient environment configuration.
+        transport.authenticate()
+    finally:
+        transport.close()
 
 
 def test_real_worker_installed_sdk_receives_exact_scientific_json_bytes_once(
@@ -745,6 +967,54 @@ def test_real_worker_installed_sdk_receives_exact_scientific_json_bytes_once(
     )
     assert "café λ".encode("utf-8") in local_bytes
     assert "café λ".encode("utf-8") not in _DocentHandler.batch_body
+
+
+def test_long_valid_collection_name_survives_compact_atomic_receipt(
+    tmp_path, monkeypatch
+):
+    path, _runs = _canonical_path(tmp_path)
+    receipt_pipe_bufs = []
+    original_pipe = os.pipe
+
+    def observed_pipe():
+        read_fd, write_fd = original_pipe()
+        receipt_pipe_bufs.append(os.fpathconf(write_fd, "PC_PIPE_BUF"))
+        return read_fd, write_fd
+
+    monkeypatch.setattr(docent_export.os, "pipe", observed_pipe)
+    base_name = "experiment-" + "x" * 12_000
+    _DocentHandler.calls = []
+    _DocentHandler.create_body = None
+    _DocentHandler.fail_path = None
+    _DocentHandler.collection_id = "loopback-collection"
+    _DocentHandler.batch_job_ids = None
+    _DocentHandler.status_responses = None
+    _DocentHandler.status_requests = []
+    server = HTTPServer(("127.0.0.1", 0), _DocentHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        monkeypatch.setenv("DOCENT_API_URL", endpoint)
+        monkeypatch.setenv("DOCENT_FRONTEND_URL", endpoint)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            result = upload(fd, base_name, "run-A", _deadline_seconds=3.0)
+        finally:
+            os.close(fd)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+    expected_name = f"{base_name}--launch-run-A"
+    assert result == DocentUploadResult(
+        collection_name=expected_name,
+        launch_namespace="run-A",
+        collection_id="loopback-collection",
+    )
+    assert _DocentHandler.create_body["name"] == expected_name
+    assert receipt_pipe_bufs
+    assert len(expected_name.encode("utf-8")) > receipt_pipe_bufs[0]
 
 
 def test_two_gzip_envelopes_vary_while_unicode_sdk_payload_bytes_stay_exact(
@@ -1010,317 +1280,6 @@ def test_real_worker_rejects_invalid_collection_id_before_any_batch(
     assert not any(call_path.endswith("/agent_runs") for _, call_path in _DocentHandler.calls)
 
 
-class _Response:
-    status_code = 202
-
-    def __init__(self, body):
-        self._body = body
-
-    def json(self):
-        return self._body
-
-
-class _Logger:
-    def info(self, *_args, **_kwargs):
-        pass
-
-    def warning(self, *_args, **_kwargs):
-        pass
-
-
-class _Progress:
-    def __init__(self, **_kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        pass
-
-    def update(self, _count):
-        pass
-
-
-@pytest.mark.parametrize(
-    ("responses", "expected_sends"),
-    [([{}], 1), ([{"job_id": "same"}, {"job_id": "same"}], 2)],
-)
-def test_each_batch_requires_an_immediate_unique_job_id_before_next_batch(
-    monkeypatch, responses, expected_sends
-):
-    from docent import Docent
-
-    client = object.__new__(Docent)
-    client._session = requests.Session()
-    client._api_url = "https://not-sent.invalid/rest"
-    client._logger = _Logger()
-    client._handle_response_errors = lambda _response: None
-    sends = []
-
-    def transport(_url, **_kwargs):
-        sends.append(1)
-        return _Response(responses[len(sends) - 1])
-
-    client._session.post = transport
-    client._post_with_retry = lambda url, max_retries=3, **kwargs: client._session.post(
-        url, **kwargs
-    )
-    client.get_agent_run_job_statuses = lambda *_args: pytest.fail(
-        "status polling must not start after a malformed batch acknowledgement"
-    )
-    tracker = docent_export._bind_single_attempt_mutation_posts(
-        client,
-        class_validated=True,
-        _budget=docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 10,
-            clock=time.monotonic,
-            sleeper=lambda _seconds: None,
-        ),
-    )
-    globals_ = Docent.add_agent_runs.__globals__
-    monkeypatch.setitem(
-        globals_,
-        "yield_agent_run_batches_by_size",
-        lambda _runs, _limit: iter([(1, b"one"), (1, b"two")]),
-    )
-    monkeypatch.setitem(globals_, "tqdm", _Progress)
-    with pytest.raises(docent_export.DocentIngestionAcknowledgementError):
-        Docent.add_agent_runs(
-            client, "collection", agent_runs(RECORDS[:2]), compression="none"
-        )
-    assert len(sends) == expected_sends
-    assert tracker.agent_batch_posts == expected_sends
-    assert tracker.job_ids == (["same"] if expected_sends == 2 else [])
-
-
-def test_status_polling_slices_101_jobs_and_requires_exact_census():
-    class Client:
-        def __init__(self):
-            self._session = requests.Session()
-            self._session.post = lambda *_args, **_kwargs: _Response({"job_id": "unused"})
-            self._post_with_retry = lambda url, max_retries=3, **kwargs: self._session.post(
-                url, **kwargs
-            )
-            self.chunks = []
-
-        def get_agent_run_job_statuses(self, _collection_id, job_ids):
-            self.chunks.append(list(job_ids))
-            return [{"job_id": job_id, "status": "completed"} for job_id in job_ids]
-
-    client = Client()
-    docent_export._bind_single_attempt_mutation_posts(
-        client,
-        class_validated=True,
-        _budget=docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 10,
-            clock=time.monotonic,
-            sleeper=lambda _seconds: None,
-        ),
-    )
-    job_ids = [f"job-{index}" for index in range(101)]
-    client._wait_for_jobs("collection", job_ids)
-    assert [len(chunk) for chunk in client.chunks] == [100, 1]
-    assert [job_id for chunk in client.chunks for job_id in chunk] == job_ids
-
-
-def test_101_job_polling_advances_pending_running_then_completed_by_sweep():
-    sleeps = []
-
-    class Client:
-        def __init__(self):
-            self._session = requests.Session()
-            self._session.post = lambda *_args, **_kwargs: _Response({"job_id": "unused"})
-            self._post_with_retry = lambda url, max_retries=3, **kwargs: self._session.post(
-                url, **kwargs
-            )
-            self.chunks = []
-
-        def get_agent_run_job_statuses(self, _collection_id, job_ids):
-            sweep = len(self.chunks) // 2
-            self.chunks.append(list(job_ids))
-            status = ("pending", "running", "completed")[sweep]
-            return [{"job_id": job_id, "status": status} for job_id in job_ids]
-
-    client = Client()
-    docent_export._bind_single_attempt_mutation_posts(
-        client,
-        class_validated=True,
-        _budget=docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 10,
-            clock=time.monotonic,
-            sleeper=sleeps.append,
-        ),
-    )
-    job_ids = [f"job-{index}" for index in range(101)]
-    client._wait_for_jobs("collection", job_ids)
-    assert [len(chunk) for chunk in client.chunks] == [100, 1, 100, 1, 100, 1]
-    assert sleeps == [1.0, 1.0]
-
-
-@pytest.mark.parametrize(
-    ("result", "posts", "tracked", "runs"),
-    [
-        ({"status": "success", "total_runs_added": 1, "job_ids": ["job-1"]}, 1, ["job-1"], 2),
-        ({"status": "success", "total_runs_added": 2, "job_ids": ["job-1"]}, 2, ["job-1", "job-2"], 2),
-    ],
-)
-def test_final_ingestion_result_refuses_run_or_batch_count_mismatch(
-    result, posts, tracked, runs
-):
-    with pytest.raises(docent_export.DocentIngestionAcknowledgementError):
-        docent_export._validate_ingestion_result(
-            result,
-            expected_runs=runs,
-            expected_batch_posts=posts,
-            expected_job_ids=tracked,
-        )
-
-
-@pytest.mark.parametrize(
-    "rows",
-    [
-        [],
-        [{"job_id": "job-0", "status": "completed"}, {"job_id": "extra", "status": "completed"}],
-        [{"job_id": "job-0", "status": "completed"}, {"job_id": "job-0", "status": "completed"}],
-        [{"job_id": "job-0", "status": "failed"}],
-        [{"job_id": "job-0", "status": "canceled"}],
-        [{"job_id": "job-0", "status": "mystery"}],
-        [{"job_id": None, "status": "completed"}],
-    ],
-)
-def test_status_polling_refuses_every_inexact_or_bad_terminal_census(rows):
-    class Client:
-        def __init__(self):
-            self._session = requests.Session()
-            self._session.post = lambda *_args, **_kwargs: _Response({"job_id": "unused"})
-            self._post_with_retry = lambda url, max_retries=3, **kwargs: self._session.post(
-                url, **kwargs
-            )
-
-        def get_agent_run_job_statuses(self, _collection_id, _job_ids):
-            return rows
-
-    client = Client()
-    docent_export._bind_single_attempt_mutation_posts(
-        client,
-        class_validated=True,
-        _budget=docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 10,
-            clock=time.monotonic,
-            sleeper=lambda _seconds: None,
-        ),
-    )
-    with pytest.raises(docent_export.DocentIngestionStatusError):
-        client._wait_for_jobs("collection", ["job-0"])
-
-
-def test_pre_auth_session_refuses_ambient_proxy_netrc_and_ca(
-    tmp_path, monkeypatch
-):
-    from urllib3.util.retry import Retry
-
-    netrc = tmp_path / "ambient.netrc"
-    netrc.write_text("machine ambient.invalid login ambient password stolen\n")
-    netrc.chmod(0o600)
-    monkeypatch.setenv("NETRC", str(netrc))
-    monkeypatch.setenv("HTTPS_PROXY", "http://ambient-proxy.invalid:9999")
-    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(tmp_path / "ambient-ca.pem"))
-    observed = {}
-
-    class RecordingAdapter(requests.adapters.HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=Retry(total=0))
-
-        def send(self, request, **kwargs):
-            observed["authorization"] = request.headers.get("Authorization")
-            observed["proxies"] = kwargs.get("proxies")
-            observed["verify"] = kwargs.get("verify")
-            observed["timeout"] = kwargs.get("timeout")
-            response = requests.Response()
-            response.status_code = 200
-            response.url = request.url
-            response.request = request
-            response._content = b"{}"
-            return response
-
-    class Client:
-        def __init__(self, *, api_key, config_file):
-            assert config_file == os.devnull
-            self._api_url = "https://ambient.invalid/rest"
-            self._session = requests.Session()
-            adapter = RecordingAdapter()
-            self._session.mount("https://", adapter)
-            self._session.mount("http://", adapter)
-            self._login(api_key)
-
-    bounded = docent_export._bounded_docent_type(
-        Client,
-        docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 1000,
-            clock=time.monotonic,
-            sleeper=lambda _seconds: None,
-        ),
-    )
-    client = bounded(api_key="explicit-key", config_file=os.devnull)
-    assert client._session.trust_env is False
-    assert observed == {
-        "authorization": "Bearer explicit-key",
-        "proxies": {},
-        "verify": True,
-        "timeout": (10.0, 120.0),
-    }
-
-
-def test_create_batch_and_status_all_receive_exact_connect_read_timeout():
-    calls = []
-
-    class Client:
-        def __init__(self):
-            self._api_url = "https://not-sent.invalid/rest"
-            self._session = requests.Session()
-            self._session.post = self.transport
-            self._post_with_retry = (
-                lambda url, max_retries=3, **kwargs: self._session.post(url, **kwargs)
-            )
-
-        def transport(self, url, **kwargs):
-            calls.append((url, kwargs["timeout"]))
-            if url.endswith("/create"):
-                return _Response({"collection_id": "collection"})
-            if url.endswith("/agent_runs"):
-                return _Response({"job_id": "job-1"})
-            return _Response(
-                {"jobs": [{"job_id": "job-1", "status": "completed"}]}
-            )
-
-        def get_agent_run_job_statuses(self, collection_id, job_ids):
-            response = self._session.post(
-                f"{self._api_url}/{collection_id}/agent_runs/jobs/batch_status",
-                json={"job_ids": job_ids},
-            )
-            return response.json()["jobs"]
-
-    client = Client()
-    docent_export._bind_single_attempt_mutation_posts(
-        client,
-        class_validated=True,
-        _budget=docent_export._DocentTimeBudget(
-            deadline=time.monotonic() + 1000,
-            clock=time.monotonic,
-            sleeper=lambda _seconds: None,
-        ),
-    )
-    assert docent_export._create_collection_once(client, "name") == "collection"
-    client._post_with_retry(f"{client._api_url}/collection/agent_runs", data=b"x")
-    client._wait_for_jobs("collection", ["job-1"])
-    assert [timeout for _url, timeout in calls] == [
-        (10.0, 120.0),
-        (10.0, 120.0),
-        (10.0, 120.0),
-    ]
-
-
 def test_permission_error_during_group_kill_is_not_treated_as_absence(monkeypatch):
     monkeypatch.setattr(
         docent_export.os,
@@ -1378,16 +1337,14 @@ def test_lost_wait_ownership_cannot_accept_terminal_success(tmp_path, monkeypatc
     assert result.error_type == "DocentUploadChildOwnershipError"
 
 
-def test_sdk_version_drift_refuses_before_client_construction(monkeypatch):
-    import docent
-
+def test_sdk_version_drift_refuses_before_transport_or_mutation(monkeypatch):
     constructions = []
 
-    class DriftedDocent:
-        def __init__(self, **_kwargs):
+    class ForbiddenTransport:
+        def __init__(self, *_args, **_kwargs):
             constructions.append(1)
 
-    monkeypatch.setattr(docent, "Docent", DriftedDocent)
+    monkeypatch.setattr(docent_export, "_DocentHTTPTransport", ForbiddenTransport)
     monkeypatch.setattr(docent_export, "version", lambda _name: "9.9.9")
     result = docent_export._upload_in_child_process(
         agent_runs(RECORDS[:1]),
@@ -1404,6 +1361,40 @@ def test_sdk_version_drift_refuses_before_client_construction(monkeypatch):
     )
     assert isinstance(result, DocentUploadFailure)
     assert result.collection_id is None
+    assert constructions == []
+
+
+def test_sdk_serializer_drift_refuses_before_transport_or_mutation(monkeypatch):
+    from docent.sdk import _client_util
+
+    constructions = []
+
+    class ForbiddenTransport:
+        def __init__(self, *_args, **_kwargs):
+            constructions.append(1)
+
+    monkeypatch.setattr(docent_export, "_DocentHTTPTransport", ForbiddenTransport)
+    monkeypatch.setattr(
+        _client_util,
+        "serialize_agent_run",
+        lambda _run: b"unreviewed",
+    )
+    result = docent_export._upload_in_child_process(
+        agent_runs(RECORDS[:1]),
+        "math-pc-rl--launch-run-A",
+        "run-A",
+        _budget=docent_export._DocentTimeBudget(
+            deadline=time.monotonic() + 10,
+            clock=time.monotonic,
+            sleeper=lambda _seconds: None,
+        ),
+        on_collection_confirmed=lambda _value: pytest.fail(
+            "drift must not mutate"
+        ),
+    )
+    assert isinstance(result, DocentUploadFailure)
+    assert result.collection_id is None
+    assert result.error_type == "RuntimeError"
     assert constructions == []
 
 

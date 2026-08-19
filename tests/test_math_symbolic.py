@@ -29,25 +29,13 @@ from infra.envs.tasks.math_verify_worker import (
     MathVerifyWorker,
     canonicalize_math_expression,
 )
+from _dataset_tqdm_monitor import dataset_tqdm_monitor_owner
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _stop_dataset_tqdm_monitor_after_module():
-    """Release only the tqdm monitor started by this module's cache audits."""
-    from datasets.utils.tqdm import tqdm as datasets_tqdm
-
-    monitor_before = datasets_tqdm.monitor
-    yield
-    module_monitor = datasets_tqdm.monitor
-    if (
-        monitor_before is None
-        and module_monitor is not None
-        and datasets_tqdm.monitor is module_monitor
-    ):
-        module_monitor.exit()
-        module_monitor.join()
-        if datasets_tqdm.monitor is module_monitor:
-            datasets_tqdm.monitor = None
+@pytest.fixture(scope="module")
+def dataset_monitor_call():
+    with dataset_tqdm_monitor_owner() as monitor_call:
+        yield monitor_call
 
 
 class FakeWorker:
@@ -325,7 +313,7 @@ def test_cohort_construction_rejects_duplicate_source_position():
         build_symbolic_cohorts(train, test, validate_production=False)
 
 
-def test_pinned_cached_dataset_digest_counts_and_quotas():
+def test_pinned_cached_dataset_digest_counts_and_quotas(dataset_monitor_call):
     # Explicitly offline: absent cache is an allowed skip; a present but
     # changed/corrupt pinned revision must fail rather than silently skip.
     from datasets import DownloadConfig, config, load_dataset
@@ -333,7 +321,8 @@ def test_pinned_cached_dataset_digest_counts_and_quotas():
     processed_cache = Path(config.HF_DATASETS_CACHE) / "the-jb___hendrycks-math"
     if not any(processed_cache.glob(f"**/{DATASET_REVISION}")):
         pytest.skip("pinned Hendrycks-MATH revision is not cached")
-    dataset = load_dataset(
+    dataset = dataset_monitor_call(
+        load_dataset,
         DATASET_ID,
         revision=DATASET_REVISION,
         download_config=DownloadConfig(local_files_only=True),
@@ -352,7 +341,9 @@ def test_pinned_cached_dataset_digest_counts_and_quotas():
     assert all("solution" not in row for rows in cohorts.values() for row in rows)
 
 
-def test_pinned_cached_selected_golds_all_parse_in_real_worker_without_cohort_mutation():
+def test_pinned_cached_selected_golds_all_parse_in_real_worker_without_cohort_mutation(
+    dataset_monitor_call,
+):
     """Independent production audit: every exposed raw gold must be gradeable.
 
     Only an absent pinned dataset cache can skip this. Missing dependencies,
@@ -363,7 +354,8 @@ def test_pinned_cached_selected_golds_all_parse_in_real_worker_without_cohort_mu
     processed_cache = Path(config.HF_DATASETS_CACHE) / "the-jb___hendrycks-math"
     if not any(processed_cache.glob(f"**/{DATASET_REVISION}")):
         pytest.skip("pinned Hendrycks-MATH revision is not cached")
-    dataset = load_dataset(
+    dataset = dataset_monitor_call(
+        load_dataset,
         DATASET_ID,
         revision=DATASET_REVISION,
         download_config=DownloadConfig(local_files_only=True),
