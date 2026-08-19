@@ -31,6 +31,25 @@ from infra.envs.tasks.math_verify_worker import (
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _stop_dataset_tqdm_monitor_after_module():
+    """Release only the tqdm monitor started by this module's cache audits."""
+    from datasets.utils.tqdm import tqdm as datasets_tqdm
+
+    monitor_before = datasets_tqdm.monitor
+    yield
+    module_monitor = datasets_tqdm.monitor
+    if (
+        monitor_before is None
+        and module_monitor is not None
+        and datasets_tqdm.monitor is module_monitor
+    ):
+        module_monitor.exit()
+        module_monitor.join()
+        if datasets_tqdm.monitor is module_monitor:
+            datasets_tqdm.monitor = None
+
+
 class FakeWorker:
     def __init__(self, *, unparsable=(), fatal: Exception | None = None):
         self.unparsable = set(unparsable)

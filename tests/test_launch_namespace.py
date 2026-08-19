@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import inspect
 import os
+import socket
 import subprocess
 import sys
 import textwrap
@@ -18,6 +20,7 @@ import pytest
 from infra.launch_namespace import (
     ENV_VAR,
     claim_directory,
+    open_claimed_read_fd,
     open_claimed_text_file,
     require_claimed_directory,
     resolve_launch_namespace,
@@ -194,6 +197,127 @@ def test_retained_writer_exclusively_creates_regular_output(tmp_path):
         open_claimed_text_file(target, "step-00001.jsonl")
 
     assert (target / "step-00001.jsonl").read_bytes() == original
+
+
+def test_retained_reader_returns_blocking_read_only_fd_at_byte_zero(tmp_path):
+    target = tmp_path / "artifacts" / "run" / "attempt"
+    claim_directory(target)
+    payload = b"complete evidence\n"
+    source = target / "step-00001.jsonl"
+    source.write_bytes(payload)
+    source.chmod(0o640)
+
+    file_fd = open_claimed_read_fd(target, source.name)
+    try:
+        status_flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+        assert status_flags & os.O_ACCMODE == os.O_RDONLY
+        assert not status_flags & os.O_NONBLOCK
+        assert not os.get_inheritable(file_fd)
+        assert os.lseek(file_fd, 0, os.SEEK_CUR) == 0
+        assert os.read(file_fd, len(payload) + 1) == payload
+    finally:
+        os.close(file_fd)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["", ".", "..", "../escape", "nested/file", "has space", "é", "a" * 256],
+)
+def test_retained_reader_refuses_unsafe_leaf_names(tmp_path, filename):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+
+    with pytest.raises(ValueError, match="one safe component"):
+        open_claimed_read_fd(target, filename)
+
+
+def test_retained_reader_requires_this_process_claim(tmp_path):
+    target = tmp_path / "existing"
+    target.mkdir()
+    (target / "result.json").write_text("evidence")
+
+    with pytest.raises(ValueError, match="not claimed by this process"):
+        open_claimed_read_fd(target, "result.json")
+
+
+def test_retained_reader_refuses_replaced_claimed_directory(tmp_path):
+    parent = tmp_path / "artifacts"
+    target = parent / "run" / "attempt"
+    claim_directory(target)
+    (target / "result.json").write_text("retained")
+    retained = tmp_path / "artifacts-retained"
+    parent.rename(retained)
+    replacement = tmp_path / "artifacts" / "run" / "attempt"
+    replacement.mkdir(parents=True)
+    (replacement / "result.json").write_text("replacement")
+
+    with pytest.raises(ValueError, match="identity changed"):
+        open_claimed_read_fd(target, "result.json")
+
+
+def test_retained_reader_refuses_symlink_and_hardlink(tmp_path):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+    source = target / "source.json"
+    source.write_text("evidence")
+    (target / "symlink.json").symlink_to(source.name)
+    os.link(source, target / "hardlink.json")
+
+    with pytest.raises(RuntimeError, match="unsafe claimed input"):
+        open_claimed_read_fd(target, "symlink.json")
+    with pytest.raises(RuntimeError, match="exactly one hard link"):
+        open_claimed_read_fd(target, "hardlink.json")
+
+
+def test_retained_reader_refuses_fifo_without_blocking(tmp_path):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+    os.mkfifo(target / "stream")
+
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        open_claimed_read_fd(target, "stream")
+
+
+def test_retained_reader_refuses_unix_socket(tmp_path):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+    server = socket.socket(socket.AF_UNIX)
+    try:
+        server.bind(str(target / "service.sock"))
+        with pytest.raises(RuntimeError, match="unsafe claimed input"):
+            open_claimed_read_fd(target, "service.sock")
+    finally:
+        server.close()
+
+
+def test_retained_reader_refuses_group_or_other_writable_file(tmp_path):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+    source = target / "result.json"
+    source.write_text("evidence")
+    source.chmod(0o660)
+
+    with pytest.raises(RuntimeError, match="group- or other-writable"):
+        open_claimed_read_fd(target, source.name)
+
+
+def test_retained_reader_fd_pins_inode_across_named_path_replacement(tmp_path):
+    target = tmp_path / "attempt"
+    claim_directory(target)
+    source = target / "result.json"
+    source.write_bytes(b"original")
+    original_inode = source.stat().st_ino
+
+    file_fd = open_claimed_read_fd(target, source.name)
+    try:
+        source.rename(target / "original-retained.json")
+        source.write_bytes(b"replacement")
+
+        assert os.fstat(file_fd).st_ino == original_inode
+        assert os.read(file_fd, 32) == b"original"
+        assert source.read_bytes() == b"replacement"
+    finally:
+        os.close(file_fd)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")

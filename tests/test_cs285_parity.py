@@ -261,6 +261,8 @@ def test_zero_kl_coef_clears_both_mechanism_guards():
 
 def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     """The debate arm changes the environment, not the validated optimizer."""
+    from datasets.utils.tqdm import tqdm as datasets_tqdm
+
     from infra.config import load_experiment
     from infra.run_debate import build_env, split_agents, validate_experiment
 
@@ -304,15 +306,37 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     # Exercise the real prompt-splice/config constructor: math_hw4.yaml is
     # answer-only and cannot satisfy the debate pack; the approved math prompt
     # supplies the inspectable derivation and every required splice.
-    env = build_env(debate, trained, frozen)
-    trained_slots = [
-        (cs.speaker, cs.slot.name, cs.slot.max_total_tokens)
-        for cs in env.protocol.compile()
-        if cs.speaker in trained
-    ]
-    assert trained_slots == [
-        ("alice", "proposal", 512),
-        ("bob", "critique", 300),
-        ("alice", "defense", 300),
-        ("bob", "rebuttal", 300),
-    ]
+    monitor_before = datasets_tqdm.monitor
+    env = None
+    created_monitor = None
+    try:
+        env = build_env(debate, trained, frozen)
+        created_monitor = datasets_tqdm.monitor
+        trained_slots = [
+            (cs.speaker, cs.slot.name, cs.slot.max_total_tokens)
+            for cs in env.protocol.compile()
+            if cs.speaker in trained
+        ]
+        assert trained_slots == [
+            ("alice", "proposal", 512),
+            ("bob", "critique", 300),
+            ("alice", "defense", 300),
+            ("bob", "rebuttal", 300),
+        ]
+    finally:
+        try:
+            if env is not None:
+                env.family.close()
+        finally:
+            # Dataset loading can start tqdm's process-global daemon monitor.
+            # Own only the exact monitor this test created, preserving any
+            # preexisting monitor or a replacement installed by another owner.
+            if (
+                monitor_before is None
+                and created_monitor is not None
+                and datasets_tqdm.monitor is created_monitor
+            ):
+                created_monitor.exit()
+                created_monitor.join()
+                if datasets_tqdm.monitor is created_monitor:
+                    datasets_tqdm.monitor = None

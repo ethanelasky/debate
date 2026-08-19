@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -713,6 +714,9 @@ def _main_impl(argv: Optional[list[str]] = None, task_source=None):
 
         runs = agent_runs(env)
         export_jsonl_claimed(runs, artifact_dir, "docent.jsonl")
+        # The authoritative JSONL FD, not a second in-memory trajectory list,
+        # crosses the dedicated uploader boundary.
+        runs = None
         if args.docent_collection is not None:
             collection_name = (
                 f"{args.docent_collection}--launch-{launch_namespace}"
@@ -722,15 +726,22 @@ def _main_impl(argv: Optional[list[str]] = None, task_source=None):
                     collection_name_for_launch,
                     upload,
                 )
+                from infra.launch_namespace import open_claimed_read_fd
 
                 collection_name = collection_name_for_launch(
                     args.docent_collection, launch_namespace
                 )
-                upload_result = upload(
-                    runs,
-                    base_collection_name=args.docent_collection,
-                    launch_namespace=launch_namespace,
+                docent_jsonl_fd = open_claimed_read_fd(
+                    artifact_dir, "docent.jsonl"
                 )
+                try:
+                    upload_result = upload(
+                        docent_jsonl_fd,
+                        base_collection_name=args.docent_collection,
+                        launch_namespace=launch_namespace,
+                    )
+                finally:
+                    os.close(docent_jsonl_fd)
                 control_flow = (
                     upload_result
                     if isinstance(upload_result, DocentUploadControlFlow)
@@ -774,27 +785,83 @@ def _main_impl(argv: Optional[list[str]] = None, task_source=None):
                         # re-raise below remains authoritative.
                         pass
                     return control_flow
-                print(
-                    json.dumps(receipt, sort_keys=True),
-                    file=sys.stderr,
-                    flush=True,
-                )
+                try:
+                    print(
+                        json.dumps(receipt, sort_keys=True),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    kind = (
+                        "KeyboardInterrupt"
+                        if isinstance(exc, KeyboardInterrupt)
+                        else "SystemExit"
+                    )
+                    exit_code = None
+                    if isinstance(exc, SystemExit):
+                        exit_code = (
+                            exc.code
+                            if type(exc.code) is int
+                            else 1
+                        )
+                    pending_docent_control_flow = DocentUploadControlFlow(
+                        failure=DocentUploadFailure(
+                            collection_name=receipt["collection_name"],
+                            launch_namespace=receipt["launch_namespace"],
+                            collection_id=receipt["collection_id"],
+                            error_type=kind,
+                        ),
+                        kind=kind,
+                        exit_code=exit_code,
+                    )
+                    return pending_docent_control_flow
+                except Exception:
+                    # Receipt I/O is attempted once. A broken stderr cannot
+                    # turn best-effort external provenance into a local failure.
+                    pass
             except Exception as exc:
-                print(
-                    json.dumps(
-                        {
-                            "event": "docent_upload_receipt",
-                            "status": "ambiguous_or_unconfirmed",
-                            "collection_name": collection_name,
-                            "launch_namespace": launch_namespace,
-                            "collection_id": None,
-                            "error_type": _sanitized_error_type(exc),
-                        },
-                        sort_keys=True,
-                    ),
-                    file=sys.stderr,
-                    flush=True,
-                )
+                try:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "docent_upload_receipt",
+                                "status": "ambiguous_or_unconfirmed",
+                                "collection_name": collection_name,
+                                "launch_namespace": launch_namespace,
+                                "collection_id": None,
+                                "error_type": _sanitized_error_type(exc),
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except (KeyboardInterrupt, SystemExit) as receipt_exc:
+                    kind = (
+                        "KeyboardInterrupt"
+                        if isinstance(receipt_exc, KeyboardInterrupt)
+                        else "SystemExit"
+                    )
+                    exit_code = None
+                    if isinstance(receipt_exc, SystemExit):
+                        exit_code = (
+                            receipt_exc.code
+                            if type(receipt_exc.code) is int
+                            else 1
+                        )
+                    pending_docent_control_flow = DocentUploadControlFlow(
+                        failure=DocentUploadFailure(
+                            collection_name=collection_name,
+                            launch_namespace=launch_namespace,
+                            collection_id=None,
+                            error_type=kind,
+                        ),
+                        kind=kind,
+                        exit_code=exit_code,
+                    )
+                    return pending_docent_control_flow
+                except Exception:
+                    pass
 
         if summary["n_failed"]:
             print(
@@ -829,7 +896,12 @@ def _raise_fresh_docent_control_flow(control_flow) -> None:
     if control_flow.kind == "KeyboardInterrupt":
         raise KeyboardInterrupt()
     if control_flow.kind == "SystemExit":
-        raise SystemExit(control_flow.exit_code)
+        exit_code = (
+            control_flow.exit_code
+            if type(control_flow.exit_code) is int
+            else 1
+        )
+        raise SystemExit(exit_code)
     raise RuntimeError("unknown sanitized Docent control-flow carrier")
 
 

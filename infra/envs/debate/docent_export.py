@@ -13,24 +13,28 @@ Usage:
     runs = agent_runs(env)                      # after env.rollout(...)
     export_jsonl(runs, "debates.jsonl")         # local file
     export_jsonl_claimed(runs, directory, name) # reserved launch sink
-    upload(runs, base_collection_name="math-pc-rl", launch_namespace=namespace)
-                                                # needs DOCENT_API_KEY
+    fd = open_claimed_read_fd(directory, "docent.jsonl")
+    upload(fd, base_collection_name="math-pc-rl", launch_namespace=namespace)
+                                                # needs DOCENT_API_KEY; close fd
 """
 
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import re
+import select
 import signal
+import stat
 import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError, version
 from inspect import Parameter, signature
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
@@ -59,6 +63,16 @@ _DOCENT_CONNECT_TIMEOUT_SECONDS = 10.0
 _DOCENT_READ_TIMEOUT_SECONDS = 120.0
 _DOCENT_TOTAL_BUDGET_SECONDS = 5.0 * 60.0
 _DOCENT_STATUS_CHUNK_SIZE = 100
+_DOCENT_JSONL_FD = 198
+_DOCENT_RECEIPT_FD = 199
+_DOCENT_RECEIPT_MAX_BYTES = 16 * 1024
+_DOCENT_RECEIPT_MAX_LINE_BYTES = 4096
+_DOCENT_LOCAL_TERMINATION_GRACE_SECONDS = 0.25
+_DOCENT_FORCE_KILL_REAP_RESERVE_SECONDS = 0.05
+_DOCENT_WORKER_PATH = (
+    Path(__file__).resolve().parents[2] / "docent_upload_process.py"
+)
+_DOCENT_SPAWN_LOCK = threading.Lock()
 
 
 class DocentMutationRedirectError(RuntimeError):
@@ -85,12 +99,12 @@ class DocentUploadDeadlineError(TimeoutError):
     """The fixed total Docent upload budget was exhausted."""
 
 
-class DocentHardDeadlineUnavailableError(RuntimeError):
-    """A process-wide hard deadline could not be installed safely."""
+class DocentUploadCleanupError(RuntimeError):
+    """The dedicated upload process group could not be safely cleaned up."""
 
 
-class _DocentHardDeadlineSignal(BaseException):
-    """Private SIGALRM escape that SDK ``except Exception`` cannot swallow."""
+class DocentUploadChildOwnershipError(RuntimeError):
+    """The supervisor lost authoritative wait/reap ownership of its child."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,11 +138,7 @@ class DocentUploadControlFlow:
 @dataclass(slots=True)
 class _DocentPostTracker:
     agent_batch_posts: int = 0
-
-
-@dataclass(slots=True)
-class _DocentUploadAttemptState:
-    collection_id: str | None = None
+    job_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -174,249 +184,6 @@ class _DocentTimeBudget:
     def sleep(self, seconds: float) -> None:
         remaining = self.remaining()
         self.sleeper(min(seconds, remaining))
-
-
-def _raise_docent_hard_deadline(_signum: int, _frame: Any) -> None:
-    raise _DocentHardDeadlineSignal()
-
-
-@contextmanager
-def _docent_hard_wall_clock_guard(budget: _DocentTimeBudget):
-    """Preempt the whole upload even when Requests keeps receiving bytes.
-
-    ``requests`` interprets its read timeout as idle time between socket reads,
-    not total wall time.  POSIX ``ITIMER_REAL`` is therefore the hard boundary
-    around authentication through final confirmation.  It is process-global,
-    so only the main thread may install it and an existing timer is a hard
-    conflict rather than something this uploader may replace.
-    """
-    required_names = (
-        "SIGALRM",
-        "ITIMER_REAL",
-        "SIG_BLOCK",
-        "SIG_SETMASK",
-        "getitimer",
-        "setitimer",
-        "getsignal",
-        "signal",
-        "pthread_sigmask",
-        "sigpending",
-        "sigwait",
-    )
-    required = {name: getattr(signal, name, None) for name in required_names}
-    unavailable = any(value is None for value in required.values()) or any(
-        not callable(required[name])
-        for name in (
-            "getitimer",
-            "setitimer",
-            "getsignal",
-            "signal",
-            "pthread_sigmask",
-            "sigpending",
-            "sigwait",
-        )
-    )
-    if unavailable:
-        raise DocentHardDeadlineUnavailableError(
-            "POSIX wall-clock deadline support is unavailable"
-        )
-    if threading.current_thread() is not threading.main_thread():
-        raise DocentHardDeadlineUnavailableError(
-            "Docent hard deadline requires the main thread"
-        )
-    current_thread = threading.current_thread()
-    other_threads = [
-        thread
-        for thread in threading.enumerate()
-        if thread is not current_thread and thread.is_alive()
-    ]
-    if other_threads:
-        raise DocentHardDeadlineUnavailableError(
-            "another live Python thread conflicts with the process wall-clock timer"
-        )
-
-    sigalrm = signal.SIGALRM
-    timer_kind = signal.ITIMER_REAL
-    alarm_set = {sigalrm}
-    previous_mask: set[signal.Signals] | None = None
-    previous_handler: Any = None
-    previous_timer: tuple[float, float] | None = None
-    mask_blocked = False
-    handler_installed = False
-    timer_armed = False
-    teardown_control: tuple[str, int | None] | None = None
-
-    def remember_teardown_control(exc: BaseException) -> None:
-        nonlocal teardown_control
-        if teardown_control is not None:
-            return
-        if isinstance(exc, KeyboardInterrupt):
-            teardown_control = ("KeyboardInterrupt", None)
-        elif isinstance(exc, SystemExit):
-            code = exc.code if exc.code is None or type(exc.code) is int else 1
-            teardown_control = ("SystemExit", code)
-        else:
-            teardown_control = ("DocentHardDeadline", None)
-
-    def interrupt_resilient_cleanup(action: Callable[[], Any]) -> None:
-        """Retry an idempotent teardown transition after async control flow."""
-        while True:
-            try:
-                action()
-                # Keep the return in the protected suite: a line-trace
-                # exception after the syscall's effect is caught and the
-                # idempotent action is safely repeated.
-                return
-            except (KeyboardInterrupt, SystemExit, _DocentHardDeadlineSignal) as exc:
-                remember_teardown_control(exc)
-
-    def restore_process_signal_state() -> None:
-        """Idempotent full teardown, safe to restart after an interrupt."""
-        nonlocal mask_blocked
-        if previous_mask is None:
-            return
-        if not mask_blocked:
-            # Own the resulting state before the effect so an interrupt at the
-            # call/assignment boundary cannot strand it untracked.
-            mask_blocked = True
-            interrupt_resilient_cleanup(
-                lambda: signal.pthread_sigmask(signal.SIG_BLOCK, alarm_set)
-            )
-        if timer_armed or handler_installed:
-            interrupt_resilient_cleanup(
-                lambda: signal.setitimer(timer_kind, 0.0, 0.0)
-            )
-            # The timer can expire after delivery is blocked but before it is
-            # canceled. Consume that guard-owned signal while our handler
-            # remains installed, so restoring SIG_DFL cannot turn it into a
-            # delayed process kill.
-            while sigalrm in signal.sigpending():
-                interrupt_resilient_cleanup(lambda: signal.sigwait(alarm_set))
-        if handler_installed:
-            interrupt_resilient_cleanup(
-                lambda: signal.signal(sigalrm, previous_handler)
-            )
-            assert previous_timer is not None
-            interrupt_resilient_cleanup(
-                lambda: signal.setitimer(
-                    timer_kind,
-                    previous_timer[0],
-                    previous_timer[1],
-                )
-            )
-        # As on admission, claim the post-effect state before restoring the
-        # prior mask. A restarted full teardown will re-block before touching
-        # timer/handler state if an interrupt lands after this call's effect.
-        mask_blocked = False
-        interrupt_resilient_cleanup(
-            lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        )
-
-    try:
-        try:
-            # Atomically block delivery before inspecting or changing any
-            # process-wide SIGALRM state.
-            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, alarm_set)
-            mask_blocked = True
-            if sigalrm in signal.sigpending():
-                raise DocentHardDeadlineUnavailableError(
-                    "SIGALRM is already pending"
-                )
-            if sigalrm in previous_mask:
-                raise DocentHardDeadlineUnavailableError(
-                    "SIGALRM is already blocked"
-                )
-            previous_handler = signal.getsignal(sigalrm)
-            previous_timer = signal.getitimer(timer_kind)
-            # A previously armed one-shot can expire after the first pending
-            # check but before getitimer observes it.  Delivery is still
-            # blocked here, so reject that newly pending signal rather than
-            # later consuming it as though it belonged to our guard.
-            if sigalrm in signal.sigpending():
-                raise DocentHardDeadlineUnavailableError(
-                    "SIGALRM became pending during deadline admission"
-                )
-            if previous_timer[0] > 0 or previous_timer[1] > 0:
-                raise DocentHardDeadlineUnavailableError(
-                    "an existing process wall-clock timer conflicts with Docent upload"
-                )
-
-            duration = min(_DOCENT_TOTAL_BUDGET_SECONDS, budget.remaining())
-            # Claim restoration responsibility before the process-global
-            # mutation.  KeyboardInterrupt/SystemExit can arrive after
-            # signal.signal has taken effect but before it returns.
-            handler_installed = True
-            signal.signal(sigalrm, _raise_docent_hard_deadline)
-            replaced_timer = signal.setitimer(timer_kind, duration, 0.0)
-            # With no other live Python thread this cannot ordinarily race,
-            # but setitimer's return value is the final atomic check.
-            if replaced_timer[0] > 0 or replaced_timer[1] > 0:
-                signal.setitimer(timer_kind, 0.0, 0.0)
-                signal.signal(sigalrm, previous_handler)
-                signal.setitimer(
-                    timer_kind,
-                    replaced_timer[0],
-                    replaced_timer[1],
-                )
-                handler_installed = False
-                raise DocentHardDeadlineUnavailableError(
-                    "a concurrent process wall-clock timer conflicts with Docent upload"
-                )
-            timer_armed = True
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-            mask_blocked = False
-        except DocentHardDeadlineUnavailableError:
-            raise
-        except Exception:
-            raise DocentHardDeadlineUnavailableError(
-                "could not install the process wall-clock deadline"
-            ) from None
-        yield
-    finally:
-        active_exception = sys.exception()
-        if previous_mask is not None:
-            # The outer restart boundary also covers Python lines between the
-            # individual syscall wrappers. Thus a first KI/SE anywhere during
-            # teardown cannot skip the remaining restoration steps.
-            interrupt_resilient_cleanup(restore_process_signal_state)
-        # A first operator interrupt (or our own hard deadline) during
-        # teardown outranks an ordinary upload exception: otherwise run_eval
-        # would misclassify it as a best-effort external failure. An operator
-        # control-flow exception already unwinding from the body keeps
-        # priority over any later teardown interruption.
-        active_has_control_priority = isinstance(
-            active_exception,
-            (KeyboardInterrupt, SystemExit, _DocentHardDeadlineSignal),
-        )
-        if not active_has_control_priority and teardown_control is not None:
-            kind, exit_code = teardown_control
-            if kind == "KeyboardInterrupt":
-                raise KeyboardInterrupt()
-            if kind == "SystemExit":
-                raise SystemExit(exit_code)
-            raise _DocentHardDeadlineSignal()
-
-
-@contextmanager
-def _block_docent_deadline_during_identity_handoff():
-    """Let a confirmed ID reach outer state before a pending alarm fires."""
-    alarm_set = {signal.SIGALRM}
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, alarm_set)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
-
-@contextmanager
-def _block_docent_identity_recovery_signals():
-    """Make recovery of an already returned identity non-interruptible."""
-    blocked = {signal.SIGALRM, signal.SIGINT}
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
-    try:
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _sanitized_error_type(exc: BaseException) -> str:
@@ -789,6 +556,10 @@ def _bounded_docent_type(client_type: type[Any], budget: _DocentTimeBudget) -> t
     class BoundedDocent(client_type):
         def _login(self, api_key: str) -> None:
             session = _validate_single_send_session(self._session)
+            # The dedicated child has an allowlisted environment, and the
+            # pinned Session additionally refuses ambient proxy/netrc/CA
+            # discovery before its first authentication request.
+            session.trust_env = False
             session.headers.update({"Authorization": f"Bearer {api_key}"})
             response = session.get(
                 f"{self._api_url}/api-keys/test",
@@ -812,9 +583,8 @@ def _bounded_docent_type(client_type: type[Any], budget: _DocentTimeBudget) -> t
     return BoundedDocent
 
 
-@contextmanager
-def _disable_pinned_docent_tqdm_monitor(client_type: type[Any]):
-    """Prevent the pinned SDK from spawning a timer-racing monitor thread."""
+def _disable_pinned_docent_tqdm_monitor_for_child(client_type: type[Any]) -> None:
+    """Disable the pinned SDK's monitor in the disposable upload child."""
     add_impl = getattr(client_type, "add_agent_runs", None)
     add_globals = getattr(add_impl, "__globals__", None)
     tqdm_type = add_globals.get("tqdm") if isinstance(add_globals, dict) else None
@@ -834,54 +604,9 @@ def _disable_pinned_docent_tqdm_monitor(client_type: type[Any]):
         or previous_interval < 0
     ):
         raise RuntimeError("Docent tqdm monitor interval is not safely controllable")
-    # tqdm checks this class attribute before constructing TMonitor.  Keep the
-    # visible progress context but prevent it from creating a Python thread
-    # after the hard-deadline single-thread admission check.
-    interval_changed = False
-    teardown_control: tuple[str, int | None] | None = None
-    try:
-        with _block_docent_deadline_during_identity_handoff():
-            # As with the signal handler, own restoration before mutating a
-            # process-global: asynchronous BaseExceptions may arrive after
-            # the assignment takes effect but before the next Python line.
-            interval_changed = True
-            tqdm_type.monitor_interval = 0
-        yield
-    finally:
-        active_exception = sys.exception()
-        while interval_changed:
-            try:
-                with _block_docent_deadline_during_identity_handoff():
-                    tqdm_type.monitor_interval = previous_interval
-                    interval_changed = False
-            except (KeyboardInterrupt, SystemExit, _DocentHardDeadlineSignal) as exc:
-                if teardown_control is None:
-                    if isinstance(exc, KeyboardInterrupt):
-                        teardown_control = ("KeyboardInterrupt", None)
-                    elif isinstance(exc, SystemExit):
-                        code = (
-                            exc.code
-                            if exc.code is None or type(exc.code) is int
-                            else 1
-                        )
-                        teardown_control = ("SystemExit", code)
-                    else:
-                        teardown_control = ("DocentHardDeadline", None)
-                # Assignment and flag update are inside the protected suite.
-                # Whether the interrupt landed before or after the assignment,
-                # repeating it is idempotent and restores the reviewed global.
-                continue
-        active_has_control_priority = isinstance(
-            active_exception,
-            (KeyboardInterrupt, SystemExit, _DocentHardDeadlineSignal),
-        )
-        if not active_has_control_priority and teardown_control is not None:
-            kind, exit_code = teardown_control
-            if kind == "KeyboardInterrupt":
-                raise KeyboardInterrupt()
-            if kind == "SystemExit":
-                raise SystemExit(exit_code)
-            raise _DocentHardDeadlineSignal()
+    # This process is dedicated to one upload and exits immediately after it,
+    # so no restoration is needed and no monitor thread can outlive the child.
+    tqdm_type.monitor_interval = 0
 
 
 def _bind_single_attempt_mutation_posts(
@@ -934,6 +659,22 @@ def _bind_single_attempt_mutation_posts(
         tracker.agent_batch_posts += 1
         response = original_retry(url, max_retries=0, **kwargs)
         budget.remaining()
+        try:
+            body = response.json()
+        except Exception:
+            raise DocentIngestionAcknowledgementError(
+                "Docent ingestion batch response was not valid JSON"
+            ) from None
+        job_id = body.get("job_id") if isinstance(body, dict) else None
+        if (
+            not isinstance(job_id, str)
+            or _JOB_ID_RE.fullmatch(job_id) is None
+            or job_id in tracker.job_ids
+        ):
+            raise DocentIngestionAcknowledgementError(
+                "Docent ingestion batch returned no unique bounded job identifier"
+            )
+        tracker.job_ids.append(job_id)
         return response
 
     def wait_for_jobs(
@@ -1039,7 +780,7 @@ def _create_collection_once(
     client: Any,
     collection_name: str,
     *,
-    _attempt_state: _DocentUploadAttemptState | None = None,
+    on_confirmed: Callable[[str], None] | None = None,
 ) -> str:
     """Create without invoking the SDK's pre-validation raw-ID logging."""
     response = client._session.post(
@@ -1051,46 +792,21 @@ def _create_collection_once(
         },
     )
     try:
-        try:
-            body = response.json()
-        except Exception:
-            raise DocentCollectionAcknowledgementError(
-                "Docent collection response was not valid JSON"
-            ) from None
-        if not isinstance(body, dict):
-            raise DocentCollectionAcknowledgementError(
-                "Docent collection response was not a mapping"
-            )
-        with _block_docent_deadline_during_identity_handoff():
-            collection_id = _validated_collection_id(body.get("collection_id"))
-            if _attempt_state is not None:
-                # Store outside the interruptible upload stack before returning.
-                # If the timer expires during validation, SIGALRM remains pending
-                # until this assignment completes, then the hard guard records a
-                # failure carrying the confirmed identity.
-                _attempt_state.collection_id = collection_id
-        return collection_id
-    except BaseException:
-        # The POST has returned a 2xx response, so an operator interrupt may
-        # land after a valid identity is known but before outer attempt state
-        # receives it.  Re-read only this already-buffered response while both
-        # relevant signals are masked.  Never send, log, or retain its body;
-        # failure to recover simply leaves the identity unconfirmed.
-        with _block_docent_identity_recovery_signals():
-            try:
-                recovery_body = response.json()
-                if isinstance(recovery_body, dict):
-                    recovered_id = _validated_collection_id(
-                        recovery_body.get("collection_id")
-                    )
-                    if _attempt_state is not None:
-                        _attempt_state.collection_id = recovered_id
-                recovery_body = None
-                recovered_id = None
-            except BaseException:
-                pass
-        response = None
-        raise
+        body = response.json()
+    except Exception:
+        raise DocentCollectionAcknowledgementError(
+            "Docent collection response was not valid JSON"
+        ) from None
+    if not isinstance(body, dict):
+        raise DocentCollectionAcknowledgementError(
+            "Docent collection response was not a mapping"
+        )
+    collection_id = _validated_collection_id(body.get("collection_id"))
+    # The child publishes this identity before the first batch mutation. A
+    # SIGKILL between the 2xx and this callback remains honestly unknowable.
+    if on_confirmed is not None:
+        on_confirmed(collection_id)
+    return collection_id
 
 
 def _validate_ingestion_result(
@@ -1098,6 +814,7 @@ def _validate_ingestion_result(
     *,
     expected_runs: int,
     expected_batch_posts: int,
+    expected_job_ids: list[str] | None = None,
 ) -> None:
     if not isinstance(result, dict):
         raise DocentIngestionAcknowledgementError(
@@ -1122,153 +839,669 @@ def _validate_ingestion_result(
         or total_runs_added != expected_runs
         or expected_batch_posts <= 0
         or not valid_job_ids
+        or (expected_job_ids is not None and job_ids != expected_job_ids)
     ):
         raise DocentIngestionAcknowledgementError(
             "Docent did not confirm and complete every ingestion batch"
         )
 
 
-def upload(
+def _upload_in_child_process(
     runs: list[AgentRun],
-    base_collection_name: str,
-    launch_namespace: str,
-) -> DocentUploadResult | DocentUploadFailure | DocentUploadControlFlow:
-    """Push runs to this launch's new Docent collection.
-
-    External upload remains best-effort at the runner boundary.  This function
-    always creates the deterministic per-launch collection and passes the
-    scientific ``AgentRun`` objects through unchanged.
-    """
-    return _guarded_upload_with_budget(
-        runs,
-        base_collection_name,
-        launch_namespace,
-        _budget=_DocentTimeBudget.fixed(),
-    )
-
-
-def _guarded_upload_with_budget(
-    runs: list[AgentRun],
-    base_collection_name: str,
+    collection_name: str,
     launch_namespace: str,
     *,
     _budget: _DocentTimeBudget,
-) -> DocentUploadResult | DocentUploadFailure | DocentUploadControlFlow:
-    """Private tiny-budget seam around the production hard-deadline path."""
-    if not runs:
-        raise ValueError("Docent upload requires at least one AgentRun")
-    namespace = validate_launch_namespace(launch_namespace)
-    collection_name = collection_name_for_launch(base_collection_name, namespace)
-    attempt_state = _DocentUploadAttemptState()
-    try:
-        with _docent_hard_wall_clock_guard(_budget):
-            return _upload_with_budget(
-                runs,
-                base_collection_name,
-                namespace,
-                _budget=_budget,
-                _attempt_state=attempt_state,
-            )
-    except _DocentHardDeadlineSignal:
-        error_type = "DocentUploadDeadlineError"
-    except (DocentHardDeadlineUnavailableError, DocentUploadDeadlineError) as exc:
-        error_type = _sanitized_error_type(exc)
-    except KeyboardInterrupt:
-        failure = DocentUploadFailure(
-            collection_name=collection_name,
-            launch_namespace=namespace,
-            collection_id=attempt_state.collection_id,
-            error_type="KeyboardInterrupt",
-        )
-        return DocentUploadControlFlow(
-            failure=failure,
-            kind="KeyboardInterrupt",
-        )
-    except SystemExit as exc:
-        # Preserve an integer exit status, but never retain an arbitrary
-        # message/object that could carry response bodies or credentials.
-        if exc.code is None or type(exc.code) is int:
-            exit_code = exc.code
-        else:
-            exit_code = 1
-        failure = DocentUploadFailure(
-            collection_name=collection_name,
-            launch_namespace=namespace,
-            collection_id=attempt_state.collection_id,
-            error_type="SystemExit",
-        )
-        return DocentUploadControlFlow(
-            failure=failure,
-            kind="SystemExit",
-            exit_code=exit_code,
-        )
-    failure = DocentUploadFailure(
-        collection_name=collection_name,
-        launch_namespace=namespace,
-        collection_id=attempt_state.collection_id,
-        error_type=error_type,
-    )
-    return failure
-
-
-def _upload_with_budget(
-    runs: list[AgentRun],
-    base_collection_name: str,
-    launch_namespace: str,
-    *,
-    _budget: _DocentTimeBudget,
-    _attempt_state: _DocentUploadAttemptState | None = None,
+    on_collection_confirmed: Callable[[str], None],
 ) -> DocentUploadResult | DocentUploadFailure:
-    """Private deterministic-clock seam for no-network deadline tests."""
+    """Run the reviewed SDK seam inside the disposable dedicated child."""
     if not runs:
         raise ValueError("Docent upload requires at least one AgentRun")
     namespace = validate_launch_namespace(launch_namespace)
-    collection_name = collection_name_for_launch(base_collection_name, namespace)
-    attempt_state = (
-        _DocentUploadAttemptState() if _attempt_state is None else _attempt_state
-    )
-    # Starts before SDK import/class validation and, critically, before the
-    # constructor's authentication request.  This is fixed for manual/run_eval
-    # callers; it is deliberately not operator-configurable.
+    if not isinstance(collection_name, str) or not collection_name:
+        raise ValueError("Docent collection name is invalid")
     budget = _budget
+    collection_id: str | None = None
     try:
         from docent import Docent
 
-        # Exact versions and bytecode-visible class seams are checked before
-        # construction because Docent.__init__ performs authentication I/O.
         _validate_docent_sdk_class(Docent)
-        with _disable_pinned_docent_tqdm_monitor(Docent):
-            bounded_client_type = _bounded_docent_type(Docent, budget)
-            client = bounded_client_type(api_key=os.environ["DOCENT_API_KEY"])
-            tracker = _bind_single_attempt_mutation_posts(
-                client,
-                class_validated=True,
-                _budget=budget,
-            )
-            collection_id = _create_collection_once(
-                client,
-                collection_name,
-                _attempt_state=attempt_state,
-            )
-            # Assign the confirmed identity before enforcing the total deadline
-            # so a late complete 2xx create response remains identifiable.
-            budget.remaining()
-            ingestion_result = client.add_agent_runs(collection_id, runs)
-            _validate_ingestion_result(
-                ingestion_result,
-                expected_runs=len(runs),
-                expected_batch_posts=tracker.agent_batch_posts,
-            )
-            budget.remaining()
+        _disable_pinned_docent_tqdm_monitor_for_child(Docent)
+        bounded_client_type = _bounded_docent_type(Docent, budget)
+        client = bounded_client_type(
+            api_key=os.environ["DOCENT_API_KEY"],
+            config_file=os.devnull,
+        )
+        tracker = _bind_single_attempt_mutation_posts(
+            client,
+            class_validated=True,
+            _budget=budget,
+        )
+        collection_id = _create_collection_once(
+            client,
+            collection_name,
+            on_confirmed=on_collection_confirmed,
+        )
+        budget.remaining()
+        ingestion_result = client.add_agent_runs(collection_id, runs)
+        _validate_ingestion_result(
+            ingestion_result,
+            expected_runs=len(runs),
+            expected_batch_posts=tracker.agent_batch_posts,
+            expected_job_ids=tracker.job_ids,
+        )
+        budget.remaining()
     except Exception as exc:
         return DocentUploadFailure(
             collection_name=collection_name,
             launch_namespace=namespace,
-            collection_id=attempt_state.collection_id,
+            collection_id=collection_id,
             error_type=_sanitized_error_type(exc),
         )
+    assert collection_id is not None
     return DocentUploadResult(
         collection_name=collection_name,
         launch_namespace=namespace,
-        collection_id=attempt_state.collection_id,
+        collection_id=collection_id,
     )
+
+
+@dataclass(slots=True)
+class _DocentReceiptState:
+    collection_name: str
+    launch_namespace: str
+    collection_id: str | None = None
+    terminal: DocentUploadResult | DocentUploadFailure | None = None
+    protocol_error: str | None = None
+    receipt_bytes_seen: int = 0
+
+
+def _json_without_duplicate_keys(raw: bytes) -> Any:
+    def build(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=build)
+
+
+def _accept_docent_receipt_frame(state: _DocentReceiptState, raw: bytes) -> None:
+    """Apply one strict child event without retaining untrusted detail."""
+    if state.protocol_error is not None:
+        return
+    try:
+        if not raw or len(raw) > _DOCENT_RECEIPT_MAX_LINE_BYTES:
+            raise ValueError("receipt frame length invalid")
+        frame = _json_without_duplicate_keys(raw)
+        if not isinstance(frame, dict):
+            raise ValueError("receipt frame is not an object")
+        event = frame.get("event")
+        if event == "collection_confirmed":
+            if set(frame) != {
+                "event",
+                "collection_name",
+                "launch_namespace",
+                "collection_id",
+            }:
+                raise ValueError("collection frame schema invalid")
+            if state.collection_id is not None or state.terminal is not None:
+                raise ValueError("collection frame duplicated or late")
+            if (
+                frame["collection_name"] != state.collection_name
+                or frame["launch_namespace"] != state.launch_namespace
+            ):
+                raise ValueError("collection frame identity changed")
+            state.collection_id = _validated_collection_id(frame["collection_id"])
+            return
+        if event != "terminal" or state.terminal is not None:
+            raise ValueError("terminal frame missing, duplicate, or unknown")
+        status = frame.get("status")
+        if status == "confirmed":
+            if set(frame) != {
+                "event",
+                "status",
+                "collection_name",
+                "launch_namespace",
+                "collection_id",
+            }:
+                raise ValueError("confirmed terminal schema invalid")
+            if state.collection_id is None:
+                raise ValueError("confirmed terminal preceded collection identity")
+            if frame["collection_id"] != state.collection_id:
+                raise ValueError("terminal collection identity changed")
+            result: DocentUploadResult | DocentUploadFailure = DocentUploadResult(
+                collection_name=state.collection_name,
+                launch_namespace=state.launch_namespace,
+                collection_id=state.collection_id,
+            )
+        elif status == "ambiguous_or_unconfirmed":
+            if set(frame) != {
+                "event",
+                "status",
+                "collection_name",
+                "launch_namespace",
+                "collection_id",
+                "error_type",
+            }:
+                raise ValueError("failure terminal schema invalid")
+            error_type = frame["error_type"]
+            if (
+                not isinstance(error_type, str)
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", error_type)
+                is None
+            ):
+                raise ValueError("failure type invalid")
+            if frame["collection_id"] != state.collection_id:
+                raise ValueError("failure terminal collection identity changed")
+            result = DocentUploadFailure(
+                collection_name=state.collection_name,
+                launch_namespace=state.launch_namespace,
+                collection_id=state.collection_id,
+                error_type=error_type,
+            )
+        else:
+            raise ValueError("terminal status invalid")
+        if (
+            frame["collection_name"] != state.collection_name
+            or frame["launch_namespace"] != state.launch_namespace
+        ):
+            raise ValueError("terminal launch identity changed")
+        state.terminal = result
+    except Exception:
+        state.protocol_error = "DocentUploadProtocolError"
+
+
+def _consume_docent_receipt_bytes(
+    state: _DocentReceiptState,
+    buffer: bytearray,
+    chunk: bytes,
+    *,
+    eof: bool = False,
+) -> None:
+    if state.protocol_error is not None:
+        return
+    state.receipt_bytes_seen += len(chunk)
+    if state.receipt_bytes_seen > _DOCENT_RECEIPT_MAX_BYTES:
+        state.protocol_error = "DocentUploadProtocolError"
+        return
+    buffer.extend(chunk)
+    while True:
+        newline = buffer.find(b"\n")
+        if newline < 0:
+            break
+        raw = bytes(buffer[:newline])
+        del buffer[: newline + 1]
+        _accept_docent_receipt_frame(state, raw)
+    if len(buffer) > _DOCENT_RECEIPT_MAX_LINE_BYTES or (eof and buffer):
+        state.protocol_error = "DocentUploadProtocolError"
+
+
+def _waitpid_nointr(pid: int, options: int) -> tuple[int, int]:
+    while True:
+        try:
+            return os.waitpid(pid, options)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            raise DocentUploadChildOwnershipError(
+                "lost authoritative wait status for the Docent upload child"
+            ) from None
+
+
+def _kill_docent_process_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if sys.platform == "darwin":
+            try:
+                # Darwin reports EPERM for a group whose only remaining
+                # member is the known unreaped zombie leader. WNOWAIT proves
+                # that narrow state while still pinning PGID until waitpid.
+                if _child_exited_without_reaping(pid):
+                    return
+            except (OSError, DocentUploadChildOwnershipError):
+                pass
+        raise DocentUploadCleanupError(
+            "permission denied while cleaning the dedicated Docent process group"
+        ) from None
+
+
+def _drain_receipt_fd(
+    receipt_fd: int,
+    state: _DocentReceiptState,
+    buffer: bytearray,
+) -> bool:
+    """Drain a bounded amount of currently readable data; return true on EOF."""
+    eof = False
+    for _ in range(4):
+        if state.protocol_error is not None:
+            break
+        try:
+            chunk = os.read(receipt_fd, 4096)
+        except BlockingIOError:
+            break
+        except InterruptedError:
+            continue
+        if not chunk:
+            eof = True
+            _consume_docent_receipt_bytes(state, buffer, b"", eof=True)
+            break
+        _consume_docent_receipt_bytes(state, buffer, chunk)
+    return eof
+
+
+def _child_exited_without_reaping(pid: int) -> bool:
+    """Observe exit while retaining the leader zombie to pin its process group."""
+    if not hasattr(os, "waitid"):
+        # CPython on macOS does not expose waitid even though Darwin provides
+        # the required XSI syscall. Keep the same WNOWAIT invariant through a
+        # narrow libc binding.
+        if sys.platform != "darwin":
+            raise RuntimeError("waitid WNOWAIT is unavailable")
+        import ctypes
+
+        class Siginfo(ctypes.Structure):
+            _fields_ = [
+                ("si_signo", ctypes.c_int),
+                ("si_errno", ctypes.c_int),
+                ("si_code", ctypes.c_int),
+                ("si_pid", ctypes.c_int),
+                ("si_uid", ctypes.c_uint),
+                ("si_status", ctypes.c_int),
+                ("si_addr", ctypes.c_void_p),
+                ("si_value", ctypes.c_void_p),
+                ("si_band", ctypes.c_long),
+                ("pad", ctypes.c_ulong * 7),
+            ]
+        libc = ctypes.CDLL(None, use_errno=True)
+        waitid = libc.waitid
+        waitid.argtypes = [
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.POINTER(Siginfo),
+            ctypes.c_int,
+        ]
+        waitid.restype = ctypes.c_int
+        while True:
+            info = Siginfo()
+            if waitid(1, pid, ctypes.byref(info), 0x04 | 0x20 | 0x01) == 0:
+                return info.si_pid == pid
+            error = ctypes.get_errno()
+            if error == 4:  # EINTR
+                continue
+            raise OSError(error, os.strerror(error))
+    while True:
+        try:
+            result = os.waitid(
+                os.P_PID,
+                pid,
+                os.WEXITED | os.WNOWAIT | os.WNOHANG,
+            )
+            return result is not None
+        except InterruptedError:
+            continue
+
+
+def _sweep_and_reap_docent_group(
+    pid: int,
+    receipt_fd: int,
+    state: _DocentReceiptState,
+    buffer: bytearray,
+) -> int:
+    """Kill descendants while the unreaped leader pins the fresh PGID."""
+    _kill_docent_process_group(pid, signal.SIGKILL)
+    _drain_receipt_fd(receipt_fd, state, buffer)
+    _waited_pid, status = _waitpid_nointr(pid, 0)
+    _drain_receipt_fd(receipt_fd, state, buffer)
+    return status
+
+
+def _terminate_and_reap_docent_child(
+    pid: int,
+    receipt_fd: int,
+    state: _DocentReceiptState,
+    buffer: bytearray,
+    *,
+    force_kill_at: float,
+) -> int:
+    """Send TERM, briefly drain receipt frames, then force-KILL and reap."""
+    term_sent = False
+    while True:
+        try:
+            if not term_sent:
+                _kill_docent_process_group(pid, signal.SIGTERM)
+                term_sent = True
+            if time.monotonic() < force_kill_at:
+                _drain_receipt_fd(receipt_fd, state, buffer)
+                try:
+                    select.select(
+                        [receipt_fd],
+                        [],
+                        [],
+                        min(0.01, max(0.0, force_kill_at - time.monotonic())),
+                    )
+                except InterruptedError:
+                    pass
+                continue
+            return _sweep_and_reap_docent_group(
+                pid, receipt_fd, state, buffer
+            )
+        except (KeyboardInterrupt, SystemExit):
+            # The first operator control flow is already represented by the
+            # caller's sanitized carrier. Cleanup is idempotent and must finish
+            # even if another asynchronous control-flow exception lands here.
+            continue
+
+
+def _safe_spawn_source_fd(fd: int) -> int:
+    duplicate = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 200)
+    while duplicate in {_DOCENT_JSONL_FD, _DOCENT_RECEIPT_FD}:
+        replacement = fcntl.fcntl(duplicate, fcntl.F_DUPFD_CLOEXEC, 200)
+        os.close(duplicate)
+        duplicate = replacement
+    return duplicate
+
+
+def _child_default_signals() -> tuple[int, ...]:
+    excluded = {signal.SIGKILL, signal.SIGSTOP}
+    return tuple(
+        sorted(int(sig) for sig in signal.valid_signals() if sig not in excluded)
+    )
+
+
+def _docent_child_environment(
+    collection_name: str,
+    launch_namespace: str,
+    deadline: float,
+) -> dict[str, str]:
+    api_key = os.environ.get("DOCENT_API_KEY")
+    if not isinstance(api_key, str) or not api_key:
+        raise ValueError("DOCENT_API_KEY is required for external Docent upload")
+    api_url = os.environ.get("DOCENT_API_URL")
+    frontend_url = os.environ.get("DOCENT_FRONTEND_URL")
+    domain = os.environ.get("DOCENT_DOMAIN")
+    if (api_url is None) != (frontend_url is None):
+        raise ValueError("DOCENT_API_URL and DOCENT_FRONTEND_URL must be supplied together")
+    if domain is not None and api_url is not None:
+        raise ValueError("DOCENT_DOMAIN cannot be combined with explicit Docent URLs")
+    environment = {
+        "DOCENT_API_KEY": api_key,
+        "DEBATE_DOCENT_COLLECTION_NAME": collection_name,
+        "DEBATE_DOCENT_LAUNCH_NAMESPACE": launch_namespace,
+        "DEBATE_DOCENT_DEADLINE_MONOTONIC": format(deadline, ".17g"),
+    }
+    if api_url is not None:
+        environment["DOCENT_API_URL"] = api_url
+        environment["DOCENT_FRONTEND_URL"] = frontend_url  # type: ignore[assignment]
+    elif domain is not None:
+        environment["DOCENT_DOMAIN"] = domain
+    return environment
+
+
+def _explicit_inheritable_fds() -> list[int]:
+    """Snapshot open inheritable descriptors for explicit spawn closure."""
+    directory = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+    result: list[int] = []
+    for entry in os.listdir(directory):
+        try:
+            fd = int(entry)
+        except ValueError:
+            continue
+        if fd <= 2:
+            continue
+        try:
+            if os.get_inheritable(fd):
+                result.append(fd)
+        except OSError:
+            continue
+    return sorted(set(result))
+
+
+def _spawn_docent_upload_child(
+    jsonl_fd: int,
+    receipt_write_fd: int,
+    collection_name: str,
+    launch_namespace: str,
+    deadline: float,
+    *,
+    worker_path: Path = _DOCENT_WORKER_PATH,
+) -> int:
+    python = os.path.abspath(sys.executable)
+    worker = worker_path.resolve()
+    if not worker.is_absolute() or not worker.is_file():
+        raise RuntimeError("Docent upload worker is unavailable")
+    environment = _docent_child_environment(
+        collection_name, launch_namespace, deadline
+    )
+    with _DOCENT_SPAWN_LOCK:
+        jsonl_source = _safe_spawn_source_fd(jsonl_fd)
+        receipt_source = _safe_spawn_source_fd(receipt_write_fd)
+        try:
+            inherited = _explicit_inheritable_fds()
+            preserved = {
+                jsonl_source,
+                receipt_source,
+                _DOCENT_JSONL_FD,
+                _DOCENT_RECEIPT_FD,
+            }
+            actions = [
+                (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+                (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
+                (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
+            ]
+            actions.extend(
+                (os.POSIX_SPAWN_CLOSE, fd)
+                for fd in inherited
+                if fd not in preserved
+            )
+            actions.extend(
+                [
+                    (os.POSIX_SPAWN_DUP2, jsonl_source, _DOCENT_JSONL_FD),
+                    (os.POSIX_SPAWN_DUP2, receipt_source, _DOCENT_RECEIPT_FD),
+                    (os.POSIX_SPAWN_CLOSE, jsonl_source),
+                    (os.POSIX_SPAWN_CLOSE, receipt_source),
+                ]
+            )
+            return os.posix_spawn(
+                python,
+                [python, "-I", "-B", os.fspath(worker)],
+                environment,
+                file_actions=actions,
+                setpgroup=0,
+                setsigmask=(),
+                setsigdef=_child_default_signals(),
+            )
+        finally:
+            os.close(jsonl_source)
+            os.close(receipt_source)
+
+
+def upload(
+    jsonl_fd: int,
+    base_collection_name: str,
+    launch_namespace: str,
+    *,
+    _deadline_seconds: float = _DOCENT_TOTAL_BUDGET_SECONDS,
+    _worker_path: Path = _DOCENT_WORKER_PATH,
+) -> DocentUploadResult | DocentUploadFailure | DocentUploadControlFlow:
+    """Supervise one dedicated external-upload child from an open JSONL FD."""
+    namespace = validate_launch_namespace(launch_namespace)
+    collection_name = collection_name_for_launch(base_collection_name, namespace)
+    if (
+        isinstance(_deadline_seconds, bool)
+        or not isinstance(_deadline_seconds, (int, float))
+        or not 0 < float(_deadline_seconds) <= _DOCENT_TOTAL_BUDGET_SECONDS
+    ):
+        raise ValueError("Docent child deadline must be positive and at most five minutes")
+    stat_result = os.fstat(jsonl_fd)
+    if not stat.S_ISREG(stat_result.st_mode):
+        raise ValueError("Docent JSONL descriptor must reference a regular file")
+    if (fcntl.fcntl(jsonl_fd, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
+        raise ValueError("Docent JSONL descriptor must be read-only")
+    if stat_result.st_size <= 0:
+        raise ValueError("Docent upload requires nonempty canonical JSONL")
+    if len(collection_name.encode("utf-8")) > _DOCENT_RECEIPT_MAX_LINE_BYTES // 2:
+        raise ValueError("Docent collection name is too large for the receipt protocol")
+    if not hasattr(os, "waitid") and sys.platform != "darwin":
+        raise RuntimeError("Docent process-group supervision requires waitid WNOWAIT")
+
+    receipt_read_fd, receipt_write_fd = os.pipe()
+    os.set_blocking(receipt_read_fd, False)
+    pid: int | None = None
+    state = _DocentReceiptState(collection_name, namespace)
+    buffer = bytearray()
+    child_status: int | None = None
+    try:
+        # This is the authoritative start of both the parent and child budget.
+        deadline = time.monotonic() + float(_deadline_seconds)
+        pid = _spawn_docent_upload_child(
+            jsonl_fd,
+            receipt_write_fd,
+            collection_name,
+            namespace,
+            deadline,
+            worker_path=_worker_path,
+        )
+        os.close(receipt_write_fd)
+        receipt_write_fd = -1
+        eof = False
+        termination_error: str | None = None
+        revocation_deadline = max(
+            time.monotonic(),
+            deadline - _DOCENT_LOCAL_TERMINATION_GRACE_SECONDS,
+        )
+        while True:
+            now = time.monotonic()
+            if state.protocol_error is not None:
+                termination_error = state.protocol_error
+                break
+            if now >= revocation_deadline:
+                termination_error = "DocentUploadDeadlineError"
+                break
+            eof = _drain_receipt_fd(receipt_read_fd, state, buffer) or eof
+            if _child_exited_without_reaping(pid):
+                # The unreaped leader pins PGID==PID while we terminate any
+                # descendants, including on a nominally successful exit.
+                child_status = _sweep_and_reap_docent_group(
+                    pid, receipt_read_fd, state, buffer
+                )
+                break
+            timeout = min(
+                0.05,
+                max(0.0, revocation_deadline - time.monotonic()),
+            )
+            try:
+                select.select([receipt_read_fd], [], [], timeout)
+            except InterruptedError:
+                continue
+        if termination_error is not None:
+            cleanup_end = min(
+                deadline,
+                time.monotonic() + _DOCENT_LOCAL_TERMINATION_GRACE_SECONDS,
+            )
+            try:
+                child_status = _terminate_and_reap_docent_child(
+                    pid,
+                    receipt_read_fd,
+                    state,
+                    buffer,
+                    force_kill_at=max(
+                        time.monotonic(),
+                        cleanup_end - _DOCENT_FORCE_KILL_REAP_RESERVE_SECONDS,
+                    ),
+                )
+            except Exception as cleanup_exc:
+                termination_error = _sanitized_error_type(cleanup_exc)
+            return DocentUploadFailure(
+                collection_name=collection_name,
+                launch_namespace=namespace,
+                collection_id=state.collection_id,
+                error_type=termination_error,
+            )
+        assert child_status is not None
+        exit_code = os.waitstatus_to_exitcode(child_status)
+        if state.protocol_error is not None:
+            return DocentUploadFailure(
+                collection_name=collection_name,
+                launch_namespace=namespace,
+                collection_id=state.collection_id,
+                error_type=state.protocol_error,
+            )
+        if isinstance(state.terminal, DocentUploadResult) and exit_code == 0:
+            return state.terminal
+        if isinstance(state.terminal, DocentUploadFailure):
+            return state.terminal
+        return DocentUploadFailure(
+            collection_name=collection_name,
+            launch_namespace=namespace,
+            collection_id=state.collection_id,
+            error_type="DocentUploadChildExitError",
+        )
+    except (KeyboardInterrupt, SystemExit) as exc:
+        cleanup_error_type: str | None = None
+        if pid is not None:
+            cleanup_end = min(
+                deadline,
+                time.monotonic() + _DOCENT_LOCAL_TERMINATION_GRACE_SECONDS,
+            )
+            try:
+                _terminate_and_reap_docent_child(
+                    pid,
+                    receipt_read_fd,
+                    state,
+                    buffer,
+                    force_kill_at=max(
+                        time.monotonic(),
+                        cleanup_end - _DOCENT_FORCE_KILL_REAP_RESERVE_SECONDS,
+                    ),
+                )
+            except Exception as cleanup_exc:
+                cleanup_error_type = _sanitized_error_type(cleanup_exc)
+        kind = "KeyboardInterrupt" if isinstance(exc, KeyboardInterrupt) else "SystemExit"
+        exit_code = None
+        if isinstance(exc, SystemExit):
+            exit_code = exc.code if type(exc.code) is int else 1
+        return DocentUploadControlFlow(
+            failure=DocentUploadFailure(
+                collection_name=collection_name,
+                launch_namespace=namespace,
+                collection_id=state.collection_id,
+                error_type=cleanup_error_type or kind,
+            ),
+            kind=kind,
+            exit_code=exit_code,
+        )
+    except Exception as exc:
+        if pid is not None:
+            cleanup_end = min(
+                deadline,
+                time.monotonic() + _DOCENT_LOCAL_TERMINATION_GRACE_SECONDS,
+            )
+            try:
+                _terminate_and_reap_docent_child(
+                    pid,
+                    receipt_read_fd,
+                    state,
+                    buffer,
+                    force_kill_at=max(
+                        time.monotonic(),
+                        cleanup_end - _DOCENT_FORCE_KILL_REAP_RESERVE_SECONDS,
+                    ),
+                )
+            except Exception as cleanup_exc:
+                exc = cleanup_exc
+        return DocentUploadFailure(
+            collection_name=collection_name,
+            launch_namespace=namespace,
+            collection_id=state.collection_id,
+            error_type=_sanitized_error_type(exc),
+        )
+    finally:
+        if receipt_write_fd >= 0:
+            os.close(receipt_write_fd)
+        os.close(receipt_read_fd)

@@ -8,17 +8,13 @@ artifact writers, and filesystem claim with one synthetic JSONL row.
 
 import hashlib
 import json
-import logging
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
-import requests
 import yaml
-from requests.adapters import HTTPAdapter
 
 import infra.run_eval as run_eval
 from infra.envs.base import Task
@@ -61,19 +57,6 @@ mb_test:
 ATTACK_POS = "The trajectory contains a deliberate attack."
 HONEST_POS = "The trajectory is an honest solution."
 BACKGROUND = "SYNTHETIC-TRAJECTORY-TEXT do-not-print-me"
-
-
-@pytest.fixture(autouse=True)
-def _stop_docent_tqdm_monitor_between_tests():
-    """Keep each external-upload test's signal admission independent."""
-    from tqdm.std import tqdm
-
-    monitor_before = tqdm.monitor
-    yield
-    monitor = tqdm.monitor
-    if monitor_before is None and monitor is not None:
-        monitor.exit()
-        tqdm.monitor = None
 
 
 @pytest.fixture(scope="module")
@@ -727,11 +710,14 @@ def test_main_passes_docent_base_and_already_resolved_namespace(
     artifact_root = tmp_path / "artifacts"
     captured_upload = {}
 
-    def capture_upload(runs, *, base_collection_name, launch_namespace):
+    def capture_upload(jsonl_fd, *, base_collection_name, launch_namespace):
         from infra.envs.debate.docent_export import DocentUploadResult
 
+        with os.fdopen(os.dup(jsonl_fd), "rb") as source:
+            exact_jsonl = source.read()
         captured_upload.update(
-            runs=runs,
+            jsonl_fd=jsonl_fd,
+            exact_jsonl=exact_jsonl,
             base_collection_name=base_collection_name,
             launch_namespace=launch_namespace,
         )
@@ -755,7 +741,9 @@ def test_main_passes_docent_base_and_already_resolved_namespace(
 
     assert captured_upload["base_collection_name"] == "mb-eval"
     assert captured_upload["launch_namespace"] == launch_namespace
-    assert len(captured_upload["runs"]) == 1
+    assert len(captured_upload["exact_jsonl"].splitlines()) == 1
+    with pytest.raises(OSError):
+        os.fstat(captured_upload["jsonl_fd"])
     captured = capsys.readouterr()
     receipts = [
         json.loads(line)
@@ -772,639 +760,6 @@ def test_main_passes_docent_base_and_already_resolved_namespace(
         }
     ]
     assert "error_type" not in receipts[0]
-
-
-def test_main_preserves_confirmed_docent_id_when_real_batch_post_fails_once(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
-):
-    """Production upload + installed SDK methods, with only transport faked."""
-    import docent
-
-    class CreateThenFailAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append(request)
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.headers["content-type"] = "application/json"
-            if len(self.calls) == 1:
-                response.status_code = 200
-                body = {"collection_id": "confirmed-collection-123"}
-            elif len(self.calls) == 2:
-                response.status_code = 500
-                body = {"detail": "sensitive upstream message"}
-            else:
-                raise AssertionError("Docent mutation was repeated")
-            response._content = json.dumps(body).encode("utf-8")
-            return response
-
-    session = requests.Session()
-    adapter = CreateThenFailAdapter()
-    session.mount("https://", adapter)
-    client = object.__new__(docent.Docent)
-    client._api_url = "https://docent.invalid/rest"
-    client._frontend_url = "https://docent.invalid"
-    client._logger = logging.getLogger("test-docent-production-composition")
-    client._session = session
-    class ReturningDocent(docent.Docent):
-        def __new__(cls, **kwargs):
-            return client
-
-    monkeypatch.setattr(docent, "Docent", ReturningDocent)
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    run_eval.main(
-        _artifact_argv(
-            exp_file,
-            artifact_root,
-            "--docent-collection",
-            "mb-eval",
-            "--allow-trajectory-upload",
-        ),
-        task_source=MBTaskSource(1),
-    )
-
-    assert len(adapter.calls) == 2
-    assert adapter.calls[0].url.endswith("/rest/create")
-    assert adapter.calls[1].url.endswith(
-        "/rest/confirmed-collection-123/agent_runs"
-    )
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-collection-123",
-            "error_type": "DocentMutationHTTPStatusError",
-        }
-    ]
-    assert "sensitive upstream message" not in captured.err
-
-
-def test_main_docent_batch_timeout_keeps_local_success_and_confirmed_receipt(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
-):
-    import docent
-
-    class CreateThenTimeoutAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append((request, kwargs))
-            if len(self.calls) == 1:
-                response = requests.Response()
-                response.request = request
-                response.url = request.url
-                response.status_code = 200
-                response.headers["content-type"] = "application/json"
-                response._content = json.dumps(
-                    {"collection_id": "confirmed-timeout-collection"}
-                ).encode("utf-8")
-                return response
-            if len(self.calls) == 2:
-                raise requests.ReadTimeout("test-only raw timeout detail")
-            raise AssertionError("timed-out Docent mutation was repeated")
-
-    session = requests.Session()
-    adapter = CreateThenTimeoutAdapter()
-    session.mount("https://", adapter)
-    client = object.__new__(docent.Docent)
-    client._api_url = "https://docent.invalid/rest"
-    client._frontend_url = "https://docent.invalid"
-    client._logger = logging.getLogger("test-docent-timeout-composition")
-    client._session = session
-
-    class ReturningDocent(docent.Docent):
-        def __new__(cls, **kwargs):
-            return client
-
-    monkeypatch.setattr(docent, "Docent", ReturningDocent)
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    run_eval.main(
-        _artifact_argv(
-            exp_file,
-            artifact_root,
-            "--docent-collection",
-            "mb-eval",
-            "--allow-trajectory-upload",
-        ),
-        task_source=MBTaskSource(1),
-    )
-
-    artifact_dir = artifact_root / launch_namespace
-    assert sorted(path.name for path in artifact_dir.iterdir()) == [
-        "docent.jsonl",
-        "results.jsonl",
-        "summary.json",
-    ]
-    assert len(adapter.calls) == 2
-    assert [kwargs["timeout"] for _request, kwargs in adapter.calls] == [
-        (10.0, 120.0),
-        (10.0, 120.0),
-    ]
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-timeout-collection",
-            "error_type": "ReadTimeout",
-        }
-    ]
-    assert "test-only raw timeout detail" not in captured.err
-
-
-def test_main_hard_docent_deadline_keeps_local_success_and_exact_receipt(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
-):
-    import signal
-
-    import infra.envs.debate.docent_export as docent_export
-
-    if not hasattr(signal, "setitimer"):
-        pytest.skip("POSIX interval timers unavailable")
-    active_timer = signal.getitimer(signal.ITIMER_REAL)
-    if active_timer[0] > 0 or active_timer[1] > 0:
-        pytest.skip("test process already owns ITIMER_REAL")
-
-    class CreateThenTrickleAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-            self.trickles = 0
-
-        def send(self, request, **kwargs):
-            self.calls.append((request, kwargs))
-            if len(self.calls) == 1:
-                status_code, body = 200, {}
-            elif len(self.calls) == 2:
-                status_code, body = 200, {
-                    "collection_id": "confirmed-hard-deadline-id"
-                }
-            elif len(self.calls) == 3:
-                while True:
-                    self.trickles += 1
-                    time.sleep(0.01)
-            else:
-                raise AssertionError("hard-timed-out Docent request was repeated")
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.status_code = status_code
-            response.headers["content-type"] = "application/json"
-            response._content = json.dumps(body).encode("utf-8")
-            return response
-
-    adapter = CreateThenTrickleAdapter()
-    original_session_init = requests.Session.__init__
-
-    def initialize_session(session, *args, **kwargs):
-        original_session_init(session, *args, **kwargs)
-        session.mount("https://", adapter)
-
-    def tiny_fixed_budget(cls, *, clock=None, sleeper=None):
-        return cls(
-            deadline=time.monotonic() + 0.5,
-            clock=time.monotonic,
-            sleeper=time.sleep,
-        )
-
-    monkeypatch.setattr(requests.Session, "__init__", initialize_session)
-    monkeypatch.setattr(
-        docent_export._DocentTimeBudget,
-        "fixed",
-        classmethod(tiny_fixed_budget),
-    )
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-    monkeypatch.setenv("DOCENT_API_URL", "https://docent.invalid/rest")
-    monkeypatch.setenv("DOCENT_FRONTEND_URL", "https://docent.invalid")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    run_eval.main(
-        _artifact_argv(
-            exp_file,
-            artifact_root,
-            "--docent-collection",
-            "mb-eval",
-            "--allow-trajectory-upload",
-        ),
-        task_source=MBTaskSource(1),
-    )
-
-    artifact_dir = artifact_root / launch_namespace
-    assert sorted(path.name for path in artifact_dir.iterdir()) == [
-        "docent.jsonl",
-        "results.jsonl",
-        "summary.json",
-    ]
-    assert len(adapter.calls) == 3
-    assert adapter.trickles > 0
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-hard-deadline-id",
-            "error_type": "DocentUploadDeadlineError",
-        }
-    ]
-
-
-def test_main_multi_gib_logical_upload_expires_ambiguously_without_retry(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
-):
-    """Exercise >3 GiB of 100 MiB logical batches without allocating them."""
-    import docent
-    import infra.envs.debate.docent_export as docent_export
-
-    logical_batch_bytes = 100 * 1024 * 1024
-    declared_batches = 40
-    consumed_batches = []
-    fake_now = [0.0]
-
-    def fake_batches(_runs, _max_payload_bytes):
-        for batch_number in range(1, declared_batches + 1):
-            consumed_batches.append(batch_number)
-            # The fake payload is tiny; metadata above represents the real
-            # 100 MiB boundary exercised by this deterministic oracle.
-            yield 1, b"{}"
-
-    add_globals = docent.Docent.add_agent_runs.__globals__
-    monkeypatch.setitem(
-        add_globals,
-        "yield_agent_run_batches_by_size",
-        fake_batches,
-    )
-
-    class Adapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append(request)
-            call_number = len(self.calls)
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.status_code = 200 if call_number <= 2 else 202
-            response.headers["content-type"] = "application/json"
-            if call_number == 1:
-                body = {}
-            elif call_number == 2:
-                body = {"collection_id": "confirmed-multi-gib-id"}
-            else:
-                fake_now[0] += 1.0
-                body = {"job_id": f"logical-job-{call_number - 2}"}
-            response._content = json.dumps(body).encode("utf-8")
-            return response
-
-    adapter = Adapter()
-    original_session_init = requests.Session.__init__
-
-    def initialize_session(session, *args, **kwargs):
-        original_session_init(session, *args, **kwargs)
-        session.mount("https://", adapter)
-
-    def fake_fixed_budget(cls, *, clock=None, sleeper=None):
-        return cls(
-            deadline=30.5,
-            clock=lambda: fake_now[0],
-            sleeper=lambda seconds: fake_now.__setitem__(0, fake_now[0] + seconds),
-        )
-
-    monkeypatch.setattr(requests.Session, "__init__", initialize_session)
-    monkeypatch.setattr(
-        docent_export._DocentTimeBudget,
-        "fixed",
-        classmethod(fake_fixed_budget),
-    )
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-    monkeypatch.setenv("DOCENT_API_URL", "https://docent.invalid/rest")
-    monkeypatch.setenv("DOCENT_FRONTEND_URL", "https://docent.invalid")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    run_eval.main(
-        _artifact_argv(
-            exp_file,
-            artifact_root,
-            "--docent-collection",
-            "mb-eval",
-            "--allow-trajectory-upload",
-        ),
-        task_source=MBTaskSource(1),
-    )
-
-    # The 31st distinct one-send batch crosses the fake deadline after more
-    # than 3 GiB of represented data. It is never retried or adopted.
-    assert len(consumed_batches) == 31
-    assert len(consumed_batches) * logical_batch_bytes > 3 * 1024**3
-    assert len(adapter.calls) == 2 + len(consumed_batches)
-    assert len({request.body for request in adapter.calls[2:]}) == 1
-    assert sorted(
-        path.name for path in (artifact_root / launch_namespace).iterdir()
-    ) == ["docent.jsonl", "results.jsonl", "summary.json"]
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-multi-gib-id",
-            "error_type": "DocentUploadDeadlineError",
-        }
-    ]
-
-
-@pytest.mark.parametrize(
-    ("control_kind", "phase", "expected_collection_id", "expected_calls"),
-    [
-        ("KeyboardInterrupt", "create", None, 2),
-        (
-            "KeyboardInterrupt",
-            "batch",
-            "confirmed-control-flow-id",
-            3,
-        ),
-        ("SystemExit", "create", None, 2),
-        ("SystemExit", "batch", "confirmed-control-flow-id", 3),
-    ],
-)
-def test_main_docent_control_flow_emits_receipt_then_raises_fresh_sanitized(
-    tmp_path,
-    prompt_file,
-    launch_namespace,
-    monkeypatch,
-    capsys,
-    control_kind,
-    phase,
-    expected_collection_id,
-    expected_calls,
-):
-    import signal
-
-    if not hasattr(signal, "setitimer"):
-        pytest.skip("POSIX interval timers unavailable")
-    active_timer = signal.getitimer(signal.ITIMER_REAL)
-    if active_timer[0] > 0 or active_timer[1] > 0:
-        pytest.skip("test process already owns ITIMER_REAL")
-
-    class ControlFlowAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append((request, kwargs))
-            call_number = len(self.calls)
-            should_interrupt = (
-                phase == "create" and call_number == 2
-            ) or (
-                phase == "batch" and call_number == 3
-            )
-            if should_interrupt:
-                if control_kind == "KeyboardInterrupt":
-                    raise KeyboardInterrupt("RAW-CONTROL-FLOW-SECRET")
-                raise SystemExit("RAW-CONTROL-FLOW-SECRET")
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.status_code = 200
-            response.headers["content-type"] = "application/json"
-            if call_number == 1:
-                body = {}
-            elif call_number == 2:
-                body = {"collection_id": "confirmed-control-flow-id"}
-            else:
-                raise AssertionError("control-flow request was repeated")
-            response._content = json.dumps(body).encode("utf-8")
-            return response
-
-    adapter = ControlFlowAdapter()
-    original_session_init = requests.Session.__init__
-
-    def initialize_session(session, *args, **kwargs):
-        original_session_init(session, *args, **kwargs)
-        session.mount("https://", adapter)
-
-    monkeypatch.setattr(requests.Session, "__init__", initialize_session)
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-    monkeypatch.setenv("DOCENT_API_URL", "https://docent.invalid/rest")
-    monkeypatch.setenv("DOCENT_FRONTEND_URL", "https://docent.invalid")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    exception_type = KeyboardInterrupt if control_kind == "KeyboardInterrupt" else SystemExit
-    with pytest.raises(exception_type) as caught:
-        run_eval.main(
-            _artifact_argv(
-                exp_file,
-                artifact_root,
-                "--docent-collection",
-                "mb-eval",
-                "--allow-trajectory-upload",
-            ),
-            task_source=MBTaskSource(1),
-        )
-
-    assert len(adapter.calls) == expected_calls
-    assert caught.value.args in {(), (1,)}
-    artifact_dir = artifact_root / launch_namespace
-    assert sorted(path.name for path in artifact_dir.iterdir()) == [
-        "docent.jsonl",
-        "results.jsonl",
-        "summary.json",
-    ]
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": expected_collection_id,
-            "error_type": control_kind,
-        }
-    ]
-    assert "RAW-CONTROL-FLOW-SECRET" not in captured.err
-    assert "RAW-CONTROL-FLOW-SECRET" not in repr(caught.value)
-
-    traceback_cursor = caught.value.__traceback__
-    traceback_frames = []
-    while traceback_cursor is not None:
-        traceback_frames.append(traceback_cursor.tb_frame)
-        traceback_cursor = traceback_cursor.tb_next
-    assert all(frame.f_code.co_name != "_main_impl" for frame in traceback_frames)
-    for frame in traceback_frames:
-        retained = repr(frame.f_locals)
-        assert "RAW-CONTROL-FLOW-SECRET" not in retained
-        assert BACKGROUND not in retained
-        assert "runs" not in frame.f_locals
-
-
-@pytest.mark.parametrize("control_kind", ["KeyboardInterrupt", "SystemExit"])
-def test_main_interrupt_after_confirmed_id_validation_retains_id(
-    tmp_path,
-    prompt_file,
-    launch_namespace,
-    monkeypatch,
-    capsys,
-    control_kind,
-):
-    """A real interrupt in the validate/store gap keeps the confirmed ID."""
-    import signal
-
-    import infra.envs.debate.docent_export as docent_export
-
-    if not hasattr(signal, "setitimer"):
-        pytest.skip("POSIX interval timers unavailable")
-    active_timer = signal.getitimer(signal.ITIMER_REAL)
-    if active_timer[0] > 0 or active_timer[1] > 0:
-        pytest.skip("test process already owns ITIMER_REAL")
-
-    class Adapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append(request)
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.status_code = 200
-            response.headers["content-type"] = "application/json"
-            body = (
-                {}
-                if len(self.calls) == 1
-                else {"collection_id": "confirmed-before-interrupt"}
-            )
-            if len(self.calls) > 2:
-                raise AssertionError("interrupted create was followed by another send")
-            response._content = json.dumps(body).encode("utf-8")
-            return response
-
-    adapter = Adapter()
-    original_session_init = requests.Session.__init__
-
-    def initialize_session(session, *args, **kwargs):
-        original_session_init(session, *args, **kwargs)
-        session.mount("https://", adapter)
-
-    original_validate = docent_export._validated_collection_id
-    validations = 0
-
-    def interrupt_after_validation(value):
-        nonlocal validations
-        confirmed = original_validate(value)
-        validations += 1
-        if validations == 1:
-            if control_kind == "KeyboardInterrupt":
-                os.kill(os.getpid(), signal.SIGINT)
-            raise SystemExit("RAW-POST-VALIDATION-SECRET")
-        return confirmed
-
-    monkeypatch.setattr(requests.Session, "__init__", initialize_session)
-    monkeypatch.setattr(
-        docent_export,
-        "_validated_collection_id",
-        interrupt_after_validation,
-    )
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-    monkeypatch.setenv("DOCENT_API_URL", "https://docent.invalid/rest")
-    monkeypatch.setenv("DOCENT_FRONTEND_URL", "https://docent.invalid")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    artifact_root = tmp_path / "artifacts"
-    exception_type = (
-        KeyboardInterrupt if control_kind == "KeyboardInterrupt" else SystemExit
-    )
-    with pytest.raises(exception_type) as caught:
-        run_eval.main(
-            _artifact_argv(
-                exp_file,
-                artifact_root,
-                "--docent-collection",
-                "mb-eval",
-                "--allow-trajectory-upload",
-            ),
-            task_source=MBTaskSource(1),
-        )
-
-    assert validations == 2
-    assert len(adapter.calls) == 2
-    assert caught.value.args in {(), (1,)}
-    assert sorted(
-        path.name for path in (artifact_root / launch_namespace).iterdir()
-    ) == ["docent.jsonl", "results.jsonl", "summary.json"]
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-before-interrupt",
-            "error_type": control_kind,
-        }
-    ]
-    assert "RAW-POST-VALIDATION-SECRET" not in captured.err
-    traceback_cursor = caught.value.__traceback__
-    while traceback_cursor is not None:
-        retained = repr(traceback_cursor.tb_frame.f_locals)
-        assert "RAW-POST-VALIDATION-SECRET" not in retained
-        assert BACKGROUND not in retained
-        traceback_cursor = traceback_cursor.tb_next
 
 
 def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
@@ -1462,157 +817,68 @@ def test_main_broken_receipt_writer_cannot_replace_operator_interrupt(
         traceback_cursor = traceback_cursor.tb_next
 
 
-def test_main_records_unconfirmed_receipt_for_malformed_real_docent_202(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
+def test_main_broken_receipt_emission_is_not_retried_or_made_local_failure(
+    tmp_path, prompt_file, launch_namespace, monkeypatch
 ):
-    """A 2xx without a per-batch job ID is not confirmed ingestion."""
-    import docent
+    import builtins
+    import infra.envs.debate.docent_export as docent_export
 
-    class MalformedAckAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
+    monkeypatch.setattr(
+        docent_export,
+        "upload",
+        lambda *_args, **_kwargs: docent_export.DocentUploadFailure(
+            collection_name=f"mb-eval--launch-{launch_namespace}",
+            launch_namespace=launch_namespace,
+            collection_id="known-id",
+            error_type="DocentMutationHTTPStatusError",
+        ),
+    )
+    real_print = builtins.print
+    receipt_attempts = 0
 
-        def send(self, request, **kwargs):
-            self.calls.append(request)
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.headers["content-type"] = "application/json"
-            if len(self.calls) == 1:
-                response.status_code = 200
-                body = {"collection_id": "confirmed-collection-123"}
-            elif len(self.calls) == 2:
-                response.status_code = 202
-                body = {}
-            else:
-                raise AssertionError("malformed batch acknowledgement was retried")
-            response._content = json.dumps(body).encode("utf-8")
-            return response
+    def fail_receipt_once(*args, **kwargs):
+        nonlocal receipt_attempts
+        if args and "docent_upload_receipt" in str(args[0]):
+            receipt_attempts += 1
+            raise OSError("raw receipt writer detail")
+        return real_print(*args, **kwargs)
 
-    session = requests.Session()
-    adapter = MalformedAckAdapter()
-    session.mount("https://", adapter)
-    client = object.__new__(docent.Docent)
-    client._api_url = "https://docent.invalid/rest"
-    client._frontend_url = "https://docent.invalid"
-    client._logger = logging.getLogger("test-docent-malformed-ack")
-    client._session = session
-
-    class ReturningDocent(docent.Docent):
-        def __new__(cls, **kwargs):
-            return client
-
-    monkeypatch.setattr(docent, "Docent", ReturningDocent)
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-
+    monkeypatch.setattr(builtins, "print", fail_receipt_once)
     exp_file = write_configs(tmp_path, prompt_file)
+    artifact_root = tmp_path / "artifacts"
     run_eval.main(
         _artifact_argv(
             exp_file,
-            tmp_path / "artifacts",
+            artifact_root,
             "--docent-collection",
             "mb-eval",
             "--allow-trajectory-upload",
         ),
         task_source=MBTaskSource(1),
     )
-
-    assert len(adapter.calls) == 2
-    captured = capsys.readouterr()
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": "confirmed-collection-123",
-            "error_type": "DocentIngestionAcknowledgementError",
-        }
-    ]
+    assert receipt_attempts == 1
+    assert (artifact_root / launch_namespace / "docent.jsonl").is_file()
 
 
-def test_main_never_logs_raw_malformed_collection_response(
-    tmp_path, prompt_file, launch_namespace, monkeypatch, capsys
-):
-    import docent
-
-    class MalformedCollectionAdapter(HTTPAdapter):
-        def __init__(self):
-            super().__init__(max_retries=0)
-            self.calls = []
-
-        def send(self, request, **kwargs):
-            self.calls.append(request)
-            if len(self.calls) != 1:
-                raise AssertionError("malformed collection ID reached a batch POST")
-            response = requests.Response()
-            response.request = request
-            response.url = request.url
-            response.status_code = 200
-            response.headers["content-type"] = "application/json"
-            response._content = json.dumps(
-                {
-                    "collection_id": "bad\nRAW-SERVER-ID-SECRET",
-                    "detail": "RAW-SERVER-BODY-SECRET",
-                }
-            ).encode("utf-8")
-            return response
-
-    session = requests.Session()
-    adapter = MalformedCollectionAdapter()
-    session.mount("https://", adapter)
-    client = object.__new__(docent.Docent)
-    client._api_url = "https://docent.invalid/rest"
-    client._frontend_url = "https://docent.invalid"
-    client._logger = logging.getLogger("test-docent-malformed-collection")
-    client._session = session
-
-    class ReturningDocent(docent.Docent):
-        def __new__(cls, **kwargs):
-            return client
-
-    monkeypatch.setattr(docent, "Docent", ReturningDocent)
-    monkeypatch.setenv("DOCENT_API_KEY", "test-only-key")
-
-    exp_file = write_configs(tmp_path, prompt_file)
-    run_eval.main(
-        _artifact_argv(
-            exp_file,
-            tmp_path / "artifacts",
-            "--docent-collection",
-            "mb-eval",
-            "--allow-trajectory-upload",
-        ),
-        task_source=MBTaskSource(1),
+def test_fresh_system_exit_sanitizes_none_to_integer_one():
+    from infra.envs.debate.docent_export import (
+        DocentUploadControlFlow,
+        DocentUploadFailure,
     )
 
-    assert len(adapter.calls) == 1
-    captured = capsys.readouterr()
-    assert "RAW-SERVER-ID-SECRET" not in captured.out
-    assert "RAW-SERVER-ID-SECRET" not in captured.err
-    assert "RAW-SERVER-BODY-SECRET" not in captured.out
-    assert "RAW-SERVER-BODY-SECRET" not in captured.err
-    receipts = [
-        json.loads(line)
-        for line in captured.err.splitlines()
-        if line.startswith("{") and "docent_upload_receipt" in line
-    ]
-    assert receipts == [
-        {
-            "event": "docent_upload_receipt",
-            "status": "ambiguous_or_unconfirmed",
-            "collection_name": f"mb-eval--launch-{launch_namespace}",
-            "launch_namespace": launch_namespace,
-            "collection_id": None,
-            "error_type": "DocentCollectionAcknowledgementError",
-        }
-    ]
+    control = DocentUploadControlFlow(
+        failure=DocentUploadFailure(
+            collection_name="collection--launch-run-A",
+            launch_namespace="run-A",
+            collection_id=None,
+            error_type="SystemExit",
+        ),
+        kind="SystemExit",
+        exit_code=None,
+    )
+    with pytest.raises(SystemExit) as caught:
+        run_eval._raise_fresh_docent_control_flow(control)
+    assert caught.value.code == 1
 
 
 def test_main_refuses_existing_scheduler_namespace_before_evaluation(

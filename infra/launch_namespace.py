@@ -7,6 +7,7 @@ string to every sink.  Scheduler launches provide it through
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
@@ -312,4 +313,115 @@ def open_claimed_text_file(
             )
         return os.fdopen(file_fd, "w", encoding="utf-8")
     finally:
+        os.close(authority_fd)
+
+
+def open_claimed_read_fd(
+    directory: str | os.PathLike[str],
+    filename: str,
+) -> int:
+    """Open one completed, immutable-looking file through retained authority.
+
+    The returned descriptor is caller-owned, read-only, blocking, and
+    positioned at byte zero.  Its open file description pins the validated
+    inode even if the directory entry is subsequently renamed or replaced.
+    """
+    if (
+        not isinstance(filename, str)
+        or _FILE_COMPONENT_RE.fullmatch(filename) is None
+    ):
+        raise ValueError(
+            f"input filename must be one safe component, got {filename!r}"
+        )
+    claimed = Path(directory)
+    with _CLAIM_LOCK:
+        authority = _PROCESS_CLAIMS.get(_process_claim_key(claimed))
+        if authority is None:
+            raise ValueError(
+                f"directory was not claimed by this process: {claimed}"
+            )
+        authority_fd = os.dup(authority.fd)
+        expected = authority.device, authority.inode
+    file_fd = -1
+    try:
+        try:
+            actual = _existing_directory_identity(claimed)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"claimed directory is no longer safely reachable: {claimed}"
+            ) from exc
+        if actual != expected:
+            raise ValueError(
+                f"claimed directory identity changed after reservation: {claimed}"
+            )
+
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+        )
+        try:
+            file_fd = os.open(filename, flags, dir_fd=authority_fd)
+        except OSError as exc:
+            raise RuntimeError(
+                f"refusing unsafe claimed input: {claimed / filename}"
+            ) from exc
+
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError(
+                f"claimed input is not a regular file: {claimed / filename}"
+            )
+        if opened.st_uid != os.geteuid():
+            raise RuntimeError(
+                f"claimed input is not owned by euid {os.geteuid()}: "
+                f"{claimed / filename}"
+            )
+        if opened.st_nlink != 1:
+            raise RuntimeError(
+                f"claimed input must have exactly one hard link: "
+                f"{claimed / filename}"
+            )
+        if opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(
+                f"claimed input must not be group- or other-writable: "
+                f"{claimed / filename}"
+            )
+
+        try:
+            named = os.stat(filename, dir_fd=authority_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"claimed input changed while validating: {claimed / filename}"
+            ) from exc
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(
+                f"claimed input changed while validating: {claimed / filename}"
+            )
+
+        status_flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+        if status_flags & os.O_ACCMODE != os.O_RDONLY:
+            raise RuntimeError(
+                f"claimed input did not open read-only: {claimed / filename}"
+            )
+        if status_flags & os.O_NONBLOCK:
+            fcntl.fcntl(file_fd, fcntl.F_SETFL, status_flags & ~os.O_NONBLOCK)
+        final_flags = fcntl.fcntl(file_fd, fcntl.F_GETFL)
+        if final_flags & os.O_ACCMODE != os.O_RDONLY or final_flags & os.O_NONBLOCK:
+            raise RuntimeError(
+                f"claimed input descriptor flags are unsafe: {claimed / filename}"
+            )
+        if os.lseek(file_fd, 0, os.SEEK_SET) != 0:
+            raise RuntimeError(
+                f"claimed input is not positioned at byte zero: "
+                f"{claimed / filename}"
+            )
+
+        result = file_fd
+        file_fd = -1
+        return result
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
         os.close(authority_fd)
