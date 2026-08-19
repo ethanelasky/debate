@@ -21,6 +21,15 @@
 # is what reaps it.
 set -euo pipefail
 
+# Secrets ride in the git-ignored repo-local .env (synced alongside the repo);
+# explicit environment always wins over the file.
+if [ -f "$(dirname "$0")/../.env" ]; then
+  while IFS='=' read -r _k _v; do
+    case "$_k" in ''|'#'*) continue ;; esac
+    [ -n "$(eval echo "\${${_k}:-}")" ] || export "${_k}=${_v}"
+  done < "$(dirname "$0")/../.env"
+fi
+
 MODE="${1:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
 EXP="${2:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
 
