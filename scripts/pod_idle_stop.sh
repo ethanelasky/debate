@@ -98,7 +98,16 @@ if [ "$ONCE" -eq 0 ]; then
     ''|*[!0-9]*) fatal "GRACE_MINUTES='${GRACE_MINUTES}' is not an integer number of minutes (digits only, e.g. GRACE_MINUTES=10); a non-numeric grace window silently never expires and the pod would bill forever" ;;
   esac
 
-  [ -n "${RUNPOD_POD_ID:-}" ] || fatal "RUNPOD_POD_ID is unset; without a pod id this watchdog cannot stop anything — the pod will bill until stopped by hand"
+  # Non-interactive SSH sessions do not inherit the container's env, but the
+  # pod id and the pod-scoped API key are always in the init process's
+  # environment — recover both from there before giving up.
+  for _var in RUNPOD_POD_ID RUNPOD_API_KEY; do
+    if [ -z "$(eval echo "\${${_var}:-}")" ] && [ -r /proc/1/environ ]; then
+      _val="$(tr '\0' '\n' < /proc/1/environ | sed -n "s/^${_var}=//p" | head -1)"
+      [ -n "$_val" ] && export "${_var}=${_val}"
+    fi
+  done
+  [ -n "${RUNPOD_POD_ID:-}" ] || fatal "RUNPOD_POD_ID is unset and not in /proc/1/environ; without a pod id this watchdog cannot stop anything — the pod will bill until stopped by hand"
   command -v runpodctl >/dev/null 2>&1 || fatal "runpodctl not on PATH; the watchdog could reap the judge but never stop the pod, so it refuses to run at all"
 
   # Two watchdogs would race on the teardown and double-stop, so the newer one
