@@ -114,6 +114,11 @@ def _rows(split, levels: set[int]) -> list[dict[str, Any]]:
     return rows
 
 
+def problem_key(problem: str) -> str:
+    """Stable identity for a problem row across processes and machines."""
+    return hashlib.sha256(problem.encode("utf-8")).hexdigest()[:16]
+
+
 class MathEnv(SingleTurnEnv):
     def __init__(
         self,
@@ -126,6 +131,7 @@ class MathEnv(SingleTurnEnv):
         shaped_reward: float = 0.0,
         think_overshoot_penalty: float = 0.0,
         prompt_file: str | None = None,
+        train_filter_file: str | None = None,
     ):
         self.rng = random.Random(seed)
         self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
@@ -164,6 +170,20 @@ class MathEnv(SingleTurnEnv):
         # decisions during training; test/ is touched once at the end.
         k = min(len(self.test_rows), max(1, len(self.train_rows) // 10))
         self.dev_rows, self.train_rows = self.train_rows[:k], self.train_rows[k:]
+        # Applied AFTER the dev/test carve so both eval cohorts stay
+        # byte-identical to the unfiltered lineage; only the training pool
+        # shrinks.
+        if train_filter_file:
+            keep = set(json.load(open(train_filter_file)))
+            before = len(self.train_rows)
+            self.train_rows = [
+                r for r in self.train_rows if problem_key(r["problem"]) in keep
+            ]
+            if not self.train_rows:
+                raise RuntimeError(
+                    f"math env: train_filter_file {train_filter_file} matched "
+                    f"0 of {before} train rows"
+                )
         if len(self.train_rows) < 2 or not self.test_rows:
             raise RuntimeError(
                 f"math env: too few rows after filtering (train={len(self.train_rows)}, test={len(self.test_rows)})"
@@ -259,6 +279,7 @@ class MathFamily(TaskFamily):
                 "correct_reward",
                 "format_reward",
                 "relaxed_correct_bonus",
+                "train_filter_file",
             },
             "math",
         )
@@ -277,6 +298,9 @@ class MathFamily(TaskFamily):
             relaxed_correct_bonus=float(ds.get("relaxed_correct_bonus", 0.1)),
             think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
             prompt_file=str(prompt_path),
+            train_filter_file=(
+                str(ds["train_filter_file"]) if ds.get("train_filter_file") else None
+            ),
         )
         self._protocol_identity = _numeric_protocol_identity(
             env,

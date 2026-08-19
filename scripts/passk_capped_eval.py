@@ -85,6 +85,12 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=20000)
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--out", default=None)
+    p.add_argument(
+        "--full-pool",
+        action="store_true",
+        help="iterate every row of the split in order instead of env.tasks() "
+        "(train split samples randomly; this makes the sweep exhaustive)",
+    )
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -94,7 +100,10 @@ def main() -> None:
     family = get_family(args.family)
     env = family.source(json.loads(args.dataset_args))
     pool = getattr(env, f"{args.split}_rows")
-    tasks = env.tasks(len(pool), split=args.split)
+    if args.full_pool:
+        tasks = [env._task(row, args.split) for row in pool]
+    else:
+        tasks = env.tasks(len(pool), split=args.split)
 
     tok = AutoTokenizer.from_pretrained(args.model)
     prompts = [

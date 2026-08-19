@@ -56,6 +56,16 @@ mathl5_qwen35_dapo:
     kl_mechanism: advantage
     dynamic_sampling_retries: 5
 
+mathl5_qwen35_cispo_filtered:
+  _extends: mathl5_qwen35_cispo
+  # train pool cut to rows the base solves >0 of 8 at the capped protocol
+  # (sweep 2026-08-19): 864 of 1600. Drops the 46% that is 0-for-8 (degenerate
+  # all-wrong groups from step 0) but KEEPS the 17% 8-for-8: always-solved
+  # rows cost idle rollouts while healthy and become mixed groups with
+  # corrective gradient if format drifts — the 2vsj3nmi collapse had no such
+  # anchor. Pure solve-band variant: configs/filters/l5_solveband_qwen35.json.
+  dataset: {train_filter_file: configs/filters/l5_nonzero_qwen35.json}
+
 mathl5_qwen35_smoke:
   _extends: mathl5_qwen35_cispo
   training:
