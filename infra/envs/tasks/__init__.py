@@ -2,6 +2,7 @@
 implementing TaskFamily + one entry here."""
 
 from infra.envs.tasks.aime import AimeFamily
+from infra.envs.tasks.aime_archive import AimeArchiveFamily
 from infra.envs.tasks.amc import AmcFamily
 from infra.envs.tasks.base import TaskFamily
 from infra.envs.tasks.codecontests import CodeContestsFamily
@@ -11,6 +12,7 @@ from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 
 TASK_FAMILIES: dict[str, type[TaskFamily]] = {
     "aime": AimeFamily,
+    "aime_archive": AimeArchiveFamily,
     "amc": AmcFamily,
     "codecontests": CodeContestsFamily,
     "math": MathFamily,
