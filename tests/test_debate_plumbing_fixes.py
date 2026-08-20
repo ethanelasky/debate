@@ -18,6 +18,7 @@ import pytest
 import yaml
 
 from infra.backend.base import SamplingParams
+from infra.config import load_experiment
 from infra.envs.base import Policy, SlotLimits
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
@@ -28,8 +29,14 @@ from infra.envs.tasks.math import MathFamily
 from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.models.base import ModelSettings, SpeechStructure
 from infra.models.factory import instantiate_model
+from infra.models.local_model import LocalModel
 from infra.run_common import build_backend
-from infra.run_debate import debate_gen_budgets, validate_trained_seats
+from infra.run_debate import (
+    debate_gen_budgets,
+    split_agents,
+    validate_experiment,
+    validate_trained_seats,
+)
 
 from test_budget_sampling import TOK, run as budget_run
 from test_debate_env import (
@@ -102,6 +109,100 @@ def test_local_factory_forwards_thinking_and_logprob_capture(monkeypatch):
     # None = don't send (server default), mirroring the openrouter branch
     assert "enable_thinking" not in captured
     assert captured["capture_token_logprobs"] is False
+
+
+@pytest.mark.parametrize("enable_thinking", [True, False, None])
+def test_local_model_sends_and_copies_thinking_toggle(enable_thinking):
+    model = LocalModel(
+        alias="judge",
+        endpoint="Qwen/Qwen3.5-4B",
+        base_url="http://127.0.0.1:8788/v1",
+        enable_thinking=enable_thinking,
+    )
+    request = model.build_request_kwargs(
+        messages=[{"role": "user", "content": "problem"}],
+        speech_structure=SpeechStructure.OPEN_ENDED,
+        max_new_tokens=32,
+        top_k=20,
+    )
+
+    if enable_thinking is None:
+        assert request["extra_body"] == {"top_k": 20}
+    else:
+        assert request["extra_body"] == {
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        }
+    assert model.copy().enable_thinking is enable_thinking
+
+
+def test_math_pc_qwen35_verl_smoke_config():
+    exp = load_experiment("configs/math_pc_debate.yaml", "math_pc_qwen35_verl_smoke")
+    validate_experiment(exp)
+    trained, frozen = split_agents(exp)
+    validate_trained_seats(trained, exp["training"])
+
+    assert exp["prompt_config"] == {
+        "file_path": "infra/prompts/debate/hendrycks_math.yaml",
+        "entry": "math_proposer_critic",
+    }
+    assert exp["dataset"] == {
+        "type": "math",
+        "levels": "3-4",
+        "relaxed_extraction": True,
+        "seed": 0,
+    }
+    assert exp["scoring"]["scoring"] == "continuous"
+    assert exp["scoring"]["confidence_source"] == "json"
+    assert set(trained) == {"alice", "bob"}
+    assert set(frozen) == {"judge"}
+    assert {seat.model_file_path for seat in trained.values()} == {"Qwen/Qwen3.5-4B"}
+    assert all(seat.enable_thinking is True for seat in trained.values())
+    assert frozen["judge"].model_file_path == "Qwen/Qwen3.5-4B"
+    assert frozen["judge"].base_url == "http://127.0.0.1:8788/v1"
+    assert frozen["judge"].enable_thinking is False
+
+    training = exp["training"]
+    assert training["backend"] == "verl"
+    assert training["lora_rank"] == 32
+    assert {
+        key: training[key]
+        for key in (
+            "steps",
+            "batch_size",
+            "group_size",
+            "adv_length_norm",
+            "kl_mechanism",
+            "eval_every",
+            "eval_n",
+            "eval_max_tokens",
+            "eval_split",
+            "final_test_eval",
+            "save_every",
+        )
+    } == {
+        "steps": 2,
+        "batch_size": 2,
+        "group_size": 4,
+        "adv_length_norm": "trajectory",
+        "kl_mechanism": "loss",
+        "eval_every": 1,
+        "eval_n": 8,
+        "eval_max_tokens": 3072,
+        "eval_split": "dev",
+        "final_test_eval": False,
+        "save_every": 1,
+    }
+    assert training["verl"] == {
+        "n_gpus": 1,
+        "strategy": "fsdp2",
+        "gpu_memory_utilization": 0.33,
+        "prompt_length": 8192,
+        "response_length": 3072,
+        "max_token_len_per_gpu": 12288,
+        "checkpoint_dir": "/workspace/checkpoints",
+        "extra_overrides": ["++actor_rollout_ref.model.lora.merge=True"],
+    }
 
 
 # 3 ---------------------------------------------------- decision slot structure

@@ -88,6 +88,63 @@ math_pc_smoke:
     eval_every: 0
     save_every: 0
 
+# Local VERL bring-up for the shared Qwen3.5-4B proposer/critic adapter and a
+# separate frozen Qwen3.5-4B judge served by scripts/pod_run.sh.
+math_pc_qwen35_verl_smoke:
+  _extends: _base_math_pc
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: proposer-alice
+        enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: critic-bob
+        enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        enable_thinking: false
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  training:
+    backend: verl
+    lora_rank: 32
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    # Equal gradient mass per (seat, debate), including Alice's longer proposal.
+    adv_length_norm: trajectory
+    # Pin the local VERL default. This is differentiable low-variance KL to the
+    # frozen base, not the Tinker arm's advantage-space approximation.
+    kl_mechanism: loss
+    eval_every: 1
+    eval_n: 8
+    eval_max_tokens: 3072
+    eval_split: dev
+    final_test_eval: false
+    save_every: 1
+    verl:
+      n_gpus: 1
+      strategy: fsdp2
+      gpu_memory_utilization: 0.33
+      prompt_length: 8192
+      response_length: 3072
+      max_token_len_per_gpu: 12288
+      checkpoint_dir: /workspace/checkpoints
+      extra_overrides:
+        - "++actor_rollout_ref.model.lora.merge=True"
+
 # The elicited-confidence arm.
 math_pc_debate:
   _extends: _base_math_pc

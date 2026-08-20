@@ -35,6 +35,7 @@ class LocalModel(OpenAIModel):
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        enable_thinking: Optional[bool] = None,
         **kwargs,
     ):
         from infra.models.base import Model
@@ -51,6 +52,7 @@ class LocalModel(OpenAIModel):
         )
         self.endpoint = endpoint or self.DEFAULT_MODEL_ENDPOINT
         self.reasoning_effort = reasoning_effort
+        self.enable_thinking = enable_thinking
         self.logger = logging.getLogger(__name__)
 
     def _is_reasoning_model(self) -> bool:
@@ -111,6 +113,12 @@ class LocalModel(OpenAIModel):
         if repetition_penalty is not None and repetition_penalty != 1.0:
             # 1.0 is the identity multiplier; sending it only clutters the request.
             extra_body["repetition_penalty"] = repetition_penalty
+        if self.enable_thinking is not None:
+            # vLLM applies model-specific chat-template options from this
+            # extension object. Keep None as "use the server/model default".
+            extra_body["chat_template_kwargs"] = {
+                "enable_thinking": self.enable_thinking,
+            }
         if extra_body:
             request["extra_body"] = extra_body
         json_schema = kwargs.get("json_schema")
@@ -150,4 +158,5 @@ class LocalModel(OpenAIModel):
             base_url=str(self.client.base_url),
             api_key=self.client.api_key,
             reasoning_effort=self.reasoning_effort,
+            enable_thinking=self.enable_thinking,
         )
