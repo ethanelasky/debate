@@ -79,6 +79,10 @@ mathl5_qwen9b_cispo_qwen4b_sub8:
   model: Qwen/Qwen3.5-9B
   training:
     verl:
+      # Leave enough colocated memory for the LoRA merge/restore path. At
+      # 0.45, vLLM held 35.52 GiB and the 9B actor failed a 3.79 GiB restore
+      # allocation with only 1.06 GiB free on an 80 GB H100.
+      gpu_memory_utilization: 0.38
       # Qwen3.5's Mamba cache needs one block per decode sequence. The 9B
       # model exposes 804 blocks at the inherited 0.45 memory limit on H100;
       # verl's 1024 default fails before rollout. The production batch needs
