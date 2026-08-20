@@ -1,4 +1,4 @@
-# Qwen3.5-4B on MATH level-5: DAPO vs CISPO, 200 steps each.
+# Qwen3.5-4B/9B on MATH level-5: DAPO vs CISPO, 200 steps each.
 # Pool fit (2026-08-14, scripts/hmmt_pass_eval.py): L5 pass@1 .558 / pass@8
 # .867 at uncapped think; AIME-2026 and HMMT sit far below the 20-85 band.
 
@@ -85,8 +85,8 @@ mathl5_qwen9b_cispo_qwen4b_sub8:
       gpu_memory_utilization: 0.38
       # Qwen3.5's Mamba cache needs one block per decode sequence. The 9B
       # model exposes 804 blocks at the inherited 0.45 memory limit on H100;
-      # verl's 1024 default fails before rollout. The production batch needs
-      # 64 concurrent train sequences; the largest evaluation uses 256.
+      # verl's 1024 default fails before rollout. The runner submits 64 train
+      # requests and up to 256 eval requests; vLLM queues above KV capacity.
       extra_overrides:
         - "++actor_rollout_ref.model.lora.merge=True"
         - "actor_rollout_ref.rollout.max_num_seqs=256"
