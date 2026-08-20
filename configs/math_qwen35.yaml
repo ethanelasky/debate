@@ -74,6 +74,19 @@ mathl5_qwen35_cispo_sub8:
   # so 0-for-8 rows unlock mid-run). Drops only the 279 always-solved.
   dataset: {train_filter_file: configs/filters/l5_sub8_qwen35.json}
 
+mathl5_qwen9b_cispo_qwen4b_sub8:
+  _extends: mathl5_qwen35_cispo_sub8
+  model: Qwen/Qwen3.5-9B
+
+mathl5_qwen9b_cispo_qwen4b_sub8_smoke:
+  _extends: mathl5_qwen9b_cispo_qwen4b_sub8
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0
+
 mathl5_qwen35_smoke:
   _extends: mathl5_qwen35_cispo
   training:
