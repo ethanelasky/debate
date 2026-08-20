@@ -77,6 +77,15 @@ mathl5_qwen35_cispo_sub8:
 mathl5_qwen9b_cispo_qwen4b_sub8:
   _extends: mathl5_qwen35_cispo_sub8
   model: Qwen/Qwen3.5-9B
+  training:
+    verl:
+      # Qwen3.5's Mamba cache needs one block per decode sequence. The 9B
+      # model exposes 804 blocks at the inherited 0.45 memory limit on H100;
+      # verl's 1024 default fails before rollout. The production batch needs
+      # 64 concurrent train sequences; the largest evaluation uses 256.
+      extra_overrides:
+        - "++actor_rollout_ref.model.lora.merge=True"
+        - "actor_rollout_ref.rollout.max_num_seqs=256"
 
 mathl5_qwen9b_cispo_qwen4b_sub8_smoke:
   _extends: mathl5_qwen9b_cispo_qwen4b_sub8
