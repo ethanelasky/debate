@@ -42,7 +42,7 @@ def test_scheduler_wrapper_has_one_fresh_base_launch_and_no_passthrough() -> Non
         "bash",
         "scripts/pod_run.sh",
         "debate",
-        "mathl5_qwen35_pc_debate_verl",
+        "mathl5_qwen35_pc_debate_cispo_verl",
     )
     assert 'if [ "$#" -ne 0 ]' in shell
     for forbidden in ("--load", "--start-step", "--wandb-resume"):
@@ -77,7 +77,7 @@ def test_scheduler_wrapper_has_one_fresh_base_launch_and_no_passthrough() -> Non
 def test_scheduler_selected_experiment_uses_two_b200s_without_protocol_drift() -> None:
     base = load_experiment("configs/math_pc_debate.yaml", "math_pc_l5")
     experiment = load_experiment(
-        "configs/math_pc_debate.yaml", "mathl5_qwen35_pc_debate_verl"
+        "configs/math_pc_debate.yaml", "mathl5_qwen35_pc_debate_cispo_verl"
     )
 
     verl = experiment["training"]["verl"]
@@ -89,6 +89,11 @@ def test_scheduler_selected_experiment_uses_two_b200s_without_protocol_drift() -
     assert not (
         {"load", "start_step", "wandb_resume"} & experiment["training"].keys()
     )
+    assert experiment["training"]["loss"] == {
+        "kind": "cispo",
+        "clip_low": 0.8,
+        "clip_high": 1.28,
+    }
 
     # The scheduler-only hardware mapping must not rewrite the inherited
     # debate, prompt, dataset, judging, reward, or evaluation protocol.
@@ -144,7 +149,7 @@ def _containment_document() -> dict[str, object]:
             "/workspace/artifacts/launch-123/scheduler-output"
         ),
         "checkpoint_working_root": (
-            "/workspace/checkpoints/mathl5_qwen35_pc_debate_verl/launch-123"
+            "/workspace/checkpoints/mathl5_qwen35_pc_debate_cispo_verl/launch-123"
         ),
     }
 

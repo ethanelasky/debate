@@ -1,9 +1,8 @@
 # Scheduler-owned RunPod debate workload
 
-This document describes Debate's provider-free half of the approved D-036
-RunPod design. It does not open RUNPOD-001, certify the deadline mechanism,
-authorize a paid Pod, or launch training. The job scheduler remains the only
-component allowed to create, stop, or otherwise control a RunPod worker.
+This document describes Debate's workload half of the scheduler-owned RunPod
+path. The job scheduler remains the only component allowed to create, stop, or
+otherwise control a RunPod worker.
 
 ## Ownership boundary
 
@@ -47,7 +46,7 @@ evidence. It writes `workload-terminal.json`, never `terminal.json`.
 `scripts/scheduler_debate_run.sh` accepts no arguments. It always launches:
 
 ```text
-bash scripts/pod_run.sh debate mathl5_qwen35_pc_debate_verl
+bash scripts/pod_run.sh debate mathl5_qwen35_pc_debate_cispo_verl
 ```
 
 The wrapper cannot append `--load`, `--start-step`, `--wandb-resume`, or any
@@ -162,7 +161,7 @@ scheduler-output/
 ```
 
 `checkpoint-manifest.json` hash-lists the exact
-`/workspace/checkpoints/mathl5_qwen35_pc_debate_verl/<ns>/` tree and binds it to
+`/workspace/checkpoints/mathl5_qwen35_pc_debate_cispo_verl/<ns>/` tree and binds it to
 the SHA-256 of the scheduler-owned destination JSON. The final evidence
 manifest hash-lists every regular file in the attempt tree except itself and
 refuses symlinks or hard links. A zero trainer exit is not wrapper success

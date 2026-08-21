@@ -29,7 +29,7 @@ from typing import BinaryIO, Mapping, Optional
 
 
 SCHEMA = "debate-scheduler-workload/v1"
-RUN_NAME = "mathl5_qwen35_pc_debate_verl"
+RUN_NAME = "mathl5_qwen35_pc_debate_cispo_verl"
 LAUNCH_ARGV = (
     "bash",
     "scripts/pod_run.sh",
