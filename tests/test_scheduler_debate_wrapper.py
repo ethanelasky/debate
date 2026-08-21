@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from infra.config import load_experiment
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL_WRAPPER = ROOT / "scripts" / "scheduler_debate_run.sh"
@@ -71,6 +72,54 @@ def test_scheduler_wrapper_has_one_fresh_base_launch_and_no_passthrough() -> Non
     for independent_control in ("runpodctl", "pod_idle_stop.sh", "ssh "):
         assert independent_control not in shell
         assert independent_control not in supervisor
+
+
+def test_scheduler_selected_experiment_uses_two_b200s_without_protocol_drift() -> None:
+    base = load_experiment("configs/math_pc_debate.yaml", "math_pc_l5")
+    experiment = load_experiment(
+        "configs/math_pc_debate.yaml", "mathl5_qwen35_pc_debate_verl"
+    )
+
+    verl = experiment["training"]["verl"]
+    assert (verl["n_gpus"], verl["strategy"], verl["rollout_tp"]) == (
+        2,
+        "fsdp2",
+        1,
+    )
+    assert not (
+        {"load", "start_step", "wandb_resume"} & experiment["training"].keys()
+    )
+
+    # The scheduler-only hardware mapping must not rewrite the inherited
+    # debate, prompt, dataset, judging, reward, or evaluation protocol.
+    for key in (
+        "protocol",
+        "prompt_config",
+        "fresh_positions",
+        "judge_config",
+        "scoring",
+        "dataset",
+    ):
+        assert experiment[key] == base[key]
+    for key in ("eval_every", "eval_n", "eval_max_tokens"):
+        assert experiment["training"][key] == base["training"][key]
+
+    agents = experiment["agents"]
+    assert {agents[name]["model_settings"]["model_file_path"] for name in agents} == {
+        "Qwen/Qwen3.5-4B"
+    }
+    assert {name for name in ("alice", "bob") if agents[name]["trained"]} == {
+        "alice",
+        "bob",
+    }
+    assert {
+        name: agents[name]["model_settings"]["enable_thinking"] for name in agents
+    } == {"alice": True, "bob": True, "judge": False}
+    assert {
+        name: agents[name]["model_settings"]["sampling"]["train"] for name in agents
+    } == {
+        name: {"temperature": 1.0, "top_p": 1.0} for name in agents
+    }
 
 
 def _containment_document() -> dict[str, object]:

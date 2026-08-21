@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+FROM --platform=linux/amd64 ghcr.io/ethanelasky/verl-megatron-ssh@sha256:162f12d0ba6fbceaf56294d783551b2e83aefcc6e76b9138737acd358ee0baa8 AS assemble
+COPY runtime_image/runtime_contract.py \
+     runtime_image/generate_runtime_metadata.py \
+     runtime_image/prepare_binary_seed.py \
+     runtime_image/dependency.lock \
+     runtime_image/build-spec.json \
+     /build/runtime_image/
+RUN --network=none \
+    --mount=type=bind,from=runtime_seed,source=/,target=/build-inputs,readonly \
+    /usr/bin/python3.12 -I -S /build/runtime_image/prepare_binary_seed.py \
+      --dependency-lock /build/runtime_image/dependency.lock \
+      --binary-seed /build-inputs/verl-b200-portable.tar \
+      --base-python /usr/bin/python3.12 \
+      --staging-root / \
+      --archive-format tar \
+ && /usr/bin/python3.12 -I -S /build/runtime_image/generate_runtime_metadata.py \
+      --dependency-lock /build/runtime_image/dependency.lock \
+      --build-spec /build/runtime_image/build-spec.json \
+      --uncompressed-seed /build-inputs/verl-b200-portable.tar \
+      --staging-root /
+
+FROM --platform=linux/amd64 ghcr.io/ethanelasky/verl-megatron-ssh@sha256:162f12d0ba6fbceaf56294d783551b2e83aefcc6e76b9138737acd358ee0baa8
+COPY --from=assemble --chown=0:0 \
+     /opt/job-scheduler/debate-runtime/v1 \
+     /opt/job-scheduler/debate-runtime/v1

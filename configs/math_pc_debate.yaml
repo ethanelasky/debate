@@ -134,3 +134,88 @@ math_pc_l5:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 2048, max_total_tokens: 6144}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
+
+# ---------------------------------------------------------------------------
+# DRAFT — not launched. Fresh-start qwen3.5 L5 debate on verl
+# (Ethan, 2026-08-20).
+#
+# Why verl rather than the tinker seats every other arm here uses: the
+# scheduler-owned runtime is verl/FSDP LoRA, and
+# infra/backend/tinker.py's load() takes a Tinker service state
+# (`create_training_client_from_state_with_optimizer`), not a local checkpoint
+# directory. Backend and seat model_type are coupled by
+# run_debate.BACKEND_MODEL_TYPES ({"verl": ModelType.LOCAL}), so the trained
+# seats declare `local` and are served through verl's OpenAI shim. Structure
+# follows math_pc_olmo_l5_g8, the proven debate+verl arm.
+#
+# The scheduler launch is an exact fresh Qwen/Qwen3.5-4B start: no checkpoint
+# input, --load, --start-step, or --wandb-resume. The checkpoint directory
+# below is output-only for this run.
+#
+# Dataset is the UNFILTERED L5 pool (no train_filter_file), i.e. the same pool
+# mathl5_qwen35_cispo trained on — not the l5_nonzero/sub8/solveband carves.
+mathl5_qwen35_pc_debate_verl:
+  _extends: math_pc_l5
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: proposer-alice
+        enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: critic-bob
+        enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+    judge:
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: judge
+        base_url: http://127.0.0.1:8788/v1
+        enable_thinking: false
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  training:
+    backend: verl
+    verl:
+      n_gpus: 2
+      strategy: fsdp2
+      # One TP1 rollout replica per B200; training remains FSDP2 across both.
+      rollout_tp: 1
+      checkpoint_dir: /workspace/checkpoints
+      # 0.33 not math_qwen35's 0.45: the standalone frozen 4B judge reserves
+      # ~0.18 on its selected GPU, exactly as math_pc_olmo_l5_g8 documents.
+      gpu_memory_utilization: 0.33
+      # Derived, not guessed. run_debate.debate_gen_budgets cross-checks
+      # response_length against every TRAINED seat's slot cap, and the largest
+      # is the proposal at 6144 (math_pc_l5); critique/defense/rebuttal are 768
+      # and the judge is excluded (it generates on its own vLLM, so
+      # response_length cannot truncate it).
+      response_length: 6144
+      # Worst-case trained-seat context is bob's REBUTTAL, the last trained
+      # generation, which sees base + proposal + critique + defense. Thinking
+      # never enters it -- round.py:63, "stored; NEVER rendered into any
+      # context" -- so think budgets do not compound across turns:
+      #   base (system + L5 problem)        ~2144  (math_qwen35 prompt_length
+      #                                             6144 - think_tokens 4000)
+      #   proposal  visible worst case       6144
+      #   critique                            768
+      #   defense                             768
+      #                                    -------
+      #                                      9824  -> round up
+      prompt_length: 10240
+      # prompt_length + response_length. NEEDS A SMOKE: this is the per-GPU
+      # memory envelope, including the GPU selected by the standalone judge.
+      max_token_len_per_gpu: 16384
+      extra_overrides:
+        # LOAD-BEARING, per math_qwen35.yaml: adapter-name sync crashes on the
+        # VL wrapper's vision tower and silently drops LoRA on GDN in_proj_a/b
+        # (vllm#38085). Do not remove without a passing smoke.
+        - "++actor_rollout_ref.model.lora.merge=True"
+    lora_rank: 32   # one shared rank-32 adapter across both trained seats

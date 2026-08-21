@@ -42,6 +42,11 @@ MANIFEST_SCHEMA = contract.MANIFEST_SCHEMA
 LOCK_SCHEMA = contract.LOCK_SCHEMA
 SPEC_SCHEMA = contract.SPEC_SCHEMA
 INVENTORY_SCHEMA = contract.INVENTORY_SCHEMA
+BINARY_SEED_MANIFEST_SCHEMA = contract.BINARY_SEED_MANIFEST_SCHEMA
+BINARY_SEED_LOCK_SCHEMA = contract.BINARY_SEED_LOCK_SCHEMA
+BINARY_SEED_SPEC_SCHEMA = contract.BINARY_SEED_SPEC_SCHEMA
+BINARY_SEED_INVENTORY_SCHEMA = contract.BINARY_SEED_INVENTORY_SCHEMA
+SEED_TRANSFORMATION_SCHEMA = contract.SEED_TRANSFORMATION_SCHEMA
 IMPORT_PROBE_SCHEMA = contract.IMPORT_PROBE_SCHEMA
 CUDA_PROBE_SCHEMA = contract.CUDA_PROBE_SCHEMA
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -53,6 +58,7 @@ MAX_FILES = contract.MAX_FILES
 MAX_FILE_SIZE = contract.MAX_FILE_SIZE
 FIXED_IMPORT_SOURCE = contract.FIXED_IMPORT_SOURCE
 FIXED_CUDA_SOURCE = contract.FIXED_CUDA_SOURCE
+SEED_TRANSFORMATION_NAME = "seed-transformation.json"
 
 
 class Refusal(RuntimeError):
@@ -87,6 +93,15 @@ def digest_file(path: Path) -> str:
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def digest_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    for block in iter(lambda: os.read(fd, 1024 * 1024), b""):
+        digest.update(block)
+    os.lseek(fd, 0, os.SEEK_SET)
     return "sha256:" + digest.hexdigest()
 
 
@@ -150,7 +165,7 @@ def _relative_path(value: object, field: str) -> str:
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         raise Refusal(f"{field} must be normalized below its declared root")
-    if path.as_posix() != value or any(ord(char) < 33 or ord(char) > 126 for char in value):
+    if path.as_posix() != value or any(ord(char) < 32 or ord(char) > 126 for char in value):
         raise Refusal(f"{field} must be normalized printable ASCII")
     return value
 
@@ -245,10 +260,268 @@ def _inspect_locked_wheel(
         raise Refusal("locked runtime artifact is not a valid wheel ZIP") from exc
 
 
+def _validate_binary_seed_lock(
+    path: Path,
+    payload: bytes,
+    document: dict[str, Any],
+    seed_path: Path | None,
+    uncompressed_seed_path: Path | None,
+) -> tuple[bytes, dict[str, tuple[str, dict[str, object]]], str]:
+    _exact_keys(document, contract.BINARY_SEED_LOCK_KEYS, "binary-seed lock")
+    if (
+        document["schema"] != BINARY_SEED_LOCK_SCHEMA
+        or document["provenance_tier"] != contract.PROVENANCE_TIER_BINARY_SEED
+        or document["runtime_root"] != RUNTIME_ROOT
+    ):
+        raise Refusal("binary-seed lock identity differs")
+    python_version = _version(document["python_version"], "binary-seed Python version")
+
+    base = document["base_image"]
+    if not isinstance(base, dict):
+        raise Refusal("binary-seed base image must be an object")
+    _exact_keys(base, contract.BINARY_SEED_BASE_IMAGE_KEYS, "binary-seed base image")
+    reference = base["reference"]
+    if (
+        not isinstance(reference, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9./_-]{1,254}@sha256:[0-9a-f]{64}", reference)
+        is None
+        or reference != contract.B200_BASE_IMAGE_REFERENCE
+    ):
+        raise Refusal("binary-seed base image must be digest-pinned")
+    base_python = base["python"]
+    if not isinstance(base_python, dict):
+        raise Refusal("binary-seed base Python must be an object")
+    _exact_keys(
+        base_python, contract.BINARY_SEED_BASE_PYTHON_KEYS, "binary-seed base Python"
+    )
+    if base_python["path"] != contract.B200_BASE_PYTHON_PATH or not isinstance(
+        base_python["sha256"], str
+    ) or DIGEST_RE.fullmatch(base_python["sha256"]) is None or base_python[
+        "sha256"
+    ] != contract.B200_BASE_PYTHON_SHA256:
+        raise Refusal("binary-seed base Python identity differs")
+
+    seed = document["seed"]
+    if not isinstance(seed, dict):
+        raise Refusal("binary-seed source must be an object")
+    _exact_keys(seed, contract.BINARY_SEED_KEYS, "binary-seed source")
+    if (
+        not isinstance(seed["repository"], str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}/[A-Za-z0-9_.-]{1,128}", seed["repository"])
+        is None
+        or not isinstance(seed["revision"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", seed["revision"]) is None
+        or _relative_path(seed["path"], "binary-seed artifact path")
+        != seed["path"]
+        or "/" in seed["path"]
+        or type(seed["size"]) is not int
+        or seed["size"] <= 0
+        or not isinstance(seed["sha256"], str)
+        or DIGEST_RE.fullmatch(seed["sha256"]) is None
+        or _relative_path(seed["uncompressed_path"], "binary-seed raw tar path")
+        != seed["uncompressed_path"]
+        or "/" in seed["uncompressed_path"]
+        or seed["format"] != "tar+zstd"
+        or _relative_path(seed["prefix"], "binary-seed archive prefix")
+        != seed["prefix"]
+        or seed["repository"] != contract.B200_SEED_REPOSITORY
+        or seed["revision"] != contract.B200_SEED_REVISION
+        or seed["path"] != contract.B200_SEED_PATH
+        or seed["size"] != contract.B200_SEED_SIZE
+        or seed["sha256"] != contract.B200_SEED_SHA256
+        or type(seed["uncompressed_size"]) is not int
+        or seed["uncompressed_size"] != contract.B200_SEED_UNCOMPRESSED_SIZE
+        or not isinstance(seed["uncompressed_sha256"], str)
+        or DIGEST_RE.fullmatch(seed["uncompressed_sha256"]) is None
+        or seed["uncompressed_sha256"]
+        != contract.B200_SEED_UNCOMPRESSED_SHA256
+        or seed["uncompressed_path"] != contract.B200_SEED_UNCOMPRESSED_PATH
+        or seed["prefix"] != contract.B200_SEED_PREFIX
+    ):
+        raise Refusal("binary-seed source identity is malformed")
+    if (seed_path is None) == (uncompressed_seed_path is None):
+        raise Refusal("exactly one compressed or uncompressed binary seed is required")
+    selected = seed_path if seed_path is not None else uncompressed_seed_path
+    assert selected is not None
+    expected_path = seed["path"] if seed_path is not None else seed["uncompressed_path"]
+    expected_size = seed["size"] if seed_path is not None else seed["uncompressed_size"]
+    expected_sha256 = (
+        seed["sha256"] if seed_path is not None else seed["uncompressed_sha256"]
+    )
+    compressed_blob_name = str(expected_sha256).removeprefix("sha256:")
+    allowed_names = (
+        {str(expected_path), compressed_blob_name}
+        if seed_path is not None
+        else {str(expected_path)}
+    )
+    if selected.name not in allowed_names or not selected.is_absolute():
+        raise Refusal("content-addressed binary seed path differs")
+    try:
+        seed_info = os.lstat(selected)
+        resolved_seed = selected.resolve(strict=True)
+        if resolved_seed != selected.absolute():
+            raise Refusal("content-addressed binary seed path is redirected")
+        fd = os.open(selected, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise Refusal("content-addressed binary seed is absent") from exc
+    except OSError as exc:
+        raise Refusal("content-addressed binary seed is unsafe") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(seed_info.st_mode)
+            or stat.S_ISLNK(seed_info.st_mode)
+            or seed_info.st_nlink != 1
+            or opened.st_dev != seed_info.st_dev
+            or opened.st_ino != seed_info.st_ino
+            or opened.st_nlink != 1
+            or opened.st_size != expected_size
+            or digest_fd(fd) != expected_sha256
+        ):
+            raise Refusal("content-addressed binary seed bytes differ")
+    finally:
+        os.close(fd)
+
+    transformation = document["transformation"]
+    if not isinstance(transformation, dict):
+        raise Refusal("binary-seed transformation must be an object")
+    _exact_keys(
+        transformation,
+        contract.BINARY_SEED_TRANSFORMATION_KEYS,
+        "binary-seed transformation",
+    )
+    removed_paths = transformation["removed_paths"]
+    if not isinstance(removed_paths, list) or not removed_paths:
+        raise Refusal("binary-seed removed paths are malformed")
+    prior_path = ""
+    for raw in removed_paths:
+        item = _relative_path(raw, "binary-seed removed path")
+        if item <= prior_path:
+            raise Refusal("binary-seed removed paths must be unique and sorted")
+        prior_path = item
+    removed_links = transformation["removed_links"]
+    if not isinstance(removed_links, list) or not removed_links:
+        raise Refusal("binary-seed removed links are malformed")
+    prior_link = ""
+    for raw in removed_links:
+        if not isinstance(raw, dict):
+            raise Refusal("binary-seed removed link must be an object")
+        _exact_keys(raw, contract.BINARY_SEED_REMOVED_LINK_KEYS, "removed link")
+        link_path = _relative_path(raw["path"], "removed link path")
+        if link_path <= prior_link or not isinstance(raw["target"], str) or not raw["target"]:
+            raise Refusal("binary-seed removed links must be unique and sorted")
+        prior_link = link_path
+    allowed_pth = transformation["allowed_pth"]
+    if not isinstance(allowed_pth, list) or not allowed_pth:
+        raise Refusal("binary-seed PTH allowlist is malformed")
+    prior_pth = ""
+    for raw in allowed_pth:
+        if not isinstance(raw, dict):
+            raise Refusal("binary-seed PTH allowlist entry must be an object")
+        _exact_keys(raw, contract.BINARY_SEED_PTH_KEYS, "allowed PTH")
+        pth_path = _relative_path(raw["path"], "allowed PTH path")
+        if (
+            pth_path <= prior_pth
+            or not pth_path.endswith(".pth")
+            or not isinstance(raw["sha256"], str)
+            or DIGEST_RE.fullmatch(raw["sha256"]) is None
+        ):
+            raise Refusal("binary-seed PTH allowlist must be unique and sorted")
+        prior_pth = pth_path
+    allowed_workspace = transformation["allowed_workspace_files"]
+    if not isinstance(allowed_workspace, list):
+        raise Refusal("binary-seed workspace occurrence allowlist is malformed")
+    prior_workspace = ""
+    for raw in allowed_workspace:
+        if not isinstance(raw, dict):
+            raise Refusal("workspace occurrence allowlist entry must be an object")
+        _exact_keys(
+            raw,
+            contract.BINARY_SEED_WORKSPACE_FILE_KEYS,
+            "allowed workspace occurrence",
+        )
+        workspace_path = _relative_path(raw["path"], "allowed workspace file path")
+        if (
+            workspace_path <= prior_workspace
+            or not isinstance(raw["sha256"], str)
+            or DIGEST_RE.fullmatch(raw["sha256"]) is None
+        ):
+            raise Refusal("workspace occurrence allowlist must be unique and sorted")
+        prior_workspace = workspace_path
+    ignored_members = transformation["ignored_archive_members"]
+    if (
+        not isinstance(ignored_members, list)
+        or ignored_members != list(contract.B200_IGNORED_ARCHIVE_MEMBERS)
+    ):
+        raise Refusal("binary-seed ignored archive members differ")
+    prior_ignored = ""
+    for raw in ignored_members:
+        item = _relative_path(raw, "ignored archive member")
+        if item <= prior_ignored or item.startswith(seed["prefix"] + "/"):
+            raise Refusal("ignored archive members must be unique and outside the seed")
+        prior_ignored = item
+    rewrite_paths = transformation["rewrite_prefix_paths"]
+    if not isinstance(rewrite_paths, list) or not rewrite_paths:
+        raise Refusal("binary-seed prefix rewrite paths are malformed")
+    prior_rewrite = ""
+    for raw in rewrite_paths:
+        item = _relative_path(raw, "binary-seed prefix rewrite path")
+        if item <= prior_rewrite:
+            raise Refusal("binary-seed prefix rewrite paths must be unique and sorted")
+        prior_rewrite = item
+    if (
+        transformation["remove_bytecode"] is not True
+        or transformation["source_prefix"] != "/workspace/envs/verl-b200"
+        or transformation["target_prefix"] != RUNTIME_ROOT + "/python"
+        or
+        transformation["source_shebang"]
+        != "#!/workspace/envs/verl-b200/bin/python\n"
+        or transformation["target_shebang"] != "#!" + RUNTIME_PYTHON + "\n"
+        or not isinstance(transformation["source_pyvenv_sha256"], str)
+        or DIGEST_RE.fullmatch(transformation["source_pyvenv_sha256"]) is None
+        or not isinstance(transformation["target_pyvenv"], str)
+        or transformation["target_pyvenv"]
+        != "home = /usr/bin\nimplementation = CPython\nuv = 0.12.0\nversion_info = 3.12.3\ninclude-system-site-packages = false\nseed = true\n"
+    ):
+        raise Refusal("binary-seed deterministic rewrite policy differs")
+
+    distributions = document["distributions"]
+    if not isinstance(distributions, list) or not 1 <= len(distributions) <= MAX_DISTRIBUTIONS:
+        raise Refusal("binary-seed distribution count is invalid")
+    locked: dict[str, tuple[str, dict[str, object]]] = {}
+    prior_name = ""
+    for index, raw in enumerate(distributions):
+        if not isinstance(raw, dict):
+            raise Refusal("binary-seed distribution must be an object")
+        _exact_keys(
+            raw, contract.BINARY_SEED_DISTRIBUTION_KEYS, "binary-seed distribution"
+        )
+        name = _name(raw["name"], f"distributions[{index}].name")
+        version = _version(raw["version"], f"distributions[{index}].version")
+        if name <= prior_name or name in locked or name == "debate":
+            raise Refusal("binary-seed distributions must be unique, sorted, and non-editable")
+        locked[name] = (
+            version,
+            {
+                "provenance_tier": contract.PROVENANCE_TIER_BINARY_SEED,
+                "seed_sha256": seed["sha256"],
+            },
+        )
+        prior_name = name
+    return payload, locked, python_version
+
+
 def validate_lock(
     path: Path,
+    *,
+    seed_path: Path | None = None,
+    uncompressed_seed_path: Path | None = None,
 ) -> tuple[bytes, dict[str, tuple[str, dict[str, object]]], str]:
     payload, document = _read_canonical(path, maximum=16 * 1024 * 1024)
+    if document.get("schema") == BINARY_SEED_LOCK_SCHEMA:
+        return _validate_binary_seed_lock(
+            path, payload, document, seed_path, uncompressed_seed_path
+        )
     _exact_keys(
         document,
         contract.LOCK_KEYS,
@@ -321,12 +594,18 @@ def validate_spec(
     locked_python_version: str,
 ) -> dict[str, Any]:
     _, document = _read_canonical(path, maximum=1024 * 1024)
+    seed_mode = bool(locked) and all(
+        isinstance(item[1], dict)
+        and item[1].get("provenance_tier") == contract.PROVENANCE_TIER_BINARY_SEED
+        for item in locked.values()
+    )
     _exact_keys(
         document,
         contract.SPEC_KEYS,
         "build spec",
     )
-    if document["schema"] != SPEC_SCHEMA or document["runtime_root"] != RUNTIME_ROOT:
+    expected_schema = BINARY_SEED_SPEC_SCHEMA if seed_mode else SPEC_SCHEMA
+    if document["schema"] != expected_schema or document["runtime_root"] != RUNTIME_ROOT:
         raise Refusal("build spec schema or runtime root differs")
     python = document["python"]
     if not isinstance(python, dict):
@@ -367,20 +646,61 @@ def validate_spec(
         raise Refusal("cuda build spec must be an object")
     _exact_keys(
         cuda,
-        contract.CUDA_SPEC_KEYS,
+        contract.BINARY_SEED_CUDA_SPEC_KEYS if seed_mode else contract.CUDA_SPEC_KEYS,
         "cuda build spec",
     )
     torch_distribution = _name(cuda["torch_distribution"], "torch distribution")
     torch_version = _version(cuda["torch_version"], "torch version")
+    torch_distribution_version = (
+        _version(cuda["torch_distribution_version"], "torch distribution version")
+        if seed_mode
+        else torch_version
+    )
+    if seed_mode and (
+        torch_distribution_version != contract.B200_TORCH_DISTRIBUTION_VERSION
+        or torch_version != contract.B200_TORCH_LIVE_VERSION
+    ):
+        raise Refusal("B200 seed requires the exact Torch distribution/live-version pair")
     torch_cuda_version = _version(cuda["torch_cuda_version"], "torch CUDA version")
-    if torch_distribution not in locked or locked[torch_distribution][0] != torch_version:
+    if (
+        torch_distribution not in locked
+        or locked[torch_distribution][0] != torch_distribution_version
+    ):
         raise Refusal("CUDA torch identity does not match the dependency lock")
+    if torch_cuda_version != contract.EXACT_TORCH_CUDA_VERSION:
+        raise Refusal("D043 B200 runtime requires exact torch CUDA version 13.0")
     device_count = cuda["device_count"]
-    if isinstance(device_count, bool) or device_count != contract.EXACT_DEVICE_COUNT:
-        raise Refusal("D043 H100 runtime requires exact device_count 1")
+    if type(device_count) is not int or device_count != contract.EXACT_DEVICE_COUNT:
+        raise Refusal("D043 B200 runtime requires exact device_count 2")
+    device_name = cuda["device_name"]
+    if device_name != contract.EXACT_DEVICE_NAME:
+        raise Refusal("D043 B200 runtime requires exact device name NVIDIA B200")
     capability = cuda["compute_capability"]
-    if capability != contract.EXACT_COMPUTE_CAPABILITY:
-        raise Refusal("D043 H100 runtime requires exact compute capability [9,0]")
+    if (
+        not isinstance(capability, list)
+        or capability != contract.EXACT_COMPUTE_CAPABILITY
+        or any(type(component) is not int for component in capability)
+    ):
+        raise Refusal("D043 B200 runtime requires exact compute capability [10,0]")
+    minimum_driver = cuda["minimum_host_driver_version"]
+    if (
+        type(minimum_driver) is not int
+        or minimum_driver != contract.MINIMUM_HOST_DRIVER_VERSION
+    ):
+        raise Refusal("D043 B200 runtime requires host driver version >=580")
+    nvlink_pairs = cuda["nvlink_pairs"]
+    if (
+        not isinstance(nvlink_pairs, list)
+        or nvlink_pairs != contract.EXACT_NVLINK_PAIRS
+        or any(
+            not isinstance(pair, list)
+            or any(type(index) is not int for index in pair)
+            for pair in nvlink_pairs
+        )
+    ):
+        raise Refusal("D043 B200 runtime requires exact peer NVLink pair [[0,1]]")
+    if cuda["nvlink_link_label"] != contract.EXACT_NVLINK_LINK_LABEL:
+        raise Refusal("D043 B200 runtime requires exact peer NVLink label NV18")
     extensions = cuda["compiled_extensions"]
     if not isinstance(extensions, list) or not 1 <= len(extensions) <= contract.MAX_EXTENSIONS:
         raise Refusal("compiled_extensions count is invalid")
@@ -393,7 +713,7 @@ def validate_spec(
         if module <= previous_extension:
             raise Refusal("compiled extensions must be unique and module-sorted")
         previous_extension = module
-    if document["python"]["version"] != python_version or not torch_cuda_version:
+    if document["python"]["version"] != python_version:
         raise Refusal("invalid exact build spec")
     return document
 
@@ -423,7 +743,13 @@ def inventory(
     staging_root: Path,
     spec: Mapping[str, Any],
     locked: Mapping[str, tuple[str, object]],
+    *,
+    runtime_files: list[dict[str, Any]] | None = None,
+    runtime_directories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    seed_mode = runtime_files is not None or runtime_directories is not None
+    if (runtime_files is None) != (runtime_directories is None):
+        raise Refusal("binary-seed runtime tree inventories must be provided together")
     physical_root = _physical(staging_root, RUNTIME_ROOT)
     site_packages = _physical(staging_root, str(spec["site_packages_path"]))
     if not site_packages.is_dir() or site_packages.is_symlink():
@@ -435,6 +761,7 @@ def inventory(
     ).as_posix()
     distributions: list[dict[str, Any]] = []
     all_paths: set[str] = set()
+    claims_by_path: dict[str, set[str]] = {}
     dist_infos = sorted(site_packages.glob("*.dist-info"))
     for dist_info in dist_infos:
         if (
@@ -459,8 +786,10 @@ def inventory(
         for package_path in files:
             located = Path(distribution.locate_file(package_path))
             relative, size, sha256 = _safe_runtime_file(located, physical_root)
-            if relative in all_paths:
-                raise Refusal(f"installed file is claimed more than once: {relative}")
+            claimants = claims_by_path.setdefault(relative, set())
+            if name in claimants:
+                raise Refusal(f"installed file is duplicated within RECORD: {relative}")
+            claimants.add(name)
             all_paths.add(relative)
             file_records.append({"path": relative, "sha256": sha256, "size": size})
         file_records.sort(key=lambda item: item["path"])
@@ -481,20 +810,21 @@ def inventory(
         if not isinstance(locked_artifact, dict):
             raise Refusal("internal locked artifact identity is malformed")
         wheel_files = locked_artifact.get("wheel_files")
-        if not isinstance(wheel_files, dict):
-            raise Refusal("locked wheel source inventory is unavailable")
-        record_digest_by_path = {
-            str(item["path"]): str(item["sha256"]) for item in file_records
-        }
-        for wheel_path, wheel_digest in wheel_files.items():
-            if wheel_path.endswith(".dist-info/RECORD") or ".data/" in wheel_path:
-                continue
-            installed_path = site_relative + "/" + wheel_path
-            if record_digest_by_path.get(installed_path) != wheel_digest:
-                raise Refusal(
-                    f"installed bytes differ from locked wheel source for {name}: "
-                    f"{wheel_path}"
-                )
+        if not seed_mode:
+            if not isinstance(wheel_files, dict):
+                raise Refusal("locked wheel source inventory is unavailable")
+            record_digest_by_path = {
+                str(item["path"]): str(item["sha256"]) for item in file_records
+            }
+            for wheel_path, wheel_digest in wheel_files.items():
+                if wheel_path.endswith(".dist-info/RECORD") or ".data/" in wheel_path:
+                    continue
+                installed_path = site_relative + "/" + wheel_path
+                if record_digest_by_path.get(installed_path) != wheel_digest:
+                    raise Refusal(
+                        f"installed bytes differ from locked wheel source for {name}: "
+                        f"{wheel_path}"
+                    )
         direct_path = metadata_file.parent / "direct_url.json"
         direct_origin: object = None
         if direct_path.exists():
@@ -511,6 +841,10 @@ def inventory(
             dir_info = parsed.get("dir_info")
             if isinstance(dir_info, dict) and dir_info.get("editable") is True:
                 raise Refusal(f"editable direct_url.json is forbidden for {name}")
+            if seed_mode and isinstance(parsed.get("url"), str) and parsed[
+                "url"
+            ].lower().startswith("file:"):
+                raise Refusal(f"local direct_url.json is forbidden for {name}")
             direct_origin = {
                 "canonical_json": canonical(parsed).decode("ascii"),
                 "path": relative,
@@ -579,14 +913,25 @@ def inventory(
     claimed_site_files = {
         path for path in all_paths if path.startswith(site_relative + "/")
     }
-    if actual_site_files != claimed_site_files:
+    if seed_mode:
+        if (
+            claimed_site_files - actual_site_files
+            or actual_site_files - claimed_site_files
+            != set(contract.B200_ALLOWED_UNCLAIMED_SITE_FILES)
+        ):
+            raise Refusal("binary-seed site-packages unclaimed file set differs")
+    elif actual_site_files != claimed_site_files:
         raise Refusal("installed inventory is not complete for site-packages")
-    return {
+    result = {
         "distributions": distributions,
         "python_path": RUNTIME_PYTHON,
         "runtime_root": RUNTIME_ROOT,
-        "schema": INVENTORY_SCHEMA,
+        "schema": BINARY_SEED_INVENTORY_SCHEMA if seed_mode else INVENTORY_SCHEMA,
     }
+    if runtime_files is not None:
+        result["runtime_files"] = runtime_files
+        result["runtime_directories"] = runtime_directories
+    return result
 
 
 def probe_documents(spec: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -610,14 +955,32 @@ def probe_documents(spec: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     ]
     cuda_expected = {
         "compiled_extensions": extension_results,
+        "compute": {
+            "bf16_matmul": [
+                {"device_index": index, "passed": True}
+                for index in range(cuda["device_count"])
+            ],
+        },
+        "driver": {
+            "compatible": True,
+            "minimum_version": cuda["minimum_host_driver_version"],
+        },
         "gpu": {
             "available": True,
             "compute_capabilities": [
                 list(cuda["compute_capability"]) for _ in range(cuda["device_count"])
             ],
             "count": cuda["device_count"],
+            "device_names": [
+                cuda["device_name"] for _ in range(cuda["device_count"])
+            ],
         },
         "python": python,
+        "topology": {
+            "compatible": True,
+            "link_label": cuda["nvlink_link_label"],
+            "nvlink_pairs": cuda["nvlink_pairs"],
+        },
         "torch": {
             "cuda_version": cuda["torch_cuda_version"],
             "version": cuda["torch_version"],
@@ -637,8 +1000,161 @@ def probe_documents(spec: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     return import_probe, cuda_probe
 
 
+def validate_seed_transformation(
+    staging_root: Path,
+    *,
+    lock_payload: bytes,
+    lock_document: Mapping[str, Any],
+) -> tuple[bytes, list[dict[str, Any]], list[dict[str, Any]]]:
+    physical_root = _physical(staging_root, RUNTIME_ROOT)
+    receipt_path = physical_root / SEED_TRANSFORMATION_NAME
+    payload, receipt = _read_canonical(receipt_path, maximum=64 * 1024 * 1024)
+    _exact_keys(receipt, contract.SEED_TRANSFORMATION_KEYS, "seed transformation receipt")
+    seed = lock_document.get("seed")
+    base = lock_document.get("base_image")
+    if not isinstance(seed, dict) or not isinstance(base, dict) or not isinstance(
+        base.get("python"), dict
+    ):
+        raise Refusal("binary-seed lock identity is unavailable")
+    if (
+        receipt["schema"] != SEED_TRANSFORMATION_SCHEMA
+        or receipt["dependency_lock_sha256"] != digest_bytes(lock_payload)
+        or receipt["seed_sha256"] != seed.get("sha256")
+        or receipt["uncompressed_seed_sha256"]
+        != seed.get("uncompressed_sha256")
+        or receipt["base_python_sha256"] != base["python"].get("sha256")
+    ):
+        raise Refusal("seed transformation receipt identity differs")
+    records = receipt["files"]
+    if not isinstance(records, list) or not records or len(records) > MAX_FILES:
+        raise Refusal("seed transformation file inventory is malformed")
+    expected: dict[str, tuple[int, int, int, str]] = {}
+    prior = ""
+    for raw in records:
+        if not isinstance(raw, dict):
+            raise Refusal("seed transformation file record must be an object")
+        _exact_keys(
+            raw,
+            contract.BINARY_SEED_RUNTIME_FILE_KEYS,
+            "seed transformation file",
+        )
+        relative = _relative_path(raw["path"], "seed transformation file path")
+        mode = raw["mode"]
+        mtime_ns = raw["mtime_ns"]
+        size = raw["size"]
+        sha256 = raw["sha256"]
+        if (
+            relative <= prior
+            or type(mode) is not int
+            or mode not in (
+                contract.RUNTIME_FILE_MODE,
+                contract.RUNTIME_EXECUTABLE_MODE,
+            )
+            or type(mtime_ns) is not int
+            or mtime_ns != contract.RUNTIME_MTIME_NS
+            or type(size) is not int
+            or size < 0
+            or size > MAX_FILE_SIZE
+            or not isinstance(sha256, str)
+            or DIGEST_RE.fullmatch(sha256) is None
+        ):
+            raise Refusal("seed transformation file inventory is not canonical")
+        expected[relative] = (mode, mtime_ns, size, sha256)
+        prior = relative
+
+    directory_records = receipt["directories"]
+    if (
+        not isinstance(directory_records, list)
+        or not directory_records
+        or len(directory_records) > MAX_FILES
+    ):
+        raise Refusal("seed transformation directory inventory is malformed")
+    expected_directories: dict[str, tuple[int, int]] = {}
+    prior = ""
+    for raw in directory_records:
+        if not isinstance(raw, dict):
+            raise Refusal("seed transformation directory record must be an object")
+        _exact_keys(
+            raw,
+            contract.BINARY_SEED_RUNTIME_DIRECTORY_KEYS,
+            "seed transformation directory",
+        )
+        relative = _relative_path(raw["path"], "seed transformation directory path")
+        mode = raw["mode"]
+        mtime_ns = raw["mtime_ns"]
+        if (
+            relative <= prior
+            or type(mode) is not int
+            or mode != contract.RUNTIME_DIRECTORY_MODE
+            or type(mtime_ns) is not int
+            or mtime_ns != contract.RUNTIME_MTIME_NS
+        ):
+            raise Refusal("seed transformation directory inventory is not canonical")
+        expected_directories[relative] = (mode, mtime_ns)
+        prior = relative
+
+    actual: dict[str, tuple[int, int, int, str]] = {}
+    actual_directories: dict[str, tuple[int, int]] = {}
+    for current, directories, files in os.walk(physical_root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            directory = current_path / name
+            info = os.lstat(directory)
+            relative = directory.relative_to(physical_root).as_posix()
+            mode = stat.S_IMODE(info.st_mode)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or mode != contract.RUNTIME_DIRECTORY_MODE
+                or info.st_mtime_ns != contract.RUNTIME_MTIME_NS
+            ):
+                raise Refusal(f"seed runtime contains an unsafe directory: {directory}")
+            actual_directories[relative] = (mode, info.st_mtime_ns)
+        for name in files:
+            entry = current_path / name
+            relative = entry.relative_to(physical_root).as_posix()
+            info = os.lstat(entry)
+            if relative == SEED_TRANSFORMATION_NAME:
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != contract.RUNTIME_FILE_MODE
+                    or info.st_mtime_ns != contract.RUNTIME_MTIME_NS
+                ):
+                    raise Refusal("seed transformation receipt is unsafe")
+                continue
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) not in (
+                    contract.RUNTIME_FILE_MODE,
+                    contract.RUNTIME_EXECUTABLE_MODE,
+                )
+                or info.st_mtime_ns != contract.RUNTIME_MTIME_NS
+                or info.st_size > MAX_FILE_SIZE
+            ):
+                raise Refusal(f"seed runtime contains an unsafe file: {entry}")
+            actual[relative] = (
+                stat.S_IMODE(info.st_mode),
+                info.st_mtime_ns,
+                info.st_size,
+                digest_file(entry),
+            )
+            if len(actual) > MAX_FILES:
+                raise Refusal("seed runtime contains too many files")
+    if actual != expected or actual_directories != expected_directories:
+        raise Refusal("seed runtime tree differs from its transformation receipt")
+    return payload, records, directory_records
+
+
 def _publish(path: Path, payload: bytes, *, mode: int = 0o444) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        mode,
+    )
     try:
         view = memoryview(payload)
         while view:
@@ -648,12 +1164,26 @@ def _publish(path: Path, payload: bytes, *, mode: int = 0o444) -> None:
             view = view[written:]
         os.fsync(fd)
         os.fchmod(fd, mode)
+        os.utime(fd, ns=(contract.RUNTIME_MTIME_NS, contract.RUNTIME_MTIME_NS))
     finally:
         os.close(fd)
 
 
-def generate(staging_root: Path, lock_path: Path, spec_path: Path) -> dict[str, Any]:
-    lock_payload, locked, locked_python_version = validate_lock(lock_path)
+def generate(
+    staging_root: Path,
+    lock_path: Path,
+    spec_path: Path,
+    *,
+    seed_path: Path | None = None,
+    uncompressed_seed_path: Path | None = None,
+) -> dict[str, Any]:
+    lock_payload, locked, locked_python_version = validate_lock(
+        lock_path,
+        seed_path=seed_path,
+        uncompressed_seed_path=uncompressed_seed_path,
+    )
+    lock_document = json.loads(lock_payload.decode("ascii"))
+    seed_mode = lock_document.get("schema") == BINARY_SEED_LOCK_SCHEMA
     spec = validate_spec(spec_path, locked, locked_python_version)
     physical_root = _physical(staging_root, RUNTIME_ROOT)
     python_path = _physical(staging_root, RUNTIME_PYTHON)
@@ -666,7 +1196,33 @@ def generate(staging_root: Path, lock_path: Path, spec_path: Path) -> dict[str, 
         or python_path.resolve(strict=True) != python_path.absolute()
     ):
         raise Refusal("runtime Python must be a canonical mode-0555 single-link file")
-    installed = inventory(staging_root, spec, locked)
+    seed_receipt_payload: bytes | None = None
+    runtime_files: list[dict[str, Any]] | None = None
+    runtime_directories: list[dict[str, Any]] | None = None
+    if seed_mode:
+        seed_receipt_payload, runtime_files, runtime_directories = validate_seed_transformation(
+            staging_root, lock_payload=lock_payload, lock_document=lock_document
+        )
+        python_sha256 = digest_file(python_path)
+        base_python_sha256 = lock_document["base_image"]["python"]["sha256"]
+        runtime_python_relative = python_path.relative_to(physical_root).as_posix()
+        python_records = [
+            item for item in runtime_files if item["path"] == runtime_python_relative
+        ]
+        if (
+            python_sha256 != base_python_sha256
+            or len(python_records) != 1
+            or python_records[0]["sha256"] != base_python_sha256
+            or python_records[0]["mode"] != contract.RUNTIME_EXECUTABLE_MODE
+        ):
+            raise Refusal("runtime Python bytes differ from the pinned base image")
+    installed = inventory(
+        staging_root,
+        spec,
+        locked,
+        runtime_files=runtime_files,
+        runtime_directories=runtime_directories,
+    )
     import_probe, cuda_probe = probe_documents(spec)
     members = {
         "dependency.lock": lock_payload,
@@ -697,11 +1253,22 @@ def generate(staging_root: Path, lock_path: Path, spec_path: Path) -> dict[str, 
             members["required-import-probe.json"]
         ),
         "runtime_root": RUNTIME_ROOT,
-        "schema": MANIFEST_SCHEMA,
+        "schema": BINARY_SEED_MANIFEST_SCHEMA if seed_mode else MANIFEST_SCHEMA,
     }
+    if seed_receipt_payload is not None:
+        unsigned_manifest["seed_transformation_sha256"] = digest_bytes(
+            seed_receipt_payload
+        )
     manifest = dict(unsigned_manifest)
     manifest["runtime_manifest_sha256"] = digest_bytes(canonical(unsigned_manifest))
     _publish(physical_root / "runtime-manifest.json", canonical(manifest))
+    if seed_mode:
+        os.chmod(physical_root, contract.RUNTIME_DIRECTORY_MODE)
+        os.utime(
+            physical_root,
+            ns=(contract.RUNTIME_MTIME_NS, contract.RUNTIME_MTIME_NS),
+            follow_symlinks=False,
+        )
     return manifest
 
 
@@ -709,14 +1276,26 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dependency-lock", required=True, type=Path)
     parser.add_argument("--build-spec", required=True, type=Path)
+    parser.add_argument("--binary-seed", type=Path)
+    parser.add_argument("--uncompressed-seed", type=Path)
     parser.add_argument("--staging-root", type=Path, default=Path("/"))
     parser.add_argument("--check-inputs-only", action="store_true")
     args = parser.parse_args(argv)
     try:
-        _, locked, locked_python_version = validate_lock(args.dependency_lock)
+        _, locked, locked_python_version = validate_lock(
+            args.dependency_lock,
+            seed_path=args.binary_seed,
+            uncompressed_seed_path=args.uncompressed_seed,
+        )
         validate_spec(args.build_spec, locked, locked_python_version)
         if not args.check_inputs_only:
-            generate(args.staging_root.resolve(strict=True), args.dependency_lock, args.build_spec)
+            generate(
+                args.staging_root.resolve(strict=True),
+                args.dependency_lock,
+                args.build_spec,
+                seed_path=args.binary_seed,
+                uncompressed_seed_path=args.uncompressed_seed,
+            )
     except (OSError, Refusal) as exc:
         print(f"generate_runtime_metadata: REFUSED: {exc}", file=sys.stderr)
         return 2

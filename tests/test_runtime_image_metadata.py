@@ -6,7 +6,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import subprocess
+import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -179,8 +182,12 @@ def _fixture(tmp_path: Path):
                 {"module": "flash_attn_2_cuda"},
                 {"module": "vllm._C"},
             ],
-            "compute_capability": [9, 0],
-            "device_count": 1,
+            "compute_capability": [10, 0],
+            "device_count": 2,
+            "device_name": "NVIDIA B200",
+            "minimum_host_driver_version": 580,
+            "nvlink_link_label": "NV18",
+            "nvlink_pairs": [[0, 1]],
             "torch_cuda_version": "13.0",
             "torch_distribution": "torch",
             "torch_version": "2.11.0+cu130",
@@ -263,9 +270,55 @@ def test_generator_emits_scheduler_manifest_inventory_and_executable_probes(
         )
     assert cuda_probe["expected_result"]["gpu"] == {
         "available": True,
-        "compute_capabilities": [[9, 0]],
-        "count": 1,
+        "compute_capabilities": [[10, 0], [10, 0]],
+        "count": 2,
+        "device_names": ["NVIDIA B200", "NVIDIA B200"],
     }
+    assert cuda_probe["expected_result"]["driver"] == {
+        "compatible": True,
+        "minimum_version": 580,
+    }
+    assert cuda_probe["expected_result"]["compute"] == {
+        "bf16_matmul": [
+            {"device_index": 0, "passed": True},
+            {"device_index": 1, "passed": True},
+        ]
+    }
+    assert cuda_probe["expected_result"]["topology"] == {
+        "compatible": True,
+        "link_label": "NV18",
+        "nvlink_pairs": [[0, 1]],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("device_count", 1, "exact device_count 2"),
+        ("device_count", 2.0, "exact device_count 2"),
+        ("device_name", "NVIDIA H100 80GB HBM3", "exact device name NVIDIA B200"),
+        ("compute_capability", [9, 0], "exact compute capability \\[10,0\\]"),
+        ("compute_capability", [10.0, 0], "exact compute capability \\[10,0\\]"),
+        ("torch_cuda_version", "12.8", "exact torch CUDA version 13.0"),
+        ("minimum_host_driver_version", 579, "host driver version >=580"),
+        ("minimum_host_driver_version", True, "host driver version >=580"),
+        ("minimum_host_driver_version", 580.0, "host driver version >=580"),
+        ("nvlink_pairs", [], "exact peer NVLink pair \\[\\[0,1\\]\\]"),
+        ("nvlink_pairs", [[0.0, 1]], "exact peer NVLink pair \\[\\[0,1\\]\\]"),
+        ("nvlink_link_label", "NV1", "exact peer NVLink label NV18"),
+    ],
+)
+def test_build_spec_refuses_non_b200_or_wrong_driver_floor(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    module, _, _, lock_path, spec_path = _fixture(tmp_path)
+    spec_document = json.loads(spec_path.read_bytes())
+    spec_document["cuda"][field] = value
+    spec_path.write_bytes(_canonical(spec_document))
+    _, locked, python_version = module.validate_lock(lock_path)
+
+    with pytest.raises(module.Refusal, match=message):
+        module.validate_spec(spec_path, locked, python_version)
 
 
 def test_generator_refuses_unhashed_or_incomplete_lock(tmp_path: Path) -> None:
@@ -383,9 +436,11 @@ def test_inventory_refuses_unclaimed_or_unsafe_site_packages_entries(
         module.inventory(staging, spec, locked)
 
 
-def test_checked_in_build_frontier_fails_closed_without_fake_lock() -> None:
-    assert not (ROOT / "runtime_image" / "dependency.lock").exists()
-    assert not (ROOT / "runtime_image" / "build-spec.json").exists()
+def test_checked_in_build_frontier_requires_external_content_addressed_seed() -> None:
+    lock = ROOT / "runtime_image" / "dependency.lock"
+    spec = ROOT / "runtime_image" / "build-spec.json"
+    assert _canonical(json.loads(lock.read_bytes())) == lock.read_bytes()
+    assert _canonical(json.loads(spec.read_bytes())) == spec.read_bytes()
 
     result = subprocess.run(
         ["bash", str(INPUT_CHECK)], text=True, capture_output=True, cwd=ROOT
@@ -393,7 +448,7 @@ def test_checked_in_build_frontier_fails_closed_without_fake_lock() -> None:
 
     assert result.returncode == 2
     assert "D043 REFUSED" in result.stderr
-    assert "uv.lock" in result.stderr
+    assert "DEBATE_RUNTIME_BINARY_SEED" in result.stderr
 
 
 def test_fixed_probe_sources_match_scheduler_contract_digests() -> None:
@@ -402,5 +457,184 @@ def test_fixed_probe_sources_match_scheduler_contract_digests() -> None:
         "4cff35d9b6d9d7ce0d9877f8a48c910950e86110d1b6981252cf84a75c0e0c9c"
     )
     assert hashlib.sha256(module.FIXED_CUDA_SOURCE.encode("ascii")).hexdigest() == (
-        "a294898149dba0c6b60486f169e985150e8c152a1ce11c917cf1f576b7cb0ebc"
+        "fdce677887461baeca032b1c8d4d0f7ccfc5d01e5896aa14feb13ff950169203"
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "reported_driver",
+        "driver_compatible",
+        "reported_topology",
+        "topology_compatible",
+        "compute_compatible",
+    ),
+    [
+        (
+            "580.65.06\n580.65.06\n",
+            True,
+            "        GPU0 GPU1 CPU Affinity\nGPU0    X    NV18  0-63\nGPU1    NV18 X    0-63\n",
+            True,
+            True,
+        ),
+        (
+            "579.99.99\n579.99.99\n",
+            False,
+            "        GPU0 GPU1 CPU Affinity\nGPU0    X    PIX  0-63\nGPU1    PIX  X    0-63\n",
+            False,
+            True,
+        ),
+        (
+            "580.65.06\n580.65.06\n",
+            True,
+            "        GPU0 GPU1 CPU Affinity\nGPU0    X    NV18  0-63\nGPU1    NV18 X    0-63\n",
+            True,
+            False,
+        ),
+    ],
+)
+def test_fixed_cuda_probe_enforces_driver_and_normalizes_nvlink_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    reported_driver: str,
+    driver_compatible: bool,
+    reported_topology: str,
+    topology_compatible: bool,
+    compute_compatible: bool,
+) -> None:
+    module = _module()
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__version__ = "2.11.0+cu130"
+    fake_torch.version = types.SimpleNamespace(cuda="13.0")
+    fake_torch.bfloat16 = object()
+    synchronized: list[int] = []
+
+    class FakeTensor:
+        def __init__(self, values: list[list[float]], device_index: int) -> None:
+            self._values = values
+            self.device = types.SimpleNamespace(type="cuda", index=device_index)
+            self.dtype = fake_torch.bfloat16
+            self.shape = (len(values), len(values[0]))
+
+        def tolist(self) -> list[list[float]]:
+            return self._values
+
+    def fake_tensor(
+        values: list[list[float]], *, dtype: object, device: str
+    ) -> FakeTensor:
+        assert dtype is fake_torch.bfloat16
+        return FakeTensor(values, int(device.removeprefix("cuda:")))
+
+    def fake_matmul(left: FakeTensor, right: FakeTensor) -> FakeTensor:
+        values = [
+            [
+                sum(left._values[row][inner] * right._values[inner][column] for inner in range(2))
+                for column in range(2)
+            ]
+            for row in range(2)
+        ]
+        if not compute_compatible:
+            values[0][0] = 0.0
+        return FakeTensor(values, left.device.index)
+
+    fake_torch.tensor = fake_tensor
+    fake_torch.matmul = fake_matmul
+    fake_torch.cuda = types.SimpleNamespace(
+        device_count=lambda: 2,
+        get_device_capability=lambda _index: (10, 0),
+        get_device_name=lambda _index: "NVIDIA B200",
+        is_available=lambda: True,
+        synchronize=lambda index: synchronized.append(index),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    observed_run: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        observed_run.append((args, kwargs))
+        command = args[0]
+        assert isinstance(command, list)
+        output = reported_topology if command[1:] == ["topo", "-m"] else reported_driver
+        return types.SimpleNamespace(stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    config = {
+        "compiled_extensions": [{"loaded": True, "module": "json"}],
+        "compute": {
+            "bf16_matmul": [
+                {"device_index": 0, "passed": True},
+                {"device_index": 1, "passed": True},
+            ]
+        },
+        "driver": {"compatible": True, "minimum_version": 580},
+        "gpu": {
+            "available": True,
+            "compute_capabilities": [[10, 0], [10, 0]],
+            "count": 2,
+            "device_names": ["NVIDIA B200", "NVIDIA B200"],
+        },
+        "python": {"path": sys.executable, "version": platform.python_version()},
+        "topology": {
+            "compatible": True,
+            "link_label": "NV18",
+            "nvlink_pairs": [[0, 1]],
+        },
+        "torch": {"cuda_version": "13.0", "version": "2.11.0+cu130"},
+    }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["probe", _canonical(config).decode("ascii")],
+    )
+
+    exec(compile(module.FIXED_CUDA_SOURCE, "<fixed-cuda-probe>", "exec"), {})
+
+    stdout = capsys.readouterr().out
+    observed = json.loads(stdout)
+    assert observed["driver"] == {
+        "compatible": driver_compatible,
+        "minimum_version": 580,
+    }
+    assert observed["topology"] == {
+        "compatible": topology_compatible,
+        "link_label": "NV18",
+        "nvlink_pairs": [[0, 1]],
+    }
+    assert observed["compute"] == {
+        "bf16_matmul": [
+            {"device_index": 0, "passed": compute_compatible},
+            {"device_index": 1, "passed": compute_compatible},
+        ]
+    }
+    assert synchronized == [0, 1]
+    assert reported_driver.strip() not in stdout
+    assert "CPU Affinity" not in stdout
+    assert observed_run == [
+        (
+            (
+                [
+                    "/usr/bin/nvidia-smi",
+                    "--query-gpu=driver_version",
+                    "--format=csv,noheader,nounits",
+                ],
+            ),
+            {
+                "check": True,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "ascii",
+                "env": {"LC_ALL": "C"},
+            },
+        ),
+        (
+            (["/usr/bin/nvidia-smi", "topo", "-m"],),
+            {
+                "check": True,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "ascii",
+                "env": {"LC_ALL": "C"},
+            },
+        ),
+    ]

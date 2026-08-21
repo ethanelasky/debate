@@ -284,20 +284,94 @@ def _grad_norm_metrics(grad_norm: float, clip_norm: float) -> dict[str, float]:
 
 
 def _release_training_cache(*_args, **_kwargs):
-    """Runs INSIDE the training worker (dispatched via execute_func_rank_zero;
-    must stay module-level picklable). Returns MiB (allocated, reserved)
-    before and after the flush so the driver can tell real allocations from
-    cache when a wake still OOMs."""
+    """Run inside one training worker; must stay module-level picklable.
+
+    The driver dispatches this function to every worker via RayWorkerGroup's
+    ``execute_all_sync`` API. Return the worker's global rank with MiB
+    (allocated, reserved) before and after the flush so the driver can prove
+    that every configured training rank completed before waking rollout.
+    """
     import gc
 
     import torch
 
     mib = 1024 * 1024
+    rank = int(os.environ["RANK"])
     before = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
     gc.collect()
     torch.cuda.empty_cache()
     after = (torch.cuda.memory_allocated() // mib, torch.cuda.memory_reserved() // mib)
-    return {"before": before, "after": after}
+    return {"rank": rank, "success": True, "before": before, "after": after}
+
+
+def _validate_training_cache_release_stats(stats, expected_ranks: int) -> list[dict]:
+    """Require one finite, successful allocator-flush record per rank."""
+    if (
+        not isinstance(expected_ranks, int)
+        or isinstance(expected_ranks, bool)
+        or expected_ranks < 1
+    ):
+        raise RuntimeError(f"invalid configured training rank count: {expected_ranks!r}")
+    if not isinstance(stats, list):
+        raise RuntimeError(
+            "all-rank training cache release returned an invalid result container "
+            f"{type(stats).__name__}; expected list"
+        )
+    if len(stats) != expected_ranks:
+        raise RuntimeError(
+            "all-rank training cache release cardinality mismatch: "
+            f"expected {expected_ranks}, got {len(stats)}"
+        )
+
+    by_rank: dict[int, dict] = {}
+    for index, record in enumerate(stats):
+        if not isinstance(record, dict):
+            raise RuntimeError(
+                f"training cache release result {index} is not a mapping: {record!r}"
+            )
+        rank = record.get("rank")
+        if not isinstance(rank, int) or isinstance(rank, bool):
+            raise RuntimeError(
+                f"training cache release result {index} has invalid rank: {rank!r}"
+            )
+        if rank < 0 or rank >= expected_ranks:
+            raise RuntimeError(
+                f"training cache release result {index} has out-of-range rank {rank}; "
+                f"expected 0..{expected_ranks - 1}"
+            )
+        if rank in by_rank:
+            raise RuntimeError(f"duplicate training cache release result for rank {rank}")
+        if record.get("success") is not True:
+            raise RuntimeError(f"training cache release failed on rank {rank}: {record!r}")
+
+        for phase in ("before", "after"):
+            values = record.get(phase)
+            if not isinstance(values, (list, tuple)) or len(values) != 2:
+                raise RuntimeError(
+                    f"training cache release rank {rank} has invalid {phase} telemetry: "
+                    f"{values!r}"
+                )
+            for value in values:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise RuntimeError(
+                        f"training cache release rank {rank} has invalid {phase} telemetry: "
+                        f"{values!r}"
+                    )
+                try:
+                    finite = math.isfinite(value)
+                except (OverflowError, TypeError, ValueError):
+                    finite = False
+                if not finite or value < 0:
+                    raise RuntimeError(
+                        f"training cache release rank {rank} has nonfinite or negative "
+                        f"{phase} telemetry: {values!r}"
+                    )
+        by_rank[rank] = record
+
+    missing = sorted(set(range(expected_ranks)) - set(by_rank))
+    if missing:
+        raise RuntimeError(f"missing training cache release results for ranks {missing}")
+    return [by_rank[rank] for rank in range(expected_ranks)]
 
 
 class VerlBackend(Backend):
@@ -363,13 +437,27 @@ class VerlBackend(Backend):
     # ------------------------------------------------------------- sampling
 
     def sync_sampler(self) -> None:
-        # Flush the training actor's allocator BEFORE the slept vLLM re-pins
-        # its pools: wake-time create_and_map competes for the same physical
+        # Flush every training allocator BEFORE the slept vLLM re-pins its
+        # pools: wake-time create_and_map competes for the same physical
         # memory, and at MB lengths (65k packing units, ~79GB train peak) the
         # cached-but-free segments alone are the difference between wake and
-        # OOM (2026-08-05 bisection). RANK_ZERO is exact for n_gpus=1; on
-        # multi-GPU this flushes only rank 0 — revisit then.
-        stats = self.wg.execute_func_rank_zero(_release_training_cache)
+        # OOM (2026-08-05 bisection). RayWorkerGroup.execute_all_sync invokes
+        # the named worker method once per rank and resolves every Ray result.
+        expected_ranks = self.config.n_gpus
+        if getattr(self.wg, "world_size", None) != expected_ranks:
+            raise RuntimeError(
+                "training worker-group cardinality mismatch before cache release: "
+                f"configured {expected_ranks}, worker group has "
+                f"{getattr(self.wg, 'world_size', None)!r}"
+            )
+        execute_all_sync = getattr(self.wg, "execute_all_sync", None)
+        if not callable(execute_all_sync):
+            raise RuntimeError(
+                "installed Verl RayWorkerGroup does not support execute_all_sync; "
+                "refusing to wake rollout without an all-rank cache release"
+            )
+        stats = execute_all_sync("execute_func_rank_zero", _release_training_cache)
+        stats = _validate_training_cache_release_stats(stats, expected_ranks)
         print(f"[verl] train-actor CUDA MiB (alloc/reserved) before->after flush: {stats}")
         # Wakes the rollout engine and pushes current FSDP weights (CUDA IPC).
         self.checkpoint_manager.update_weights(self._global_step)

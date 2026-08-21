@@ -1,92 +1,158 @@
-# D043 immutable Debate runtime assets
+# D043 immutable Debate B200 runtime
 
-This directory contains the provider-free metadata frontier for the fixed
-runtime root `/opt/job-scheduler/debate-runtime/v1`. It does not build or pull
-an image, resolve or install a dependency, contact RunPod, or authorize START.
+This directory now closes the provider-free build inputs for the fixed runtime
+root `/opt/job-scheduler/debate-runtime/v1`. It does not contact Hugging Face,
+a package index, a registry, RunPod, or a GPU provider, and it does not
+authorize START.
 
-The current repository cannot yet produce a truthful runtime image. Its
-`uv.lock` covers the Debate application but not the GPU execution stack:
-`torch`, `vllm`, `verl`, `ray`, and `flash-attn` are absent. The existing
-provisioner admits `vllm==0.24.*`, lets a resolver choose transitive packages,
-and patches four installed source files in place. The locally cached
-flash-attn wheels are not tracked build inputs. An immutable base-image digest
-and a complete artifact wheelhouse (including wheels with the approved source
-patches already applied) are also absent.
+The approved runtime uses a content-addressed binary-seed provenance tier. It
+does **not** claim that the portable environment came from a complete wheel
+set. The older wheel-lock v1 generator path remains available for genuinely
+wheel-derived runtimes; this B200 runtime uses the separate v2 seed schemas.
 
-For that reason, this change intentionally does **not** add a placeholder
-`dependency.lock`, `build-spec.json`, or Dockerfile. A placeholder would make a
-partial environment look reproducible. `verify_build_inputs.sh` fails closed
-until both canonical inputs exist and every lock artifact is present and
-hash-matched.
+## Closed source identities
 
-`runtime_contract.py` is the single exported machine-readable contract for
-all closed key sets, schema literals, limits, fixed paths, and exact probe
-programs. The generator loads that tracked module explicitly even under
-isolated Python. Scheduler bootstrap tests consume the same golden source and
-must reject a divergent local copy.
+`dependency.lock` is canonical compact ASCII JSON and binds all of:
 
-## Required build inputs
+- base image
+  `ghcr.io/ethanelasky/verl-megatron-ssh@sha256:162f12d0ba6fbceaf56294d783551b2e83aefcc6e76b9138737acd358ee0baa8`;
+- the base's real `/usr/bin/python3.12`, SHA-256
+  `e1efa562c2cc2e35521a5c9c9b9939921001ff8ca9708a13ef15ace68cc2ccd7`;
+- Hugging Face dataset `ethanelasky/verl-b200-env`, immutable revision
+  `dd4c26f6cb38002a56d55556c6e622308394e400`;
+- `verl-b200-portable.tar.zst`, exactly 3,891,912,437 bytes, SHA-256
+  `65ebafdd4e02e64887cb03740c9557dfcd17e98f8b8f720700c8166179fe62e9`;
+- its exact raw tar stream, exactly 10,294,538,240 bytes, SHA-256
+  `171b9b1c8ccd7e5a28b8a919e16e268d5b60cb7a34186ff78e4f7a15f5fa9c59`;
+- the deterministic relocation/removal policy; and
+- all 279 final installed distribution names and exact METADATA versions.
 
-`dependency.lock` is canonical compact ASCII JSON with no newline:
+The 3.9 GB seed and derived 10.3 GB tar are deliberately not stored in Git.
+Their bytes are external build inputs, not ambient dependency sources.
 
-```text
-{
-  "schema": "runpod-safety.debate-runtime-dependency-lock/v1",
-  "runtime_root": "/opt/job-scheduler/debate-runtime/v1",
-  "python_version": "<exact 3.12 version>",
-  "distributions": [
-    {"name":"<PEP-503 normalized>","version":"<exact>",
-     "artifact":{"path":"<relative tracked wheel>","sha256":"sha256:<64hex>"}}
-  ]
-}
+The checked `build-spec.json` fixes Python 3.12.3, distribution Torch 2.11.0,
+live `torch.__version__` 2.11.0+cu130, CUDA 13.0, Ray 2.56.1, Transformers
+5.14.1, Verl 0.9.0.dev0 (whose retained HTTPS VCS origin names commit
+`e9618406de5bad40041d7612554e465ec2003ec1`), vLLM 0.24.0, and compiled
+extension `vllm._C`. The validated seed does not contain flash-attn, so the
+spec does not invent a flash-attn import or provenance claim.
+
+## Deterministic offline preparation
+
+`prepare_binary_seed.py` accepts only the checked lock and one exact seed. It:
+
+- permits only normalized regular files/directories and the four declared
+  source symlinks, then removes every link from the final tree;
+- binds and ignores the archive's one exact empty out-of-prefix directory,
+  `workspace/uv/python`, while refusing every other out-of-prefix member;
+- refuses traversal, hard links, devices, FIFOs, unknown symlinks, duplicate
+  members, oversized members, editable hooks, and `file:` direct origins;
+- removes the complete editable Debate installation (scripts, finder, PTH,
+  bytecode, and dist-info), because the scheduler stages the reviewed Debate
+  source separately;
+- removes every retained `__pycache__`/`.pyc` and deterministically removes
+  those rows from each distribution `RECORD`;
+- admits only the three exact digest-allowlisted non-Debate PTH files;
+- preserves legitimate shared `RECORD` claims in each distribution inventory
+  while recording and hashing each final payload file exactly once;
+- binds the seed's two intentional virtualenv bootstrap files, `_virtualenv.pth`
+  and `_virtualenv.py`, as the only site-packages files not claimed by a
+  distribution `RECORD`;
+- replaces the portable Python link with the exact real base Python as a
+  mode-0555 single-link file;
+- changes `pyvenv.cfg` only from its exact source digest to the fixed
+  `home = /usr/bin` bytes;
+- rewrites only the exact source shebang and five declared activation files to
+  the fixed runtime root, always refuses the old
+  `/workspace/envs/verl-b200` prefix, and admits other `/workspace/` strings
+  only in 25 exact path-and-hash allowlisted SDK documentation/example or
+  native source/debug-string files; and
+- normalizes every payload file and directory to mtime zero, makes each file
+  exactly mode 0444 or 0555 and each directory mode 0555, and publishes a
+  canonical, complete `seed-transformation.json` file/directory inventory.
+
+The pinned outer image does not contain zstd. The preferred Docker input is
+therefore the content-addressed raw tar. Produce it outside the image using a
+locally reviewed decoder, then verify it before it enters the build context:
+
+```sh
+/opt/homebrew/bin/zstd -dcf verl-b200-portable.tar.zst \
+  -o verl-b200-portable.tar
+test "$(stat -f %z verl-b200-portable.tar)" = 10294538240
+test "$(shasum -a 256 verl-b200-portable.tar | awk '{print $1}')" = \
+  171b9b1c8ccd7e5a28b8a919e16e268d5b60cb7a34186ff78e4f7a15f5fa9c59
 ```
 
-Every installed distribution, including installer tooling left in the runtime,
-must appear exactly once. Entries are name-sorted. Each artifact is a regular,
-single-link file adjacent to the lock's build context; URLs, ranges, wildcards,
-editable installs, and ambient indexes are not accepted. The generator opens
-each artifact as a wheel, validates its METADATA identity and every RECORD
-hash/size, and compares installed package bytes with that locked source. An
-in-place source patch therefore fails; an approved patch must be represented by
-a new tracked, hashed wheel.
+On Linux use `stat -c %s`; the hash is platform-independent. The preparer
+rehashes the entire raw stream again, so decoder identity is not trusted.
 
-`build-spec.json` is canonical compact ASCII JSON with exact keys `schema`,
-`runtime_root`, `python`, `site_packages_path`, `required_imports`, and `cuda`.
-Its schema is `runpod-safety.debate-runtime-build-spec/v1`. Python fixes the
-path `/opt/job-scheduler/debate-runtime/v1/python/bin/python3.12` and an exact
-version. Required imports map a sorted module to its exact normalized
-distribution and version. CUDA fixes the torch distribution/version, the
-torch CUDA version, exact device count `1`, compute capability `[9,0]`, and a
-sorted nonempty list of compiled extension modules.
+The real transformed-tree audit found zero ELF `RPATH`/`RUNPATH` dynamic tags
+containing `/workspace`; the 25 reviewed occurrences above are content-bound
+in the lock. Any byte or path drift, any reappearance of the source environment
+prefix, or any new `/workspace/` occurrence refuses preparation.
 
-## Generated image objects
+Inside an offline build stage based on the literal pinned image digest:
 
-After an offline, hash-enforcing installer has populated the fixed runtime,
-run the generator as root in the image build. It writes, without replacement:
+```sh
+/usr/bin/python3.12 -I -S runtime_image/prepare_binary_seed.py \
+  --dependency-lock runtime_image/dependency.lock \
+  --binary-seed /build-inputs/verl-b200-portable.tar \
+  --archive-format tar \
+  --base-python /usr/bin/python3.12 \
+  --staging-root /
 
-- `dependency.lock`
-- `installed-distributions.json`
-- `required-import-probe.json`
-- `cuda-compatibility-probe.json`
-- `runtime-manifest.json`
+/usr/bin/python3.12 -I -S runtime_image/generate_runtime_metadata.py \
+  --dependency-lock runtime_image/dependency.lock \
+  --build-spec runtime_image/build-spec.json \
+  --uncompressed-seed /build-inputs/verl-b200-portable.tar \
+  --staging-root /
+```
 
-All JSON is canonical compact ASCII without a trailing newline. Support files
-are mode `0444`; the exact Python is a real mode-`0555` file, not a symlink.
-The final image step must make the complete runtime tree root-owned and
-non-writable, then the scheduler bootstrap independently rehashes it.
+`Dockerfile.binary-seed` encodes those two commands with `RUN --network=none`.
+For example, if a local directory contains only the locked raw tar:
 
-The inventory is complete against every `.dist-info/RECORD`, rejects editable
-or legacy installs, hashes every claimed regular file, records the exact
-metadata directory, and binds `direct_url.json` raw bytes plus its canonical
-semantic JSON when present. Its normalized distribution set and versions must
-equal the dependency lock exactly.
+```sh
+docker buildx build --pull=false --network=none \
+  --build-context runtime_seed=/absolute/raw-seed-directory \
+  --file runtime_image/Dockerfile.binary-seed \
+  --tag debate-b200-runtime:local --load .
+```
 
-Each probe document has exactly `schema`, `argv`, and `expected_result`.
-`argv` is exactly five elements: the fixed Python, `-I`, `-c`, the generator's
-fixed probe source, and canonical expected-result JSON. At START the installed
-bootstrap must execute that exact argv under a sanitized environment and
-require return code zero, empty stderr, and stdout byte-equal to canonical
-`expected_result` with no newline. The import probe checks live import plus
-distribution/version identity. The CUDA probe checks the live Python and
-torch/CUDA identity, exact H100 device count/capabilities, and compiled
-extension imports.
+Pass the raw tar through a BuildKit bind/named build context; do not add it to
+the repository or image. Build with `--network=none --pull=false`. Preparation
+does not implement a compressed mode: the pinned base has no decoder, and the
+raw bytes are independently content-addressed by the lock.
+
+The Dockerfile also digest-pins its Dockerfile frontend. That frontend, the
+literal base image, and the raw-tar named context must already be present in
+the local builder cache for a build with no registry access.
+
+`verify_build_inputs.sh` performs only the lock/spec/seed checks. Set exactly
+one of `DEBATE_RUNTIME_BINARY_SEED` or
+`DEBATE_RUNTIME_UNCOMPRESSED_SEED` before running it.
+
+## Generated evidence and readiness
+
+The generator publishes, without replacement:
+
+- `dependency.lock`;
+- `seed-transformation.json` (published by the preparer and bound by manifest);
+- `installed-distributions.json`, including every distribution RECORD file and
+  the complete transformed payload file-and-directory inventory, with exact
+  mode and normalized mtime;
+- `required-import-probe.json`;
+- `cuda-compatibility-probe.json`; and
+- `runtime-manifest.json`.
+
+The v2 manifest binds every sibling plus the exact Python. The scheduler
+bootstrap must rehash every payload file, reject any extra final-tree entry,
+and execute both canonical probes under its clean UID-10001 environment before
+READY. Evidence siblings are individually manifest-bound; the manifest binds
+itself by hashing the canonical document without its self-digest field.
+
+The CUDA probe requires the live runtime to report exactly two NVIDIA B200s,
+SM100 `[10,0]`, CUDA 13.0, driver major at least 580, symmetric NV18 for pair
+`[[0,1]]`, deterministic BF16 matmul plus synchronization on both devices, and
+the compiled vLLM extension. This provider-free closure does not claim that a
+real 2xB200 Debate run passed. That remains a separately authorized paid-run
+certification gate.
