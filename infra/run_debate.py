@@ -48,6 +48,7 @@ from infra.launch_namespace import (
     safe_path_component,
     validate_launch_namespace,
 )
+from infra.local_metrics_evidence import scheduler_artifact_attempt_root
 from infra.run_common import (
     TRAINING_KEYS,
     VERL_KEYS,
@@ -86,12 +87,20 @@ def _docent_run_dir(run_name: str, *, launch_namespace: str) -> str:
     Sweep arms share a working directory, so the run name must namespace their
     rollout files.  Unsafe or overlong names get a readable slug plus a digest:
     the digest prevents distinct names that sanitize alike from colliding. The
-    already-validated launch namespace is preserved byte-for-byte.
+    already-validated launch namespace is preserved byte-for-byte. Scheduler
+    runs put the namespace above ``docent/`` in their retained attempt root;
+    manual runs retain the historical ``docent/<run>/<namespace>`` layout.
     """
+    namespace = validate_launch_namespace(launch_namespace)
+    attempt_root = scheduler_artifact_attempt_root(namespace)
+    if attempt_root is not None:
+        return os.path.join(
+            attempt_root,
+            "docent",
+            safe_path_component(run_name, fallback="run"),
+        )
     return os.path.join(
-        "docent",
-        safe_path_component(run_name, fallback="run"),
-        validate_launch_namespace(launch_namespace),
+        "docent", safe_path_component(run_name, fallback="run"), namespace
     )
 
 
@@ -582,14 +591,22 @@ def _main_after_resume_frontier(
     )
     transcript_dir = None
     if config_kwargs.get("log_transcripts", Config.log_transcripts):
-        transcript_dir = str(
-            claim_directory(
-                os.path.join(
-                    "transcripts",
-                    safe_path_component(run_name, fallback="run"),
-                    launch_namespace,
-                )
+        artifact_attempt_root = scheduler_artifact_attempt_root(launch_namespace)
+        transcript_path = (
+            os.path.join(
+                artifact_attempt_root,
+                "transcripts",
+                safe_path_component(run_name, fallback="run"),
             )
+            if artifact_attempt_root is not None
+            else os.path.join(
+                "transcripts",
+                safe_path_component(run_name, fallback="run"),
+                launch_namespace,
+            )
+        )
+        transcript_dir = str(
+            claim_directory(transcript_path)
         )
 
     dataset_type = (exp.get("dataset") or {}).get("type")

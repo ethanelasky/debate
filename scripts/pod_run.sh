@@ -2,7 +2,10 @@
 # All-on-pod training launcher for both run modes:
 #   bash scripts/pod_run.sh debate <experiment> [runner args...]  # starts judge vLLM
 #   bash scripts/pod_run.sh rlvr   <experiment> [runner args...]  # no judge
-# Prereqs: provision_pod.sh has built $VOL/envs/verl-sm90; repo synced to /root/debate.
+# Manual-launch prereq: provision_pod.sh has built $VOL/envs/verl-sm90.
+# Scheduler launches instead use the immutable image runtime below /opt. The
+# repository may live at any frozen staging path; this launcher derives it from
+# its own file.
 #
 # Exit codes (a SEPARATE namespace from pod_up.sh's — same numbers, different
 # meanings; read them against this script only):
@@ -11,7 +14,7 @@
 #   2  unknown mode, invalid launch namespace, unresolvable judge config, or
 #      legacy checkpoint layout
 #   3  judge vLLM failed to start, serve, or free its port
-#   4  editable pip install/dependency preflight failed or timed out
+#   4  runtime validation, editable install, or dependency preflight failed
 #   5  a trainer is already running, another pod_run.sh holds the launch lock,
 #      or the pod is mid-teardown (a watchdog has committed to stopping it)
 #   6  the idle watchdog could not be started (pod would bill unprotected)
@@ -21,14 +24,47 @@
 # is what reaps it.
 set -euo pipefail
 
+# Resolve before reading any repository-relative path or changing directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+
+# Scheduler mode is a deliberately narrower launch surface. The scheduler
+# supplies credentials through the provider-owned process environment; it must
+# never make a git-ignored repository .env part of the frozen workload input.
+case "${DEBATE_SCHEDULER_MODE:-0}" in
+  0|1) ;;
+  *) echo "FATAL: DEBATE_SCHEDULER_MODE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${DEBATE_SCHEDULER_MODE:-0}" = 1 ] && [ "${POD_IDLE_STOP:-x}" != 0 ]; then
+  echo "FATAL: scheduler mode requires POD_IDLE_STOP=0; the scheduler owns the deadline and Pod lifecycle" >&2
+  exit 2
+fi
+
 # Secrets ride in the git-ignored repo-local .env (synced alongside the repo);
-# explicit environment always wins over the file.
-if [ -f "$(dirname "$0")/../.env" ]; then
+# explicit environment always wins over the file. Scheduler mode never opens
+# this file: provider-template secret injection is its only secret source.
+if [ "${DEBATE_SCHEDULER_MODE:-0}" != 1 ] && [ -f "$REPO_ROOT/.env" ]; then
   while IFS='=' read -r _k _v; do
     case "$_k" in ''|'#'*) continue ;; esac
     [ -n "$(eval echo "\${${_k}:-}")" ] || export "${_k}=${_v}"
-  done < "$(dirname "$0")/../.env"
+  done < "$REPO_ROOT/.env"
 fi
+
+# Scheduler launches keep pod-run diagnostics on the retained attempt tree.
+# Manual launches retain the historical /root location. The caller creates the
+# directory; refusing symlinks/canonicalization drift prevents a supplied path
+# from redirecting locks or judge logs after launch.
+POD_RUN_STATE_DIR="${POD_RUN_STATE_DIR:-/root}"
+if [ ! -d "$POD_RUN_STATE_DIR" ] || [ -L "$POD_RUN_STATE_DIR" ]; then
+  echo "FATAL: POD_RUN_STATE_DIR must be an existing non-symlink directory: $POD_RUN_STATE_DIR" >&2
+  exit 2
+fi
+POD_RUN_STATE_DIR_REAL="$(cd "$POD_RUN_STATE_DIR" && pwd -P)"
+if [ "$POD_RUN_STATE_DIR" != "$POD_RUN_STATE_DIR_REAL" ]; then
+  echo "FATAL: POD_RUN_STATE_DIR must be absolute and canonical: $POD_RUN_STATE_DIR_REAL" >&2
+  exit 2
+fi
+readonly SCRIPT_DIR REPO_ROOT POD_RUN_STATE_DIR POD_RUN_STATE_DIR_REAL
 
 MODE="${1:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
 EXP="${2:?usage: pod_run.sh <debate|rlvr> <experiment> [args...]}"
@@ -62,7 +98,7 @@ export DEBATE_LAUNCH_NAMESPACE
 # booting judge), and both launch watchdogs that then defer to each other and
 # exit. The lock is released just before the exec, where the trainer guard
 # takes over as the protection for the RUNNING phase.
-exec 9>/root/pod_run.lock
+exec 9>"$POD_RUN_STATE_DIR/pod_run.lock"
 flock -n 9 || {
   echo "FATAL: another pod_run.sh is mid-launch (lock held); wait for it to exec its trainer" >&2
   exit 5
@@ -135,7 +171,8 @@ live_watchdog_pids() {
 #                           state word and no pid was ever recorded: accepted,
 #                           writer unknown.
 # No state auto-removes the marker; every one exits 5.
-if [ -f /root/pod_idle_stop.stopping ]; then
+if [ "${DEBATE_SCHEDULER_MODE:-0}" != 1 ] \
+  && [ -f /root/pod_idle_stop.stopping ]; then
   STOPPING_PID=""
   STOPPING_STATE=""
   {
@@ -188,10 +225,21 @@ if [ -f /root/pod_idle_stop.stopping ]; then
   exit 5
 fi
 
-PY="${PY:-/workspace/envs/verl-sm90/bin/python}"
-# Resolved BEFORE the cd: an invocation by relative path would otherwise leave
-# the sibling-script lookup below pointing at the wrong directory.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCHEDULER_RUNTIME_PYTHON=/opt/job-scheduler/debate-runtime/v1/python/bin/python3.12
+readonly SCHEDULER_RUNTIME_PYTHON
+if [ "${DEBATE_SCHEDULER_MODE:-0}" = 1 ]; then
+  if [ "${PY+x}" = x ] && [ "$PY" != "$SCHEDULER_RUNTIME_PYTHON" ]; then
+    echo "FATAL: scheduler mode forbids a Python override outside the immutable image runtime" >&2
+    exit 4
+  fi
+  PY="$SCHEDULER_RUNTIME_PYTHON"
+else
+  PY="${PY:-/workspace/envs/verl-sm90/bin/python}"
+fi
+if [ ! -x "$PY" ]; then
+  echo "FATAL: required Python is not executable: $PY" >&2
+  exit 4
+fi
 
 # Toolkit preference mirrors provision_pod.sh, which means the SAME test it
 # runs: a system nvcc reporting `release 13.` (anchored on the dot so a future
@@ -237,7 +285,7 @@ export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
 # __pycache__/*.pyc back into it, so every run mutates a dependency others are
 # executing out of. Harmless in isolation; pointless risk on a shared volume.
 export PYTHONDONTWRITEBYTECODE=1
-cd /root/debate
+cd "$REPO_ROOT"
 
 # Everything below assumes an otherwise-idle pod: the stale-vLLM sweep kills by
 # pattern, and a trainer's COLOCATED verl rollout is itself a VLLM::EngineCore
@@ -361,17 +409,22 @@ kill_judge() {
   return 0
 }
 
-# The editable install has stalled indefinitely against an NFS-backed $VOL;
-# a bounded failure is recoverable, a silent hang bills the pod. Runs BEFORE
-# the judge: an install failure then aborts with nothing to clean up.
-if ! timeout -k 30s 600 "$PY" -m pip install -q -e . --no-deps; then
-  echo "FATAL: editable install of /root/debate failed or exceeded 600s (NFS stall writing to site-packages?), or $PY / timeout is missing (rc 127)" >&2
-  exit 4
+# Manual runs retain the historical editable install. Scheduler runs import the
+# frozen staged repository from their cwd and must never mutate or repair the
+# root-owned image runtime at START.
+if [ "${DEBATE_SCHEDULER_MODE:-0}" != 1 ]; then
+  # The editable install has stalled indefinitely against an NFS-backed $VOL;
+  # a bounded failure is recoverable, a silent hang bills the pod. Runs BEFORE
+  # the judge: an install failure then aborts with nothing to clean up.
+  if ! timeout -k 30s 600 "$PY" -m pip install -q -e . --no-deps; then
+    echo "FATAL: editable install of $REPO_ROOT failed or exceeded 600s (NFS stall writing to site-packages?), or $PY / timeout is missing (rc 127)" >&2
+    exit 4
+  fi
 fi
 
-# The editable install deliberately uses --no-deps because the shared GPU env
-# is provisioned as one jointly-resolved unit. That also means a prebuilt env
-# can be older than this checkout while the editable install still succeeds.
+# The manual editable install deliberately uses --no-deps because its shared
+# GPU env is provisioned as one jointly-resolved unit. The scheduler image is
+# independently digest-locked and receives the same read-only preflight.
 # Verify the symbolic grader stack before starting a judge or touching a GPU;
 # these are required project dependencies even when this particular run uses a
 # non-symbolic task family.
@@ -445,7 +498,7 @@ if [ "$MODE" = debate ]; then
   # here: a config-side judge change against a hardcoded launch means the
   # trainer 404s on every judge call, every datum drops, and the run burns
   # H100-hours producing no training signal. Loaded with the repo's own
-  # resolver (inheritance/presets applied) from /root/debate, as the runner does.
+  # resolver (inheritance/presets applied) from the derived repo root, as the runner does.
   JUDGE_CFG="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
 import os
 import sys
@@ -532,8 +585,9 @@ finally:
   echo "== starting judge vLLM server =="
   # The usual reason we are here is "the judge died mid-run"; truncating its log
   # would destroy the only evidence of why. Keep the previous incarnation.
-  if [ -f /root/judge_server.log ]; then
-    mv -f /root/judge_server.log /root/judge_server.log.prev
+  JUDGE_LOG="$POD_RUN_STATE_DIR/judge_server.log"
+  if [ -f "$JUDGE_LOG" ]; then
+    mv -f "$JUDGE_LOG" "$JUDGE_LOG.prev"
   fi
   # gpu-memory-utilization is a server-launch parameter, not a config field:
   # 0.18 leaves room for the trainer's rollout engine + FSDP init peak on 80GB.
@@ -549,7 +603,7 @@ finally:
     --model "$JUDGE_MODEL" --port "$JUDGE_PORT" \
     --gpu-memory-utilization 0.18 --max-model-len "${JUDGE_MAX_LEN:-16384}" \
     --max-num-seqs 32 --enable-prefix-caching \
-    > /root/judge_server.log 2>&1 9>&- &   # 9>&-: do not inherit the launch lock
+    > "$JUDGE_LOG" 2>&1 9>&- &   # 9>&-: do not inherit the launch lock
   JUDGE_PID=$!
   JUDGE_PGID="$(ps -o pgid= -p "$JUDGE_PID" 2>/dev/null | tr -d ' ' || true)"
   # Never group-kill our own group: if setsid did not detach, fall back to
@@ -565,14 +619,14 @@ finally:
   JUDGE_DEADLINE=$(( SECONDS + 900 ))
   until judge_ok; do
     if ! kill -0 "$JUDGE_PID" 2>/dev/null; then
-      echo "FATAL: judge vLLM (pid $JUDGE_PID) exited before serving; last 40 lines of /root/judge_server.log:" >&2
-      tail -40 /root/judge_server.log >&2 || true
+      echo "FATAL: judge vLLM (pid $JUDGE_PID) exited before serving; last 40 lines of $JUDGE_LOG:" >&2
+      tail -40 "$JUDGE_LOG" >&2 || true
       kill_judge
       exit 3
     fi
     if [ "$SECONDS" -ge "$JUDGE_DEADLINE" ]; then
-      echo "FATAL: judge vLLM alive but not answering /v1/completions on 127.0.0.1:$JUDGE_PORT after 900s; check /root/judge_server.log (last 40 lines below) and nvidia-smi for a wedged engine" >&2
-      tail -40 /root/judge_server.log >&2 || true
+      echo "FATAL: judge vLLM alive but not answering /v1/completions on 127.0.0.1:$JUDGE_PORT after 900s; check $JUDGE_LOG (last 40 lines below) and nvidia-smi for a wedged engine" >&2
+      tail -40 "$JUDGE_LOG" >&2 || true
       kill_judge
       exit 3
     fi

@@ -3,8 +3,10 @@
 With ``Config.log_transcripts`` (default true), every training rollout and
 every eval pass is captured (Ethan, 2026-08-05):
 
-  - FULL transcripts are success-gating local evidence under
-    ``transcripts/{safe_run_name}/{launch_namespace}/``. When W&B is active,
+  - FULL transcripts are success-gating local evidence under the manual path
+    ``transcripts/{safe_run_name}/{launch_namespace}/`` or, when the scheduler
+    supplies its retained root, under
+    ``{artifact_root}/{launch_namespace}/transcripts/{safe_run_name}/``. When W&B is active,
     best-effort copies land in Artifacts under a STABLE collection name per
     split — ``{split}-transcripts`` (type ``transcripts``), including the
     train/dev/test/eval split names used by callers. Stable names are the
@@ -52,6 +54,7 @@ from infra.launch_namespace import (
     safe_path_component,
     validate_launch_namespace,
 )
+from infra.local_metrics_evidence import scheduler_artifact_attempt_root
 
 SAMPLE_ROWS = 4
 SAMPLE_CHARS = 25_000  # per-cell truncation for the sample table only
@@ -168,7 +171,12 @@ def log_rollout_transcripts(
         )
 
     safe_run_name = safe_path_component(run_name, fallback="run")
-    expected_dir = os.path.join("transcripts", safe_run_name, namespace)
+    artifact_attempt_root = scheduler_artifact_attempt_root(namespace)
+    expected_dir = (
+        os.path.join(artifact_attempt_root, "transcripts", safe_run_name)
+        if artifact_attempt_root is not None
+        else os.path.join("transcripts", safe_run_name, namespace)
+    )
     if output_dir is None:
         out_dir = str(claim_directory(expected_dir))
     else:

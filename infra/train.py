@@ -502,17 +502,49 @@ def train(env: Env, backend: Backend, cfg: Config, eval_env: Env | None = None) 
                     f"expected {expected_transcript_dir}, got {cfg.transcript_dir}"
                 )
             require_claimed_directory(cfg.transcript_dir)
+    # Scheduler launches supply this root out-of-band.  It is intentionally not
+    # a Config/YAML field: a job or profile cannot redirect required evidence
+    # away from the scheduler-owned retained-volume destination.
+    from infra.local_metrics_evidence import LocalMetricsEvidence
+
+    local_metrics = LocalMetricsEvidence.from_environment(cfg.launch_namespace)
     logger: _RunLogger | None = None
+    succeeded = False
     try:
         logger = _make_logger(cfg)
         if transcript_run_name is not None:
             cfg._transcript_run_name = transcript_run_name
             cfg._transcript_sink_used = True
-        _train_with_logger(env, backend, cfg, eval_env, logger)
+
+        def log_metrics(step: int, metrics: dict[str, Any]) -> None:
+            # Required local evidence commits first.  W&B remains the same
+            # best-effort external mirror it was before this sink existed.
+            if local_metrics is not None:
+                local_metrics.metrics(step, metrics)
+            logger(step, metrics)
+
+        _train_with_logger(env, backend, cfg, eval_env, log_metrics)
+        succeeded = True
     finally:
-        close = getattr(logger, "close", None) if logger is not None else None
-        if close is not None:
-            close()
+        close_failed = False
+        try:
+            close = getattr(logger, "close", None) if logger is not None else None
+            if close is not None:
+                close()
+        except BaseException:
+            close_failed = True
+            raise
+        finally:
+            if local_metrics is not None:
+                try:
+                    local_metrics.finalize(
+                        succeeded=succeeded and not close_failed
+                    )
+                except BaseException:
+                    # Preserve an already-active training/logger failure.  On
+                    # the successful path, local finalization remains gating.
+                    if succeeded and not close_failed:
+                        raise
 
 
 def _train_with_logger(

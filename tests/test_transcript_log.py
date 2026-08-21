@@ -209,6 +209,37 @@ def test_local_transcript_path_is_namespaced_and_refuses_overwrite(
     assert path.read_bytes() == original
 
 
+def test_scheduler_transcript_path_uses_retained_attempt_root(
+    tmp_path, monkeypatch
+):
+    import wandb
+
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+    monkeypatch.setenv("DEBATE_ARTIFACT_ROOT", str(artifact_root))
+    monkeypatch.setenv("DEBATE_LAUNCH_NAMESPACE", "attempt-8")
+    monkeypatch.setattr(wandb, "run", None)
+    env = MetaEnv()
+    env.rollout(env.tasks(1), _policy(["answer"]), group_size=1)
+
+    log_rollout_transcripts(
+        4,
+        env,
+        "train",
+        run_name="run",
+        launch_namespace="attempt-8",
+        upload=False,
+    )
+
+    assert (
+        artifact_root
+        / "attempt-8"
+        / "transcripts"
+        / "run"
+        / "train-step-00004.jsonl"
+    ).is_file()
+
+
 def test_transcript_writer_refuses_unclaimed_existing_directory(
     tmp_path, monkeypatch
 ):

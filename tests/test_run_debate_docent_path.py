@@ -1,5 +1,5 @@
 import pytest
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from infra.run_debate import _docent_run_dir
 
@@ -51,3 +51,16 @@ def test_docent_run_dir_sanitizes_separators_without_collisions_or_escape():
 def test_docent_run_dir_rejects_injected_launch_namespace():
     with pytest.raises(ValueError, match="DEBATE_LAUNCH_NAMESPACE"):
         _docent_run_dir("debate", launch_namespace="../../other")
+
+
+def test_scheduler_docent_dir_is_inside_attempt_root_without_duplicate_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("DEBATE_ARTIFACT_ROOT", str(root))
+    monkeypatch.setenv("DEBATE_LAUNCH_NAMESPACE", "attempt-100")
+
+    assert _docent_run_dir("debate", launch_namespace="attempt-100") == str(
+        root / "attempt-100" / "docent" / "debate"
+    )
