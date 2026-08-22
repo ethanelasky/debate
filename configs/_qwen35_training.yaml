@@ -27,6 +27,7 @@
 #
 #   RESOLVED — now shared below:
 #     group_size     8               (was 4 on the debate arm; see the note there)
+#     eval_n         256             (was 32 on the debate arm — SE +/-0.087, unreadable)
 #
 #   PROBABLY ACCIDENTAL — no protocol reason found:
 #     lr             1e-4  vs 1e-5        (10x; the largest single gap)
@@ -36,7 +37,6 @@
 #     steps          200   vs 100
 #     save_every     10    vs 50
 #     eval_every     10    vs 5
-#     eval_n         256   vs 32
 #     eval_max_tokens 5120 vs 3072
 #     eval_split     dev   vs <unset>
 #     eval_dataset   amc   vs <unset>     (experiment-level, not training)
@@ -67,6 +67,13 @@ _qwen35_train_base:
     # group of 4 is often unanimous, and a unanimous group has zero advantage
     # and is dropped. A live run at step 36 dropped 60 of 68 datums that way.
     group_size: 8
+
+    # ---- evaluation ---------------------------------------------------------
+    # 256, not 32. At p=0.4 an n=32 eval has a standard error of +/-0.087, so a
+    # live debate run's eval read 0.438 -> 0.219 -> 0.469 -> 0.406 across 40
+    # steps: a range entirely explicable as noise. An eval that cannot separate
+    # a working run from a broken one is not worth the GPU time it costs.
+    eval_n: 256
 
     # ---- wandb -------------------------------------------------------------
     # The TEAM, not the api key's personal default entity — without this, runs
