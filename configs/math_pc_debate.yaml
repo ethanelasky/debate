@@ -202,8 +202,6 @@ mathl5_qwen35_pc_debate_cispo_verl:
     # between the two arms — see the OPEN DIVERGENCES list in
     # configs/_qwen35_training.yaml.
     lr: 1.0e-5
-    # PENDING DECISION: half the RLVR arm's rollouts per prompt (8 -> 4).
-    group_size: 4
     verl:
       n_gpus: 2
       strategy: fsdp2

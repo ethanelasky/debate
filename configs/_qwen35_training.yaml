@@ -25,12 +25,14 @@
 # mathl5_qwen35_pc_debate_cispo_verl (debate). Each wants a decision: is it
 # protocol-forced, or accidental drift?
 #
+#   RESOLVED — now shared below:
+#     group_size     8               (was 4 on the debate arm; see the note there)
+#
 #   PROBABLY ACCIDENTAL — no protocol reason found:
 #     lr             1e-4  vs 1e-5        (10x; the largest single gap)
 #     lr_schedule    cosine vs <unset>
 #     min_lr_ratio   0.2   vs <unset>
 #     warmup_steps   10    vs <unset>
-#     group_size     8     vs 4           (half the rollouts per prompt)
 #     steps          200   vs 100
 #     save_every     10    vs 50
 #     eval_every     10    vs 5
@@ -58,6 +60,13 @@ _qwen35_train_base:
     # comparison stops meaning anything. That is the whole point of the file.
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
+
+    # ---- sampling -----------------------------------------------------------
+    # Rollouts per prompt. Both arms use 8. The debate arm ran 4 for a while
+    # and it cost signal, not just time: with solution_correct around 0.8 a
+    # group of 4 is often unanimous, and a unanimous group has zero advantage
+    # and is dropped. A live run at step 36 dropped 60 of 68 datums that way.
+    group_size: 8
 
     # ---- wandb -------------------------------------------------------------
     # The TEAM, not the api key's personal default entity — without this, runs
