@@ -2,6 +2,10 @@
 # Pool fit (2026-08-14, scripts/hmmt_pass_eval.py): L5 pass@1 .558 / pass@8
 # .867 at uncapped think; AIME-2026 and HMMT sit far below the 20-85 band.
 
+# Objective shared with the debate arm (configs/_qwen35_training.yaml):
+# loss, KL and optimizer live there so the pair cannot drift.
+_includes: [_qwen35_training.yaml]
+
 _qwen35_l5:
   model: Qwen/Qwen3.5-4B
   enable_thinking: true
@@ -43,10 +47,10 @@ _qwen35_l5:
     save_every: 10
 
 mathl5_qwen35_cispo:
-  _extends: _qwen35_l5
-  training:
-    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
-    kl_coef: 0.02
+  # Protocol/model from _qwen35_l5; objective from the shared base (later
+  # parent wins). loss and kl_coef are NOT restated here: they must move on
+  # both arms at once or the debate comparison is meaningless.
+  _extends: [_qwen35_l5, _qwen35_train_base]
 
 mathl5_qwen35_dapo:
   _extends: _qwen35_l5

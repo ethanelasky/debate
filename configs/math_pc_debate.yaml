@@ -3,6 +3,11 @@
 # last word, as in the old PC arm) -> judge deliberation (private) + verdict.
 # Run: debate-rl --experiment-file configs/math_pc_debate.yaml --experiment <name>
 
+# Objective shared with the RLVR arm (configs/_qwen35_training.yaml).
+# Only the Qwen3.5 cispo arm below extends it; the ppo/gspo/reinforce
+# arms keep _base_math_pc's own loss.
+_includes: [_qwen35_training.yaml]
+
 _base_math_pc:
   protocol:
     turns:
@@ -154,7 +159,9 @@ math_pc_l5:
 # Dataset is the UNFILTERED L5 pool (no train_filter_file), i.e. the same pool
 # mathl5_qwen35_cispo trained on — not the l5_nonzero/sub8/solveband carves.
 mathl5_qwen35_pc_debate_cispo_verl:
-  _extends: math_pc_l5
+  # Protocol from math_pc_l5; objective from the shared base (later parent
+  # wins), so loss/kl_coef cannot drift from the RLVR arm.
+  _extends: [math_pc_l5, _qwen35_train_base]
   agents:
     alice:
       trained: true
@@ -184,7 +191,19 @@ mathl5_qwen35_pc_debate_cispo_verl:
     backend: verl
     # Match the Qwen3.5 RLVR arm's CISPO objective while keeping the debate
     # protocol/reward channel as the intervention.
-    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    # loss and kl_coef now come from _qwen35_train_base — do not restate them.
+    #
+    # OVERRIDES BELOW MUST SAY WHY. Everything here is either protocol-forced
+    # or a pending decision; an override without a reason is drift.
+    #
+    # PENDING DECISION (not protocol-forced): the RLVR arm runs lr 1e-4 with a
+    # cosine schedule, min_lr_ratio 0.2 and 10 warmup steps. This arm runs 1e-5
+    # with none of them. A 10x lr gap is the largest unexplained difference
+    # between the two arms — see the OPEN DIVERGENCES list in
+    # configs/_qwen35_training.yaml.
+    lr: 1.0e-5
+    # PENDING DECISION: half the RLVR arm's rollouts per prompt (8 -> 4).
+    group_size: 4
     verl:
       n_gpus: 2
       strategy: fsdp2

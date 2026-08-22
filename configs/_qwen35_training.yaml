@@ -1,0 +1,66 @@
+# Shared `training:` block for the Qwen3.5 RLVR/debate pair — the same role
+# _olmo_training.yaml plays for the OLMo pair, and written under the same
+# constraints:
+#
+#   * Only `training:`. Never `protocol:` — deep_merge merges lists BY INDEX,
+#     so a shared protocol block would silently corrupt turn definitions.
+#   * Never RLVR experiment-level keys (`model`, `enable_thinking`,
+#     `think_tokens`, `max_completion_tokens`, `eval_dataset`): run_debate's
+#     EXPERIMENT_KEYS does not know them.
+#
+# Why this file exists: the two arms are supposed to differ ONLY in the
+# protocol and reward channel, but they were maintained as independent copies
+# and had drifted on 23 training keys. What must match now lives here, in one
+# place, so a change to the objective cannot land on one arm and miss the
+# other.
+#
+# This file holds ONLY keys the two arms genuinely agree on today. Divergent
+# values are deliberately NOT parked here behind per-arm overrides — that
+# would look unified while changing nothing, and would make "delete the
+# override" a silent behaviour change. They are listed below instead, and each
+# is commented at its site in the arm that sets it.
+#
+# ---------------------------------------------------------------------------
+# OPEN DIVERGENCES between mathl5_qwen35_cispo (RLVR) and
+# mathl5_qwen35_pc_debate_cispo_verl (debate). Each wants a decision: is it
+# protocol-forced, or accidental drift?
+#
+#   PROBABLY ACCIDENTAL — no protocol reason found:
+#     lr             1e-4  vs 1e-5        (10x; the largest single gap)
+#     lr_schedule    cosine vs <unset>
+#     min_lr_ratio   0.2   vs <unset>
+#     warmup_steps   10    vs <unset>
+#     group_size     8     vs 4           (half the rollouts per prompt)
+#     steps          200   vs 100
+#     save_every     10    vs 50
+#     eval_every     10    vs 5
+#     eval_n         256   vs 32
+#     eval_max_tokens 5120 vs 3072
+#     eval_split     dev   vs <unset>
+#     eval_dataset   amc   vs <unset>     (experiment-level, not training)
+#
+#   PROTOCOL-FORCED — documented at their sites, leave alone:
+#     verl.n_gpus, verl.rollout_tp, verl.strategy,
+#     verl.gpu_memory_utilization (judge reserves ~0.18 on its own vLLM),
+#     verl.prompt_length, verl.response_length (debate's slot caps),
+#     adv_length_norm, kl_discount_factor, ppo_epochs
+#
+# Resolve the first group, then move each settled key into this file.
+# ---------------------------------------------------------------------------
+
+_qwen35_train_base:
+  training:
+    backend: verl
+
+    # ---- the objective ----------------------------------------------------
+    # This is what the debate/RLVR comparison holds fixed: same loss, same
+    # clipping, same KL penalty. A change here must move both arms, or the
+    # comparison stops meaning anything. That is the whole point of the file.
+    loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
+    kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
+
+    # ---- wandb -------------------------------------------------------------
+    # The TEAM, not the api key's personal default entity — without this, runs
+    # land in whoever launched them's own namespace and the rest of the team
+    # cannot see them.
+    wandb_entity: palaestra-research

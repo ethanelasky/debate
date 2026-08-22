@@ -15,6 +15,7 @@ YAML shape:
         - model_settings: {_preset: name, ...overrides}
     my_experiment:
       _extends: _some_template           # chained inheritance
+      _extends: [_a, _b]                 # multiple; later parents win
       ...child overrides (dicts merge recursively, lists merge BY INDEX)
 """
 
@@ -118,10 +119,24 @@ def _resolve_inheritance(name: str, data: dict, cache: dict) -> dict:
     if not isinstance(config, dict):
         return config
     if "_extends" in config:
-        parent = config["_extends"]
-        if parent not in data:
-            raise ValueError(f"{name!r} extends unknown parent {parent!r}")
-        parent_resolved = _resolve_inheritance(parent, data, cache)
+        # A list is multiple inheritance, merged LEFT TO RIGHT: the last parent
+        # wins. That lets an arm take its protocol from one parent and the
+        # shared objective from another, instead of the two arms keeping
+        # independent copies of the objective that silently drift apart.
+        parents = config["_extends"]
+        if isinstance(parents, str):
+            parents = [parents]
+        elif not isinstance(parents, (list, tuple)):
+            raise ValueError(
+                f"{name!r} has a non-string, non-list _extends: {parents!r}"
+            )
+        parent_resolved: dict = {}
+        for parent in parents:
+            if parent not in data:
+                raise ValueError(f"{name!r} extends unknown parent {parent!r}")
+            parent_resolved = deep_merge(
+                parent_resolved, _resolve_inheritance(parent, data, cache)
+            )
         resolved = deep_merge(parent_resolved, {k: v for k, v in config.items() if k != "_extends"})
     else:
         resolved = copy.deepcopy(config)

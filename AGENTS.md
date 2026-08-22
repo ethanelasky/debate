@@ -81,6 +81,72 @@ or evaluation protocol require the tradeoffs to be presented and Ethan's
 decision recorded before implementation. Continue autonomously on reversible
 implementation details that stay within an approved direction.
 
+## Job scheduler (jobd)
+
+New long-running work goes through **jobd** (`~/code/jobd`, state in
+`~/.local/state/jobd`) rather than the manual `pod_create.sh` + rsync + idle-stop
+dance. It queues runs, holds immutable state, enforces the deadline, retries
+what fails, moves inputs and outputs, and retires idle pods. The manual path in
+`## Pods` below still describes what happens *on* a pod and remains accurate;
+jobd is what gets you there and what owns the lifecycle.
+
+**Always start with `jobd info`** — one JSON document listing profiles, loaded
+secrets, the live fleet, the spec shape, and how to watch a run. It exists so
+you never rediscover RunPod GPU-type strings, images, disk sizing or ports.
+
+A **profile** is a named environment: GPU type/count, image, container and
+volume sizing, ports, credentials to inject, workdir, and the `setup` shell that
+rebuilds the training env on a fresh pod. `debate-b200x2` is this repo's:
+2x B200, the cluster pytorch image, `HF_TOKEN`/`WANDB_API_KEY`/`DOCENT_API_KEY`
+injected by name, repo synced to `/workspace/debate`, and `setup` running
+`scripts/env_bootstrap.sh` then verifying `/workspace/envs/verl-b200/bin/python`.
+
+```bash
+jobd profiles ls
+jobd submit --profile debate-b200x2 -n mathl5-debate-cispo -- \
+  bash scripts/pod_run.sh debate mathl5_qwen35_pc_debate_cispo_verl
+```
+
+Declare file movement as `inputs`/`outputs`; do not rsync by hand. The scheduler
+does it as part of the attempt, so it is reproducible and repeats on a retry.
+Default excludes drop `.git`/`outputs`/`wandb`/`.venv` — the difference between
+a 154MB sync and a 26GB one.
+
+Dependency graphs are the main reason it exists: `depends_on` in a spec file,
+and a job runs only once every dependency has SUCCEEDED. A permanently failed
+job marks everything downstream `blocked` instead of leaving it queued.
+
+Semantics worth knowing:
+
+- A **timeout is not retried** (it blew a bound it asked for); a crash or lost
+  pod is, with backoff.
+- A **failed `setup` fails the attempt**, so a broken env is never mistaken for
+  a broken experiment.
+- **Missing declared outputs turn success into failure.**
+- The daemon holds no process handle — jobs run detached and write their own
+  exit code, so restarting the daemon does not disturb a run.
+- `POD_IDLE_STOP=0` under jobd: the scheduler owns the deadline, not
+  `pod_run.sh`'s watchdog. Do **not** set `DEBATE_SCHEDULER_MODE=1` unless the
+  pod actually runs the immutable `/opt/job-scheduler/debate-runtime` image;
+  that flag forces a Python interpreter that does not exist on the standard
+  cluster image.
+
+Watching — prefer these to Monitor tasks (see the section above) and to ad-hoc
+SSH loops, since they read committed scheduler state rather than guessing from
+log lines:
+
+```bash
+jobd status <job>                  # full attempt history
+jobd logs <job> --tail 50
+jobd --json events --since <seq>   # append-only; poll from your last seq
+```
+
+Spend guard is two numbers: `max_pods` and each job's `timeout_s`. Note the
+RunPod account may carry **other people's pods** — `jobd --json pods ls` shows
+only jobd's, so check account-level spend before concluding the fleet is idle.
+
+Full spec: `~/code/jobd/README.md`. Global notes: `~/AGENTS.md`.
+
 ## Pods
 
 Before stopping a pod: evacuate artifacts (adapters, merged checkpoints, logs,
