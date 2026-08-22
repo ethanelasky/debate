@@ -196,12 +196,6 @@ mathl5_qwen35_pc_debate_cispo_verl:
     # OVERRIDES BELOW MUST SAY WHY. Everything here is either protocol-forced
     # or a pending decision; an override without a reason is drift.
     #
-    # PENDING DECISION (not protocol-forced): the RLVR arm runs lr 1e-4 with a
-    # cosine schedule, min_lr_ratio 0.2 and 10 warmup steps. This arm runs 1e-5
-    # with none of them. A 10x lr gap is the largest unexplained difference
-    # between the two arms — see the OPEN DIVERGENCES list in
-    # configs/_qwen35_training.yaml.
-    lr: 1.0e-5
     verl:
       n_gpus: 2
       strategy: fsdp2
