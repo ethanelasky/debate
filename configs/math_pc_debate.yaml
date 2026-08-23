@@ -162,6 +162,20 @@ mathl5_qwen35_pc_debate_cispo_verl:
   # Protocol from math_pc_l5; objective from the shared base (later parent
   # wins), so loss/kl_coef cannot drift from the RLVR arm.
   _extends: [math_pc_l5, _qwen35_train_base]
+  # Proposal wording, byte-identical to the RLVR arm's rollout prompt: the
+  # pack's <ANSWER_GEN_USER> splice renders this file into the proposal slot,
+  # so with math.yaml here the two arms would differ in prompt as well as in
+  # protocol, and neither arm's dev curve could be attributed.
+  dataset: {prompt_file: infra/prompts/tasks/math_nocot.yaml}
+  # dev/test instrument, byte-identical to mathl5_qwen35_cispo's eval_dataset
+  # in configs/math_qwen35.yaml — change the two together or the arms stop
+  # being comparable. AMC discriminates where the L5 dev carve saturates.
+  eval_dataset: {type: amc, prompt_file: infra/prompts/tasks/math_nocot.yaml, think_overshoot_penalty: 0.1}
+  # The RLVR arm derives these from think_tokens 4000 + max_completion_tokens
+  # 1024; debate slot budgets never reach the eval env, so it states them.
+  # Without them the eval generates single-phase to eval_max_tokens and every
+  # sample still thinking at the cap is graded as a wrong answer.
+  eval_slot_limits: {max_think_tokens: 4000, max_total_tokens: 5024}
   agents:
     alice:
       trained: true

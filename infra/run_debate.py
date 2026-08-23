@@ -28,12 +28,10 @@ optimization/loop knobs only):
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from infra.backend.base import LossSpec, OptimParams, SamplingParams
+from infra.backend.base import SamplingParams
 from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
@@ -50,16 +48,23 @@ from infra.launch_namespace import (
 )
 from infra.local_metrics_evidence import scheduler_artifact_attempt_root
 from infra.run_common import (
+    EVAL_SLOT_LIMIT_KEYS,
     TRAINING_KEYS,
     VERL_KEYS,
     acquire_wandb_resume_cli_lease,
     apply_wandb_resume_cli_authorization,
-    apply_topology,
     build_backend,
-    resolve_topology,
+    build_eval_source,
+    canonical_sha256,
+    effective_learning_protocol,
+    effective_protocol_training,
+    eval_slot_limits,
+    prepare_eval_env,
     release_wandb_resume_cli_lease,
+    resolve_topology,
     run_identity_suffix,
     runner_parser,
+    safe_locator,
     training_config_kwargs,
 )
 from infra.train import Config, resolve_protocol_identity, train, validate_resume_args
@@ -71,6 +76,8 @@ EXPERIMENT_KEYS = {
     "judge_config",
     "scoring",
     "dataset",
+    "eval_dataset",
+    "eval_slot_limits",
     "training",
     "fresh_positions",
     "flip",
@@ -117,6 +124,9 @@ def validate_experiment(exp: dict) -> None:
     adding "new_key" here too, or every run dies at launch with a one-line fix.
     """
     reject_unknown_keys(exp, EXPERIMENT_KEYS, "experiment")
+    reject_unknown_keys(
+        exp.get("eval_slot_limits") or {}, EVAL_SLOT_LIMIT_KEYS, "eval_slot_limits"
+    )
     for speaker, agent in (exp.get("agents") or {}).items():
         if isinstance(agent, dict):
             reject_unknown_keys(agent, AGENT_KEYS, f"agents.{speaker}")
@@ -138,28 +148,6 @@ def split_agents(exp: dict) -> tuple[dict[str, ModelSettings], dict[str, ModelSe
 # training.backend -> the model_type trained seats must declare: verl serves
 # rollouts through the local OpenAI shim, tinker samples through tinker.
 BACKEND_MODEL_TYPES = {"tinker": ModelType.TINKER, "verl": ModelType.LOCAL}
-
-
-def _canonical_sha256(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _safe_locator(value: object, *, field: str) -> str | None:
-    """Reject URL forms that could smuggle credentials into identity hashes."""
-    if value is None:
-        return None
-    locator = str(value)
-    if "://" in locator:
-        parsed = urlsplit(locator)
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(
-                f"{field} may not contain URL credentials, query parameters, or "
-                "fragments when constructing protocol identity"
-            )
-    return locator
 
 
 def _resolved_protocol(exp: dict) -> Protocol:
@@ -190,7 +178,7 @@ def _model_payload(settings: ModelSettings) -> dict:
     train_sampling = resolved_sampling_profile(settings, "train")
     return {
         "model_type": settings.model_type.name.lower(),
-        "model": _safe_locator(settings.model_file_path, field="model_file_path"),
+        "model": safe_locator(settings.model_file_path, field="model_file_path"),
         "alias": settings.alias,
         "resolved_max_new_tokens": settings.resolved_max_new_tokens,
         "resolved_reasoning_effort": settings.resolved_reasoning_effort,
@@ -202,160 +190,9 @@ def _model_payload(settings: ModelSettings) -> dict:
         "quantizations": settings.quantizations,
         "allow_fallbacks": settings.allow_fallbacks,
         "data_collection": settings.data_collection,
-        "base_url": _safe_locator(settings.base_url, field="base_url"),
+        "base_url": safe_locator(settings.base_url, field="base_url"),
         "train_sampling": train_sampling.model_dump(mode="json"),
     }
-
-
-def _effective_protocol_training(tr: dict, args=None) -> dict:
-    def configured(key: str, default):
-        value = tr.get(key)
-        return default if value is None else value
-
-    batch_size = (
-        getattr(args, "batch_size", None)
-        if args is not None and getattr(args, "batch_size", None) is not None
-        else configured("batch_size", Config.batch_size)
-    )
-    group_size = (
-        getattr(args, "group_size", None)
-        if args is not None and getattr(args, "group_size", None) is not None
-        else configured("group_size", Config.group_size)
-    )
-    return {
-        "batch_size": int(batch_size),
-        "group_size": int(group_size),
-        "dynamic_sampling_retries": int(
-            configured("dynamic_sampling_retries", Config.dynamic_sampling_retries)
-        ),
-        "oversample_factor": float(configured("oversample_factor", Config.oversample_factor)),
-        "rl_seed": int(configured("rl_seed", Config.seed)),
-        "eval_n": int(configured("eval_n", Config.eval_n)),
-        "eval_split": str(configured("eval_split", Config.eval_split)),
-        "final_test_eval": bool(configured("final_test_eval", Config.final_test_eval)),
-        "eval_max_tokens": (
-            None
-            if tr.get("eval_max_tokens", Config.eval_max_tokens) is None
-            else int(tr["eval_max_tokens"])
-        ),
-    }
-
-
-def _redacted_verl_overrides(values: object) -> list[str]:
-    """Retain algorithm overrides while stripping credentials/output paths."""
-    out: list[str] = []
-    secret_markers = (
-        "api_key",
-        "apikey",
-        "access_token",
-        "auth_token",
-        "bearer_token",
-        "secret",
-        "password",
-        "credential",
-    )
-    operational_path_markers = (
-        "checkpoint", "output_dir", "save_dir", "log_dir", "logging_dir", "wandb_dir"
-    )
-    for raw in values or ():
-        item = str(raw)
-        if "=" not in item:
-            out.append(item)
-            continue
-        key, value = item.split("=", 1)
-        normalized = key.lstrip("+").lower()
-        if any(marker in normalized for marker in secret_markers) or normalized.endswith(
-            (".token", "_token", "-token")
-        ):
-            value = "<redacted>"
-        elif os.path.isabs(value) and any(
-            marker in normalized for marker in operational_path_markers
-        ):
-            value = "<operational-path>"
-        elif "://" in value:
-            parsed = urlsplit(value)
-            if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                value = "<redacted-url>"
-        out.append(f"{key}={value}")
-    return out
-
-
-def _effective_learning_protocol(tr: dict, topology: dict | None = None) -> dict:
-    """Resolve the immutable learning algorithm, excluding operations only.
-
-    Run length, peak learning rate, resume/checkpoint/output locations,
-    W&B/logging, and save/eval cadence remain mutable. Ambiguous fields stay in
-    the identity so a resume cannot silently change the optimization method.
-    """
-    def configured(key: str, default):
-        value = tr.get(key)
-        return default if value is None else value
-
-    loss = LossSpec(**(tr.get("loss") or {}))
-    optim = OptimParams(lr=Config.lr)
-    backend = str(tr.get("backend", "tinker"))
-    payload = {
-        "backend": backend,
-        "lora_rank": int(configured("lora_rank", Config.lora_rank)),
-        "loss": {
-            "kind": loss.kind,
-            "clip_low": float(loss.clip_low),
-            "clip_high": float(loss.clip_high),
-            "entropy_coefficient": 0.0,
-        },
-        "updates": {
-            "micro_batch": int(configured("micro_batch", Config.micro_batch)),
-            "ppo_epochs": int(configured("ppo_epochs", Config.ppo_epochs)),
-        },
-        "advantages": {
-            "norm_by_std": bool(configured("norm_adv_by_std", Config.norm_adv_by_std)),
-            "population_std": bool(
-                configured("adv_population_std", Config.adv_population_std)
-            ),
-            "length_norm": str(configured("adv_length_norm", Config.adv_length_norm)),
-            "drop_zero": bool(
-                configured("drop_zero_advantage", Config.drop_zero_advantage)
-            ),
-        },
-        "kl": {
-            "coefficient": float(configured("kl_coef", Config.kl_coef)),
-            "mechanism": str(configured("kl_mechanism", Config.kl_mechanism)),
-            "discount_factor": float(
-                configured("kl_discount_factor", Config.kl_discount_factor)
-            ),
-        },
-        "optimizer": {
-            "betas": list(optim.betas),
-            "eps": float(optim.eps),
-            "weight_decay": float(optim.weight_decay),
-            "grad_clip": float(optim.grad_clip),
-            "warmup_steps": int(configured("warmup_steps", Config.warmup_steps)),
-            "lr_schedule": str(configured("lr_schedule", Config.lr_schedule)),
-            "min_lr_ratio": float(configured("min_lr_ratio", Config.min_lr_ratio)),
-        },
-    }
-    if backend == "verl":
-        from infra.backend.verl import VerlBackendConfig
-
-        # Match build_backend's exact topology-default/arm-override merge.
-        # Only the already-classified immutable subset is selected below;
-        # memory capacity and output locations remain operational.
-        v = apply_topology(dict(tr.get("verl") or {}), topology or {})
-        payload["verl"] = {
-            "strategy": str(v.get("strategy", VerlBackendConfig.strategy)),
-            "n_gpus": int(v.get("n_gpus", VerlBackendConfig.n_gpus)),
-            "prompt_length": int(v.get("prompt_length", VerlBackendConfig.prompt_length)),
-            "response_length": int(v.get("response_length", VerlBackendConfig.response_length)),
-            "max_token_len_per_gpu": int(
-                v.get("max_token_len_per_gpu", VerlBackendConfig.max_token_len_per_gpu)
-            ),
-            "rollout_tp": int(v.get("rollout_tp", VerlBackendConfig.rollout_tp)),
-            "use_remove_padding": bool(
-                v.get("use_remove_padding", VerlBackendConfig.use_remove_padding)
-            ),
-            "extra_overrides": _redacted_verl_overrides(v.get("extra_overrides")),
-        }
-    return payload
 
 
 def debate_protocol_identity(
@@ -374,8 +211,10 @@ def debate_protocol_identity(
     prompt_bytes = Path(prompt["file_path"]).read_bytes()
     protocol = _resolved_protocol(exp)
     tr = exp.get("training") or {}
-    training_protocol = _effective_protocol_training(tr, args)
+    training_protocol = effective_protocol_training(tr, args)
     plan_tokens = exp.get("plan_tokens")
+    eval_pool = dict(exp.get("eval_dataset") or {})
+    eval_limits = dict(exp.get("eval_slot_limits") or {})
     agents = {
         speaker: {"trained": speaker in trained, **_model_payload(settings)}
         for speaker, settings in sorted((trained | frozen).items())
@@ -388,7 +227,7 @@ def debate_protocol_identity(
             "file_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         },
         "agents": agents,
-        "learning": _effective_learning_protocol(tr, topology),
+        "learning": effective_learning_protocol(tr, topology),
         "judge": JudgeConfig(**(exp.get("judge_config") or {})).model_dump(mode="json"),
         "scoring": ScoringConfig(**(exp.get("scoring") or {})).model_dump(mode="json"),
         "positions": {
@@ -412,11 +251,24 @@ def debate_protocol_identity(
                 "max_tokens": training_protocol["eval_max_tokens"],
             },
             **training_protocol,
+            # Pool and generation caps of the dev/test instrument, present only
+            # when the arm declares them: an arm that reads its task source at
+            # the plain eval_max_tokens cap keeps the identity it published.
+            **(
+                {"dataset": {k: str(v) for k, v in sorted(eval_pool.items())}}
+                if eval_pool
+                else {}
+            ),
+            **(
+                {"slot_limits": {k: int(v) for k, v in sorted(eval_limits.items())}}
+                if eval_limits
+                else {}
+            ),
         },
     }
     runner = {
         "runner_protocol": "debate-runner-v2",
-        "runner_protocol_sha256": _canonical_sha256(payload),
+        "runner_protocol_sha256": canonical_sha256(payload),
         "runner_prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         "runner_prompt_entry": str(prompt["entry"]),
     }
@@ -550,19 +402,6 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
         raise
 
 
-def _main(cleanups: list) -> None:
-    args = runner_parser(__doc__).parse_args()
-    validate_resume_args(args)
-    launch_namespace = resolve_launch_namespace()
-    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
-    try:
-        _main_after_resume_frontier(
-            cleanups, args, launch_namespace, resume_lease_handoff
-        )
-    finally:
-        release_wandb_resume_cli_lease(resume_lease_handoff)
-
-
 def _main_after_resume_frontier(
     cleanups: list,
     args,
@@ -612,6 +451,11 @@ def _main_after_resume_frontier(
     dataset_type = (exp.get("dataset") or {}).get("type")
     env = build_env(exp, trained, frozen)
     cleanups.append(env.family.close)
+    # Built before the backend so a bad eval pool fails in seconds rather than
+    # after the rollout engine is up.
+    eval_source, eval_source_close = build_eval_source(exp)
+    if eval_source_close is not None:
+        cleanups.append(eval_source_close)
     topology = resolve_topology()
     protocol_identity = debate_protocol_identity(
         exp, dataset_type, env.family, trained, frozen, args=args, topology=topology
@@ -680,18 +524,30 @@ def _main_after_resume_frontier(
 
     cfg.on_rollout = _export_docent
 
-    # RLVR evals: measure proposal accuracy on the held-out split via the
-    # task source itself (MathEnv), not a debate. plan_tokens wraps the eval in
-    # the same plan-then-answer shape as the protocol's pre-proposal plan slot,
-    # so the policy is measured in the mode it is trained in (set it to that
-    # slot's max_total_tokens).
-    eval_env = env.task_source
-    plan_tokens = exp.get("plan_tokens")
-    if plan_tokens is not None:
-        from infra.envs.planned import PlannedEnv
-
-        eval_env = PlannedEnv(eval_env, int(plan_tokens))
+    # RLVR evals: proposal accuracy on a held-out split through a task source,
+    # not through a debate. `eval_dataset:` supplies its own pool; without one
+    # the training pool's dev/test carve is read. DebateEnv never routes a
+    # rollout through its task source, so eval caps set here reach the eval
+    # only.
+    eval_env = prepare_eval_env(
+        env.task_source if eval_source is None else eval_source,
+        limits=eval_slot_limits(exp),
+        plan_tokens=exp.get("plan_tokens"),
+    )
     train(env, backend, cfg, eval_env=eval_env)
+
+
+def _main(cleanups: list) -> None:
+    args = runner_parser(__doc__).parse_args()
+    validate_resume_args(args)
+    launch_namespace = resolve_launch_namespace()
+    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
+    try:
+        _main_after_resume_frontier(
+            cleanups, args, launch_namespace, resume_lease_handoff
+        )
+    finally:
+        release_wandb_resume_cli_lease(resume_lease_handoff)
 
 
 def main() -> None:

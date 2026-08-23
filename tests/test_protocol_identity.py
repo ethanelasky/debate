@@ -337,6 +337,10 @@ def test_rlvr_runner_identity_rejects_secret_bearing_model_url():
         lambda exp: exp.update(flip=True),
         lambda exp: exp.update(first_speech_non_debate_aware=True),
         lambda exp: exp.update(plan_tokens=100),
+        # The eval instrument: which held-out pool the dev metric reads, and
+        # under which generation caps. Both change what the number means.
+        lambda exp: exp.update(eval_dataset={"type": "amc"}),
+        lambda exp: exp.update(eval_slot_limits={"max_think_tokens": 4000}),
         lambda exp: exp["agents"]["alice"]["model_settings"].update(
             model_file_path="org/other-policy"
         ),
@@ -358,6 +362,46 @@ def test_debate_runner_identity_tracks_scientific_protocol(tmp_path, mutate):
 
     assert _debate_identity(changed) != baseline
     assert all(isinstance(k, str) and isinstance(v, str) for k, v in baseline.items())
+
+
+# Published identity of the fixture experiments above. A resume matches the
+# identity byte-for-byte, so a payload-schema change — a new field, a field
+# that stops being conditional, a renamed key — locks every in-flight run out
+# of its own lineage and makes new runs incomparable to the published ones.
+# Update these ONLY together with a deliberate decision to break that, never
+# to make a red test green.
+GOLDEN_DEBATE_SHA = "95955cf178fe3e540835b79594e27b7b3e1147f17ac5ae521d5a530d5208576c"
+GOLDEN_RLVR_SHA = "619e1ab8b093f56db9ee6296e85899533478bd34248cc033566373553fccff51"
+
+
+def test_published_identity_schema_is_stable(tmp_path):
+    prompt = tmp_path / "prompts.yaml"
+    prompt.write_text("debate:\n  system: prompt\n")
+    assert (
+        _debate_identity(_debate_exp(prompt))["runner_protocol_sha256"]
+        == GOLDEN_DEBATE_SHA
+    )
+    from infra.run_rlvr import rlvr_protocol_identity
+
+    assert (
+        rlvr_protocol_identity(_rlvr_exp(), "math", IdentityFamily())[
+            "runner_protocol_sha256"
+        ]
+        == GOLDEN_RLVR_SHA
+    )
+
+
+def test_debate_identity_ignores_empty_eval_instrument_declarations(tmp_path):
+    """An arm that declares no eval pool and no eval caps keeps the identity it
+    already published: those fields enter the payload only when configured, so
+    adding the keys to the runner did not invalidate every existing run."""
+    prompt = tmp_path / "prompts.yaml"
+    prompt.write_text("debate:\n  system: prompt\n")
+    exp = _debate_exp(prompt)
+    baseline = _debate_identity(exp)
+    empty = copy.deepcopy(exp)
+    empty.update(eval_dataset={}, eval_slot_limits={})
+    assert _debate_identity(empty) == baseline
 
 
 def test_debate_runner_identity_tracks_prompt_bytes(tmp_path):

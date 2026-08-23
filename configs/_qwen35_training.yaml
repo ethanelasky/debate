@@ -4,9 +4,10 @@
 #
 #   * Only `training:`. Never `protocol:` — deep_merge merges lists BY INDEX,
 #     so a shared protocol block would silently corrupt turn definitions.
-#   * Never RLVR experiment-level keys (`model`, `enable_thinking`,
-#     `think_tokens`, `max_completion_tokens`, `eval_dataset`): run_debate's
-#     EXPERIMENT_KEYS does not know them.
+#   * Never experiment-level keys — `training:` is the only block a debate
+#     experiment and an RLVR experiment parse the same way. `model`,
+#     `enable_thinking`, `think_tokens` and `max_completion_tokens` are
+#     RLVR-only and run_debate's EXPERIMENT_KEYS rejects them outright.
 #
 # Why this file exists: the two arms are supposed to differ ONLY in the
 # protocol and reward channel, but they were maintained as independent copies
@@ -36,12 +37,27 @@
 #                    than 200: same shape, compressed. warmup_steps 10 is 10%
 #                    of the debate run against 5% of the RLVR run.
 #
-#   CANNOT BE SHARED — structural, not a decision:
-#     eval_dataset   amc (RLVR) vs unset (debate). This is an EXPERIMENT-level
-#                    key and run_debate.EXPERIMENT_KEYS does not contain it;
-#                    reject_unknown_keys would raise at startup. Giving the
-#                    debate arm a held-out eval pool needs a code change in
-#                    run_debate, not a config line.
+#   MATCHED, BUT DECLARED AT BOTH SITES — experiment-level keys, which this
+#   file (a `training:` block) cannot carry:
+#     eval_dataset   amc + math_nocot + think_overshoot_penalty 0.1 on both
+#                    arms. Parking it here would ADD a declaration rather than
+#                    replace one: _qwen35_l5 must keep its own for the arms
+#                    that never extend this base (mathl5_qwen35_dapo), and a
+#                    later parent would then silently win for some arms and
+#                    not others. One declaration per arm, pinned equal by
+#                    tests/test_debate_eval_pool.py.
+#     eval budget    RLVR: think_tokens 4000 + max_completion_tokens 1024.
+#                    Debate: eval_slot_limits {4000, 5024} — protocol slot
+#                    budgets never reach an eval env, so the debate arm states
+#                    the same caps directly. Same test pins the pair.
+#     dataset.prompt_file
+#                    math_nocot.yaml on both arms: the debate proposal slot
+#                    renders the task source's ANSWER_GEN_USER, so this is the
+#                    rollout prompt for both.
+#
+#   STILL DIFFERENT — dataset.think_overshoot_penalty is 0.1 on the RLVR train
+#   pool and 0.0 on the debate one. It prices the reward the arms are supposed
+#   to differ in, so it is not folded in here.
 #
 #   PROTOCOL-FORCED — documented at their sites, leave alone:
 #     verl.n_gpus, verl.rollout_tp, verl.strategy,

@@ -40,12 +40,9 @@ RLVR prompt is byte-identical to the eval arm's blind view by construction.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-from urllib.parse import urlsplit
 
-from infra.backend.base import LossSpec, OptimParams, SamplingParams
+from infra.backend.base import SamplingParams
 from infra.config import load_experiment, reject_unknown_keys
 from infra.envs.tasks import get_family
 from infra.launch_namespace import (
@@ -58,12 +55,17 @@ from infra.run_common import (
     VERL_KEYS,
     acquire_wandb_resume_cli_lease,
     apply_wandb_resume_cli_authorization,
-    apply_topology,
     build_backend,
-    resolve_topology,
+    build_eval_source,
+    canonical_sha256,
+    effective_learning_protocol,
+    effective_protocol_training,
+    prepare_eval_env,
     release_wandb_resume_cli_lease,
+    resolve_topology,
     run_identity_suffix,
     runner_parser,
+    safe_locator,
     training_config_kwargs,
 )
 from infra.train import Config, resolve_protocol_identity, train, validate_resume_args
@@ -94,206 +96,6 @@ EXPERIMENT_KEYS = {
 }
 
 
-def _canonical_sha256(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _safe_model_locator(value: object) -> str | None:
-    """Return a model identifier only when it cannot carry URL credentials.
-
-    Model IDs and local checkpoint paths are scientific inputs.  URL userinfo,
-    queries, and fragments are a different matter: they commonly contain API
-    keys.  Refuse those forms instead of making a secret-derived hash part of
-    the immutable W&B identity.
-    """
-    if value is None:
-        return None
-    locator = str(value)
-    if "://" in locator:
-        parsed = urlsplit(locator)
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(
-                "model identifiers in protocol identity may not contain URL "
-                "credentials, query parameters, or fragments"
-            )
-    return locator
-
-
-def _effective_protocol_training(tr: dict, args=None) -> dict:
-    """Training-loop fields that alter what is rolled out or evaluated.
-
-    Continuation and operational plumbing (steps, lr, checkpoints, logging,
-    save/eval cadence) is intentionally absent.  In particular, extending a
-    run or changing its continuation LR must not manufacture a new protocol.
-    """
-    def configured(key: str, default):
-        value = tr.get(key)
-        return default if value is None else value
-
-    batch_size = (
-        getattr(args, "batch_size", None)
-        if args is not None and getattr(args, "batch_size", None) is not None
-        else configured("batch_size", Config.batch_size)
-    )
-    group_size = (
-        getattr(args, "group_size", None)
-        if args is not None and getattr(args, "group_size", None) is not None
-        else configured("group_size", Config.group_size)
-    )
-    return {
-        "batch_size": int(batch_size),
-        "group_size": int(group_size),
-        "dynamic_sampling_retries": int(
-            configured("dynamic_sampling_retries", Config.dynamic_sampling_retries)
-        ),
-        "oversample_factor": float(configured("oversample_factor", Config.oversample_factor)),
-        "rl_seed": int(configured("rl_seed", Config.seed)),
-        "eval_n": int(configured("eval_n", Config.eval_n)),
-        "eval_split": str(configured("eval_split", Config.eval_split)),
-        "final_test_eval": bool(configured("final_test_eval", Config.final_test_eval)),
-        "eval_max_tokens": (
-            None
-            if tr.get("eval_max_tokens", Config.eval_max_tokens) is None
-            else int(tr["eval_max_tokens"])
-        ),
-    }
-
-
-def _redacted_verl_overrides(values: object) -> list[str]:
-    """Keep arbitrary algorithm overrides without retaining credentials/paths.
-
-    ``extra_overrides`` is an escape hatch and can change the optimizer or
-    loss, so dropping it would make the identity incomplete.  It can also be
-    (mis)used for secrets or machine-local paths.  Preserve order because
-    Hydra's last duplicate wins, but replace sensitive values before hashing.
-    """
-    out: list[str] = []
-    secret_markers = (
-        "api_key",
-        "apikey",
-        "access_token",
-        "auth_token",
-        "bearer_token",
-        "secret",
-        "password",
-        "credential",
-    )
-    operational_path_markers = (
-        "checkpoint", "output_dir", "save_dir", "log_dir", "logging_dir", "wandb_dir"
-    )
-    for raw in values or ():
-        item = str(raw)
-        if "=" not in item:
-            out.append(item)
-            continue
-        key, value = item.split("=", 1)
-        normalized = key.lstrip("+").lower()
-        if any(marker in normalized for marker in secret_markers) or normalized.endswith(
-            (".token", "_token", "-token")
-        ):
-            value = "<redacted>"
-        elif os.path.isabs(value) and any(
-            marker in normalized for marker in operational_path_markers
-        ):
-            value = "<operational-path>"
-        elif "://" in value:
-            parsed = urlsplit(value)
-            if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                value = "<redacted-url>"
-        out.append(f"{key}={value}")
-    return out
-
-
-def _effective_learning_protocol(tr: dict, topology: dict | None = None) -> dict:
-    """Resolve the immutable optimization contract from runner configuration.
-
-    Only explicitly operational/continuation knobs are excluded: run length,
-    peak learning rate, resume/checkpoint/output locations, W&B/logging, and
-    save/eval cadence.  When a field's scientific status is debatable, it is
-    retained: false-positive resume refusal is safer than silently continuing
-    under a different learning algorithm.
-    """
-    def configured(key: str, default):
-        value = tr.get(key)
-        return default if value is None else value
-
-    loss = LossSpec(**(tr.get("loss") or {}))
-    optim = OptimParams(lr=Config.lr)
-    backend = str(tr.get("backend", "tinker"))
-    payload = {
-        "backend": backend,
-        "lora_rank": int(configured("lora_rank", Config.lora_rank)),
-        "loss": {
-            "kind": loss.kind,
-            "clip_low": float(loss.clip_low),
-            "clip_high": float(loss.clip_high),
-            # Neither supported backend adds an entropy loss today. Record the
-            # effective value so adding one cannot happen outside this schema.
-            "entropy_coefficient": 0.0,
-        },
-        "updates": {
-            "micro_batch": int(configured("micro_batch", Config.micro_batch)),
-            "ppo_epochs": int(configured("ppo_epochs", Config.ppo_epochs)),
-        },
-        "advantages": {
-            "norm_by_std": bool(configured("norm_adv_by_std", Config.norm_adv_by_std)),
-            "population_std": bool(
-                configured("adv_population_std", Config.adv_population_std)
-            ),
-            "length_norm": str(configured("adv_length_norm", Config.adv_length_norm)),
-            "drop_zero": bool(
-                configured("drop_zero_advantage", Config.drop_zero_advantage)
-            ),
-        },
-        "kl": {
-            "coefficient": float(configured("kl_coef", Config.kl_coef)),
-            "mechanism": str(configured("kl_mechanism", Config.kl_mechanism)),
-            "discount_factor": float(
-                configured("kl_discount_factor", Config.kl_discount_factor)
-            ),
-        },
-        "optimizer": {
-            # Peak lr is deliberately mutable for continuations/sweeps. These
-            # remaining AdamW/clip settings are fixed runner defaults.
-            "betas": list(optim.betas),
-            "eps": float(optim.eps),
-            "weight_decay": float(optim.weight_decay),
-            "grad_clip": float(optim.grad_clip),
-            "warmup_steps": int(configured("warmup_steps", Config.warmup_steps)),
-            "lr_schedule": str(configured("lr_schedule", Config.lr_schedule)),
-            "min_lr_ratio": float(configured("min_lr_ratio", Config.min_lr_ratio)),
-        },
-    }
-    if backend == "verl":
-        # Importing this module is dependency-light; verl/ray imports remain
-        # local to backend construction. These are the resolved algorithm and
-        # numerical-execution settings, not the checkpoint or GPU-memory knobs.
-        from infra.backend.verl import VerlBackendConfig
-
-        # Identity must describe the same effective settings build_backend
-        # receives: topology supplies defaults, while the arm wins. Capacity
-        # and output-only keys remain excluded below.
-        v = apply_topology(dict(tr.get("verl") or {}), topology or {})
-        payload["verl"] = {
-            "strategy": str(v.get("strategy", VerlBackendConfig.strategy)),
-            "n_gpus": int(v.get("n_gpus", VerlBackendConfig.n_gpus)),
-            "prompt_length": int(v.get("prompt_length", VerlBackendConfig.prompt_length)),
-            "response_length": int(v.get("response_length", VerlBackendConfig.response_length)),
-            "max_token_len_per_gpu": int(
-                v.get("max_token_len_per_gpu", VerlBackendConfig.max_token_len_per_gpu)
-            ),
-            "rollout_tp": int(v.get("rollout_tp", VerlBackendConfig.rollout_tp)),
-            "use_remove_padding": bool(
-                v.get("use_remove_padding", VerlBackendConfig.use_remove_padding)
-            ),
-            "extra_overrides": _redacted_verl_overrides(v.get("extra_overrides")),
-        }
-    return payload
-
-
 def rlvr_protocol_identity(
     exp: dict, dataset_type: str, family, *, args=None, topology: dict | None = None
 ) -> dict[str, str]:
@@ -315,12 +117,12 @@ def rlvr_protocol_identity(
         structure = "direct"
         sampler_cap = answer_tokens
 
-    training_protocol = _effective_protocol_training(tr, args)
+    training_protocol = effective_protocol_training(tr, args)
     eval_cap = training_protocol["eval_max_tokens"]
     payload = {
         "schema": "rlvr-runner-v2",
-        "model": _safe_model_locator(exp.get("model")),
-        "learning": _effective_learning_protocol(tr, topology),
+        "model": safe_locator(exp.get("model"), field="model"),
+        "learning": effective_learning_protocol(tr, topology),
         "rollout": {
             "structure": structure,
             "answer_max_tokens": answer_tokens,
@@ -356,7 +158,7 @@ def rlvr_protocol_identity(
     runner = {
         "runner_protocol": "rlvr-runner-v2",
         "runner_rollout_structure": structure,
-        "runner_protocol_sha256": _canonical_sha256(payload),
+        "runner_protocol_sha256": canonical_sha256(payload),
     }
     collision = set(base) & set(runner)
     if collision:
@@ -464,19 +266,6 @@ def validate_experiment(exp: dict) -> None:
             )
 
 
-def _main(cleanups: list) -> None:
-    args = runner_parser(__doc__).parse_args()
-    validate_resume_args(args)
-    launch_namespace = resolve_launch_namespace()
-    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
-    try:
-        _main_after_resume_frontier(
-            cleanups, args, launch_namespace, resume_lease_handoff
-        )
-    finally:
-        release_wandb_resume_cli_lease(resume_lease_handoff)
-
-
 def _main_after_resume_frontier(
     cleanups: list,
     args,
@@ -525,12 +314,9 @@ def _main_after_resume_frontier(
     ds.pop("relaxed_extraction", None)  # debate-only knob; source envs score both
     env = family.source(ds)
 
-    eval_env = None
-    eval_ds = dict(exp.get("eval_dataset") or {})
-    if eval_ds:
-        eval_family = get_family(eval_ds.pop("type", None))
-        cleanups.append(eval_family.close)
-        eval_env = eval_family.source(eval_ds)
+    eval_env, eval_source_close = build_eval_source(exp)
+    if eval_source_close is not None:
+        cleanups.append(eval_source_close)
     topology = resolve_topology()
     protocol_identity = rlvr_protocol_identity(
         exp, dataset_type, family, args=args, topology=topology
@@ -556,6 +342,7 @@ def _main_after_resume_frontier(
     # engine must fit in one request (gen_budgets vs verl.response_length).
     think_tokens = exp.get("think_tokens")
     total_budget = int(max_tokens)
+    eval_limits = None
     # plan_tokens: the PLAN turn is the largest single generation, so the
     # sampler ceiling must be raised to it — Policy.predict min()-clamps slot
     # limits against params.max_tokens, which is exactly how the 8k plan
@@ -576,15 +363,24 @@ def _main_after_resume_frontier(
         from infra.envs.base import SlotLimits
 
         total_budget = int(think_tokens) + int(max_tokens)
-        source_env.slot_limits = SlotLimits(
+        eval_limits = SlotLimits(
             max_think_tokens=int(think_tokens), max_total_tokens=total_budget
         )
-        if eval_env is not None:
-            # Same budget-forced think closure on the eval pool: a hard cap
-            # without forcing truncates mid-think and reads as wrong answers
-            # (the 2026-08-14 greedy@5120 artifact).
-            eval_env.slot_limits = source_env.slot_limits
+        source_env.slot_limits = eval_limits
         gen_budgets["think_tokens + max_completion_tokens"] = total_budget
+
+    # A separate eval pool is measured with the TRAINING instrument: the same
+    # budget-forced think closure (a hard cap without forcing truncates
+    # mid-think and reads as wrong answers — the 2026-08-14 greedy@5120
+    # artifact) and the same plan-then-answer shape the identity already
+    # publishes under evaluation.environment. eval_env None keeps train()'s
+    # fallback to the training env, which carries both already.
+    eval_env = prepare_eval_env(
+        eval_env,
+        limits=eval_limits,
+        plan_tokens=plan_tokens,
+        plan_answer_max_tokens=int(max_tokens),
+    )
 
     backend = build_backend(
         tr,
@@ -656,6 +452,19 @@ def _main_after_resume_frontier(
 
     cfg.on_rollout = _export_docent
     train(env, backend, cfg, eval_env=eval_env)
+
+
+def _main(cleanups: list) -> None:
+    args = runner_parser(__doc__).parse_args()
+    validate_resume_args(args)
+    launch_namespace = resolve_launch_namespace()
+    resume_lease_handoff = acquire_wandb_resume_cli_lease(args)
+    try:
+        _main_after_resume_frontier(
+            cleanups, args, launch_namespace, resume_lease_handoff
+        )
+    finally:
+        release_wandb_resume_cli_lease(resume_lease_handoff)
 
 
 def main() -> None:

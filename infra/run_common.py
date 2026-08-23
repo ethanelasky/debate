@@ -1,27 +1,35 @@
 """Plumbing shared by the train runners (run_debate, run_rlvr): the
 training-block key contract, backend construction under the exact checkpoint
-layout ``<root>/<safe-run>/<namespace>``, the sweep-suffix run identity, and
-the common CLI.
+layout ``<root>/<safe-run>/<namespace>``, the sweep-suffix run identity, the
+common CLI, the identity payload fragments both runners hash, and the eval
+instrument (which held-out pool, under which caps).
 
 This module exists so the dependency points the right way: run_rlvr is the
 judge-free control arm and must not import from run_debate (the treatment)
-to get machinery both arms share. Nothing here knows about debates, judges,
-or task families.
+to get machinery both arms share. Nothing here knows about debates or judges;
+the task registry it needs for `eval_dataset:` stays behind a local import,
+so importing this module stays cheap.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
+from urllib.parse import urlsplit
 
-from infra.backend.base import LossSpec
+from infra.backend.base import LossSpec, OptimParams
+from infra.config import reject_unknown_keys
+from infra.envs.base import Env, SlotLimits
 from infra.launch_namespace import (
     claim_directory,
     resolve_launch_namespace,
     safe_path_component,
     validate_launch_namespace,
 )
+from infra.train import Config
 
 
 # Every key the runners actually read out of `training:` — the union of
@@ -548,3 +556,297 @@ def build_backend(
         backend_config.launch_namespace = namespace
         return VerlBackend(backend_config)
     raise ValueError(f"training.backend must be tinker|verl, got {backend_kind!r}")
+
+
+# ---------------------------------------------------------------------------
+# Protocol-identity fragments.
+#
+# Both runners publish an immutable identity that a resume must match, under
+# their own schema (`rlvr-runner-v2`, `debate-runner-v2`). The payload pieces
+# below are the parts that are the SAME question for both arms — how the
+# optimizer was configured, which loop knobs change what gets rolled out —
+# and they were maintained as two copies that differed only in comments. A
+# silent divergence here corrupts exactly the comparison the shared config
+# template protects, so there is one copy.
+# ---------------------------------------------------------------------------
+
+
+def canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def safe_locator(value: object, *, field: str) -> str | None:
+    """Return an identifier only when it cannot carry URL credentials.
+
+    Model IDs, local checkpoint paths and seat base URLs are scientific
+    inputs. URL userinfo, queries and fragments are a different matter: they
+    commonly carry API keys. Refuse those forms rather than make a
+    secret-derived hash part of the immutable W&B identity.
+    """
+    if value is None:
+        return None
+    locator = str(value)
+    if "://" in locator:
+        parsed = urlsplit(locator)
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(
+                f"{field} may not contain URL credentials, query parameters, or "
+                "fragments when constructing protocol identity"
+            )
+    return locator
+
+
+def effective_protocol_training(tr: dict, args=None) -> dict:
+    """Training-loop fields that alter what is rolled out or evaluated.
+
+    Continuation and operational plumbing (steps, lr, checkpoints, logging,
+    save/eval cadence) is intentionally absent. In particular, extending a run
+    or changing its continuation LR must not manufacture a new protocol.
+    """
+    def configured(key: str, default):
+        value = tr.get(key)
+        return default if value is None else value
+
+    batch_size = (
+        getattr(args, "batch_size", None)
+        if args is not None and getattr(args, "batch_size", None) is not None
+        else configured("batch_size", Config.batch_size)
+    )
+    group_size = (
+        getattr(args, "group_size", None)
+        if args is not None and getattr(args, "group_size", None) is not None
+        else configured("group_size", Config.group_size)
+    )
+    return {
+        "batch_size": int(batch_size),
+        "group_size": int(group_size),
+        "dynamic_sampling_retries": int(
+            configured("dynamic_sampling_retries", Config.dynamic_sampling_retries)
+        ),
+        "oversample_factor": float(configured("oversample_factor", Config.oversample_factor)),
+        "rl_seed": int(configured("rl_seed", Config.seed)),
+        "eval_n": int(configured("eval_n", Config.eval_n)),
+        "eval_split": str(configured("eval_split", Config.eval_split)),
+        "final_test_eval": bool(configured("final_test_eval", Config.final_test_eval)),
+        "eval_max_tokens": (
+            None
+            if tr.get("eval_max_tokens", Config.eval_max_tokens) is None
+            else int(tr["eval_max_tokens"])
+        ),
+    }
+
+
+def redacted_verl_overrides(values: object) -> list[str]:
+    """Keep arbitrary algorithm overrides without retaining credentials/paths.
+
+    ``extra_overrides`` is an escape hatch and can change the optimizer or
+    loss, so dropping it would make the identity incomplete. It can also be
+    (mis)used for secrets or machine-local paths. Preserve order because
+    Hydra's last duplicate wins, but replace sensitive values before hashing.
+    """
+    out: list[str] = []
+    secret_markers = (
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "bearer_token",
+        "secret",
+        "password",
+        "credential",
+    )
+    operational_path_markers = (
+        "checkpoint", "output_dir", "save_dir", "log_dir", "logging_dir", "wandb_dir"
+    )
+    for raw in values or ():
+        item = str(raw)
+        if "=" not in item:
+            out.append(item)
+            continue
+        key, value = item.split("=", 1)
+        normalized = key.lstrip("+").lower()
+        if any(marker in normalized for marker in secret_markers) or normalized.endswith(
+            (".token", "_token", "-token")
+        ):
+            value = "<redacted>"
+        elif os.path.isabs(value) and any(
+            marker in normalized for marker in operational_path_markers
+        ):
+            value = "<operational-path>"
+        elif "://" in value:
+            parsed = urlsplit(value)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                value = "<redacted-url>"
+        out.append(f"{key}={value}")
+    return out
+
+
+def effective_learning_protocol(tr: dict, topology: dict | None = None) -> dict:
+    """Resolve the immutable optimization contract from runner configuration.
+
+    Only explicitly operational/continuation knobs are excluded: run length,
+    peak learning rate, resume/checkpoint/output locations, W&B/logging, and
+    save/eval cadence. When a field's scientific status is debatable, it is
+    retained: false-positive resume refusal is safer than silently continuing
+    under a different learning algorithm.
+    """
+    def configured(key: str, default):
+        value = tr.get(key)
+        return default if value is None else value
+
+    loss = LossSpec(**(tr.get("loss") or {}))
+    optim = OptimParams(lr=Config.lr)
+    backend = str(tr.get("backend", "tinker"))
+    payload = {
+        "backend": backend,
+        "lora_rank": int(configured("lora_rank", Config.lora_rank)),
+        "loss": {
+            "kind": loss.kind,
+            "clip_low": float(loss.clip_low),
+            "clip_high": float(loss.clip_high),
+            # Neither supported backend adds an entropy loss today. Record the
+            # effective value so adding one cannot happen outside this schema.
+            "entropy_coefficient": 0.0,
+        },
+        "updates": {
+            "micro_batch": int(configured("micro_batch", Config.micro_batch)),
+            "ppo_epochs": int(configured("ppo_epochs", Config.ppo_epochs)),
+        },
+        "advantages": {
+            "norm_by_std": bool(configured("norm_adv_by_std", Config.norm_adv_by_std)),
+            "population_std": bool(
+                configured("adv_population_std", Config.adv_population_std)
+            ),
+            "length_norm": str(configured("adv_length_norm", Config.adv_length_norm)),
+            "drop_zero": bool(
+                configured("drop_zero_advantage", Config.drop_zero_advantage)
+            ),
+        },
+        "kl": {
+            "coefficient": float(configured("kl_coef", Config.kl_coef)),
+            "mechanism": str(configured("kl_mechanism", Config.kl_mechanism)),
+            "discount_factor": float(
+                configured("kl_discount_factor", Config.kl_discount_factor)
+            ),
+        },
+        "optimizer": {
+            # Peak lr is deliberately mutable for continuations/sweeps. These
+            # remaining AdamW/clip settings are fixed runner defaults.
+            "betas": list(optim.betas),
+            "eps": float(optim.eps),
+            "weight_decay": float(optim.weight_decay),
+            "grad_clip": float(optim.grad_clip),
+            "warmup_steps": int(configured("warmup_steps", Config.warmup_steps)),
+            "lr_schedule": str(configured("lr_schedule", Config.lr_schedule)),
+            "min_lr_ratio": float(configured("min_lr_ratio", Config.min_lr_ratio)),
+        },
+    }
+    if backend == "verl":
+        # Importing this module is dependency-light; verl/ray imports remain
+        # local to backend construction. These are the resolved algorithm and
+        # numerical-execution settings, not the checkpoint or GPU-memory knobs.
+        from infra.backend.verl import VerlBackendConfig
+
+        # Identity must describe the same effective settings build_backend
+        # receives: topology supplies defaults, while the arm wins. Capacity
+        # and output-only keys remain excluded below.
+        v = apply_topology(dict(tr.get("verl") or {}), topology or {})
+        payload["verl"] = {
+            "strategy": str(v.get("strategy", VerlBackendConfig.strategy)),
+            "n_gpus": int(v.get("n_gpus", VerlBackendConfig.n_gpus)),
+            "prompt_length": int(v.get("prompt_length", VerlBackendConfig.prompt_length)),
+            "response_length": int(v.get("response_length", VerlBackendConfig.response_length)),
+            "max_token_len_per_gpu": int(
+                v.get("max_token_len_per_gpu", VerlBackendConfig.max_token_len_per_gpu)
+            ),
+            "rollout_tp": int(v.get("rollout_tp", VerlBackendConfig.rollout_tp)),
+            "use_remove_padding": bool(
+                v.get("use_remove_padding", VerlBackendConfig.use_remove_padding)
+            ),
+            "extra_overrides": redacted_verl_overrides(v.get("extra_overrides")),
+        }
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# The eval instrument: which held-out pool the loop reads, under which caps.
+#
+# Both arms answer this the same way — a dev number is only comparable across
+# arms when every arm reads the same pool through the same generation budget —
+# so the mechanism lives here and only the values differ per config.
+# ---------------------------------------------------------------------------
+
+EVAL_SLOT_LIMIT_KEYS = {"max_think_tokens", "max_visible_tokens", "max_total_tokens"}
+
+
+def build_eval_source(exp: dict) -> tuple[Env | None, object | None]:
+    """The `eval_dataset:` pool, as (env, close). (None, None) when the
+    experiment declares none, and the caller's own env is evaluated instead.
+
+    A training pool whose dev carve saturates (MATH L5) cannot separate two
+    policies at all, and an arm reading its own carve while another reads AMC
+    is not measuring the same quantity — hence a pool that is chosen
+    independently of what the arm trains on.
+    """
+    ds = dict(exp.get("eval_dataset") or {})
+    if not ds:
+        return None, None
+    # Local: the task registry pulls every family (and their dataset/runtime
+    # dependencies) at import time, and most callers of this module never
+    # build an env.
+    from infra.envs.tasks import get_family
+
+    family = get_family(ds.pop("type", None))
+    try:
+        return family.source(ds), family.close
+    except BaseException:
+        family.close()
+        raise
+
+
+def eval_slot_limits(exp: dict) -> SlotLimits | None:
+    """`eval_slot_limits:` -> hard caps for every eval generation, or None.
+
+    An arm whose rollout budgets are not expressible as experiment-level
+    think/answer token counts (debate: they are per-protocol-slot, and slot
+    budgets never reach an eval env) states the eval budget directly. Without
+    caps the eval is a single-phase generation limited only by
+    training.eval_max_tokens: a sample still thinking at the cap is cut
+    mid-derivation, has no ``\\boxed{}`` and grades as a wrong answer. With
+    max_think_tokens set, predict() routes through budget_forced_sample, which
+    force-closes the think phase and leaves the rest of the budget to answer.
+    """
+    spec = dict(exp.get("eval_slot_limits") or {})
+    if not spec:
+        return None
+    reject_unknown_keys(spec, EVAL_SLOT_LIMIT_KEYS, "eval_slot_limits")
+    return SlotLimits(**{key: int(value) for key, value in spec.items()})
+
+
+def prepare_eval_env(
+    env: Env | None,
+    *,
+    limits: SlotLimits | None = None,
+    plan_tokens: int | None = None,
+    plan_answer_max_tokens: int | None = None,
+) -> Env | None:
+    """Apply the eval instrument to the env the loop will evaluate on.
+
+    ``None`` passes straight through, so a runner whose training env is also
+    its eval env keeps train()'s own `eval_env=None` fallback. The caps go on
+    the env because that is where SingleTurnEnv.rollout reads them.
+    plan_tokens wraps the eval in the same plan-then-answer shape as the
+    training rollout, so the policy is measured in the mode it is trained in.
+    """
+    if env is None:
+        return None
+    if limits is not None:
+        env.slot_limits = limits
+    if plan_tokens is not None:
+        from infra.envs.planned import PlannedEnv
+
+        return PlannedEnv(env, int(plan_tokens), answer_max_tokens=plan_answer_max_tokens)
+    return env

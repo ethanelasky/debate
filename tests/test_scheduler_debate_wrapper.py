@@ -96,18 +96,36 @@ def test_scheduler_selected_experiment_uses_two_b200s_without_protocol_drift() -
     }
 
     # The scheduler-only hardware mapping must not rewrite the inherited
-    # debate, prompt, dataset, judging, reward, or evaluation protocol.
+    # debate, prompt, judging or reward protocol.
     for key in (
         "protocol",
         "prompt_config",
         "fresh_positions",
         "judge_config",
         "scoring",
-        "dataset",
     ):
         assert experiment[key] == base[key]
-    for key in ("eval_every", "eval_n", "eval_max_tokens"):
-        assert experiment["training"][key] == base["training"][key]
+    # Eval cadence comes from the shared Qwen3.5 objective template, NOT from
+    # math_pc_l5: the arm's dev metric has to be the RLVR arm's, read at the
+    # same points with the same sample count.
+    rlvr = load_experiment("configs/math_qwen35.yaml", "mathl5_qwen35_cispo")
+    for key in ("eval_every", "eval_n", "eval_max_tokens", "eval_split"):
+        assert experiment["training"][key] == rlvr["training"][key]
+
+    # The one intended dataset difference is the rollout prompt, which is held
+    # equal to the RLVR arm's: the proposal slot renders the task source's
+    # ANSWER_GEN_USER, so a different file here would make the two arms differ
+    # in wording as well as in protocol. Everything else stays inherited.
+    assert experiment["dataset"] == base["dataset"] | {
+        "prompt_file": rlvr["dataset"]["prompt_file"]
+    }
+    # Held-out eval instrument: same pool, same prompt, same generation caps as
+    # the RLVR arm, or the dev curves are not comparable.
+    assert experiment["eval_dataset"] == rlvr["eval_dataset"]
+    assert experiment["eval_slot_limits"] == {
+        "max_think_tokens": rlvr["think_tokens"],
+        "max_total_tokens": rlvr["think_tokens"] + rlvr["max_completion_tokens"],
+    }
 
     agents = experiment["agents"]
     assert {agents[name]["model_settings"]["model_file_path"] for name in agents} == {
