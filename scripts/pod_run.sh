@@ -420,6 +420,11 @@ else
     echo "== idle deadman DISABLED (POD_DEADMAN_MINUTES=0) -- nothing on this pod will ever stop it =="
   elif [ -n "$(live_watchdog_pids)" ]; then
     echo "== a primary idle watchdog is already running; no deadman needed =="
+  elif [ -n "$(deadman_pids)" ]; then
+    # jobd arms one from the profile setup, which runs on every pod it creates
+    # -- including build pods, which never reach this script. Re-arming here
+    # would leave two watchdogs racing to stop the same pod.
+    echo "== a deadman is already armed (pid $(deadman_pids | tr '\n' ' ')) =="
   else
     if [ -f /root/pod_deadman.out ]; then
       mv -f /root/pod_deadman.out /root/pod_deadman.out.prev
