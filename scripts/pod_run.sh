@@ -117,11 +117,17 @@ flock -n 9 || {
 # every marker it wrote as belonging to a dead process.
 # Defined up here because the teardown check below is the first thing that needs
 # it; the watchdog launch and the armed wait use it later.
+deadman_pids() {
+  # setsid can fork, so the launcher's $! goes stale immediately -- same reason
+  # live_watchdog_pids exists rather than trusting a recorded pid.
+  pgrep -f 'bash( -[^ ]+)* [^ ]*pod_idle_stop\.sh --deadman' 2>/dev/null || true
+}
+
 live_watchdog_pids() {
   local p args
   for p in $(pgrep -f 'bash( -[^ ]+)* [^ ]*pod_idle_stop\.sh' 2>/dev/null || true); do
     args="$(ps -o args= -p "$p" 2>/dev/null || true)"
-    case "$args" in *--once*) continue ;; esac
+    case "$args" in *--once*|*--deadman*) continue ;; esac
     printf '%s\n' "$p"
   done
 }
@@ -341,7 +347,9 @@ esac
 # Idle watchdog: once the pod has been idle for IDLE_MINUTES (default 30) — no
 # trainer/eval processes, no active SSH, GPU idle — it kills leftover vLLM
 # servers and STOPS the pod. An H100 left running after a finished run is the
-# most expensive failure mode here. Set POD_IDLE_STOP=0 to keep the pod up.
+# most expensive failure mode here. POD_IDLE_STOP=0 hands that job to whoever
+# owns the pod's lifecycle instead -- but arms a long-timeout deadman behind
+# them, because that owner runs on a laptop. See the deadman block below.
 
 # Asserts that SOME watchdog is running, or aborts the launch. Which process it
 # is does not matter: setsid can fork (making our $! short-lived), and a
@@ -390,6 +398,48 @@ if [ "${POD_IDLE_STOP:-1}" != 0 ]; then
     sleep 3
     if ! kill -0 "$WATCHDOG_PID" 2>/dev/null; then
       watchdog_alive_or_fatal "it exited within 3 seconds of launch"
+    fi
+  fi
+else
+  # The primary watchdog is off because something else claims this pod's
+  # lifecycle -- jobd, or scheduler_debate_supervisor.py. That owner runs on a
+  # laptop, and if it crashes, sleeps, or loses the network, NOTHING on this
+  # pod stops it billing. That is the most expensive failure available here,
+  # and it is the one case the owner cannot protect against itself.
+  #
+  # So arm the same watchdog with an idle timeout far longer than any owner's.
+  # jobd retires an idle pod after 10 minutes, so a 3-hour deadman cannot fire
+  # while jobd is alive; it only ever fires once the owner is gone. Set
+  # POD_DEADMAN_MINUTES=0 to give that up deliberately, which is the right call
+  # for an interactive pod you mean to leave sitting idle.
+  POD_DEADMAN_MINUTES="${POD_DEADMAN_MINUTES:-180}"
+  case "$POD_DEADMAN_MINUTES" in
+    ''|*[!0-9]*) echo "FATAL: POD_DEADMAN_MINUTES must be a whole number of minutes, got '$POD_DEADMAN_MINUTES'" >&2; exit 2 ;;
+  esac
+  if [ "$POD_DEADMAN_MINUTES" = 0 ]; then
+    echo "== idle deadman DISABLED (POD_DEADMAN_MINUTES=0) -- nothing on this pod will ever stop it =="
+  elif [ -n "$(live_watchdog_pids)" ]; then
+    echo "== a primary idle watchdog is already running; no deadman needed =="
+  else
+    if [ -f /root/pod_deadman.out ]; then
+      mv -f /root/pod_deadman.out /root/pod_deadman.out.prev
+    fi
+    # 9>&- for the same reason as the primary launch above: a detached child
+    # holding a copy of fd 9 keeps the launch lock held for its whole lifetime.
+    IDLE_MINUTES="$POD_DEADMAN_MINUTES" setsid nohup \
+      bash "$SCRIPT_DIR/pod_idle_stop.sh" --deadman \
+      > /root/pod_deadman.out 2>&1 9>&- &
+    DEADMAN_PID=$!
+    sleep 3
+    if kill -0 "$DEADMAN_PID" 2>/dev/null || [ -n "$(deadman_pids)" ]; then
+      echo "== idle deadman armed (${POD_DEADMAN_MINUTES}m idle) -- backstop only; the lifecycle owner reaps long before this =="
+    else
+      # Deliberately NOT fatal. The operator turned the primary watchdog off on
+      # purpose, and refusing to run would break every scheduler-driven job.
+      # Loud, because an unarmed deadman is how an overnight bill happens.
+      echo "WARNING: idle deadman failed to arm (usually RUNPOD_POD_ID unset or runpodctl missing)." >&2
+      echo "WARNING: if the lifecycle owner dies, this pod bills until a human notices. Last 20 lines:" >&2
+      tail -20 /root/pod_deadman.out >&2 || true
     fi
   fi
 fi
