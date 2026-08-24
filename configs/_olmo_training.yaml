@@ -7,7 +7,7 @@ _olmo_train_base:
   training:
     backend: verl
     verl:
-      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_pod.sh)
+      strategy: fsdp2              # needs the modeling_olmo3 rope patch (provision_sm90.sh)
       # network volume: adapters are ~100-200MB with save_lora_only (which the
       # backend forces whenever lora_rank > 0)
       checkpoint_dir: /workspace/checkpoints

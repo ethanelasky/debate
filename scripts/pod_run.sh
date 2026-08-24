@@ -2,7 +2,7 @@
 # All-on-pod training launcher for both run modes:
 #   bash scripts/pod_run.sh debate <experiment> [runner args...]  # starts judge vLLM
 #   bash scripts/pod_run.sh rlvr   <experiment> [runner args...]  # no judge
-# Manual-launch prereq: provision_pod.sh has built $VOL/envs/verl-sm90.
+# Manual-launch prereq: provision_sm90.sh has built $VOL/envs/verl-sm90.
 # Scheduler launches instead use the immutable image runtime below /opt. The
 # repository may live at any frozen staging path; this launcher derives it from
 # its own file.
@@ -241,7 +241,7 @@ if [ ! -x "$PY" ]; then
   exit 4
 fi
 
-# Toolkit preference mirrors provision_pod.sh, which means the SAME test it
+# Toolkit preference mirrors provision_sm90.sh, which means the SAME test it
 # runs: a system nvcc reporting `release 13.` (anchored on the dot so a future
 # "release 130" does not match), else the venv's pip-shipped nvidia/cu13
 # fragments — which is what a fallback-provisioned pod actually BUILT against.
@@ -269,7 +269,7 @@ fi
 export CUDA_HOME
 # venv bin (ninja for JIT kernels) + cuda toolkit on PATH for all children
 export PATH="$(dirname "$PY"):$CUDA_HOME/bin:$PATH"
-# provision_pod.sh caches weights under $VOL/hf; without the same export at run
+# provision_sm90.sh caches weights under $VOL/hf; without the same export at run
 # time every pull lands on the container disk and is re-downloaded after each
 # pod stop/start (RunPod wipes /root, only /workspace survives).
 export HF_HOME="${HF_HOME:-/workspace/hf}"
@@ -458,7 +458,7 @@ if errors:
     raise SystemExit(
         "FATAL: the provisioned Python environment has a missing or stale "
         f"symbolic grader stack:\n  - {detail}\n"
-        "Re-provision the environment with scripts/provision_pod.sh or "
+        "Re-provision the environment with scripts/provision_sm90.sh or "
         "scripts/provision_blackwell.sh. Shared environments are write-once: "
         "build a new VENV_NAME (or rebuild only after all users have stopped); "
         "pod_run.sh will not repair it because its editable install uses --no-deps."
@@ -615,8 +615,14 @@ finally:
   # Bounded, liveness-checked wait. A missing/gated weight pull or a CUDA-OOM
   # start kills the server outright, and an unbounded `until judge_ok` then
   # bills the pod indefinitely against a process that no longer exists.
-  # 900s covers a cold HF pull of the 4B on a slow volume.
-  JUDGE_DEADLINE=$(( SECONDS + 900 ))
+  # The default must cover a COLD start, not just a cold HF pull: on a fresh
+  # B200 pod the 4B download is followed by torch.compile (~80s), an AOT
+  # compile, a warmup run (~80s) and CUDA-graph capture, which together put
+  # first-serve past 15 minutes. 900s killed a judge that was still making
+  # progress. A judge that DIED is caught by the liveness check above, whatever
+  # this value is; the deadline only bounds an alive-but-wedged engine.
+  JUDGE_BOOT_TIMEOUT_S="${JUDGE_BOOT_TIMEOUT_S:-1800}"
+  JUDGE_DEADLINE=$(( SECONDS + JUDGE_BOOT_TIMEOUT_S ))
   until judge_ok; do
     if ! kill -0 "$JUDGE_PID" 2>/dev/null; then
       echo "FATAL: judge vLLM (pid $JUDGE_PID) exited before serving; last 40 lines of $JUDGE_LOG:" >&2
@@ -625,7 +631,7 @@ finally:
       exit 3
     fi
     if [ "$SECONDS" -ge "$JUDGE_DEADLINE" ]; then
-      echo "FATAL: judge vLLM alive but not answering /v1/completions on 127.0.0.1:$JUDGE_PORT after 900s; check $JUDGE_LOG (last 40 lines below) and nvidia-smi for a wedged engine" >&2
+      echo "FATAL: judge vLLM alive but not answering /v1/completions on 127.0.0.1:$JUDGE_PORT after ${JUDGE_BOOT_TIMEOUT_S}s (raise JUDGE_BOOT_TIMEOUT_S for a cold pod); check $JUDGE_LOG (last 40 lines below) and nvidia-smi for a wedged engine" >&2
       tail -40 "$JUDGE_LOG" >&2 || true
       kill_judge
       exit 3

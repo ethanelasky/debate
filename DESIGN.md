@@ -139,7 +139,7 @@ Notes: `mask` is folded into `advantages` (`adv *= mask`) or passed as explicit
 Live smoke test passed on 2× RTX 4090 (RunPod, Qwen2.5-0.5B-Instruct, FSDP2):
 construct → sync_sampler (CUDA-IPC weight push) → sample (logprobs + fidelity)
 → forward → forward_backward ×2 → optim_step (grad_norm returned) → sharded
-save → second sync/sample cycle. Env recipe in `scripts/provision_pod.sh`
+save → second sync/sample cycle. Env recipe in `scripts/provision_sm90.sh`
 (pins vllm==0.24.*, single-arch flash-attn build, MAX_JOBS=2); prebuilt
 flash-attn wheel for torch2.11+cu130/sm89 saved at `wheels/`.
 

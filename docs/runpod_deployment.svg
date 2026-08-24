@@ -899,7 +899,7 @@ never left it — <code>runtime: null</code>, <code>ports: []</code>, and the SS
 <p><strong>WIPED on stop.</strong> Destroyed on remove.
 Sized by <code>--containerDiskSize</code> (we use 200 GB).</p>
 </div></foreignObject></g></g><g class="c3RvcmUudm9s"><g class="shape" ></g><g><foreignObject requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" x="3498.000000" y="1586.000000" width="2033" height="150"><div xmlns="http://www.w3.org/1999/xhtml" class="md color-N1" style="background-color:#eaf5ea"><h3>Network volume — <code>/workspace</code></h3>
-<p><code>$VOL</code> in every script. Holds <code>envs/verl-main</code>, <code>hf/</code> (121 GB of weights),
+<p><code>$VOL</code> in every script. Holds <code>envs/verl-sm90</code>, <code>hf/</code> (121 GB of weights),
 <code>uv/cache</code>, <code>wheels/</code>.</p>
 <p><strong>Survives stop AND remove.</strong> Bills ~$0.07/GB/month while idle.
 Attached at create with <code>--networkVolumeId</code>; <strong>cannot be added later</strong>, and
@@ -927,7 +927,7 @@ it distinguishes &quot;no route&quot; from <code>container not found</code>. Tha
 </div></foreignObject></g></g><g class="cGlwZS51cA=="><g class="shape" ></g><g><foreignObject requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" x="3858.000000" y="2242.000000" width="1313" height="24"><div xmlns="http://www.w3.org/1999/xhtml" class="md color-N1"><p><strong><code>pod_up.sh</code></strong> — RESUME only, no create path.
 Gates on maintenance windows (only visible on the authenticated GraphQL
 API; the public status page omits them). Exit 8 is the one that means money.</p>
-</div></foreignObject></g></g><g class="cGlwZS5wcm92"><g class="shape" ></g><g><foreignObject requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" x="3722.000000" y="2366.000000" width="1586" height="24"><div xmlns="http://www.w3.org/1999/xhtml" class="md color-N1"><p><strong><code>provision_pod.sh</code></strong> — builds <code>$VOL/envs/verl-main</code>.
+</div></foreignObject></g></g><g class="cGlwZS5wcm92"><g class="shape" ></g><g><foreignObject requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" x="3722.000000" y="2366.000000" width="1586" height="24"><div xmlns="http://www.w3.org/1999/xhtml" class="md color-N1"><p><strong><code>provision_sm90.sh</code></strong> — builds <code>$VOL/envs/verl-sm90</code>.
 Joint vllm+verl resolve (~25 min), three source patches, flash-attn
 (<strong>~45 min from source, ~1s with <code>FLASH_ATTN_WHEEL=</code></strong>), sanity import gate.
 Every step bounded by <code>timeout(1)</code>.</p>

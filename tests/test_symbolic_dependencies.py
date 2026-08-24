@@ -14,7 +14,7 @@ PINS = (
     "antlr4-python3-runtime==4.13.2",
 )
 PROVISION_SCRIPTS = (
-    ROOT / "scripts" / "provision_pod.sh",
+    ROOT / "scripts" / "provision_sm90.sh",
     ROOT / "scripts" / "provision_blackwell.sh",
 )
 

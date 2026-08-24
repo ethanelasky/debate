@@ -123,7 +123,7 @@ def test_docent_version_is_exactly_pinned_in_all_install_surfaces():
     project = tomllib.loads((root / "pyproject.toml").read_text())
     dependencies = project["project"]["dependencies"]
     assert "docent-python==0.1.77" in dependencies
-    for script_name in ("provision_pod.sh", "provision_blackwell.sh"):
+    for script_name in ("provision_sm90.sh", "provision_blackwell.sh"):
         text = (root / "scripts" / script_name).read_text()
         assert "docent-python==0.1.77" in text
         assert "docent-python>=" not in text

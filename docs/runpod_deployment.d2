@@ -1,5 +1,5 @@
 # How RunPod actually behaves, and where our deployment breaks.
-# Grounded in scripts/{pod_up,provision_pod,pod_run,pod_idle_stop}.sh and in the
+# Grounded in scripts/{pod_up,provision_sm90,pod_run,pod_idle_stop}.sh and in the
 # failures of 2026-08-06/07, which are annotated with what they cost.
 # Render: d2 docs/runpod_deployment.d2 docs/runpod_deployment.svg
 
@@ -76,7 +76,7 @@ store: "3 — Storage: what survives what" {
 
   vol: |||md
     ### Network volume — `/workspace`
-    `$VOL` in every script. Holds `envs/verl-main`, `hf/` (121 GB of weights),
+    `$VOL` in every script. Holds `envs/verl-sm90`, `hf/` (121 GB of weights),
     `uv/cache`, `wheels/`.
 
     **Survives stop AND remove.** Bills ~$0.07/GB/month while idle.
@@ -132,7 +132,7 @@ pipe: "5 — Our script pipeline" {
     API; the public status page omits them). Exit 8 is the one that means money.
   |||
   prov: |||md
-    **`provision_pod.sh`** — builds `$VOL/envs/verl-main`.
+    **`provision_sm90.sh`** — builds `$VOL/envs/verl-sm90`.
     Joint vllm+verl resolve (~25 min), three source patches, flash-attn
     (**~45 min from source, ~1s with `FLASH_ATTN_WHEEL=`**), sanity import gate.
     Every step bounded by `timeout(1)`.

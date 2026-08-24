@@ -401,7 +401,7 @@ def test_wandb_version_is_exactly_pinned_in_all_install_surfaces():
     assert project["project"]["optional-dependencies"]["logging"] == [
         "wandb==0.28.1"
     ]
-    for relative in ("scripts/provision_pod.sh", "scripts/provision_blackwell.sh"):
+    for relative in ("scripts/provision_sm90.sh", "scripts/provision_blackwell.sh"):
         provision = (REPO_ROOT / relative).read_text()
         assert '"wandb==0.28.1"' in provision
         assert '"wandb>=0.18"' not in provision

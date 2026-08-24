@@ -4,7 +4,7 @@
 # supplies the NVIDIA driver + nvcc; python/torch/vllm live in a uv-managed
 # env (persistent iff $VOL is a network volume; otherwise pod-lifetime).
 #
-# Usage (on the pod):  VOL=/workspace bash provision_pod.sh
+# Usage (on the pod):  VOL=/workspace bash provision_sm90.sh
 #
 # Hard-won pins (2026-07-31, first bring-up on 2x RTX 4090 / 62GB RAM):
 #  * vllm==0.24.* — the tuple verl main's CI actually tests (image vllm024.*).
@@ -69,6 +69,21 @@ STAMP="$ENV_DIR/.provisioned"
 LOCK="$VOL/locks/provision.lock"
 LOCK_TTL_SECONDS="${LOCK_TTL_SECONDS:-7200}"
 
+# Arch gate — the reciprocal of provision_blackwell.sh's, and deliberately
+# BEFORE the already-present exit below. On the shared volume the dangerous
+# path is the SILENT one: a B200 finds an sm90-built verl-sm90, reports
+# "nothing to do", exits 0, and dies at the first kernel launch ("no kernel
+# image is available") twenty minutes into a paid run. sm8x (A100 / L40S /
+# 4090) stays allowed: that is where this script was brought up (DESIGN.md)
+# and what the sm89 wheel in wheels/ came from.
+ARCH="$(timeout -k 30s 60 nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" || {
+  echo "FATAL: could not read compute_cap from nvidia-smi (hung >60s or driver wedged)" >&2; exit 1; }
+[ -n "$ARCH" ] || { echo "FATAL: empty compute_cap from nvidia-smi; cannot pick a flash-attn arch" >&2; exit 1; }
+case "$ARCH" in
+  1[0-9].*) [ "${ALLOW_NON_SM90:-0}" = 1 ] || {
+       echo "FATAL: compute_cap=$ARCH is sm100 or newer; use scripts/provision_blackwell.sh (or ALLOW_NON_SM90=1 to override)" >&2; exit 1; } ;;
+esac
+
 # The test is the INTERPRETER, not the stamp. An env built before this stamp
 # existed has none and is still a live dependency -- the shared team volume is
 # exactly that, with four jobs importing out of it right now. Keying the guard
@@ -119,10 +134,8 @@ timeout -k 30s 60 nvidia-smi --query-gpu=name,memory.total,driver_version --form
   echo "FATAL: no nvidia-smi (or it hung >60s: driver wedged, recreate the pod)" >&2; exit 1; }
 
 # Single-arch flash-attn build: ~5x less compile work and memory than the
-# default multi-arch fan-out.
-ARCH="$(timeout -k 30s 60 nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" || {
-  echo "FATAL: could not read compute_cap from nvidia-smi (hung >60s or driver wedged)" >&2; exit 1; }
-[ -n "$ARCH" ] || { echo "FATAL: empty compute_cap from nvidia-smi; cannot pick a flash-attn arch" >&2; exit 1; }
+# default multi-arch fan-out.  $ARCH is read and range-checked far above,
+# before the already-present exit, so a wrong-arch pod never gets that far.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$ARCH}"
 log "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST MAX_JOBS=$MAX_JOBS"
 

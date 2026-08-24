@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Provision the provision_pod.sh env on an sm100 (Blackwell / B200) machine.
+# Provision the provision_sm90.sh env on an sm100 (Blackwell / B200) machine.
 # SAME venv contents and layout ($VOL/envs/verl-sm90) so pod_run.sh, the
 # configs, and infra/backend/verl.py need no changes. Diverges from
-# provision_pod.sh ONLY where an sm90-era choice stops holding on sm100:
+# provision_sm90.sh ONLY where an sm90-era choice stops holding on sm100:
 #  * flash-attn: the sm90 script's wheel/source pair assumes FA2's Hopper
 #    kernel matrix. Here the source build is ATTEMPTED (arch 100, bounded) and
 #    ANY failure — including a build that succeeds but will not import — is a
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 VERL_PIN="${VERL_PIN:-e9618406de5bad40041d7612554e465ec2003ec1}"
-# Same pin as provision_pod.sh: the verl-side patches below anchor on this
+# Same pin as provision_sm90.sh: the verl-side patches below anchor on this
 # commit's source, and the two provisions must stay byte-comparable.
 # BLACKWELL-VERIFY: vllm 0.24 cu130 wheels must carry sm_100 SASS (or PTX that
 # JITs to it) in their compiled ops; the dossier should confirm from the wheel
@@ -79,11 +79,11 @@ ARCH="$(timeout -k 30s 60 nvidia-smi --query-gpu=compute_cap --format=csv,nohead
 [ -n "$ARCH" ] || { echo "FATAL: empty compute_cap from nvidia-smi; cannot pick an arch" >&2; exit 1; }
 # This script encodes sm100 decisions (flash-attn skip logic, the kernel-launch
 # sanity). On anything else those decisions are wrong in both directions:
-# provision_pod.sh is the script for sm90-era cards.
+# provision_sm90.sh is the script for sm90-era cards.
 case "$ARCH" in
   10.*) : ;;
   *) [ "${ALLOW_NON_SM100:-0}" = 1 ] || {
-       echo "FATAL: compute_cap=$ARCH is not sm100; use scripts/provision_pod.sh (or ALLOW_NON_SM100=1 to override)" >&2; exit 1; } ;;
+       echo "FATAL: compute_cap=$ARCH is not sm100; use scripts/provision_sm90.sh (or ALLOW_NON_SM100=1 to override)" >&2; exit 1; } ;;
 esac
 # B200 reports compute_cap 10.0, and nvidia-smi emits it bare — so the derived
 # list is "10.0" (verified against the csv,noheader format; no unit suffix to
@@ -95,7 +95,7 @@ esac
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$ARCH}"
 log "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST MAX_JOBS=$MAX_JOBS"
 
-# Toolkit preference identical to provision_pod.sh: a REAL system CUDA toolkit
+# Toolkit preference identical to provision_sm90.sh: a REAL system CUDA toolkit
 # whose major matches torch's (cu130 -> 13.x) is the only reliable build env.
 # CUDA 13.x targets sm_100 natively; the sm100-specific question is only
 # whether the PIP fragments' nvcc does too, and that is probed at the
@@ -143,7 +143,7 @@ P="$ENV_DIR/bin/python"
 # verl caps transformers at <5.11; our floor is >=5.13 and non-negotiable (see
 # the note after the install). Unsatisfiable together, so the resolve HAS to be
 # told which one wins. Rationale for why the override is safe lives in
-# provision_pod.sh; nothing about it is arch-dependent.
+# provision_sm90.sh; nothing about it is arch-dependent.
 OVERRIDE="$VOL/verl-transformers-override.txt"
 printf 'transformers==5.14.1\n' > "$OVERRIDE"
 
@@ -173,7 +173,7 @@ timeout -k 30s 3600 uv pip install -p "$P" --link-mode=copy --override "$OVERRID
 # keeps answering — a zombie only a real completion catches.
 
 # The three patches below are pure-python and arch-independent; kept verbatim
-# from provision_pod.sh so the two provisions stay byte-comparable.
+# from provision_sm90.sh so the two provisions stay byte-comparable.
 
 # vllm 0.24 reads the pre-5.13 flat rope_parameters schema for olmo2/3 and
 # KeyErrors on the new per-layer-type dict; shim it to accept both (same
@@ -426,7 +426,7 @@ if [ "$FA_STATE" = source ]; then
   log "exporting built wheel to $VOL/wheels"
   # Non-fatal (the env is already built) but NOT silent: an empty wheel cache
   # makes the next sm100 pod repeat the build. Wheels here are sm100-only;
-  # never feed one to provision_pod.sh on an sm90 pod.
+  # never feed one to provision_sm90.sh on an sm90 pod.
   timeout -k 30s 60 mkdir -p "$VOL/wheels" || {
     echo "WARNING: mkdir $VOL/wheels failed or hung >60s; flash-attn wheel NOT exported — the next pod will rebuild it" >&2; }
   # One of the two cache paths is normally absent; find's rc is therefore not a
@@ -437,7 +437,7 @@ if [ "$FA_STATE" = source ]; then
 fi
 
 log "sanity (imports + sm100 kernel launch; flash-attn state: $FA_STATE)"
-# Unlike provision_pod.sh this launches a real bf16 matmul: on a new arch,
+# Unlike provision_sm90.sh this launches a real bf16 matmul: on a new arch,
 # import success proves packaging, not that any wheel carries sm_100 code.
 FA_STATE="$FA_STATE" timeout -k 30s 900 "$P" - <<'PY' || { echo "FATAL: sanity failed — either an import broke, or no wheel carries sm_100 kernels ('no kernel image is available' above means the torch/vllm pins need the Blackwell dossier), or the GPU is wedged" >&2; exit 1; }
 import os

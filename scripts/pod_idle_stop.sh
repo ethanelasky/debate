@@ -292,7 +292,7 @@ is_busy() {
              'bin/debate-rl' \
              'bin/debate-train' \
              'bash( -[^ ]+)* [^ ]*pod_run\.sh' \
-             'bash( -[^ ]+)* [^ ]*provision_pod\.sh'; do
+             'bash( -[^ ]+)* [^ ]*provision_(sm90|blackwell)\.sh'; do
     pids="$(pgrep -f "$pat" 2>/dev/null || true)"
     for p in $pids; do
       BUSY_REASON="process matching '$pat' (pid $p)"
@@ -712,7 +712,7 @@ while :; do
   # probe here while a run is minutes from starting.
   if [ "$IDLE_TICKS" -ge "$IDLE_MINUTES" ] \
      && [ $(( SECONDS - STARTED )) -ge $(( GRACE_MINUTES * 60 )) ]; then
-    log "TEARDOWN: idle for ${IDLE_TICKS} consecutive minutes (no infra./pod_run.sh/provision_pod.sh/debate-rl process, no ssh session, gpu util <=5%, no terminal activity in 120s, container cpu <=30% of one core)"
+    log "TEARDOWN: idle for ${IDLE_TICKS} consecutive minutes (no infra./pod_run.sh/provision_{sm90,blackwell}.sh/debate-rl process, no ssh session, gpu util <=5%, no terminal activity in 120s, container cpu <=30% of one core)"
     log "killing judge vLLM / EngineCore processes"
     kill_judge
     sleep 5
