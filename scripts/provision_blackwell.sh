@@ -13,8 +13,11 @@
 #    extension imports cleanly and dies at first kernel launch ("no kernel
 #    image is available"), which on a paid B200 must surface HERE, not twenty
 #    minutes into a smoke run.
-# Open sm100 questions are tagged '# BLACKWELL-VERIFY:' — resolve each against
-# the Blackwell research dossier before first paid use.
+# Open sm100 questions are tagged '# BLACKWELL-VERIFY:'. Three of the original
+# five are now answered by production runs rather than by the dossier, and say
+# so inline with the evidence; what remains open is tagged and explains why it
+# has never been exercised. Answering from a run tells you a thing WORKS, not
+# WHY -- where that difference matters the note says so.
 #
 # Usage (on the pod):  VOL=/workspace bash provision_blackwell.sh
 #   FLASH_ATTN_SKIP=1    skip the flash-attn attempt outright (fastest bring-up)
@@ -24,10 +27,12 @@ set -euo pipefail
 VERL_PIN="${VERL_PIN:-e9618406de5bad40041d7612554e465ec2003ec1}"
 # Same pin as provision_sm90.sh: the verl-side patches below anchor on this
 # commit's source, and the two provisions must stay byte-comparable.
-# BLACKWELL-VERIFY: vllm 0.24 cu130 wheels must carry sm_100 SASS (or PTX that
-# JITs to it) in their compiled ops; the dossier should confirm from the wheel
-# metadata / release notes. The sanity matmul below tests torch, not vllm —
-# vllm's kernels are first exercised by blackwell_smoke.md step (b).
+# BLACKWELL-ANSWERED (by run, not dossier): vllm 0.24 cu130 works on sm100. Its
+# compiled ops were exercised for real on 2x B200 -- V1 engine initialised,
+# Qwen3.5-4B loaded in 21.9s, served a full smoke run that exited 0 (jobd
+# attempt att_10b57c35af00, 2026-08-24), across 16 B200 jobs. That establishes
+# it RUNS; it does not distinguish native sm_100 SASS from PTX that JITs, which
+# only the wheel metadata answers and which shows up as cold-start latency.
 VLLM_PIN="${VLLM_PIN:-vllm==0.24.*}"
 # 2 was forced by a 62GB-RAM host (cutlass units spike >15GB RSS each). B200
 # hosts ship several times that; raise via MAX_JOBS only after `free -g`
@@ -88,10 +93,12 @@ esac
 # B200 reports compute_cap 10.0, and nvidia-smi emits it bare — so the derived
 # list is "10.0" (verified against the csv,noheader format; no unit suffix to
 # mangle). Single-arch keeps the flash-attn attempt ~5x cheaper, as on sm90.
-# BLACKWELL-VERIFY: whether torch extensions built here need "10.0a" (the
-# arch-conditional feature set cutlass kernels target on Blackwell) instead of
-# plain "10.0". If the dossier says yes, export TORCH_CUDA_ARCH_LIST=10.0a at
-# invocation — the FLASH_ATTN_CUDA_ARCHS derivation below strips the suffix.
+# BLACKWELL-VERIFY (dormant): whether torch extensions built here need "10.0a"
+# (the arch-conditional feature set cutlass kernels target on Blackwell)
+# instead of plain "10.0". This cannot bite while FLASH_ATTN_SKIP defaults to
+# 1, because no torch extension is built at all -- every B200 run to date took
+# the skip path. It becomes live the moment anyone sets FLASH_ATTN_SKIP=0, so
+# resolve it THEN, together with the flash-attn question below.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$ARCH}"
 log "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST MAX_JOBS=$MAX_JOBS"
 
@@ -341,23 +348,32 @@ PYEOF
 # grep can find later ("flash-attn PATH:"):
 #   wheel   — operator-supplied wheel from a previous SM100 pod; verified or fatal
 #   source  — pinned build attempted with archs=100; any failure downgrades to skip
-#   skip    — vllm serves with its own fallback (FLASHINFER/TRITON), trainer
-#             side falls back too (see BLACKWELL-VERIFY below)
-# BLACKWELL-VERIFY: whether flash-attn 2.8.3.post1 can target sm100 AT ALL
-# (FLASH_ATTN_CUDA_ARCHS=100 accepted, kernels correct — FA2's Blackwell path,
-# if any, may reuse pre-Hopper kernel shapes: correct but slow). If the dossier
-# names a different pinnable version or a published sm100 wheel for
-# torch 2.11+cu130, set FLASH_ATTN_PIN / FLASH_ATTN_WHEEL accordingly.
-# BLACKWELL-VERIFY: what verl's FSDP trainer path does with flash-attn ABSENT —
-# transformers must fall back to sdpa/eager rather than error at model load.
-# If it errors, the skip path is serve-only and flash-attn becomes a hard
-# requirement here; the smoke arm (blackwell_smoke.md step d) is the test.
-# BLACKWELL-VERIFY: whether the vllm 0.24 wheel needs a separate
-# flashinfer-python install for its FLASHINFER backend or falls back to TRITON
-# without it. Do NOT freelance `uv pip install flashinfer-python` — its
-# dependency tree can move torch, and vllm's compiled extension is ABI-tied to
-# the exact torch it resolved with. If the dossier wants flashinfer, it must
-# name a pin installable with --no-deps against this torch.
+#   skip    — vllm serves through FLASHINFER and the trainer falls back to
+#             sdpa; both confirmed on 2x B200, see BLACKWELL-ANSWERED below
+# BLACKWELL-VERIFY (still open, and deliberately untested): whether flash-attn
+# 2.8.3.post1 can target sm100 AT ALL (FLASH_ATTN_CUDA_ARCHS=100 accepted,
+# kernels correct — FA2's Blackwell path, if any, may reuse pre-Hopper kernel
+# shapes: correct but slow). No B200 run has ever attempted it, because the
+# skip path below turned out to be sufficient: vllm serves through FLASHINFER
+# and the trainer steps on sdpa. So this is an open OPTIMISATION question, not
+# a correctness gate -- nothing is currently blocked on it. If the dossier
+# names a pinnable version or a published sm100 wheel for torch 2.11+cu130,
+# set FLASH_ATTN_PIN / FLASH_ATTN_WHEEL accordingly.
+# BLACKWELL-ANSWERED (by run): verl's FSDP trainer path is FINE with flash-attn
+# absent -- transformers falls back rather than erroring at model load. The
+# smoke arm ran it on 2x B200 and trained: steps 0, 1 and 2 with real
+# loss/loss, loss/mfu and kl/policy_vs_ref values, wandb run 7nxj4h16, exit 0
+# (att_10b57c35af00). The skip path is therefore NOT serve-only, and flash-attn
+# is not a hard requirement here.
+# BLACKWELL-ANSWERED (by run): no separate flashinfer-python install is needed.
+# This script never installs one, and vllm still reported "Using FLASHINFER
+# attention backend out of potential backends: ['FLASHINFER', 'FLASH_ATTN',
+# 'TRITON_ATTN', 'FLEX_ATTENTION']", ran its JIT autotuner, and auto-detected
+# TRTLLM prefill (att_10b57c35af00). It resolves through the vllm 0.24 wheel's
+# own dependencies. The standing warning still holds if that ever changes: do
+# NOT freelance `uv pip install flashinfer-python` -- its dependency tree can
+# move torch, and vllm's compiled extension is ABI-tied to the torch it
+# resolved with. Any pin must install with --no-deps against this torch.
 FLASH_ATTN_PIN="${FLASH_ATTN_PIN:-flash-attn==2.8.3.post1}"
 FA_STATE=skip
 

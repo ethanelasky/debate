@@ -339,6 +339,19 @@ if [ -z "${FLASH_ATTN_WHEEL:-}" ]; then
   FLASH_ATTN_WHEEL="$(ls -t "$VOL"/wheels/flash_attn-*.whl 2>/dev/null | head -1 || true)"
   [ -n "$FLASH_ATTN_WHEEL" ] && log "flash-attn: found exported wheel $FLASH_ATTN_WHEEL in $VOL/wheels"
 fi
+if [ -z "${FLASH_ATTN_WHEEL:-}" ]; then
+  # Second source: wheels/ in the synced repo. $VOL/wheels only ever holds what
+  # a PREVIOUS pod on this volume exported, and these profiles take a fresh
+  # per-pod volume, so it is empty on every first run. That is why the sm90-env
+  # build on 2026-08-22 repeated the whole 45-minute source build with a
+  # correctly-matched wheel (sm80sm90, cp312, torch2.11cu130) sitting unread at
+  # /workspace/debate/wheels the entire time. Still the AUTO-pick path, so the
+  # verify import below stays the arbiter: a wrong-arch wheel here is
+  # uninstalled and falls through to the source build, never fatal.
+  REPO_WHEELS="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || true)/wheels"
+  FLASH_ATTN_WHEEL="$(ls -t "$REPO_WHEELS"/flash_attn-*.whl 2>/dev/null | head -1 || true)"
+  [ -n "$FLASH_ATTN_WHEEL" ] && log "flash-attn: found checked-in wheel $FLASH_ATTN_WHEEL in $REPO_WHEELS"
+fi
 FA_INSTALLED=""
 if [ -n "${FLASH_ATTN_WHEEL:-}" ]; then
   [ -f "$FLASH_ATTN_WHEEL" ] || { echo "FATAL: FLASH_ATTN_WHEEL=$FLASH_ATTN_WHEEL not found" >&2; exit 1; }
