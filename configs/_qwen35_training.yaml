@@ -27,8 +27,9 @@
 #
 #   SHARED BELOW — the arms agreed, or were made to agree (Ethan, 2026-08-22:
 #   "change everything in debate to fit RLVR except keep steps at 100"):
-#     loss, kl_coef, lr, lr_schedule, min_lr_ratio, warmup_steps,
-#     group_size, eval_n, eval_every, eval_max_tokens, eval_split, save_every
+#     loss, kl_coef, adv_length_norm, lr, lr_schedule, min_lr_ratio,
+#     warmup_steps, group_size, eval_n, eval_every, eval_max_tokens,
+#     eval_split, save_every
 #
 #   DELIBERATELY DIFFERENT:
 #     steps          200 (RLVR) vs 100 (debate) — held at 100 by decision.
@@ -63,7 +64,7 @@
 #     verl.n_gpus, verl.rollout_tp, verl.strategy,
 #     verl.gpu_memory_utilization (judge reserves ~0.18 on its own vLLM),
 #     verl.prompt_length, verl.response_length (debate's slot caps),
-#     adv_length_norm, kl_discount_factor, ppo_epochs
+#     kl_discount_factor, ppo_epochs
 # ---------------------------------------------------------------------------
 
 _qwen35_train_base:
@@ -76,6 +77,8 @@ _qwen35_train_base:
     # comparison stops meaning anything. That is the whole point of the file.
     loss: {kind: cispo, clip_low: 0.8, clip_high: 1.28}
     kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
+    # verl aggregates token-mean; datum/trajectory divide by length twice
+    adv_length_norm: none
 
     # ---- optimizer ----------------------------------------------------------
     # The debate arm ran 1e-5 with no schedule and no warmup for a long time.
