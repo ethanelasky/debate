@@ -712,3 +712,22 @@ def test_length_normalize_balances_seats():
     datums, _ = grpo_pack([alice], length_normalize="count", drop_zero_advantage=False)
     assert abs(datums[0].advantages[0]) == pytest.approx(abs(datums[0].advantages[0]))
     assert total_mass([bob], "count") == pytest.approx(raw_bob)  # 1 datum: /1
+
+
+def test_empty_speech_census_counts_a_swallowed_think_block():
+    """A trained seat whose pre-opened <think> never closes hands the round an
+    empty speech (round._split_think fails closed). The rollout census is what
+    reports it: a debate the judge decided on a seat that said nothing."""
+    backend = ScriptedBackend(
+        ["reasoning</think>I compute. \\boxed{2}", "I still need to check the algebra"]
+    )
+    policy = Policy(backend, SamplingParams(max_tokens=128), {"enable_thinking": True})
+    env = make_env(["alice"], [GOOD_VERDICT])
+    env.rollout(TaskSource().tasks(1), policy, group_size=1)
+
+    info = env.last_rollout_info
+    assert info["trained_speeches"] == 2.0          # proposal + defense
+    assert info["empty_speeches"] == 1.0            # the defense was all think
+    assert info["empty_speeches_by_slot"] == {"defense": 1.0}
+    # The proposal closed its block, so its answer still reaches the grader.
+    assert info["extracted_solution_slots"] == 1.0

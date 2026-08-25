@@ -477,6 +477,7 @@ class DebateEnv(Env):
             "debates_unscoreable": n_unscoreable,
             "fail_reasons": fail_reasons,
             **solution_census,
+            **self._speech_census(states),
         }
         self.last_states = states  # retained for transcript export (docent)
         for g in groups:
@@ -733,6 +734,39 @@ class DebateEnv(Env):
             "extracted_solution_rate": float(extracted / produced) if produced else 0.0,
             "gradeable_solution_rate": float(gradeable / extracted) if extracted else 0.0,
             "grader_error_rate": float(grade_errors / grader_requests) if grader_requests else 0.0,
+        }
+
+    def _speech_census(self, states: list[DebateState]) -> dict[str, float | dict[str, float]]:
+        """Trained speeches that reach the judge with no text.
+
+        A slot whose think phase never closes yields an empty speech rather
+        than a published scratchpad (round._split_think). Empty is the safe
+        outcome but still a silent one: the judge rules on a debate where a
+        seat said nothing, and the reward prices that as a lost argument
+        rather than as a broken generation. Counting it per slot is what makes
+        a missing think budget visible in one glance at the run.
+
+        Counts only, no rates: rollout censuses are summed across dynamic
+        resampling rounds, and a published `_rate` key would need a declared
+        numerator/denominator pair (see train._RolloutInfoAccumulator).
+        """
+        trained = set(self.config.trained_speakers)
+        by_slot: dict[str, float] = {}
+        total = empty = 0
+        for st in states:
+            for rec in st.records:
+                if rec.slot.speaker not in trained:
+                    continue
+                total += 1
+                if rec.text.strip():
+                    continue
+                empty += 1
+                name = rec.slot.slot.name
+                by_slot[name] = by_slot.get(name, 0.0) + 1.0
+        return {
+            "trained_speeches": float(total),
+            "empty_speeches": float(empty),
+            "empty_speeches_by_slot": by_slot,
         }
 
     def _attach_labels(

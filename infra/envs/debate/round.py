@@ -140,7 +140,7 @@ class SeatRunner(ABC):
     def generate(self, requests: list[GenRequest]) -> list[SlotResult]: ...
 
 
-def _split_think(raw: str) -> tuple[Optional[str], str]:
+def _split_think(raw: str, *, thinking_opened: bool = False) -> tuple[Optional[str], str]:
     import re
 
     m = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
@@ -154,6 +154,15 @@ def _split_think(raw: str) -> tuple[Optional[str], str]:
     j = raw.find("</think>")
     if j >= 0:
         return raw[:j].strip(), raw[j + len("</think>") :].strip()
+    # Same pre-opened template, but the completion ran out of budget before it
+    # closed: EVERY token is private reasoning. `thinking_opened` says the
+    # caller knows the template opened the block, so the absence of a close is
+    # a truncated think phase rather than a model that never thinks. Returning
+    # it as speech publishes the scratchpad into the judge's context and into
+    # the trained datums; an empty speech is a protocol failure anyone can see
+    # (env counts it), while a leaked one silently changes what is scored.
+    if thinking_opened:
+        return (raw.strip() or None), ""
     return None, raw.strip()
 
 
@@ -203,7 +212,16 @@ class PolicySeat(SeatRunner):
                         [t for r in visible_spans for t in s.tokens[r.start : r.end]]
                     ).strip()
                 else:
-                    thinking, text = _split_think(s.text)
+                    # No regions means no budget forcing on this slot, so an
+                    # unterminated think block is possible; the seat's own
+                    # template kwarg is what says the block was opened.
+                    # getattr, not attribute access: Policy duck types in the
+                    # tests carry only predict(), the same allowance
+                    # SingleTurnEnv.rollout makes for the `limits` kwarg.
+                    kwargs = getattr(self.policy, "chat_template_kwargs", None) or {}
+                    thinking, text = _split_think(
+                        s.text, thinking_opened=bool(kwargs.get("enable_thinking"))
+                    )
                 results[i] = SlotResult(text=text, thinking=thinking, sample=s, datum=datum_from_sample(s))
         return [r if r is not None else SlotResult(text="", failed=True, fail_reason="missing") for r in results]
 

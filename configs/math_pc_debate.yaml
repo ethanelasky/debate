@@ -10,11 +10,16 @@ _includes: [_qwen35_training.yaml]
 
 _base_math_pc:
   protocol:
+    # EVERY trained slot of a thinking seat carries max_think_tokens. Without
+    # one there is no budget forcing, so a 4B spends the whole slot reasoning,
+    # never emits </think>, and the speech that reaches the judge is either
+    # empty or (before the round._split_think fix) the raw scratchpad. The
+    # think cap is what guarantees the seat still gets to speak.
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 1024, max_total_tokens: 3072}]
-      - bob:   [{name: critique, max_total_tokens: 768}]
-      - alice: [{name: defense,  max_total_tokens: 768}]
-      - bob:   [{name: rebuttal, max_total_tokens: 768}]
+      - bob:   [{name: critique, max_think_tokens: 768, max_total_tokens: 1536}]
+      - alice: [{name: defense,  max_think_tokens: 768, max_total_tokens: 1536}]
+      - bob:   [{name: rebuttal, max_think_tokens: 768, max_total_tokens: 1536}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 768},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
@@ -136,8 +141,13 @@ math_pc_gspo:
 math_pc_l5:
   _extends: _base_math_pc
   protocol:
+    # think 4000 + answer 1024, exactly the RLVR arm's think_tokens +
+    # max_completion_tokens: the proposal is the same generation the RLVR
+    # baseline makes on the same problem. At 2048 the close landed mid
+    # derivation and the public proposal opened on the tail of a cut-off
+    # calculation. Lists deep-merge BY INDEX, so this replaces turn 0 only.
     turns:
-      - alice: [{name: proposal, kind: solution, max_think_tokens: 2048, max_total_tokens: 6144}]
+      - alice: [{name: proposal, kind: solution, max_think_tokens: 4000, max_total_tokens: 5024}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
 
 # ---------------------------------------------------------------------------
@@ -221,24 +231,29 @@ mathl5_qwen35_pc_debate_cispo_verl:
       gpu_memory_utilization: 0.33
       # Derived, not guessed. run_debate.debate_gen_budgets cross-checks
       # response_length against every TRAINED seat's slot cap, and the largest
-      # is the proposal at 6144 (math_pc_l5); critique/defense/rebuttal are 768
-      # and the judge is excluded (it generates on its own vLLM, so
-      # response_length cannot truncate it).
-      response_length: 6144
+      # is the proposal at 5024 (math_pc_l5); critique/defense/rebuttal are
+      # 1536 and the judge is excluded (it generates on its own vLLM, so
+      # response_length cannot truncate it). 5120, not 5024: the same check
+      # covers training.eval_max_tokens, and the eval budget is shared with
+      # the RLVR arm — matching the RLVR arm's own response_length.
+      response_length: 5120
       # Worst-case trained-seat context is bob's REBUTTAL, the last trained
       # generation, which sees base + proposal + critique + defense. Thinking
       # never enters it -- round.py:63, "stored; NEVER rendered into any
-      # context" -- so think budgets do not compound across turns:
+      # context" -- so think budgets do not compound across turns. Each speech
+      # counts its FULL slot cap: a think phase that closes early leaves the
+      # rest of the budget to visible text.
       #   base (system + L5 problem)        ~2144  (math_qwen35 prompt_length
       #                                             6144 - think_tokens 4000)
-      #   proposal  visible worst case       6144
-      #   critique                            768
-      #   defense                             768
+      #   proposal  visible worst case       5024
+      #   critique                           1536
+      #   defense                            1536
       #                                    -------
-      #                                      9824  -> round up
-      prompt_length: 10240
-      # prompt_length + response_length. NEEDS A SMOKE: this is the per-GPU
-      # memory envelope, including the GPU selected by the standalone judge.
+      #                                     10240  -> round up
+      prompt_length: 11264
+      # prompt_length + response_length (11264 + 5024 = 16288). NEEDS A SMOKE:
+      # this is the per-GPU memory envelope, including the GPU selected by the
+      # standalone judge.
       max_token_len_per_gpu: 16384
       extra_overrides:
         # LOAD-BEARING, per math_qwen35.yaml: adapter-name sync crashes on the
