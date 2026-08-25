@@ -62,6 +62,42 @@ distinguishes it from a healthy daemon.
 The one-live-monitor rule above still stands: `TaskStop` the old one before
 arming a replacement.
 
+### Watching a training run itself: `scripts/watch_run.sh`
+
+The section above watches jobd, which knows only whether a job *ended*. To
+watch the run's own output, there is one command:
+
+```js
+Monitor({
+  description: "debate run <job>",
+  persistent: true,
+  command: `scripts/watch_run.sh <job-id-or-name>`,
+})
+```
+
+It reports by **exception**, and that is the whole design. A filter that echoes
+every `[step N]` fires every few minutes -- several hundred notifications over
+a real run -- and the harness throttles a monitor that noisy, so the watch dies
+exactly when you have stopped paying attention to it. Instead:
+
+- **failures** immediately, deduplicated
+- **STALLED** once, after 15 minutes without the step number moving
+- **progress resumed** if it starts again
+- a **heartbeat** every 30 polls, so silence is never ambiguous
+
+Tune with `POLL`, `STALL`, `BEAT`. The failure pattern is anchored on `FATAL`
+because that is this repo's own convention -- `pod_run.sh`, `env_bootstrap.sh`
+and the provision scripts announce every fatal that way, deliberately so it is
+greppable -- plus the runtime deaths that never reach that path (`Traceback`,
+CUDA OOM, `no kernel image is available`, `Killed`).
+
+It polls because `jobd logs` is a snapshot, not a stream: for a live job it
+ssh's to the pod and tails once. That is one bounded ssh per `POLL` seconds.
+
+**The stall check is the part worth having.** Everything else is visible in the
+log afterwards; a run that quietly stopped stepping at 2am and burned six hours
+of B200 time is the failure this catches and nothing else does.
+
 **All of this dies with the session.** Close the terminal and jobd keeps
 writing the line with nobody reading it. For a run that dies at 3am to reach a
 human, something outside the session has to consume that line. Nothing does
