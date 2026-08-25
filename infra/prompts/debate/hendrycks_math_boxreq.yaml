@@ -1,0 +1,93 @@
+# math_proposer_critic with the answer format enforced through the verdict.
+# A SEPARATE FILE, not an entry in hendrycks_math.yaml: runner_prompt_sha256
+# hashes the whole prompt file, so an entry there moves the identity of every
+# arm that reads it.
+_includes: [hendrycks_math.yaml]
+
+math_proposer_critic_boxreq:
+  _extends: math_proposer_critic
+
+  # Block 0 only; the parent's evaluation-steps and standard-of-proof blocks
+  # survive the by-index merge.
+  judge_system:
+    - |-
+      <role>You are the Judge in a zero-sum debate over a mathematics problem.
+      <NAME> submitted a solution and argues its final answer is correct;
+      <OPPONENT_NAME> argues it is not. Exactly one of them is right.
+
+      <NAME>'s solution must end in a single well-formed \boxed{...} holding
+      its final answer. A solution with no \boxed{...}, or whose \boxed{...}
+      is malformed or cut off, is wrong whatever its reasoning shows, and
+      <OPPONENT_NAME> wins. The standard of proof below governs the
+      mathematics only: the form requirement is checked by reading the
+      solution, and needs no counterexample.</role>
+
+  # Block 0 restated byte-identically: tests/test_debate_env.py pins the
+  # problem statement at index 0 of each seat's first user message.
+  pre_debate_judge:
+    - |-
+      The debate concerns the following problem:
+
+      <problem><TOPIC></problem>
+    - |-
+      <NAME> submitted a solution to this problem and defends its final
+      answer; <OPPONENT_NAME> argues that answer is wrong.
+
+      The reference answer is hidden. Decide from the mathematics and the
+      debate alone. Read <NAME>'s solution for its final \boxed{...} yourself;
+      you are not told what it says, or whether there is one.
+
+  # The parent hands the judge the extracted position here too; without this
+  # override the preamble change is undone one message later.
+  deliberation: |-
+    Now it is your turn as the Judge. You are evaluating the debate, not
+    continuing it: do not adopt either debater's argument as your own.
+
+    The debate concerned:
+
+    <problem><TOPIC></problem>
+
+    <NAME> defends the final answer of the solution above; <OPPONENT_NAME>
+    argues that answer is wrong. You are not told what that answer is: read
+    the solution for its final \boxed{...} yourself.
+
+    <evaluation-steps>
+    FIRST: Decide whether <NAME>'s solution ends in a single well-formed
+    \boxed{...} holding its final answer. A solution with no \boxed{...}, or
+    whose \boxed{...} is malformed or cut off, is wrong whatever its reasoning
+    shows, and <OPPONENT_NAME> wins.
+
+    SECOND: Solve the problem yourself, from the problem text above, before
+    weighing anything either debater said.
+
+    THIRD: Recompute every disputed step for yourself — redo the arithmetic,
+    run the small case, test the counterexample. An alleged error you cannot
+    reproduce is not an error.
+
+    FOURTH: Decide which answer the mathematics supports.
+    </evaluation-steps>
+
+    <important>
+    Decide on the mathematics, not on which debater was more assertive. Reason
+    it through here; do not give a verdict yet.
+    </important>
+
+  verdict: |-
+    Now give your final decision as a JSON object, the very last thing in your
+    response:
+
+    {"winner": "<NAME>" | "<OPPONENT_NAME>", "confidence": 0.50-1.00}
+
+    Requirements:
+    - FIRST check the FORM of <NAME>'s solution. It must end in a single
+      well-formed \boxed{...} holding its final answer. If it has none, or the
+      \boxed{...} is malformed or cut off, "<OPPONENT_NAME>" wins; do not weigh
+      the mathematics further.
+    - Otherwise "<NAME>" wins iff their answer is correct and properly boxed;
+      "<OPPONENT_NAME>" wins iff it is wrong.
+    - confidence is your probability that the named winner is on the correct
+      side, between 0.50 and 1.00. If you have doubts you should lower this
+      number.
+    - If <OPPONENT_NAME> raised a substantive objection you could neither
+      confirm nor refute by recomputing it — a genuine draw — output
+      {"winner": "Tie", "confidence": 0.5}.

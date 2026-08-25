@@ -261,3 +261,10 @@ mathl5_qwen35_pc_debate_cispo_verl:
         # (vllm#38085). Do not remove without a passing smoke.
         - "++actor_rollout_ref.model.lora.merge=True"
     lora_rank: 32   # one shared rank-32 adapter across both trained seats
+
+# Judge-enforced answer format; identical otherwise.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math_boxreq.yaml
+    entry: math_proposer_critic_boxreq
