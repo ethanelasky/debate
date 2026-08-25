@@ -14,6 +14,59 @@ If a monitor is ever genuinely needed (sub-minute reaction to a known exact
 string), keep exactly one alive: stop the old one before arming a replacement,
 and treat its timeout as a failure of the watch, not of the job.
 
+### jobd emits its own outcome lines (since jobd 7323d71)
+
+The objection above is really about *guessing*: a filter written in advance
+against a training script's output misses the failure nobody predicted. For the
+narrow question "did the job end, and how", that guess is no longer needed —
+jobd logs every terminal state itself, in a fixed format it has a test for, to
+`~/.local/state/jobd/daemon.log`:
+
+```
+job job_abc123 (lr3e-3) FAILED after attempt 2: exited 7
+job job_abc123 (lr3e-3) SUCCEEDED on attempt 1
+job job_x (smoke) CANCELLED after attempt 1: cancelled by user
+```
+
+Successes are logged deliberately, not just failures: a watcher that only ever
+sees failures cannot tell "nothing failed" from "the watch is broken".
+
+So the "known exact string" exception applies here — but **only to whether the
+job ended**. It says nothing about whether the run is *healthy*. Loss
+diverging, a hung trainer, a wandb run that quietly stopped stepping: all
+invisible to this, and a `/loop` that ssh's in and reads the log tail is still
+the right tool for those. Use this to know a run died; use a loop to know a run
+is going well.
+
+To watch it, tail the log — do not poll the database:
+
+```js
+Monitor({
+  description: "jobd job outcomes",
+  persistent: true,
+  command: `tail -n 0 -F "$HOME/.local/state/jobd/daemon.log" \
+    | grep -E --line-buffered "SUCCEEDED|FAILED|CANCELLED|TIMEOUT|crash-looping|Traceback|ERROR"`,
+})
+```
+
+Each flag earns its place: `-n 0` so existing history is not replayed as new
+events, `-F` so it survives log rotation, `--line-buffered` or matches sit
+unseen in grep's buffer. `persistent: true` matters most — without it the watch
+expires on a timeout, and per the warning above that expiry reads as "still
+running".
+
+`crash-looping` catches jobd itself dying repeatedly under launchd, where the
+process is always present and the log always says "jobd up", so nothing else
+distinguishes it from a healthy daemon.
+
+The one-live-monitor rule above still stands: `TaskStop` the old one before
+arming a replacement.
+
+**All of this dies with the session.** Close the terminal and jobd keeps
+writing the line with nobody reading it. For a run that dies at 3am to reach a
+human, something outside the session has to consume that line. Nothing does
+yet — that is unbuilt, not merely unconfigured.
+
 ## Ground rules (ported from ai-debate's AGENTS.md where they transfer)
 
 - Never delete outputs or artifacts without approval — including "temp" ones;
