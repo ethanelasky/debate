@@ -62,41 +62,43 @@ distinguishes it from a healthy daemon.
 The one-live-monitor rule above still stands: `TaskStop` the old one before
 arming a replacement.
 
-### Watching a training run itself: `scripts/watch_run.sh`
+### Watching a training run: let jobd tell you
 
-The section above watches jobd, which knows only whether a job *ended*. To
-watch the run's own output, there is one command:
+Do not tail pod logs from an agent. It was tried, and it is wrong twice over:
+the filter has to guess at a training script's output, and the volume pushes
+raw log lines into the context window, where a long enough transcript makes the
+model measurably worse at the job it was watching for.
 
-```js
-Monitor({
-  description: "debate run <job>",
-  persistent: true,
-  command: `scripts/watch_run.sh <job-id-or-name>`,
-})
-```
+jobd answers both questions itself, from the poll it already makes every tick:
 
-It reports by **exception**, and that is the whole design. A filter that echoes
-every `[step N]` fires every few minutes -- several hundred notifications over
-a real run -- and the harness throttles a monitor that noisy, so the watch dies
-exactly when you have stopped paying attention to it. Instead:
+- **did it end** — `job <id> (<name>) FAILED after attempt <n>: <reason>`
+- **is it moving** — the attempt's log size. If that has not grown in
+  `stall_after_s` (default 15m), jobd logs
+  `job <id> (<name>) attempt <n> STALLED: log has not grown in 15m`, and
+  `progressing again` if it recovers.
 
-- **failures** immediately, deduplicated
-- **STALLED** once, after 15 minutes without the step number moving
-- **progress resumed** if it starts again
-- a **heartbeat** every 30 polls, so silence is never ambiguous
+Log growth is deliberately generic. Whatever a run is, if it is doing anything
+it writes something, so there is no pattern to guess and nothing to keep in
+step with the training code.
 
-Tune with `POLL`, `STALL`, `BEAT`. The failure pattern is anchored on `FATAL`
-because that is this repo's own convention -- `pod_run.sh`, `env_bootstrap.sh`
-and the provision scripts announce every fatal that way, deliberately so it is
-greppable -- plus the runtime deaths that never reach that path (`Traceback`,
-CUDA OOM, `no kernel image is available`, `Killed`).
+So there is one thing to watch, and it is jobd's own log — see
+`~/code/jobd/AGENTS.md` for the exact Monitor invocation.
 
-It polls because `jobd logs` is a snapshot, not a stream: for a live job it
-ssh's to the pod and tails once. That is one bounded ssh per `POLL` seconds.
+#### The event budget, which is the point
 
-**The stall check is the part worth having.** Everything else is visible in the
-log afterwards; a run that quietly stopped stepping at 2am and burned six hours
-of B200 time is the failure this catches and nothing else does.
+A **healthy** eight-hour run costs **one** event: its outcome. Not a heartbeat,
+not a step line, nothing while it is fine. A sick one costs a handful — a
+stall, maybe a recovery, an outcome.
+
+That budget is the design constraint, not a side effect. Every event spends
+context, and a transcript full of training-log noise degrades the model that is
+supposed to notice the one line that mattered. If a watch starts producing
+events steadily, treat that as the watch being wrong rather than the run being
+interesting.
+
+For anything finer than "ended" or "stopped moving" -- loss diverging, reward
+collapsing, a wandb run whose metrics went flat -- use a `/loop` that reads the
+run's metrics and *thinks*, rather than a filter that forwards lines.
 
 **All of this dies with the session.** Close the terminal and jobd keeps
 writing the line with nobody reading it. For a run that dies at 3am to reach a
