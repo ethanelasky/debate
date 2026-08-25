@@ -77,8 +77,15 @@ mathl5_qwen35_cispo_sub8:
 mathl5_qwen9b_cispo_qwen4b_sub8:
   _extends: mathl5_qwen35_cispo_sub8
   model: Qwen/Qwen3.5-9B
+  think_tokens: 8000
   training:
+    # 8000 think + 1024 final answer. The forced-close resubmission prompt can
+    # carry the original prompt plus all 8000 thinking tokens.
+    eval_max_tokens: 9216
     verl:
+      prompt_length: 10240
+      response_length: 9216
+      max_token_len_per_gpu: 20480
       # Leave enough colocated memory for the LoRA merge/restore path. At
       # 0.45, vLLM held 35.52 GiB and the 9B actor failed a 3.79 GiB restore
       # allocation with only 1.06 GiB free on an 80 GB H100.
@@ -91,8 +98,23 @@ mathl5_qwen9b_cispo_qwen4b_sub8:
         - "++actor_rollout_ref.model.lora.merge=True"
         - "actor_rollout_ref.rollout.max_num_seqs=256"
 
+mathl5_qwen9b_cispo_qwen9b_sub8:
+  _extends: mathl5_qwen9b_cispo_qwen4b_sub8
+  # Qwen3.5-9B capped pass@8 sweep (2026-08-24): 1243 of 1600 rows.
+  # This drops only the 357 rows that the 9B base solved 8 of 8 times.
+  dataset: {train_filter_file: configs/filters/l5_sub8_qwen9b.json}
+
 mathl5_qwen9b_cispo_qwen4b_sub8_smoke:
   _extends: mathl5_qwen9b_cispo_qwen4b_sub8
+  training:
+    steps: 2
+    batch_size: 2
+    group_size: 4
+    eval_every: 0
+    save_every: 0
+
+mathl5_qwen9b_cispo_qwen9b_sub8_smoke:
+  _extends: mathl5_qwen9b_cispo_qwen9b_sub8
   training:
     steps: 2
     batch_size: 2
