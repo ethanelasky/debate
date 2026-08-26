@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 Tokens = list[int]
 
@@ -102,7 +102,7 @@ class Datum:
     advantages: list[float]
     mask: list[float] | None = None
     # Frozen-reference logprobs over the completion region, stamped by the
-    # train loop under kl_mechanism "loss" (verl consumes them as the batch's
+    # train loop when kl_coef > 0 (verl consumes them as the batch's
     # ref_log_prob for its differentiable in-loss KL). None = no in-loss KL.
     ref_logprobs: list[float] | None = None
 
@@ -153,6 +153,11 @@ class OptimParams:
 
 class Backend(ABC):
     tokenizer: object  # HF tokenizer for the policy model (render + decode)
+
+    #: Does forward_backward CONSUME datum.ref_logprobs as an in-loss KL term?
+    #: Not answerable by hasattr(ref_logprobs): this class defines that method,
+    #: so it is True even for a backend whose training path ignores the result.
+    consumes_ref_logprobs: ClassVar[bool] = False
 
     @abstractmethod
     def sync_sampler(self) -> None:

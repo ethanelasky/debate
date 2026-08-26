@@ -93,6 +93,23 @@ def make_gspo_loss_fn(metas: list[tuple[int, int, list[float], list[float], list
     return loss_fn
 
 
+def make_kl_loss_fn(metas: list[tuple[int, int, list[float], list[float]]], coef: float):
+    """k3 = exp(d) - d - 1, d = ref - logp_current, summed over unmasked
+    completion tokens and scaled by coef. Matches verl's low_var_kl."""
+    import torch
+
+    def loss_fn(data, logprobs_list):
+        terms = []
+        for (ob_len, n, ref, mask), lp in zip(metas, logprobs_list):
+            m = torch.tensor(mask, dtype=lp.dtype)
+            d = torch.tensor(ref, dtype=lp.dtype) - lp[ob_len : ob_len + n]
+            terms.append(((torch.exp(d) - d - 1.0) * m).sum())
+        loss = coef * torch.stack(terms).sum()
+        return loss, {"kl/in_loss_sum": float(loss.item())}
+
+    return loss_fn
+
+
 class _Resolved:
     """Adapter so pre-resolved custom-loss results flow through the same
     pending-futures path as normal forward_backward futures."""
@@ -105,13 +122,17 @@ class _Resolved:
 
 
 class TinkerBackend(Backend):
+    consumes_ref_logprobs = True
+
     def __init__(
         self,
         base_model: str,
         lora_rank: int = 32,
         service_client: tinker.ServiceClient | None = None,
+        kl_loss_coef: float = 0.0,
     ):
         self.base_model = base_model
+        self.kl_loss_coef = float(kl_loss_coef)
         self.service_client = service_client or tinker.ServiceClient()
         self.training_client = self.service_client.create_lora_training_client(
             base_model=base_model, rank=lora_rank
@@ -158,7 +179,10 @@ class TinkerBackend(Backend):
 
     def ref_logprobs(self, data: list[Datum]) -> list[list[float]]:
         """Reference = the base model (LoRA-zero == base at init). One
-        compute_logprobs call per datum, overlapped via futures."""
+        compute_logprobs call per datum, overlapped via futures.
+
+        Consumed in-loss by _accumulate_kl.
+        """
         if getattr(self, "_ref_client", None) is None:
             self._ref_client = self.service_client.create_sampling_client(base_model=self.base_model)
         futures = [
@@ -207,7 +231,38 @@ class TinkerBackend(Backend):
         n_tokens = sum(len(d.tokens) - d.prompt_len for d in data)
         fut = self.training_client.forward_backward(tds, kind, loss_fn_config=config)
         self._pending_fwd_bwd.append((fut, n_tokens))
+        self._accumulate_kl(data)
         return {}
+
+    def _accumulate_kl(self, data: list[Datum]) -> None:
+        """Gradients accumulate across forward_backward calls until optim_step,
+        so the in-loss KL is a second additive pass rather than a rewrite of
+        every built-in loss."""
+        if self.kl_loss_coef <= 0:
+            return
+        metas, tds = [], []
+        for d in data:
+            if d.ref_logprobs is None:
+                raise RuntimeError("kl_loss_coef > 0 but datum carries no ref_logprobs")
+            ob_len = d.prompt_len - 1
+            completion = d.tokens[d.prompt_len :]
+            mask = d.mask if d.mask is not None else [1.0] * len(completion)
+            metas.append((ob_len, len(completion), d.ref_logprobs, mask))
+            tds.append(
+                types.Datum(
+                    model_input=types.ModelInput.from_ints(d.tokens[:-1]),
+                    loss_fn_inputs={
+                        "target_tokens": [0] * ob_len + completion,
+                        "weights": [0.0] * (ob_len + len(completion)),
+                    },
+                )
+            )
+        result = self.training_client.forward_backward_custom(
+            tds, make_kl_loss_fn(metas, self.kl_loss_coef)
+        )
+        if hasattr(result, "result"):
+            result = result.result()
+        self._pending_fwd_bwd.append((_Resolved(result), 0))
 
     def _forward_backward_gspo(self, data: list[Datum], loss: LossSpec) -> dict[str, float]:
         """GSPO via forward_backward_custom (any loss differentiable in
@@ -235,6 +290,7 @@ class TinkerBackend(Backend):
             result = result.result()
         n_tokens = sum(len(d.tokens) - d.prompt_len for d in data)
         self._pending_fwd_bwd.append((_Resolved(result), n_tokens))
+        self._accumulate_kl(data)
         return {}
 
     def optim_step(self, params: OptimParams) -> dict[str, float]:

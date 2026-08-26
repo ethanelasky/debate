@@ -369,9 +369,10 @@ def test_debate_runner_identity_tracks_scientific_protocol(tmp_path, mutate):
 # that stops being conditional, a renamed key — locks every in-flight run out
 # of its own lineage and makes new runs incomparable to the published ones.
 # Update these ONLY together with a deliberate decision to break that, never
-# to make a red test green.
-GOLDEN_DEBATE_SHA = "95955cf178fe3e540835b79594e27b7b3e1147f17ac5ae521d5a530d5208576c"
-GOLDEN_RLVR_SHA = "619e1ab8b093f56db9ee6296e85899533478bd34248cc033566373553fccff51"
+# to make a red test green. Last moved 2026-08-26: the kl payload dropped
+# "mechanism" and "discount_factor" when the advantage-space KL was removed.
+GOLDEN_DEBATE_SHA = "111a5bafde48e0063fbf9568267494ee6c0e69c02df733a767d1498f97045b9d"
+GOLDEN_RLVR_SHA = "47c679cfd202cbf1fe9ff174d7c64945f73d70353e417754d16732ac8121a45a"
 
 
 def test_published_identity_schema_is_stable(tmp_path):

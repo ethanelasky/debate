@@ -47,7 +47,6 @@ TRAINING_KEYS = {
     "ppo_epochs",
     "adv_length_norm",
     "kl_coef",
-    "kl_discount_factor",
     "eval_every",
     "eval_max_tokens",
     "eval_n",
@@ -66,7 +65,6 @@ TRAINING_KEYS = {
     "min_lr_ratio",
     "adv_population_std",
     "drop_zero_advantage",
-    "kl_mechanism",
     "rl_seed",
 }
 
@@ -97,7 +95,6 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     ("ppo_epochs", int),
     ("adv_length_norm", str),
     ("kl_coef", float),
-    ("kl_discount_factor", float),
     ("eval_every", int),
     ("eval_max_tokens", int),
     ("eval_n", int),
@@ -123,7 +120,6 @@ CONFIG_CASTS: tuple[tuple[str, object], ...] = (
     # hw4/DeepSeekMath parity knobs (see Config for semantics).
     ("adv_population_std", _strict_bool),
     ("drop_zero_advantage", _strict_bool),
-    ("kl_mechanism", str),
     ("rl_seed", int),
 )
 
@@ -463,19 +459,7 @@ def build_backend(
     fall to the backend config's own dataclass defaults.
     """
     backend_kind = str(tr.get("backend", "tinker"))
-    # At coef 0 no KL is applied by either mechanism, so the backend pairing
-    # below cannot bite — checking it would only reject valid KL-free arms.
     _kl_on = tr.get("kl_coef") is not None and float(tr["kl_coef"]) > 0
-    if _kl_on and str(tr.get("kl_mechanism", "loss")) == "loss" and backend_kind != "verl":
-        # Tinker HAS ref_logprobs, so the train loop's capability check would
-        # pass, stamp the datums, skip the advantage penalty — and tinker's
-        # forward_backward would ignore the field: kl_coef silently becomes a
-        # no-op (round-3 audit). Only verl consumes ref_log_prob in-loss.
-        raise RuntimeError(
-            f"training.kl_mechanism 'loss' requires backend 'verl' (got "
-            f"{backend_kind!r}); on other backends the stamped ref_logprobs "
-            "are ignored and the KL vanishes without a trace."
-        )
     if "verl" in tr and backend_kind != "verl":
         # A verl block under any other backend is dead config: every knob in
         # it (response_length, n_gpus, checkpoint_dir, ...) would be ignored
@@ -491,6 +475,8 @@ def build_backend(
         # Tinker checkpoints live service-side under the run, not in a local
         # directory, so there is nothing here to namespace.
         kw = {"lora_rank": int(tr["lora_rank"])} if tr.get("lora_rank") is not None else {}
+        if _kl_on:
+            kw["kl_loss_coef"] = float(tr["kl_coef"])
         return TinkerBackend(model_path, **kw)
     if backend_kind == "verl":
         from infra.backend.verl import VerlBackend, VerlBackendConfig
@@ -530,7 +516,7 @@ def build_backend(
             )
         if tr.get("lora_rank") is not None:
             vkw["lora_rank"] = int(tr["lora_rank"])
-        if _kl_on and str(tr.get("kl_mechanism", "loss")) == "loss":
+        if _kl_on:
             # In-loss KL: the coefficient rides training.kl_coef; the backend
             # needs it at construction (use_kl_loss is a worker-config knob).
             vkw["kl_loss_coef"] = float(tr["kl_coef"])
@@ -725,13 +711,7 @@ def effective_learning_protocol(tr: dict, topology: dict | None = None) -> dict:
                 configured("drop_zero_advantage", Config.drop_zero_advantage)
             ),
         },
-        "kl": {
-            "coefficient": float(configured("kl_coef", Config.kl_coef)),
-            "mechanism": str(configured("kl_mechanism", Config.kl_mechanism)),
-            "discount_factor": float(
-                configured("kl_discount_factor", Config.kl_discount_factor)
-            ),
-        },
+        "kl": {"coefficient": float(configured("kl_coef", Config.kl_coef))},
         "optimizer": {
             # Peak lr is deliberately mutable for continuations/sweeps. These
             # remaining AdamW/clip settings are fixed runner defaults.

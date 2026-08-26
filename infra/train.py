@@ -102,17 +102,10 @@ class Config:
     # exclusive with dynamic_sampling_retries (both police the same waste).
     # 1.0 = off, loop identical to before.
     oversample_factor: float = 1.0
-    kl_coef: float = 0.0            # 0 = no reference-KL penalty
-    # Where kl_coef acts. "loss" (default): verl's native differentiable in-loss
-    # KL (k3/low_var_kl vs the frozen ref, recomputed each minibatch) —
-    # hw4/DeepSeekMath semantics; the loop stamps datum.ref_logprobs once per
-    # step and the backend forwards them. Requires a backend exposing
-    # ref_logprobs (verl + LoRA). "advantage": centered k1 penalty added to
-    # advantages once per step from the behavior logprobs — reshapes credit
-    # within the batch, zero net pull toward ref (the pre-2026-08-11 mechanism;
-    # the only option on backends without ref_logprobs, e.g. tinker).
-    # Inert either way at kl_coef 0.
-    kl_mechanism: str = "loss"
+    # 0 = no reference-KL penalty. When > 0 the loop stamps datum.ref_logprobs
+    # once per step and verl's in-loss KL (k3/low_var_kl vs the frozen ref)
+    # does the pull. Requires a backend with consumes_ref_logprobs.
+    kl_coef: float = 0.0
     # Linear lr warmup over the first N steps (0 = off, constant lr). Applied
     # in the loop by rescaling OptimParams.lr per step: verl's own scheduler
     # never advances on our tinker-worker path (optimizer_step only), and the
@@ -125,7 +118,6 @@ class Config:
     # (Ethan, 2026-08-11: "we should have lr decay").
     lr_schedule: str = "constant"
     min_lr_ratio: float = 0.1
-    kl_discount_factor: float = 0.0  # >0 smears future KL onto earlier tokens
     eval_every: int = 20
     eval_n: int = 128
     eval_max_tokens: int | None = None  # eval env generations need an explicit budget
@@ -385,10 +377,19 @@ def _select_oversampled(
 class _Phases:
     """Wall-clock per phase of a step.
 
-    Everything here is synchronous from Python's side — verl's calls block until
-    the GPU work they wrapped is done — so plain monotonic deltas are honest.
-    That is NOT true of raw torch ops, which queue asynchronously and would need
-    a cuda synchronize before timing meant anything.
+    Most phases are synchronous from Python's side — the call blocks until the
+    GPU work it wrapped is done — so plain monotonic deltas are honest. That is
+    NOT true of raw torch ops, which queue asynchronously and would need a cuda
+    synchronize before timing meant anything.
+
+    ONE PHASE PAIR IS NOT SYNCHRONOUS, and this docstring used to claim
+    otherwise. VerlBackend.forward_backward dispatches and returns a future;
+    optim_step awaits it. So `forward_backward` times the PACK AND DISPATCH
+    only, and `optim_step` covers the fwd/bwd compute as well as the optimizer
+    step. Read them as a pair, and subtract `optim/await_fwd_bwd_s` (reported
+    by the backend) to recover the real optimizer cost. Before that metric
+    existed this made the debate arms look like they spent 65-73% of every step
+    inside the optimizer.
     """
 
     def __init__(self) -> None:
@@ -431,14 +432,13 @@ def _validate_train_config(backend: Backend, cfg: Config) -> None:
         raise ValueError(f"lr_schedule must be 'constant' or 'cosine', got {cfg.lr_schedule!r}")
     if not (0.0 <= cfg.min_lr_ratio <= 1.0):
         raise ValueError(f"min_lr_ratio must be in [0, 1], got {cfg.min_lr_ratio}")
-    if cfg.kl_mechanism not in ("advantage", "loss"):
+    if cfg.kl_coef > 0 and not backend.consumes_ref_logprobs:
+        # NOT hasattr(backend, "ref_logprobs"): Backend defines that method, so
+        # that check was True for every backend and could never fire.
         raise ValueError(
-            f"kl_mechanism must be 'advantage' or 'loss', got {cfg.kl_mechanism!r}"
-        )
-    if cfg.kl_coef > 0 and cfg.kl_mechanism == "loss" and not hasattr(backend, "ref_logprobs"):
-        raise ValueError(
-            "kl_mechanism 'loss' needs a backend exposing ref_logprobs "
-            "(verl + LoRA); this backend does not."
+            f"kl_coef > 0 needs a backend whose forward_backward consumes "
+            f"ref_logprobs (verl + LoRA); {type(backend).__name__} does not, so "
+            f"the KL would silently never be applied. Set kl_coef 0."
         )
     _validate_wandb_resume_override(cfg)
 
@@ -657,7 +657,7 @@ def _train_with_logger(
         metrics.update(pack_stats)
 
         if datums:
-            from infra.rl.kl import apply_kl_penalty, entropy_proxy, ref_kl_metrics
+            from infra.rl.kl import entropy_proxy, ref_kl_metrics
 
             if cfg.sampling.temperature != 1.0 and hasattr(backend, "forward"):
                 # Tempered sampling breaks the ratio anchor: vLLM's returned
@@ -673,22 +673,16 @@ def _train_with_logger(
                         datum.sampler_logprobs = lp
 
             metrics["train/policy_token_entropy"] = entropy_proxy(datums)
-            if cfg.kl_coef > 0 and cfg.kl_mechanism == "loss":
-                # In-loss KL: stamp the frozen-ref logprobs once per step; the
-                # backend forwards them and verl's kl_loss term (k3, per
-                # minibatch vs the CURRENT policy) does the differentiable
-                # pull. hw4/DeepSeekMath semantics.
+            if cfg.kl_coef > 0:
+                # Stamp the frozen-ref logprobs once per step; the backend
+                # forwards them and verl's kl_loss term (k3, per minibatch vs
+                # the CURRENT policy) does the differentiable pull. This is a
+                # FULL forward pass over every datum on the frozen base — the
+                # cost of kl_coef, and worth seeing as its own phase.
                 with ph("kl_ref_logprobs"):
                     for datum, lp in zip(datums, backend.ref_logprobs(datums)):
                         datum.ref_logprobs = lp
                 metrics.update(ref_kl_metrics(datums))
-            elif cfg.kl_coef > 0:
-                # ref_logprobs is a FULL forward pass over every datum on the
-                # frozen base — the cost of kl_coef, and worth seeing separately.
-                with ph("kl_ref_logprobs"):
-                    metrics.update(
-                        apply_kl_penalty(backend, datums, cfg.kl_coef, cfg.kl_discount_factor)
-                    )
             import random as _random
 
             for epoch in range(max(1, cfg.ppo_epochs)):

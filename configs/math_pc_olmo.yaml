@@ -243,13 +243,11 @@ math_pc_olmo32think_cispo_os3:
     group_size: 8
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 10
     eval_n: 93
     save_every: 10
     dynamic_sampling_retries: 0
     oversample_factor: 3
-    kl_mechanism: loss
     drop_zero_advantage: false
     eval_split: dev
     final_test_eval: true
@@ -350,13 +348,11 @@ aime_pc_olmo32_cispo_os2:
     group_size: 8
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 10
     eval_n: 93
     save_every: 10
     dynamic_sampling_retries: 0
     oversample_factor: 2
-    kl_mechanism: loss
     drop_zero_advantage: false
     eval_split: dev
     final_test_eval: true

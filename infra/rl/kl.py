@@ -1,25 +1,23 @@
-"""Reference-KL penalty, tinker-cookbook style (rl/metrics.py::incorporate_kl_penalty).
+"""Reference-KL logging and the k1 estimator.
 
-Penalty (the gradient path): CENTERED k1 in advantage space —
-    adv_t += kl_coef · (avg_kl − k1_t),  k1_t = logπ_θ(a_t) − logπ_ref(a_t)
-k1 is the unbiased choice here: in the reward/score-function placement its
-gradient is the exact KL gradient in expectation, whereas differentiating k3
-directly is biased (k3's low variance is a VALUE property, not a gradient
-one). Centering by the batch mean makes the penalty zero-mean: it reshapes
-credit toward low-divergence tokens without deflating the reward scale.
-Optional kl_discount_factor smears future KL back onto earlier tokens
-(credit assignment), as in the cookbook.
+KL is applied ONE way: verl's native in-loss term against the adapter-disabled
+base (kl_loss_type=low_var_kl, i.e. k3), stamped per step as datum.ref_logprobs
+and enabled by training.kl_coef. Everything here is the value path — the
+gradient lives in the verl worker.
 
-Metrics (the value path): k1 mean (the actual estimate, cookbook's
-kl_policy_base), plus k3 = exp(δ)−δ−1 and k2 = ½δ² means as low-variance
-non-negative monitors. Log-ratios clamp at ±20 before exp.
+k3 is the right estimator for that placement. A differentiable k1 term would
+have gradient grad log pi_theta, whose expectation under theta is zero: pure
+variance, no pull.
+
+Metrics: k1 mean (the estimate), plus k3 = exp(d)-d-1 and k2 = 0.5*d**2 as
+low-variance non-negative monitors. Log-ratios clamp at +/-20 before exp.
 """
 
 from __future__ import annotations
 
 import math
 
-from infra.backend.base import Backend, Datum
+from infra.backend.base import Datum
 
 LOG_RATIO_CLIP = 20.0
 
@@ -31,67 +29,8 @@ def k1_per_token(policy_logprobs: list[float], ref_logprobs: list[float]) -> lis
     ]
 
 
-def discounted_future_sum(xs: list[float], gamma: float) -> list[float]:
-    out = [0.0] * len(xs)
-    acc = 0.0
-    for i in range(len(xs) - 1, -1, -1):
-        acc = xs[i] + gamma * acc
-        out[i] = acc
-    return out
-
-
-def apply_kl_penalty(
-    backend: Backend,
-    datums: list[Datum],
-    kl_coef: float,
-    discount_factor: float = 0.0,
-) -> dict[str, float]:
-    """Mutates packed datums' advantages in place; returns metrics. Policy
-    logprobs are the SAMPLER's (behavior policy at rollout); ref logprobs from
-    backend.ref_logprobs (frozen base)."""
-    if not datums:
-        return {}
-    ref_lps = backend.ref_logprobs(datums)
-
-    per_datum_k1: list[list[float]] = []
-    masks: list[list[float]] = []
-    k1_sum = 0.0
-    n_tokens = 0
-    for d, ref in zip(datums, ref_lps):
-        n = len(d.tokens) - d.prompt_len
-        if len(ref) != n:
-            raise ValueError(f"ref logprobs length {len(ref)} != completion length {n}")
-        mask = d.mask if d.mask is not None else [1.0] * n
-        k1 = [k if m else 0.0 for k, m in zip(k1_per_token(d.sampler_logprobs, ref), mask)]
-        per_datum_k1.append(k1)
-        masks.append(mask)
-        k1_sum += sum(k1)
-        n_tokens += sum(1 for m in mask if m)
-
-    avg_k1 = k1_sum / max(1, n_tokens)
-    k2_sum = k3_sum = 0.0
-    for d, k1, mask in zip(datums, per_datum_k1, masks):
-        penalty = [kl_coef * m * (avg_k1 - k) for k, m in zip(k1, mask)]
-        if discount_factor > 0:
-            penalty = discounted_future_sum(penalty, discount_factor)
-        for t, p in enumerate(penalty):
-            d.advantages[t] += p
-        for k, m in zip(k1, mask):
-            if m:
-                k2_sum += 0.5 * k * k
-                k3_sum += math.exp(-k) + k - 1.0  # k3 with delta = ref - policy = -k1
-
-    return {
-        "kl/policy_vs_ref_k1": avg_k1,               # cookbook's kl_policy_base
-        "kl/policy_vs_ref_k2": k2_sum / max(1, n_tokens),
-        "kl/policy_vs_ref_k3": k3_sum / max(1, n_tokens),
-        "kl/coef": float(kl_coef),
-        "kl/discount_factor": float(discount_factor),
-    }
-
-
 def ref_kl_metrics(datums: list[Datum]) -> dict[str, float]:
-    """Logging-only KL from pre-stamped ref_logprobs (the loss-mechanism path)."""
+    """Logging-only KL from the ref_logprobs the loop stamps each step."""
     k1_sum = k2_sum = k3_sum = 0.0
     n_tokens = 0
     for d in datums:

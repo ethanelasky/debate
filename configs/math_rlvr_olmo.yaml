@@ -110,7 +110,6 @@ aime_rlvr_olmo32:
     group_size: 8
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 5
     eval_n: 93         # the whole AIME held-out split
     eval_max_tokens: 1000
@@ -223,13 +222,11 @@ aime_rlvr_olmo32_plan8k_cispo:
     min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
     # Validated-recipe port (Ethan, 2026-08-11, from the CS285 exercise):
-    # kl_coef becomes a REAL in-loss k3 pull toward the ref (the old
-    # advantage-space centered k1 had zero net pull — the campaign
-    # effectively trained KL-free); seq-mean weighting via loss_agg_mode
+    # kl_coef becomes a REAL in-loss k3 pull toward the ref (runs before
+    # 2026-08-11 trained effectively KL-free); seq-mean weighting via loss_agg_mode
     # (adv_length_norm none, or it double-normalizes); grad clip 0.5
     # consciously chosen (was the backend's 1.0 default); degenerate rows
     # stay in the denominator instead of inflating effective lr.
-    kl_mechanism: loss
     adv_length_norm: none
     drop_zero_advantage: false
     verl:
@@ -360,7 +357,6 @@ aime_rlvr_olmo32think:
     group_size: 8
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 5
     eval_n: 93         # the whole AIME held-out split
     # no eval_max_tokens: eval rollouts run under the SAME think/total
@@ -406,7 +402,6 @@ aime_rlvr_qwen9b_plan8k_cispo:
     group_size: 8
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 20
     eval_n: 93
     eval_max_tokens: 1000
@@ -438,7 +433,6 @@ aime_rlvr_olmo32think_cispo:
     lr_schedule: cosine
     min_lr_ratio: 0.2
     dynamic_sampling_retries: 5
-    kl_mechanism: loss
     adv_length_norm: none
     drop_zero_advantage: false
     verl:

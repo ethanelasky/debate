@@ -81,8 +81,7 @@ _base_math_pc:
     batch_size: 8
     group_size: 4
     lr: 1.0e-5
-    kl_coef: 0.02        # centered-k1 advantage penalty vs frozen base
-    kl_discount_factor: 0.0
+    kl_coef: 0.02
     eval_every: 5      # RLVR eval: greedy MathEnv accuracy on the held-out test split
     eval_n: 32
     eval_max_tokens: 3072
@@ -149,24 +148,14 @@ math_pc_l5:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 4000, max_total_tokens: 5024}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
-  # Budget-overshoot parity with the RLVR arm — it belongs HERE, with the 4000
-  # think cap above, because that cap is what makes a slot overshootable.
-  #
-  # mathl5_qwen35_cispo prices a force-closed think phase at -0.1 through
-  # dataset.think_overshoot_penalty (configs/math_qwen35.yaml). That key is
-  # read by MathEnv.reward_sample, which a debate NEVER reaches — a debate's
-  # reward is ladder + shaping — so it was not "0.0 on this arm", it was inert
-  # here at every value. The arms therefore differed on the axis both dev
-  # instruments are dominated by: base Qwen3.5-4B is force-closed on 99.3% of
-  # rollouts, and the RLVR arm's measured gain is largely learning to terminate
-  # inside the budget and emit a box. Only one arm was being paid to learn it.
-  # Same coefficient, same slot, same cap. See configs/_qwen35_training.yaml.
-  # Both arms resolve to one FlagTerm over one think_overshoot predicate
-  # (infra/envs/shaping.py), and test_think_tokens.py pins the two coefficients
-  # to each other — so this parity is enforced, not just asserted here.
-  #
-  # Lists deep-merge BY INDEX, so index 0 is restated byte-identically from
-  # _base_math_pc; edit the two together.
+  # Budget-overshoot parity with the RLVR arm, which prices a force-closed
+  # think phase at -0.1 via dataset.think_overshoot_penalty. That key is read
+  # by MathEnv.reward_sample, which a debate never reaches, so it was inert
+  # here at any value — and base Qwen3.5-4B is force-closed on 99.3% of
+  # rollouts, so only the RLVR arm was paid to terminate and box. It belongs on
+  # this arm because the 4000 think cap above is what makes a slot
+  # overshootable. Index 0 is restated byte-identically from _base_math_pc
+  # (lists deep-merge BY INDEX); edit the two together.
   scoring:
     shaping:
       - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}

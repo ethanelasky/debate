@@ -44,6 +44,7 @@ class OneStepEnv(Env):
 
 class RecordingBackend:
     tokenizer = None
+    consumes_ref_logprobs = True
 
     def __init__(self):
         self.optim_lrs: list[float] = []
@@ -71,9 +72,9 @@ class RecordingBackend:
         pass
 
 
-def _run(cfg_kwargs, steps=3):
+def _run(cfg_kwargs, steps=3, backend=None):
     env = OneStepEnv()
-    backend = RecordingBackend()
+    backend = backend if backend is not None else RecordingBackend()
     # This synthetic Env exists only to expose optimizer/datums behavior and
     # intentionally implements neither production transcript-retention shape.
     cfg = Config(
@@ -167,36 +168,30 @@ def test_tempered_reanchor_rebinds_not_mutates():
             assert t.datums[0].sampler_logprobs == [-0.1, -0.1]
 
 
-def test_kl_mechanism_loss_stamps_ref_and_skips_advantage_penalty():
-    with mock.patch("infra.rl.kl.apply_kl_penalty") as penalty:
-        backend = _run({"kl_coef": 0.05, "kl_mechanism": "loss"}, steps=1)
+def test_kl_coef_stamps_ref_logprobs_for_the_in_loss_term():
+    backend = _run({"kl_coef": 0.05}, steps=1)
     assert backend.ref_calls == 1
-    assert not penalty.called
     assert all(d.ref_logprobs == [-0.5, -0.5] for d in backend.fb_datums[0])
 
 
-def test_kl_mechanism_loss_is_default_path():
-    with mock.patch("infra.rl.kl.apply_kl_penalty") as penalty:
-        backend = _run({"kl_coef": 0.05}, steps=1)
-    assert backend.ref_calls == 1
-    assert not penalty.called
-
-
-def test_kl_mechanism_advantage_is_opt_in():
-    backend = _run({"kl_coef": 0.05, "kl_mechanism": "advantage"}, steps=1)
-    assert backend.ref_calls >= 1  # apply_kl_penalty's ref pass
+def test_zero_kl_coef_stamps_nothing():
+    backend = _run({"kl_coef": 0.0}, steps=1)
+    assert backend.ref_calls == 0
     assert all(d.ref_logprobs is None for d in backend.fb_datums[0])
 
 
-def test_kl_mechanism_rejects_unknown_value():
-    with pytest.raises(ValueError, match="kl_mechanism"):
-        _run({"kl_mechanism": "reward"}, steps=1)
+def test_kl_coef_rejects_a_backend_that_ignores_ref_logprobs():
+    class Ignores(RecordingBackend):
+        consumes_ref_logprobs = False
+
+    with pytest.raises(ValueError, match="consumes"):
+        _run({"kl_coef": 0.05}, steps=1, backend=Ignores())
 
 
 def test_parity_knobs_flow_through_training_config():
     parser = runner_parser(None)
     args = parser.parse_args(["--experiment-file", "f.yaml", "--experiment", "e"])
-    for key in ("adv_population_std", "drop_zero_advantage", "kl_mechanism"):
+    for key in ("adv_population_std", "drop_zero_advantage"):
         assert key in TRAINING_KEYS
     kw = training_config_kwargs({"adv_population_std": True, "drop_zero_advantage": False}, args)
     assert kw["adv_population_std"] is True and kw["drop_zero_advantage"] is False
@@ -243,21 +238,20 @@ def test_sampling_ceiling_covers_think_budget():
     assert params.max_tokens == total > int(exp["max_completion_tokens"])
 
 
-def test_kl_mechanism_loss_rejects_non_verl_backend():
+def test_kl_coef_now_builds_on_tinker_too():
     from infra.run_common import build_backend
 
-    with pytest.raises(RuntimeError, match="requires backend 'verl'"):
-        build_backend({"backend": "tinker", "kl_mechanism": "loss", "kl_coef": 0.05}, "m", "r")
+    with mock.patch("infra.backend.tinker.TinkerBackend") as built:
+        build_backend({"backend": "tinker", "kl_coef": 0.05}, "m", "r")
+    assert built.call_args.kwargs["kl_loss_coef"] == 0.05
 
 
-def test_zero_kl_coef_clears_both_mechanism_guards():
-    """No KL is applied at coef 0, so the default must not reject KL-free arms:
-    the DAPO twin is verl + coef 0, the smoke arms are tinker + coef 0."""
+def test_zero_kl_coef_passes_no_coefficient_to_the_backend():
     from infra.run_common import build_backend
 
     with mock.patch("infra.backend.tinker.TinkerBackend") as built:
         build_backend({"backend": "tinker", "kl_coef": 0.0}, "m", "r")
-    assert built.called
+    assert "kl_loss_coef" not in built.call_args.kwargs
 
 
 def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
@@ -277,8 +271,8 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
     same_training = {
         "lora_rank", "loss", "ppo_epochs", "micro_batch", "warmup_steps",
         "adv_length_norm", "adv_population_std", "drop_zero_advantage",
-        "kl_mechanism", "steps", "batch_size", "group_size", "lr",
-        "kl_coef", "kl_discount_factor", "eval_every", "eval_n",
+        "steps", "batch_size", "group_size", "lr",
+        "kl_coef", "eval_every", "eval_n",
         "eval_max_tokens", "save_every",
     }
     assert {k: debate["training"][k] for k in same_training} == {

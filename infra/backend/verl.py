@@ -28,6 +28,7 @@ import asyncio
 import importlib.util
 import math
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -54,10 +55,9 @@ class VerlBackendConfig:
     max_token_len_per_gpu: int = 16384
     lora_rank: int = 32  # matches the Tinker backend; 0 = full finetune
     # verl's native differentiable in-loss KL vs the frozen ref (k3 /
-    # low_var_kl, per minibatch). 0 = off (the campaign default; advantage-
-    # space KL lives in infra/rl/kl.py). Set from training.kl_coef by
-    # build_backend when training.kl_mechanism is "loss"; the train loop then
-    # stamps datum.ref_logprobs and _pack forwards them as ref_log_prob.
+    # low_var_kl, per minibatch). 0 = off. Set from training.kl_coef by
+    # build_backend; the train loop stamps datum.ref_logprobs and _pack
+    # forwards them as ref_log_prob.
     kl_loss_coef: float = 0.0
     lr: float = 1e-5  # initial; overridden per optim_step call
     grad_clip: float = 1.0
@@ -375,6 +375,10 @@ def _validate_training_cache_release_stats(stats, expected_ranks: int) -> list[d
 
 
 class VerlBackend(Backend):
+    # _pack forwards datum.ref_logprobs as ref_log_prob and the worker runs
+    # verl's kl_loss term over it (use_kl_loss / kl_loss_type=low_var_kl, set
+    consumes_ref_logprobs = True
+
     def __init__(self, config: VerlBackendConfig):
         import ray
         from hydra import compose, initialize_config_dir
@@ -582,7 +586,7 @@ class VerlBackend(Backend):
             tensors["old_log_probs"] = old_log_probs
             tensors["advantages"] = advantages
             if any(d.ref_logprobs is not None for d in data):
-                # In-loss KL (kl_mechanism "loss"): every datum must carry the
+                # In-loss KL: every datum must carry the
                 # frozen-ref logprobs or none — a partial batch would pair
                 # zeros against real logprobs inside verl's kl_loss term.
                 if not all(d.ref_logprobs is not None for d in data):
@@ -631,7 +635,7 @@ class VerlBackend(Backend):
             # kl_loss, whose kld is masked by the same response_mask. (A
             # round-2 audit briefly swapped in one live token here; round 3
             # showed that token would carry a real KL gradient under
-            # kl_mechanism 'loss' while the NaN it guarded against cannot
+            # in-loss KL while the NaN it guarded against cannot
             # occur. Reverted.) ref_logprobs copied so the all-or-none check
             # in _pack stays consistent.
             filler = Datum(
@@ -681,8 +685,8 @@ class VerlBackend(Backend):
             raise RuntimeError(
                 f"in-loss KL config skew: kl_loss_coef={self.config.kl_loss_coef} "
                 f"but datums {'carry' if data[0].ref_logprobs is not None else 'lack'} "
-                "ref_logprobs — kl_mechanism 'loss' needs both sides wired "
-                "(build_backend does this from training.kl_mechanism)."
+                "ref_logprobs — in-loss KL needs both sides wired "
+                "(build_backend does this from training.kl_coef)."
             )
         self._sleep_rollout()
         padded = self._pad_to_world_size(data)
@@ -695,12 +699,19 @@ class VerlBackend(Backend):
     def optim_step(self, params: OptimParams) -> dict[str, float]:
         from verl.utils import tensordict_utils as tu
 
-        metrics: dict[str, float] = _token_weighted_loss_means(
-            [
-                (dict(tu.get(future.get(), "metrics") or {}), n_tokens)
-                for future, n_tokens in self._pending_fwd_bwd
-            ]
-        )
+        # forward_backward() DISPATCHES and returns a future; the fwd/bwd
+        # compute is awaited HERE. Without this split every profile reads
+        # "forward_backward ~0s, optimizer step ~10min", which is how the
+        # debate arms looked like they spent 65-73% of a step in the
+        # optimizer. Report the await separately so phase/optim_step_s can be
+        # read as (await + the actual step) rather than mistaken for the step.
+        t0 = time.monotonic()
+        collected = [
+            (dict(tu.get(future.get(), "metrics") or {}), n_tokens)
+            for future, n_tokens in self._pending_fwd_bwd
+        ]
+        await_fwd_bwd_s = time.monotonic() - t0
+        metrics: dict[str, float] = _token_weighted_loss_means(collected)
         self._pending_fwd_bwd.clear()
 
         # grad_clip is baked into the engine config; per-call override unsupported.
@@ -717,6 +728,7 @@ class VerlBackend(Backend):
                 metrics[f"optim/{k}"] = float(v)
         if "optim/grad_norm" in metrics:
             metrics.update(_grad_norm_metrics(metrics["optim/grad_norm"], self._grad_clip_norm))
+        metrics["optim/await_fwd_bwd_s"] = await_fwd_bwd_s
         self._global_step += 1
         return metrics
 

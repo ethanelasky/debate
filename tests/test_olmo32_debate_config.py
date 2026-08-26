@@ -58,13 +58,11 @@ def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
         "group_size",
         "lr",
         "kl_coef",
-        "kl_discount_factor",
         "eval_every",
         "eval_n",
         "save_every",
         "dynamic_sampling_retries",
         "oversample_factor",
-        "kl_mechanism",
         "drop_zero_advantage",
         "eval_split",
         "final_test_eval",
@@ -126,9 +124,9 @@ def test_olmo32_instruct_aime_debate_twin():
     # debates — the third draw was waste).
     same_training = {
         "lora_rank", "loss", "ppo_epochs", "adv_length_norm", "batch_size",
-        "group_size", "lr", "kl_coef", "kl_discount_factor", "eval_every",
+        "group_size", "lr", "kl_coef", "eval_every",
         "eval_n", "save_every", "dynamic_sampling_retries",
-        "kl_mechanism", "drop_zero_advantage", "eval_split", "final_test_eval",
+        "drop_zero_advantage", "eval_split", "final_test_eval",
         "warmup_steps", "lr_schedule", "min_lr_ratio",
     }
     assert {k: arm["training"][k] for k in same_training} == {

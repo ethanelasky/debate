@@ -85,7 +85,6 @@ mb_rlvr_olmo:
     group_size: 8      # 8-way groups, as in math_rlvr_olmo_l5
     lr: 1.0e-4         # the math-RLVR lr that moved the policy; sweep from here
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 5
     # The WHOLE dev split (60 attack / 60 honest, +-4.6pp binomial noise).
     # Keep this equal to the dev split size: tasks() returns test_rows[:n], a
@@ -186,8 +185,6 @@ mb_rlvr_qwen36:
     # tinker sums), which is what the two decades on either side are for.
     lr: 1.0e-4
     kl_coef: 0.02
-    kl_mechanism: advantage   # tinker ignores ref_log_prob; in-loss KL is verl-only
-    kl_discount_factor: 0.0
     # Datums here carry the whole ~16-50k-token prompt, so the default 64 per
     # forward_backward is 1-3M tokens in one call. Lower until a step is known
     # to hold.

@@ -82,16 +82,12 @@ _cs285_recipe:
     adv_population_std: true     # hw4 std(unbiased=False); default is verl parity
     drop_zero_advantage: false   # hw4 keeps all 64 rows in the seq-mean denominator
     # hw4's KL is a DIFFERENTIABLE in-loss k3 vs the frozen ref, recomputed
-    # each minibatch — not our advantage-space centered k1 (which has zero
-    # net pull). kl_mechanism loss routes kl_coef into verl's native
-    # use_kl_loss/kl_loss_coef/low_var_kl.
-    kl_mechanism: loss
+    # each minibatch; kl_coef routes into verl's use_kl_loss/low_var_kl.
     steps: 501
     batch_size: 8
     group_size: 8
     lr: 3.0e-5
     kl_coef: 0.05
-    kl_discount_factor: 0.0
     eval_every: 100
     eval_n: 512
     eval_max_tokens: 512

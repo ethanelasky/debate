@@ -27,7 +27,6 @@ _olmo_train_base:
     group_size: 8      # GRPO groups are per (task, arm, trained seat); g8 halves advantage noise vs g4
     lr: 1.0e-4         # the RLVR lr that reached 77.3%; 1e-5 was dead here
     kl_coef: 0.02
-    kl_discount_factor: 0.0
     eval_every: 5
     save_every: 25     # lora-only adapters (~100-200MB) on the network volume
 
