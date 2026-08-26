@@ -14,6 +14,10 @@ math_rlvr_olmo_l5:
   training:
     verl:
       n_gpus: 1
+      # Pinned with n_gpus deliberately: the two are one decision and an arm
+      # that states only n_gpus inherits the machine's TP for the other half.
+      # See configs/math_qwen35.yaml for the run that proved it.
+      rollout_tp: 1
       gpu_memory_utilization: 0.45 # no judge server: rollout can take more than debate's 0.33
       prompt_length: 1024          # system + one MATH problem
       response_length: 2000

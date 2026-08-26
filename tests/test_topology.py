@@ -96,3 +96,101 @@ def test_apply_topology_concatenates_extra_overrides():
 def test_apply_topology_empty_topology_is_identity():
     arm = {"n_gpus": 2, "extra_overrides": ["++a=1"]}
     assert apply_topology(dict(arm), {}) == arm
+
+
+# -- the GPU split is one decision, not two ---------------------------------
+#
+# n_gpus and rollout_tp together say how a box's GPUs are divided between the
+# FSDP training group and the rollout engine's tensor-parallel replicas. verl
+# asserts the relationship in TinkerActorRolloutRefWorker.init_model(), which
+# is reached only after the env restore, Ray startup and model shard have all
+# been paid for. These tests move that assertion to launch time, where it is
+# free.
+
+
+def test_the_half_override_that_cost_two_b200s():
+    """qwen35_fmt_warmup_l3, 2026-08-26: the arm pinned n_gpus=1 and said
+    nothing about rollout_tp, so the 2xB200 topology supplied TP=2. Nineteen
+    minutes later verl said "rollout world_size: 1 is not divisible by
+    infer_world_size: 2" and the run exited 1."""
+    with pytest.raises(RuntimeError) as exc:
+        apply_topology(
+            {"n_gpus": 1, "gpu_memory_utilization": 0.45},
+            {"n_gpus": 2, "rollout_tp": 2, "gpu_memory_utilization": 0.42},
+        )
+    assert "n_gpus=1" in str(exc.value) and "rollout_tp=2" in str(exc.value)
+
+
+def test_the_error_says_which_side_supplied_which_number():
+    """Without this the reader goes hunting for a `rollout_tp: 2` that appears
+    in no arm anywhere — it came from the machine, not the experiment."""
+    with pytest.raises(RuntimeError) as exc:
+        apply_topology({"n_gpus": 1}, {"n_gpus": 2, "rollout_tp": 2})
+    message = str(exc.value)
+    arm_at = message.index("n_gpus=1")
+    topo_at = message.index("rollout_tp=2")
+    assert "the arm" in message[arm_at:topo_at]
+    assert "topology" in message[topo_at:]
+
+
+def test_a_matched_pair_passes_whatever_the_topology_says():
+    merged = apply_topology(
+        {"n_gpus": 1, "rollout_tp": 1}, {"n_gpus": 2, "rollout_tp": 2}
+    )
+    assert (merged["n_gpus"], merged["rollout_tp"]) == (1, 1)
+
+
+def test_tp_dividing_the_group_is_fine():
+    """4 GPUs as two TP2 rollout replicas is the 4xB200 plan, not an error."""
+    assert apply_topology({}, {"n_gpus": 4, "rollout_tp": 2})["n_gpus"] == 4
+
+
+def test_absent_keys_fall_back_to_one_and_pass():
+    assert apply_topology({}, {}) == {}
+
+
+def test_absent_keys_match_the_backend_defaults():
+    """check_gpu_split writes 1 out rather than importing VerlBackendConfig,
+    which drags in torch and vllm. This is what keeps the two honest."""
+    verl = pytest.importorskip("infra.backend.verl")
+    assert verl.VerlBackendConfig.n_gpus == 1
+    assert verl.VerlBackendConfig.rollout_tp == 1
+
+
+def test_zero_tp_is_refused_rather_than_dividing_by_zero():
+    with pytest.raises(RuntimeError):
+        apply_topology({"rollout_tp": 0}, {"n_gpus": 2})
+
+
+def test_every_shipped_arm_resolves_on_every_shipped_topology():
+    """The regression net. The failure was not a typo in one arm — the sweep
+    that found it counted 132 broken (arm, topology) pairs across six files,
+    because every arm tuned for one GPU inherited TP from whatever box it
+    landed on. This is what stops the next arm reintroducing it: a new
+    n_gpus without a rollout_tp fails here, on a laptop, for free.
+    """
+    import glob
+
+    import yaml
+
+    from infra.config import resolve_experiments_from_file, runnable_experiments
+
+    with open(rc.TOPOLOGY_FILE) as fh:
+        topologies = yaml.safe_load(fh)
+
+    broken, checked = [], 0
+    for path in sorted(glob.glob("configs/*.yaml")):
+        experiments = resolve_experiments_from_file(path)
+        for name in runnable_experiments(experiments):
+            verl = ((experiments[name].get("training") or {}).get("verl")) or {}
+            for key, topology in topologies.items():
+                checked += 1
+                try:
+                    apply_topology(dict(verl), dict(topology))
+                except RuntimeError as exc:
+                    broken.append(f"{path}::{name} on {key}: {exc}")
+
+    # Guard the guard: a refactor that stops resolving configs would otherwise
+    # turn this into a test that passes by checking nothing.
+    assert checked > 100, f"only {checked} combinations checked; the sweep broke"
+    assert not broken, "\n".join(broken[:10])

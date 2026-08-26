@@ -204,6 +204,51 @@ def resolve_topology(path: str = TOPOLOGY_FILE) -> dict:
     return entry
 
 
+#: verl's own assertion, hoisted to launch time. `n_gpus` and `rollout_tp` are
+#: one decision — how the GPUs on this box are split between the FSDP training
+#: group and the rollout engine's tensor-parallel replicas — and verl checks it
+#: in TinkerActorRolloutRefWorker.init_model(), which is reached only AFTER the
+#: env is restored, Ray is up and the model is sharded. On 2026-08-26 that was
+#: nineteen minutes and two rented B200s into `qwen35_fmt_warmup_l3` before the
+#: run said `rollout world_size: 1 is not divisible by infer_world_size: 2`.
+def check_gpu_split(merged: dict, *, arm: dict, topology: dict) -> None:
+    """Refuse a GPU split that verl will reject once it has spent the money.
+
+    The failure this exists for is not a typo. It is a HALF override: an arm
+    that pins `n_gpus` and says nothing about `rollout_tp` silently keeps the
+    detected machine's value for the half it did not mention, so an arm tuned
+    for one GPU inherits TP=2 the first time it lands on a two-GPU box and is
+    wrong in a way neither file looks wrong on its own. The error therefore
+    names which side supplied which number — without that, the reader goes
+    looking for a `rollout_tp: 2` that appears in no arm anywhere.
+    """
+    # Both default to 1, mirroring VerlBackendConfig. Written out rather than
+    # imported: infra.backend.verl pulls in torch and vllm, and this runs while
+    # resolving config, before anything has decided to touch a GPU.
+    # test_absent_keys_match_the_backend_defaults pins the pair.
+    n_gpus = int(merged.get("n_gpus", 1))
+    rollout_tp = int(merged.get("rollout_tp", 1))
+    if rollout_tp >= 1 and n_gpus % rollout_tp == 0:
+        return
+
+    def whose(key: str) -> str:
+        if key in arm:
+            return "the arm"
+        if key in topology:
+            return f"the {os.environ.get('DEBATE_TOPOLOGY') or 'detected'} topology"
+        return "the backend default"
+
+    raise RuntimeError(
+        f"n_gpus={n_gpus} (from {whose('n_gpus')}) is not divisible by "
+        f"rollout_tp={rollout_tp} (from {whose('rollout_tp')}). verl asserts "
+        "this when the rollout worker initialises, long after the env restore "
+        "and model shard have been paid for. An arm that pins one of these "
+        "must pin both: they are a single decision about how this box's GPUs "
+        "are split, and inheriting half of it from another machine's topology "
+        "is not a configuration anybody chose."
+    )
+
+
 def apply_topology(verl_cfg: dict, topology: dict) -> dict:
     """Topology supplies defaults; the arm's own keys win. extra_overrides is
     the one list-valued key, and 'arm wins' would silently DROP the topology's
@@ -214,6 +259,7 @@ def apply_topology(verl_cfg: dict, topology: dict) -> dict:
     extras += [e for e in (verl_cfg.get("extra_overrides") or []) if e not in extras]
     if extras:
         merged["extra_overrides"] = extras
+    check_gpu_split(merged, arm=verl_cfg, topology=topology)
     return merged
 
 

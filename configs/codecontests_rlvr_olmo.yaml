@@ -61,6 +61,10 @@ codecontests_rlvr_olmo:
   training:
     verl:
       n_gpus: 1
+      # Pinned with n_gpus deliberately: the two are one decision and an arm
+      # that states only n_gpus inherits the machine's TP for the other half.
+      # See configs/math_qwen35.yaml for the run that proved it.
+      rollout_tp: 1
       gpu_memory_utilization: 0.45 # no judge server here: rollout can take more than debate's 0.33
       # CodeContests statements are ~3x MATH: 474 tokens median, 1323 at p99,
       # 1850 max, plus the answer-gen preamble.

@@ -19,6 +19,16 @@ _qwen35_l5:
     backend: verl
     verl:
       n_gpus: 1
+      # Pinned WITH n_gpus, not left to the topology. These two are one
+      # decision -- how the box's GPUs split between the FSDP training group
+      # and the rollout engine's TP replicas -- and an arm that states only
+      # n_gpus keeps the detected machine's rollout_tp for the half it did not
+      # mention. On a 2xB200 pod that silently produced n_gpus 1 with TP 2, and
+      # verl asserted "rollout world_size: 1 is not divisible by
+      # infer_world_size: 2" nineteen minutes and two rented B200s into
+      # qwen35_fmt_warmup_l3 (2026-08-26). run_common.check_gpu_split now
+      # refuses that combination at launch; this states the value it wants.
+      rollout_tp: 1
       gpu_memory_utilization: 0.45
       # budget-forced resubmission: prompt side sees base + think_tokens
       prompt_length: 6144
