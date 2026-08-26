@@ -149,6 +149,28 @@ math_pc_l5:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 4000, max_total_tokens: 5024}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
+  # Budget-overshoot parity with the RLVR arm — it belongs HERE, with the 4000
+  # think cap above, because that cap is what makes a slot overshootable.
+  #
+  # mathl5_qwen35_cispo prices a force-closed think phase at -0.1 through
+  # dataset.think_overshoot_penalty (configs/math_qwen35.yaml). That key is
+  # read by MathEnv.reward_sample, which a debate NEVER reaches — a debate's
+  # reward is ladder + shaping — so it was not "0.0 on this arm", it was inert
+  # here at every value. The arms therefore differed on the axis both dev
+  # instruments are dominated by: base Qwen3.5-4B is force-closed on 99.3% of
+  # rollouts, and the RLVR arm's measured gain is largely learning to terminate
+  # inside the budget and emit a box. Only one arm was being paid to learn it.
+  # Same coefficient, same slot, same cap. See configs/_qwen35_training.yaml.
+  # Both arms resolve to one FlagTerm over one think_overshoot predicate
+  # (infra/envs/shaping.py), and test_think_tokens.py pins the two coefficients
+  # to each other — so this parity is enforced, not just asserted here.
+  #
+  # Lists deep-merge BY INDEX, so index 0 is restated byte-identically from
+  # _base_math_pc; edit the two together.
+  scoring:
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: think_overshoot_penalty, coeff: 0.1, slots: [proposal], flag: think_overshoot}
 
 # ---------------------------------------------------------------------------
 # Scheduler workload — fresh-start Qwen3.5 L5 CISPO debate on verl.
@@ -172,10 +194,15 @@ mathl5_qwen35_pc_debate_cispo_verl:
   # Protocol from math_pc_l5; objective from the shared base (later parent
   # wins), so loss/kl_coef cannot drift from the RLVR arm.
   _extends: [math_pc_l5, _qwen35_train_base]
-  # Proposal wording, byte-identical to the RLVR arm's rollout prompt: the
-  # pack's <ANSWER_GEN_USER> splice renders this file into the proposal slot,
-  # so with math.yaml here the two arms would differ in prompt as well as in
-  # protocol, and neither arm's dev curve could be attributed.
+  # Proposal USER MESSAGE, byte-identical to the RLVR arm's rollout prompt:
+  # the pack's <ANSWER_GEN_USER> splice renders this file into the proposal
+  # slot, so with math.yaml here the two arms would differ in prompt as well as
+  # in protocol, and neither arm's dev curve could be attributed.
+  #
+  # The SYSTEM CARD still differs, and deliberately is not claimed to match:
+  # first_speech_non_debate_aware defaults False (infra/envs/debate/env.py), so
+  # the proposer generates knowing a critic is coming. math_pc_solo is the arm
+  # that closes that gap; this is not it. State the layer a claim holds at.
   dataset: {prompt_file: infra/prompts/tasks/math_nocot.yaml}
   # dev/test instrument, byte-identical to mathl5_qwen35_cispo's eval_dataset
   # in configs/math_qwen35.yaml — change the two together or the arms stop

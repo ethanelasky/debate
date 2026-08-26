@@ -526,6 +526,29 @@ def test_format_reward_targets_solution_datum():
     assert t.reward == pytest.approx(1.125)  # mean, for logging
 
 
+def test_overshoot_shaping_rejects_a_slot_with_no_think_cap():
+    """A slot with no max_think_tokens can never be force-closed, so pricing
+    overshoot on it buys a constant 0.0 — the same value-shaped void that made
+    dataset.think_overshoot_penalty read as "0.0 on the debate arm" when it was
+    in fact inert there. Refuse it at construction instead of paying it."""
+    from infra.envs.debate.rewards import ScoringConfig
+
+    with pytest.raises(ValueError, match="max_think_tokens"):
+        make_env(
+            ["alice"],
+            [GOOD_VERDICT],
+            scoring=ScoringConfig(
+                shaping=[
+                    {
+                        "kind": "think_overshoot_penalty",
+                        "coeff": 0.1,
+                        "slots": ["proposal"],
+                    }
+                ]
+            ),
+        )
+
+
 def test_format_shaping_and_census_share_the_extraction_parse():
     class SingleParseFamily(MathFamily):
         def __init__(self):

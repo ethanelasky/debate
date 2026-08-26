@@ -19,6 +19,7 @@ from typing import Any, Iterable, Optional, Sequence
 from datasets import load_dataset
 
 from infra.envs.base import Env, SingleTurnEnv, Task
+from infra.envs.shaping import FlagTerm, shaped_sample_reward
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import (
     AnswerParse,
@@ -561,17 +562,15 @@ class SymbolicMathEnv(SingleTurnEnv):
         }
         return reward, info
 
+    def sample_terms(self) -> list[FlagTerm]:
+        """Sample-level shaping this env prices; see MathEnv.sample_terms. The
+        format bonus stays in reward(), on THIS family's answer_format_valid
+        predicate rather than MathEnv's raw-box one."""
+        return [FlagTerm(self.think_overshoot_penalty, "think_overshoot", sign=-1)]
+
     def reward_sample(self, task: Task, sample) -> tuple[float, dict[str, Any]]:
         reward, info = self.reward(task, sample.text)
-        if self.think_overshoot_penalty == 0.0:
-            return reward, info
-        overshoot = any(
-            region.kind == "forced_close"
-            for region in (getattr(sample, "regions", None) or ())
-        )
-        if overshoot:
-            reward -= self.think_overshoot_penalty
-        return reward, {**info, "think_overshoot": float(overshoot)}
+        return shaped_sample_reward(reward, info, sample, self.sample_terms())
 
 
 class SymbolicMathFamily(TaskFamily):

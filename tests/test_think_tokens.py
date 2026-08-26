@@ -274,3 +274,66 @@ def test_negative_penalty_rejected_before_dataset_load():
         MathFamily().source({"think_overshoot_penalty": -0.1})
     with pytest.raises(ValueError, match="think_overshoot_penalty"):
         AimeFamily().source({"think_overshoot_penalty": -0.1})
+
+
+# ------------------------------------------- one term, priced on both arms
+
+
+def _overshoot_delta_rlvr(coeff: float, sample) -> float:
+    env = _math_env(coeff)
+    shaped, _ = env.reward_sample(TASK, sample)
+    plain, _ = env.reward(TASK, sample.text)
+    return shaped - plain
+
+
+def _overshoot_delta_debate(coeff: float, sample) -> float:
+    from infra.envs.debate.rewards import (
+        RoundTokenReport,
+        SeatReward,
+        SlotTokenCounts,
+        ThinkOvershootPenalty,
+    )
+    from infra.envs.shaping import think_overshoot
+
+    report = RoundTokenReport(
+        counts={
+            ("alice", "proposal"): SlotTokenCounts(
+                think=0,
+                visible=0,
+                total=0,
+                flags={"think_overshoot": float(think_overshoot(sample))},
+            )
+        }
+    )
+    delta = ThinkOvershootPenalty(coeff=coeff, slots=["proposal"]).apply(
+        {"alice": SeatReward(0.0, True, "win")}, report
+    )
+    return delta.per_slot[("alice", "proposal")]
+
+
+@pytest.mark.parametrize("regions", [FORCED_REGIONS, NATURAL_REGIONS])
+def test_both_arms_price_overshoot_identically(regions):
+    """The arms spell the term on different config surfaces —
+    dataset.think_overshoot_penalty on RLVR, a scoring.shaping entry on debate
+    — but a stated coefficient must buy the same signed delta on both. Until
+    infra/envs/shaping.py there were two implementations and this was asserted
+    only by a config comment."""
+    sample = _sample(BOXED_AFTER_THINK, regions)
+    assert _overshoot_delta_rlvr(0.1, sample) == pytest.approx(
+        _overshoot_delta_debate(0.1, sample)
+    )
+
+
+def test_paired_arms_declare_the_same_overshoot_coefficient():
+    """mathl5_qwen35_cispo and its debate pair are only comparable if both
+    price budget overshoot at the same rate on the same slot."""
+    rlvr = load_experiment("configs/math_qwen35.yaml", "mathl5_qwen35_cispo")
+    debate = load_experiment(
+        "configs/math_pc_debate.yaml", "mathl5_qwen35_pc_debate_cispo_verl"
+    )
+    priced = [
+        t for t in debate["scoring"]["shaping"] if t["kind"] == "think_overshoot_penalty"
+    ]
+    assert len(priced) == 1, "the debate arm must price overshoot exactly once"
+    assert priced[0]["coeff"] == rlvr["dataset"]["think_overshoot_penalty"]
+    assert priced[0]["slots"] == ["proposal"]

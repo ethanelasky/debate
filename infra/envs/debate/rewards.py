@@ -8,11 +8,12 @@ environment; gt rides along in info for metrics.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Protocol
+from typing import ClassVar, Literal, Optional, Protocol
 
 from pydantic import BaseModel, Field
 
 from infra.envs.debate.judge import LogitStatus, SeatVerdict, Verdict
+from infra.envs.shaping import FlagTerm
 from infra.models.base import ModelSettings, resolved_sampling_profile
 
 RewardMode = Literal["competitive", "collaborative"]
@@ -186,12 +187,27 @@ class ShapingTerm(Protocol):
 
 
 @dataclass
-class LengthPenalty:
+class SlotTerm:
+    """One pass over the round's scored slots.
+
+    Every shaping term here is "a coefficient times a per-slot quantity",
+    differing only in WHICH quantity and where the delta lands. Subclasses
+    supply value(); the loop lives here once, and with it the rule that
+    shaping NEVER touches unscoreable data.
+
+    ``kind`` is the config spelling (``{kind: ...}``) and is what construction
+    errors name, because that is what a config author actually wrote. ``sign``
+    and ``per_slot`` are ClassVars on terms that fix them, so a config cannot
+    reach in and flip a penalty into a bonus."""
+
     coeff: float = 0.0
-    counts: Literal["think", "visible", "total"] = "total"
     slots: Optional[list[str]] = None  # None = every trained-seat slot
-    per_slot: bool = True
-    normalize: Optional[Literal["cap"]] = None
+
+    kind: ClassVar[str] = "slot_term"
+    per_slot: ClassVar[bool] = True
+
+    def value(self, counts: SlotTokenCounts) -> float:
+        raise NotImplementedError
 
     def apply(self, scored: dict[str, SeatReward], report: RoundTokenReport) -> ShapingDelta:
         delta = ShapingDelta()
@@ -201,12 +217,7 @@ class LengthPenalty:
                 continue
             if self.slots is not None and slot not in self.slots:
                 continue
-            n = float(getattr(c, self.counts))
-            if self.normalize == "cap":
-                if not c.cap_total:
-                    continue
-                n /= c.cap_total
-            d = -self.coeff * n
+            d = self.value(c)
             if self.per_slot:
                 delta.per_slot[(seat, slot)] = delta.per_slot.get((seat, slot), 0.0) + d
             else:
@@ -215,32 +226,73 @@ class LengthPenalty:
 
 
 @dataclass
-class FormatReward:
+class LengthPenalty(SlotTerm):
+    counts: Literal["think", "visible", "total"] = "total"
+    per_slot: bool = True  # instance field here: this term alone can broadcast
+    normalize: Optional[Literal["cap"]] = None
+
+    kind: ClassVar[str] = "length_penalty"
+
+    def value(self, counts: SlotTokenCounts) -> float:
+        n = float(getattr(counts, self.counts))
+        if self.normalize == "cap":
+            if not counts.cap_total:
+                return 0.0
+            n /= counts.cap_total
+        return -self.coeff * n
+
+
+@dataclass
+class FlagShaping(SlotTerm):
+    """A flat coefficient gated on an env-computed per-slot flag.
+
+    Shares FlagTerm with the RLVR arm (infra/envs/shaping.py), so a feature
+    priced on both arms cannot pick up a different sign or a different
+    coefficient convention on one of them: both state a POSITIVE coeff and let
+    the KIND decide whether it is paid or charged."""
+
+    flag: str = "answer_format_valid"
+
+    sign: ClassVar[int] = 1
+
+    def value(self, counts: SlotTokenCounts) -> float:
+        # slots are filtered by the loop, so this term matches every slot
+        return FlagTerm(self.coeff, self.flag, self.sign).delta(counts.flags)
+
+
+@dataclass
+class FormatReward(FlagShaping):
     """Per-slot bonus gated on an env-computed flag — e.g.
     {kind: format_reward, coeff: 0.1, slots: [proposal],
      flag: answer_format_valid}
     pays +0.1 on the proposal datum iff the task family's strict answer
     format was present."""
 
-    coeff: float = 0.0
-    flag: str = "answer_format_valid"
-    slots: Optional[list[str]] = None  # None = every trained-seat slot
-
-    def apply(self, scored: dict[str, SeatReward], report: RoundTokenReport) -> ShapingDelta:
-        delta = ShapingDelta()
-        for (seat, slot), c in report.counts.items():
-            reward = scored.get(seat)
-            if reward is None or not reward.scoreable:
-                continue
-            if self.slots is not None and slot not in self.slots:
-                continue
-            v = c.flags.get(self.flag)
-            if v:
-                delta.per_slot[(seat, slot)] = delta.per_slot.get((seat, slot), 0.0) + self.coeff * v
-        return delta
+    kind: ClassVar[str] = "format_reward"
+    sign: ClassVar[int] = 1
 
 
-SHAPING_REGISTRY = {"length_penalty": LengthPenalty, "format_reward": FormatReward}
+@dataclass
+class ThinkOvershootPenalty(FlagShaping):
+    """Per-slot penalty when the slot's think phase was FORCE-CLOSED at its
+    cap — the debate-side spelling of ``dataset.think_overshoot_penalty``.
+
+    A debate's reward is ladder + shaping and never reaches
+    ``MathEnv.reward_sample``, so the dataset key is structurally inert on this
+    arm at any value; pricing overshoot here is how the two arms are made
+    comparable on it. Both spellings resolve to the same FlagTerm over the same
+    ``think_overshoot`` predicate (infra/envs/shaping.py). See
+    configs/_qwen35_training.yaml."""
+
+    flag: str = "think_overshoot"
+
+    kind: ClassVar[str] = "think_overshoot_penalty"
+    sign: ClassVar[int] = -1
+
+
+SHAPING_REGISTRY = {
+    cls.kind: cls for cls in (LengthPenalty, FormatReward, ThinkOvershootPenalty)
+}
 
 
 def build_shaping(cfgs: list[dict]) -> list[ShapingTerm]:

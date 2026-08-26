@@ -56,9 +56,39 @@
 #                    renders the task source's ANSWER_GEN_USER, so this is the
 #                    rollout prompt for both.
 #
-#   STILL DIFFERENT — dataset.think_overshoot_penalty is 0.1 on the RLVR train
-#   pool and 0.0 on the debate one. It prices the reward the arms are supposed
-#   to differ in, so it is not folded in here.
+#   MATCHED AS OF 2026-08-26 — budget overshoot. This was previously recorded
+#   here as a deliberate difference ("it prices the reward the arms are
+#   supposed to differ in"). That was wrong on both counts.
+#
+#   Wrong mechanically: dataset.think_overshoot_penalty is read by
+#   MathEnv.reward_sample (infra/envs/tasks/math.py:233). A debate's reward is
+#   ladder + shaping (infra/envs/debate/env.py:_rollout_rewards), which never
+#   calls reward_sample — so the key was not "0.0 on the debate arm", it was
+#   INERT there at every value. One arm had the term; the other could not have
+#   it from any config.
+#
+#   Wrong in principle: overshoot pricing is budget shaping, orthogonal to the
+#   judge-vs-verifier reward channel — the same category as format_reward,
+#   which this repo already matches at 0.1 on both arms deliberately. It was
+#   left unmatched because it lives on a different config surface, not because
+#   anyone chose to differ on it.
+#
+#   And it is not small. Base Qwen3.5-4B is force-closed at the 4000-token
+#   think cap on 99.3% of aime_archive rollouts (outputs/qwen35_endpoint_evals,
+#   greedy), falling to 65.7% by step 160 — so the RLVR arm ate -0.1 on nearly
+#   every early rollout, against correct_reward 1.0. That pressure is most of
+#   what "learn to stop thinking and emit a box" is, and box-rate is what both
+#   dev instruments overwhelmingly measure (AMC .506 -> .928 boxed while
+#   accuracy-given-boxed FELL .81 -> .83 flat; archive .247 -> .893 boxed with
+#   accuracy-given-boxed .973 -> .631). Paying one arm for it and not the other
+#   confounds the comparison on its dominant axis.
+#
+#   Now matched: RLVR keeps dataset.think_overshoot_penalty: 0.1; the debate
+#   arm carries {kind: think_overshoot_penalty, coeff: 0.1, slots: [proposal]}
+#   in scoring.shaping (configs/math_pc_debate.yaml). Same coefficient, same
+#   slot, same 4000-token cap. Move them together — and
+#   test_paired_arms_declare_the_same_overshoot_coefficient fails if you don't,
+#   which is the difference between this note and the one it replaced.
 #
 #   PROTOCOL-FORCED — documented at their sites, leave alone:
 #     verl.n_gpus, verl.rollout_tp, verl.strategy,

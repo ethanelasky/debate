@@ -34,6 +34,7 @@ from infra.envs.debate.rewards import (
     score,
     validate_scoring,
 )
+from infra.envs.shaping import think_overshoot
 from infra.envs.debate.round import (
     DebateRound,
     DebateState,
@@ -275,23 +276,42 @@ class DebateEnv(Env):
         # build_shaping accepts any slots/flag; a typo would silently zero the
         # term's bonus, so the names are checked against the protocol and the
         # family here.
-        slot_names = {cs.slot.name for cs in self.protocol.compile()}
-        flag_names = {"answer_format_valid"}
+        compiled = self.protocol.compile()
+        slot_names = {cs.slot.name for cs in compiled}
+        think_capped = {cs.slot.name for cs in compiled if cs.slot.max_think_tokens is not None}
+        flag_names = {"answer_format_valid", "think_overshoot"}
+        # Slots where a priced term gates on think_overshoot: _token_report
+        # refuses to report a 0.0 there when the feature is unknowable.
+        self._overshoot_priced_slots: set[str] = set()
         for term in self.shaping:
+            kind = getattr(type(term), "kind", type(term).__name__)
             term_slots = getattr(term, "slots", None)
             if term_slots is not None:
                 unknown_slots = sorted(set(term_slots) - slot_names)
                 if unknown_slots:
                     raise ValueError(
-                        f"shaping term {type(term).__name__} targets unknown slot(s) "
+                        f"shaping term {kind} targets unknown slot(s) "
                         f"{unknown_slots}; protocol slots: {sorted(slot_names)}"
                     )
             term_flag = getattr(term, "flag", None)
             if term_flag is not None and term_flag not in flag_names:
                 raise ValueError(
-                    f"shaping term {type(term).__name__} gates on unknown flag {term_flag!r}; "
+                    f"shaping term {kind} gates on unknown flag {term_flag!r}; "
                     f"generic format flags: {sorted(flag_names)}"
                 )
+            if term_flag == "think_overshoot" and getattr(term, "coeff", 0.0):
+                targeted = slot_names if term_slots is None else set(term_slots)
+                # A slot with no think cap cannot be force-closed, so the term
+                # would price a constant 0.0 there. That is the value-shaped
+                # void this term exists to close; say so instead of paying it.
+                uncappable = sorted(targeted - think_capped)
+                if uncappable:
+                    raise ValueError(
+                        f"shaping term {kind} prices think overshoot on slot(s) "
+                        f"{uncappable}, which declare no max_think_tokens and so can "
+                        "never be force-closed; the term would be a constant 0.0 there"
+                    )
+                self._overshoot_priced_slots |= targeted
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
     def _inject_task_prompt_templates(self) -> None:
@@ -616,7 +636,19 @@ class DebateEnv(Env):
                         visible += reg.end - reg.start
             else:
                 visible = len(r.sample.tokens)
-            flags: dict[str, float] = {}
+                if r.slot.slot.name in self._overshoot_priced_slots:
+                    raise RuntimeError(
+                        f"slot {r.slot.slot.name!r} (seat {r.slot.speaker!r}) prices "
+                        "think_overshoot but its sample carries no regions, so the "
+                        "seat did not enforce the think cap (frozen API seats cannot "
+                        "— see round.py). Overshoot is UNKNOWN here, not False: "
+                        "reading the absence as 0.0 is the same value-shaped void "
+                        "this term was added to close. Drop the term or train the seat."
+                    )
+            # think_overshoot has ONE definition, shared with the RLVR arm
+            # (infra/envs/shaping.py). Present on EVERY slot, so a gating term
+            # reads 0.0 rather than a missing key.
+            flags: dict[str, float] = {"think_overshoot": float(think_overshoot(r.sample))}
             if r.slot.slot.kind == Kind.SOLUTION:
                 if r.answer_format_valid is None:
                     raise RuntimeError(

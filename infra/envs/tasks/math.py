@@ -20,6 +20,7 @@ from infra.envs.answer_parsing import (
     parse_number,
 )
 from infra.envs.base import Env, SingleTurnEnv, Task
+from infra.envs.shaping import FlagTerm, shaped_sample_reward
 from infra.envs.task_prompts import load_generation_prompts, resolve_prompt_file
 from infra.envs.tasks.base import AnswerParse, TaskFamily, reject_unknown_keys
 
@@ -231,25 +232,25 @@ class MathEnv(SingleTurnEnv):
         }
         return reward, info
 
+    def sample_terms(self) -> list[FlagTerm]:
+        """The sample-level shaping this env prices, for shaped_sample_reward.
+
+        The format bonus is deliberately NOT here: it lives inside reward(), on
+        this family's historical raw-``\\boxed{`` test, which is not the same
+        predicate the observational answer_format_valid metric uses (see
+        reward()). Only the machinery is shared across arms, not the feature."""
+        return [FlagTerm(self.think_overshoot_penalty, "think_overshoot", sign=-1)]
+
     def reward_sample(self, task: Task, sample) -> tuple[float, dict[str, Any]]:
-        """reward() plus the think-overshoot penalty: a flat coefficient off
-        the reward when the sample's think phase was FORCE-CLOSED at its cap —
-        i.e. the Sample carries a "forced_close" region, which only
-        budget_forced_sample (the think_tokens arms) ever writes, so the knob
-        is inert on single-phase rollouts. 0.0 (the default) short-circuits to
-        the plain reward() path: byte-identical rewards AND info. When active,
-        think_overshoot (0.0/1.0) is present on EVERY branch (reward()'s
-        every-branch rule), so eval-time means are over all samples."""
+        """reward() plus this env's sample-level shaping — today just the
+        think-overshoot penalty, a flat coefficient off the reward when the
+        think phase was FORCE-CLOSED at its cap. 0.0 (the default) prices
+        nothing and short-circuits to the plain reward() path, byte-identical
+        in rewards AND info; when priced, the flag rides on EVERY branch.
+        The debate arm prices the same feature through the same FlagTerm
+        semantics — see infra/envs/shaping.py."""
         reward, info = self.reward(task, sample.text)
-        coeff = self.think_overshoot_penalty
-        if coeff == 0.0:
-            return reward, info
-        overshoot = any(
-            r.kind == "forced_close" for r in (getattr(sample, "regions", None) or ())
-        )
-        if overshoot:
-            reward -= coeff
-        return reward, {**info, "think_overshoot": float(overshoot)}
+        return shaped_sample_reward(reward, info, sample, self.sample_terms())
 
 
 def _parse_levels(spec) -> tuple[int, ...]:
