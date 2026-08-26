@@ -284,3 +284,26 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq:
   prompt_config:
     file_path: infra/prompts/debate/hendrycks_math_boxreq.yaml
     entry: math_proposer_critic_boxreq
+
+# Judge-enforced answer format, on the sub8 carve. Ethan, 2026-08-26.
+#
+# Pairs with mathl5_qwen35_cispo_sub8 (wandb 5ib0lvxe, 200 steps): that is the
+# only COMPLETED filtered RLVR arm, so sub8 is what makes this debate arm
+# comparable to anything. The l5_nonzero carve would pair with nothing —
+# mathl5_qwen35_cispo_filtered has never been launched.
+#
+# This deliberately departs from the parent's "UNFILTERED L5 pool" note above,
+# which exists to pair with mathl5_qwen35_cispo (hqsmdq5c). Filtering is NOT
+# motivated by zero-advantage waste on this side: the debate arm drops ~0.6% of
+# datums (2 of 248 on 0s44ib3q) because judge verdicts vary even on rows the
+# proposer never solves. It is here only to match the baseline's pool.
+#
+# train_filter_file is honored on the debate path — MathFamily.source() applies
+# it before DebateEnv ever calls .tasks(), verified 1600 -> 1321 train rows with
+# dev/test untouched. Unlike dataset.think_overshoot_penalty (see above), this
+# dataset key is NOT inert here.
+#
+# Overshoot is priced through scoring.shaping, inherited from math_pc_l5.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq
+  dataset: {train_filter_file: configs/filters/l5_sub8_qwen35.json}
