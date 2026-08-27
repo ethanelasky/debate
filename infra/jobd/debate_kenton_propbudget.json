@@ -1,0 +1,49 @@
+{
+  "profile": "debate-b200x2",
+  "jobs": [
+    {
+      "name": "debate-kenton-propbudget",
+      "gpus": 2,
+      "priority": 10,
+      "timeout_s": 129600,
+      "inputs": [
+        {
+          "local": "~/code/debate",
+          "remote": "/workspace/debate",
+          "exclude": [
+            ".git",
+            ".venv",
+            "venv",
+            "__pycache__",
+            "*.pyc",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            "node_modules",
+            "wandb",
+            "outputs",
+            "*.egg-info",
+            ".DS_Store",
+            "wheels",
+            "artifacts"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "remote": "/workspace/checkpoints/mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget/propbudget/",
+          "local": "~/code/debate/artifacts/debate-kenton-propbudget/checkpoints"
+        },
+        {
+          "remote": "/workspace/debate/transcripts",
+          "local": "~/code/debate/outputs/debate_kenton_propbudget/transcripts"
+        },
+        {
+          "remote": "/workspace/debate/docent",
+          "local": "~/code/debate/outputs/debate_kenton_propbudget/docent"
+        }
+      ],
+      "command": "set -euo pipefail\nexport POD_IDLE_STOP=0\nexport HF_HUB_DISABLE_XET=1\nunset HF_HUB_ENABLE_HF_TRANSFER\nexport HF_HOME=/workspace/hf\n# The profile's setup restores exactly ONE of these, and WHICH one is not\n# knowable here: debate-b200x2 ladders to debate-h200x2, and the two ship\n# different arch-pinned tarballs (verl-b200 vs verl-sm90). A hardcoded path\n# turns a routine REBOUND into an instant failure on the substitute pod.\nPY=\"\"\nfor v in verl-b200 verl-sm90; do\n  if [ -x \"/workspace/envs/$v/bin/python\" ]; then PY=\"/workspace/envs/$v/bin/python\"; break; fi\ndone\ntest -n \"$PY\" || { echo \"FATAL: no verl env under /workspace/envs\" >&2; ls -la /workspace/envs >&2; exit 1; }\nexport PY\necho \"== using $PY ==\"\nexport CONFIG=configs/math_pc_debate.yaml\nnvidia-smi --query-gpu=name --format=csv,noheader\n\n# Same namespace as the paired RLVR arm: different experiment roots, so the\n# leaf cannot collide, and one name for one comparison stays legible later.\nexport DEBATE_LAUNCH_NAMESPACE=propbudget\n\n# VANILLA START, identical to debate_kenton.json -- the only difference\n# between the two runs is the proportional proposal budget in\n# scoring.shaping, so this is a paired comparison on one variable.\n# All three seats -- alice, bob, and the judge -- are stock\n# Qwen/Qwen3.5-4B, so there is no adapter input and no merge step; the _warm\n# arms' block is absent rather than disabled because there is nothing to fold\n# in. The judge was already stock on the warm arms, deliberately: its verdict\n# IS the reward channel, so warming it would change the reward function rather\n# than the policy.\n#\n# The prefetch stays, and its stderr is NOT silenced. The first cut of the warm\n# spec piped `hf download` to /dev/null; when the hub refused to run at all\n# (HF_HUB_ENABLE_HF_TRANSFER=1 with the extra uninstallable -- \"does not\n# provide the extra 'hf-transfer'\" -- raises rather than falling back), the\n# failure surfaced as an empty variable and a bare exit 1 saying nothing, and\n# two rented H200 attempts died that way on 2026-08-27.\nBASE_SNAP=$(ls -d \"$HF_HOME\"/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null | head -1 || true)\nif [ -z \"${BASE_SNAP:-}\" ] || [ ! -f \"$BASE_SNAP/config.json\" ]; then\n  echo \"== base snapshot not cached; downloading Qwen/Qwen3.5-4B ==\"\n  hf download Qwen/Qwen3.5-4B\n  BASE_SNAP=$(ls -d \"$HF_HOME\"/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null | head -1 || true)\nfi\ntest -n \"${BASE_SNAP:-}\" || { echo \"FATAL: no Qwen3.5-4B snapshot under $HF_HOME\" >&2; ls -la \"$HF_HOME/hub\" >&2 2>/dev/null; exit 1; }\ntest -f \"$BASE_SNAP/config.json\" || { echo \"FATAL: $BASE_SNAP has no config.json\" >&2; ls -la \"$BASE_SNAP\" >&2; exit 1; }\necho \"== base snapshot: $BASE_SNAP ==\"\n\n# a cancelled attempt can strand its detached judge on 8788\npkill -9 -f -- '--port 8788' 2>/dev/null || true\nsleep 3\nbash scripts/pod_run.sh debate mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget\n"
+    }
+  ]
+}

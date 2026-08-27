@@ -339,3 +339,165 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq:
 mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8:
   _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq
   dataset: {train_filter_file: configs/filters/l5_sub8_qwen35.json}
+
+# Warm-started counterpart of the sub8 boxreq arm. Ethan, 2026-08-27.
+#
+# alice and bob start from the format warmup folded into base weights:
+# qwen35_fmt_warmup_l3, ORIGINAL lineage `final` (step 40). Held-out AMC at
+# that checkpoint is fmt .747 / correct_strict .711 against base .530/.530.
+#
+# Step 40 and not later: format plateaued there (.783/.795/.771 at steps 40/50/60
+# are within half a standard error of each other on n=83) while correctness fell
+# monotonically to .542, because this arm's reward is format ONLY
+# (correct_reward 0.0) and nothing in it protects the answer. Conditional
+# accuracy -- correct given a valid box -- went .95 -> .86 -> .76 -> .70 across
+# those same evals. The later checkpoints buy formatting with arithmetic, which
+# is the opposite of what a debate arm needs.
+#
+# The JUDGE stays on stock Qwen/Qwen3.5-4B, deliberately. Its verdict IS the
+# reward channel here, so warming it would change the reward function rather
+# than the policy, and no earlier debate arm would remain comparable.
+#
+# model_file_path is a POD-LOCAL path, not an HF repo id. The launching jobd
+# spec ships the 913MB LoRA checkpoint in as a declared input and merges it into
+# base at the top of the command; scripts/merge_lora_ckpt.py writes exactly this
+# directory. Merging is not a convenience over --load: adapter-mode vLLM
+# silently drops LoRA on GDN in_proj_a/b for Qwen3.5 (vllm#38085), which is the
+# same defect the inherited "++actor_rollout_ref.model.lora.merge=True" override
+# exists for. A warmup adapter loaded rather than merged would be partly absent
+# from the rollouts it is supposed to shape.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8
+  agents:
+    alice:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-fmt-warmup-l3-s40
+    bob:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-fmt-warmup-l3-s40
+
+# Kenton word limit priced PROPORTIONALLY, from vanilla Qwen. Ethan, 2026-08-27.
+#
+# Two changes from the sub8 boxreq parent, both about how length is priced.
+#
+# 1. The word limit becomes proportional to the excess, which is what Kenton et
+#    al. (2608.17776 3.4) actually specify: "a soft additive penalty
+#    proportional to the excess". The inherited speech_overshoot_penalty gates
+#    on `truncated`, so under the cue's 150-word limit and a 320-token ceiling
+#    it fires only at the ceiling -- a 200-word speech paid nothing, the same as
+#    a 140-word one, while a speech cut mid-sentence paid the whole 0.1. The
+#    limit was stated in the cue and then priced at a threshold ~50 words past
+#    it. It is set to 0.0 here rather than deleted because scoring.shaping is a
+#    list and lists deep-merge BY INDEX; a kind swapped in at an occupied index
+#    would inherit the old entry's `flag` key.
+#
+#    coeff 0.002/word is calibrated to the term it replaces: the 320-token cap
+#    is ~200 words at the 1.6 tokens/word this protocol's LaTeX-dense speech
+#    measured, so a speech at the cap is ~50 words over and pays ~0.1, the
+#    flat term's old price. Below the limit the term is exactly zero, so it
+#    prices exceeding a budget and never rewards brevity for its own sake.
+#
+# 2. think_overshoot_penalty on the proposal goes to 0.0. Kenton exempts the
+#    solution turn, and on 2026-08-27 this term is what broke the RLVR arm:
+#    being flat, it contributes to a CISPO advantage only through its variance
+#    inside the group, so it drove length down until train/think_overshoot hit
+#    0.000 at step 32 and then went inert, leaving the policy in a short regime
+#    with nothing holding it there. Held-out correctness fell .699 -> .530 while
+#    21.9% of step-49 rollouts were repetition loops emitting `</think>` 37x.
+#
+# Starts from stock Qwen/Qwen3.5-4B: no model_file_path override, so this does
+# NOT inherit the fmt-warmup checkpoint the _warm arms used.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8
+  scoring:
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
+      - {kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
+         slots: [critique, alice_rebuttal, bob_rebuttal]}
+      # mode is stated rather than left to the default: it is the whole
+      # intervention, and `mode: flat` at coeff 0.1 reproduces the behaviour
+      # this arm exists to replace, which makes the ablation a one-word edit.
+      - {kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
+         slots: [critique, alice_rebuttal, bob_rebuttal]}
+
+# Debate warm-started from the RLVR control's step 20. Ethan, 2026-08-27.
+#
+# WHY THIS ARM EXISTS: the cold Kenton debate arm did not move in ten steps --
+# dev truncation sat at .482 at both step 0 and step 10 while the RLVR control
+# on the same proposal distribution went .494 -> .253 over the same span. A
+# judge verdict appears to be too blunt a teacher for "close your think phase":
+# a proposal cut off mid-derivation and one that is complete but wrong both
+# simply lose, where RLVR pays 0.1 for the box itself. So this arm hands debate
+# a policy that already finishes and asks whether it can then learn the thing
+# it is actually for.
+#
+# STEP 20 AND NOT 40, deliberately: 40 is the better model (fmt .988/corr .771/
+# trunc .000 against 20's .964/.711/.024) but it is 40 steps deep into the RLVR
+# objective, and the more saturated the start the less room debate has to show
+# an effect distinguishable from further RLVR. Step 20 is past the truncation
+# problem (.024) without being optimised much beyond it.
+#
+# THE CONTROL IS FREE: mathl5_qwen35_cispo_sub8_kenton continues past step 20 on
+# its own pod, so debate-from-s20 at step N compares against RLVR at step 20+N
+# -- same starting parameters, same number of subsequent steps, only the
+# objective differs. That is a cleaner isolation than either arm against a cold
+# start, and it costs nothing extra.
+#
+# The JUDGE stays on stock Qwen/Qwen3.5-4B. Its verdict IS the reward channel,
+# so warming it would change the reward function rather than the policy.
+#
+# model_file_path is a POD-LOCAL path. The launching jobd spec ships the 950MB
+# step-20 LoRA checkpoint in as a declared input and merges it into base at the
+# top of the command. Merging rather than continuing the adapter is what makes
+# the comparison well-posed: a continued adapter has the debate gradient
+# rewriting the same parameters that encode the RLVR behaviour, so a later drop
+# in correctness could not be told apart from debate eating its own warm start.
+# It also leaves the full rank-32 adapter free for debate-specific learning.
+# NOTE this checkpoint is FSDP2-SHARDED across 2 ranks (the RLVR arm trains on
+# 2 GPUs); scripts/merge_lora_ckpt.py reassembles the DTensors, and reading
+# rank 0 alone would merge half of every LoRA matrix without erroring.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_rlvrs20:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+  agents:
+    alice:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+    bob:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+
+# Cold-start debate with a PROPORTIONAL budget on the proposal. Ethan, 2026-08-27.
+#
+# The other attack on the same stall. Where the _rlvrs20 arm above hands debate
+# a policy that already finishes, this one gives debate the reward pressure to
+# learn finishing itself, from stock Qwen/Qwen3.5-4B.
+#
+# The budget is on TOTAL, not think: total length is what actually truncates
+# (the proposal slot caps at 5024) and pricing the total lets the policy choose
+# its own split between reasoning and answer rather than being told where to
+# save. limit 4000 against an observed dev mean of 4818 means most proposals
+# start out over it -- which is the point. A FLAT term would then be nearly
+# constant across a group and the baseline would remove it, exactly how the old
+# think_overshoot_penalty went inert; proportional keeps 200-vs-1024 tokens of
+# excess distinguishable, so there is gradient the whole way down.
+#
+# coeff 0.0002: a proposal pinned at the 5024 cap pays 0.205 against a +/-1
+# ladder, ~10% of the win-loss span. Below 4000 the term is exactly zero, so
+# this prices overrun and never rewards brevity for its own sake.
+#
+# Index 4 APPENDS to the parent's four shaping entries (lists deep-merge BY
+# INDEX, and an index past the end appends). The word budget on the reply slots
+# is inherited unchanged at index 3.
+mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+  scoring:
+    shaping:
+      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
+      - {kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
+         slots: [critique, alice_rebuttal, bob_rebuttal]}
+      - {kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
+         slots: [critique, alice_rebuttal, bob_rebuttal]}
+      - {kind: budget_penalty, coeff: 0.0002, limit: 4000, mode: proportional,
+         counts: total, slots: [proposal]}

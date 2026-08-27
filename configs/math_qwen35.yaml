@@ -121,3 +121,80 @@ qwen35_fmt_warmup_l3:
     steps: 100
     save_every: 10
     eval_every: 10
+
+# RLVR baseline for the warm-start comparison. Ethan, 2026-08-27.
+#
+# Pairs with mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm: same merged
+# weights, same sub8 pool, same CISPO objective, and the debate PROTOCOL is the
+# only intervention. Both arms read `model` from the identical pod-local
+# directory produced by scripts/merge_lora_ckpt.py, so the two start from
+# byte-identical parameters -- which is what makes this a control rather than
+# an approximate one.
+#
+# See the debate arm's note for why the warmup's step-40 `final` and not a
+# later checkpoint, and for why the adapter is merged rather than --load'ed.
+mathl5_qwen35_cispo_sub8_warm:
+  _extends: mathl5_qwen35_cispo_sub8
+  model: /workspace/models/qwen35-fmt-warmup-l3-s40
+  training:
+    verl:
+      # OVERRIDE, with the reason: 2 GPUs, not _qwen35_l5's 1. Rollout is
+      # 70-85% of a step on this protocol (the format warmup measured
+      # rollout_generate_s 230-300s inside a ~350s step on 1x H200), and that
+      # is the part data parallelism actually shortens -- one TP1 rollout
+      # replica per GPU, FSDP2 training across both, exactly the split
+      # mathl5_qwen35_pc_debate_cispo_verl uses on 2x B200. Expect ~1.7x, not
+      # 2x: optim and the KL reference pass do not scale as cleanly.
+      #
+      # The effective batch is UNCHANGED -- batch_size 8 x group_size 8 = 64
+      # trajectories per step either way, split across ranks rather than
+      # enlarged -- so this is a throughput decision, not a training one.
+      #
+      # rollout_tp is restated WITH n_gpus and not left to the topology.
+      # run_common.check_gpu_split refuses the half-override for the reason its
+      # docstring gives: an arm that pins only n_gpus keeps the detected
+      # machine's TP for the half it never mentioned. That is what put n_gpus 1
+      # against TP 2 nineteen minutes and two rented B200s into
+      # qwen35_fmt_warmup_l3 on 2026-08-26.
+      n_gpus: 2
+      rollout_tp: 1
+
+# RLVR control for the Kenton debate arm, from vanilla Qwen. Ethan, 2026-08-27.
+#
+# think_overshoot_penalty goes to 0.0, which is the faithful translation rather
+# than a softening: Kenton et al. (2608.17776 3.4) limit the CRITIQUE and
+# REBUTTAL turns and exempt Alice's solution turn. An RLVR rollout is a solution
+# turn and nothing else, so under that design it carries no length term at all.
+# The debate arm's proposal slot is zeroed for the same reason.
+#
+# It is also the term that broke this arm on 2026-08-27 at 0.1. Being flat, it
+# reaches a CISPO advantage only through its variance inside the group, so its
+# pressure peaked near a 50% trip rate and vanished as the policy complied:
+# train/think_overshoot hit 0.000 at step 32 and the term went inert, leaving a
+# short-output regime with nothing holding it there. Held-out correct_strict
+# fell .699 -> .530 (base level) between steps 30 and 40 while mean response
+# length fell 2954 -> 1856 tokens, and by step 49, 21.9% of rollouts were
+# repetition loops emitting `</think>` 37 times on average -- which SATISFIED
+# answer_format_valid, so the format term was paying for the degeneracy.
+#
+# Length is still bounded: think_tokens 4000 is a hard cap enforced by
+# budget_forced_sample, not a priced budget. Expect truncation to stay high from
+# a vanilla start (base Qwen3.5-4B is force-closed on 99.3% of rollouts); this
+# arm buys an uncontaminated correctness signal at that cost, and truncation is
+# observable as dev/truncated if it needs revisiting.
+mathl5_qwen35_cispo_sub8_kenton:
+  _extends: mathl5_qwen35_cispo_sub8
+  # BOTH, and not just `dataset`: eval_dataset carries its own copy of the key,
+  # so zeroing only the train side leaves dev/reward_mean scored under a reward
+  # function the policy is no longer trained on. dev/correct_strict and
+  # dev/answer_format_valid are unaffected either way; the reward series is not.
+  dataset: {think_overshoot_penalty: 0.0}
+  eval_dataset: {think_overshoot_penalty: 0.0}
+  training:
+    verl:
+      # 2 GPUs, not _qwen35_l5's 1 — same reasoning as
+      # mathl5_qwen35_cispo_sub8_warm above: rollout is 70-85% of a step and is
+      # the part data parallelism shortens. rollout_tp is restated WITH n_gpus
+      # because run_common.check_gpu_split refuses the half-override.
+      n_gpus: 2
+      rollout_tp: 1

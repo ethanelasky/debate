@@ -1,0 +1,36 @@
+{
+  "profile": "debate-b200x2",
+  "jobs": [
+    {
+      "name": "rlvr-cispo-sub8-kenton",
+      "gpus": 2,
+      "timeout_s": 129600,
+      "inputs": [
+        {
+          "local": "~/code/debate",
+          "remote": "/workspace/debate",
+          "exclude": [
+            ".git", ".venv", "venv", "__pycache__", "*.pyc", ".pytest_cache",
+            ".mypy_cache", ".ruff_cache", "node_modules", "wandb", "outputs",
+            "*.egg-info", ".DS_Store", "wheels", "artifacts"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "remote": "/workspace/checkpoints/mathl5_qwen35_cispo_sub8_kenton/kenton01/",
+          "local": "~/code/debate/artifacts/rlvr-cispo-sub8-kenton/checkpoints"
+        },
+        {
+          "remote": "/workspace/debate/transcripts",
+          "local": "~/code/debate/outputs/rlvr_cispo_sub8_kenton/transcripts"
+        },
+        {
+          "remote": "/workspace/debate/docent",
+          "local": "~/code/debate/outputs/rlvr_cispo_sub8_kenton/docent"
+        }
+      ],
+      "command": "set -euo pipefail\nexport POD_IDLE_STOP=0\nexport HF_HUB_DISABLE_XET=1\nunset HF_HUB_ENABLE_HF_TRANSFER\nexport HF_HOME=/workspace/hf\n# The profile's setup restores exactly ONE of these, and WHICH one is not\n# knowable here: debate-b200x2 ladders to debate-h200x2, and the two ship\n# different arch-pinned tarballs (verl-b200 vs verl-sm90). A hardcoded path\n# turns a routine REBOUND into an instant failure on the substitute pod.\nPY=\"\"\nfor v in verl-b200 verl-sm90; do\n  if [ -x \"/workspace/envs/$v/bin/python\" ]; then PY=\"/workspace/envs/$v/bin/python\"; break; fi\ndone\ntest -n \"$PY\" || { echo \"FATAL: no verl env under /workspace/envs\" >&2; ls -la /workspace/envs >&2; exit 1; }\nexport PY\necho \"== using $PY ==\"\nexport CONFIG=configs/math_qwen35.yaml\nnvidia-smi --query-gpu=name --format=csv,noheader\n\n# Same namespace as the paired debate arm: different experiment roots, so the\n# leaf cannot collide, and one name for one comparison stays legible later.\nexport DEBATE_LAUNCH_NAMESPACE=kenton01\n\n# VANILLA START. No adapter input, no merge, no --load: this arm begins at\n# stock Qwen/Qwen3.5-4B, which is what mathl5_qwen35_cispo_sub8_kenton's\n# `model` key already says. The _warm arms' merge block is deliberately absent\n# rather than disabled -- there is no checkpoint to fold in.\n#\n# The prefetch stays, though, and its stderr is NOT silenced. The first cut of\n# the warm spec piped `hf download` to /dev/null; when the hub refused to run\n# at all (HF_HUB_ENABLE_HF_TRANSFER=1 with the extra uninstallable -- \"does not\n# provide the extra 'hf-transfer'\" -- raises rather than falling back), the\n# whole failure surfaced as an empty variable and a bare exit 1 saying nothing,\n# and two rented H200 attempts died that way on 2026-08-27. Pulling the weights\n# here rather than inside verl keeps a fetch failure legible.\nBASE_SNAP=$(ls -d \"$HF_HOME\"/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null | head -1 || true)\nif [ -z \"${BASE_SNAP:-}\" ] || [ ! -f \"$BASE_SNAP/config.json\" ]; then\n  echo \"== base snapshot not cached; downloading Qwen/Qwen3.5-4B ==\"\n  hf download Qwen/Qwen3.5-4B\n  BASE_SNAP=$(ls -d \"$HF_HOME\"/hub/models--Qwen--Qwen3.5-4B/snapshots/*/ 2>/dev/null | head -1 || true)\nfi\ntest -n \"${BASE_SNAP:-}\" || { echo \"FATAL: no Qwen3.5-4B snapshot under $HF_HOME\" >&2; ls -la \"$HF_HOME/hub\" >&2 2>/dev/null; exit 1; }\ntest -f \"$BASE_SNAP/config.json\" || { echo \"FATAL: $BASE_SNAP has no config.json\" >&2; ls -la \"$BASE_SNAP\" >&2; exit 1; }\necho \"== base snapshot: $BASE_SNAP ==\"\n\nbash scripts/pod_run.sh rlvr mathl5_qwen35_cispo_sub8_kenton\n"
+    }
+  ]
+}
