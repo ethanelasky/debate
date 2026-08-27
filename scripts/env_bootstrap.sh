@@ -10,6 +10,13 @@
 #   ENV_REPO=...        HF dataset repo holding the tarball
 #   TARBALL=...         tarball filename inside that repo
 #   VENV_NAME=...       env directory under /workspace/envs
+#   ENV_LOCAL_ROOT=...  where the bytes land (default /opt/envroot, container
+#                       disk); /workspace/envs/$VENV_NAME becomes a symlink
+#   ENV_LOCAL_MIN_GB=.. free GB required there, else extract onto /workspace
+#                       as before (default 40)
+#
+# A pod stop wipes container disk but keeps the volume, so the symlink is left
+# dangling: -e follows it, reads false, and the env restores again.
 #
 # Defaults restore the Blackwell (sm100 / B200) env, which is what every
 # existing caller expects. The sm90 (H100/H200) pair is:
@@ -50,8 +57,22 @@ command -v zstd >/dev/null || { apt-get update -qq && apt-get install -y -qq zst
 # for 54 of them. A stall now ends the transfer, and the transfer resumes from
 # what is already on disk rather than starting the multi-GB download again.
 cd /root
+STAGE_START=$SECONDS
 URL="https://huggingface.co/datasets/$ENV_REPO/resolve/main/$TARBALL"
 if command -v hf >/dev/null 2>&1; then
+  # Xet off. With it on the download holds live TLS sockets while every worker
+  # thread sits in futex_wait -- twice on one H200, 2026-08-26, frozen at 2.0GB
+  # of 3.64GB. Xet is the default in huggingface_hub >=1.x, so this has to be
+  # turned OFF explicitly rather than merely not turned on.
+  #
+  # No retry loop here on purpose: a stalled restore is jobd's to notice
+  # (stall_after_s) and jobd's to retry (max_attempts). A timeout+retry wrapper
+  # in this script duplicated both, and GNU timeout setpgid()s itself into a new
+  # process group, which put the download out from under jobd's cancel.
+  export HF_HUB_DISABLE_XET=1
+  # Deprecated in hub 1.x and ignored; unset so it stops printing a warning
+  # that reads like a cause when somebody is debugging a slow restore.
+  unset HF_HUB_ENABLE_HF_TRANSFER
   hf download "$ENV_REPO" "$TARBALL" --repo-type dataset --local-dir /root
 elif command -v curl >/dev/null 2>&1; then
   # --speed-limit/--speed-time is the stall detector: under 100KB/s averaged
@@ -96,7 +117,45 @@ else:
 PYEOF
 fi
 
-tar -I zstd -xf "/root/$TARBALL" -C /
+echo "download: $((SECONDS - STAGE_START))s"
+STAGE_START=$SECONDS
+
+# Extract onto container disk, not onto /workspace.
+#
+# /workspace is a RunPod network volume: MooseFS over FUSE. Measured on a live
+# B200, creating a file there costs 6.85ms against 0.084ms on the container
+# overlay, and sequential write runs 455MB/s against 3.3GB/s. The b200 env is
+# 19GB across 93,342 files, so extracting in place spends ~11 minutes in
+# metadata round trips where local disk takes ~14 seconds.
+#
+# The venv bakes absolute /workspace/envs/<name> paths into its shebangs and
+# pyvenv.cfg, so that path has to keep resolving -- hence a symlink rather
+# than a different prefix.
+LOCAL_ROOT="${ENV_LOCAL_ROOT:-/opt/envroot}"
+NEED_GB="${ENV_LOCAL_MIN_GB:-40}"
+mkdir -p "$LOCAL_ROOT"
+AVAIL_GB=$(df -BG --output=avail "$LOCAL_ROOT" | tail -1 | tr -dc '0-9')
+if [ "${AVAIL_GB:-0}" -ge "$NEED_GB" ]; then
+  echo "extracting to $LOCAL_ROOT (${AVAIL_GB}G free), linked into /workspace"
+  tar -I zstd -xf "/root/$TARBALL" -C "$LOCAL_ROOT"
+  # One link per leaf the tarball actually placed -- envs/<name>, uv/python --
+  # rather than one link over /workspace/envs, so restoring a second env onto
+  # this pod later does not have to share the link.
+  find "$LOCAL_ROOT/workspace" -mindepth 2 -maxdepth 2 | while IFS= read -r SRC; do
+    DST="/workspace/${SRC#"$LOCAL_ROOT"/workspace/}"
+    mkdir -p "$(dirname "$DST")"
+    # An earlier restore that died mid-extract leaves a real directory here,
+    # and ln would then put the link INSIDE it and hide the whole env.
+    rm -rf "$DST"
+    ln -sfn "$SRC" "$DST"
+  done
+else
+  # A slow restore beats a run that dies on ENOSPC an hour in.
+  echo "only ${AVAIL_GB}G free on $LOCAL_ROOT; extracting onto /workspace" >&2
+  rmdir "$LOCAL_ROOT" 2>/dev/null || true
+  tar -I zstd -xf "/root/$TARBALL" -C /
+fi
+echo "extract: $((SECONDS - STAGE_START))s"
 rm -f "/root/$TARBALL"
 
 if [ ! -x "$ENV_DIR/bin/python" ]; then

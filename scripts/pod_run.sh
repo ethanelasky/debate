@@ -279,6 +279,20 @@ export PATH="$(dirname "$PY"):$CUDA_HOME/bin:$PATH"
 # time every pull lands on the container disk and is re-downloaded after each
 # pod stop/start (RunPod wipes /root, only /workspace survives).
 export HF_HOME="${HF_HOME:-/workspace/hf}"
+# Xet off, for every HF pull this launcher's children make -- the model fetch
+# most of all. With Xet on, huggingface_hub holds live TLS sockets while every
+# worker thread sits in futex_wait: seen 2026-08-26 on the env tarball (twice,
+# frozen at 2.0GB of 3.64GB) and again on the Qwen3.5-4B weights, stuck at
+# "Fetching 2 files: 0%" for 46 minutes of rented H200. Xet is the default in
+# huggingface_hub >=1.x, so it has to be turned OFF rather than not turned on.
+#
+# It belongs HERE and not only in env_bootstrap.sh: that script is invoked as a
+# child (`bash scripts/env_bootstrap.sh`), so its export dies with it and never
+# reaches the training payload. This export is the one the payload inherits.
+export HF_HUB_DISABLE_XET=1
+# Deprecated in hub 1.x and ignored; unset so it stops printing a warning that
+# reads like a cause when somebody is debugging a slow pull.
+unset HF_HUB_ENABLE_HF_TRANSFER
 # Ray's memory monitor pre-emptively kills workers at 95% of the CONTAINER
 # limit; verl's weight-sync transiently spikes each FSDP worker to ~157GB RSS
 # (32B, 2026-08-08: 447GB peak tripped the monitor on a 503GB pod while a
