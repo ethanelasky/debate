@@ -8,6 +8,11 @@ wandb/
 wheels/
 checkpoints/
 
+# Rescued run artifacts: LoRA checkpoints pulled off pods mid-run and the
+# models merged from them. Multi-GB, and reproducible from the run that
+# produced them plus scripts/merge_lora_ckpt.py.
+artifacts/
+
 # Built datasets: reproducible from scripts/build_codecontests_rlvr.py
 # (the manifest pins revision, seed and sha256), too large to track.
 data/
