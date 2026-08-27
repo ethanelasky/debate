@@ -229,11 +229,11 @@ math_proposer_critic:
   critique: |-
     The solution above is under debate. The boxed answer it defends: <OPPONENT_POSITION>
 
-    Open your case to the Judge. Stake out ONE argument that this answer is
-    wrong: take the single step the solution most depends on and break it with a
-    concrete check the Judge can redo — recompute the step, test a small case,
-    or give a counterexample. Where you can, name the answer you say is correct
-    instead.
+    Open your case to the Judge. You must show the answer is wrong somehow. 
+    Stake out ONE argument that this answer is wrong: take the single step the 
+    solution most depends on and break it with a concrete check the Judge can 
+    redo — recompute the step, test a small case, or give a counterexample. 
+    Where you can, name the answer you say is correct instead.
 
     Do not re-solve the problem from scratch as if it were yours, and do not
     list every doubt you have. One step, one check.

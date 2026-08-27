@@ -26,8 +26,16 @@ BOXREQ_ARM = "mathl5_qwen35_pc_debate_cispo_verl_boxreq"
 # of --wandb-resume. 0a4369a1... was published by runs 0s44ib3q and 7dlmbk7i;
 # the reply-slot rename and the 150-word cue limit moved it deliberately, with
 # no run in flight.
+#
+# 1cf56447... -> e9e03c6c... on 2026-08-27: the critique cue gained "You must
+# show the answer is wrong somehow." Bob is the critic seat in every proposer-
+# critic arm, so this is a real change to the protocol and not a typo fix — it
+# instructs the critic to attack unconditionally, including on the rows where
+# Alice is right. Repinned deliberately, with the warm arms cancelled and only
+# the _kenton pair in flight; arms before this point were run under the old cue
+# and are not comparable on Bob's behaviour.
 PUBLISHED_MATH_PROMPT_SHA = (
-    "1cf564476cd3dc9b332987ed64024951fb262b945329b39ef2d4ede50a3e4a4b"
+    "e9e03c6cf2b137e101feeded4aa54b0384b80211156e640726c7dbbf4d0fd973"
 )
 
 
