@@ -109,6 +109,15 @@ qwen35_fmt_warmup_l3:
     format_reward: 1.0
     relaxed_correct_bonus: 0.0
   training:
-    steps: 40
+    # 100, not 40. The self-termination premise above -- saturated groups drop
+    # to zero advantage, so the arm stops itself once compliance lands -- reads
+    # the TRAIN metric, and that premise did not hold: train reward saturated
+    # near .95 by step ~10 with whole batches dropping, while held-out
+    # dev/answer_format_valid was still .66 at step 30 (.53 at step 0). L3
+    # compliance landed; compliance that TRANSFERS, which is the only kind the
+    # debate arm can use, had not. The extra steps buy that gap, and the arm
+    # still self-terminates -- just against a bar it has actually cleared
+    # (2026-08-26).
+    steps: 100
     save_every: 10
     eval_every: 10
