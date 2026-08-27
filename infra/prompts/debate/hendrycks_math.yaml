@@ -237,7 +237,10 @@ math_proposer_critic:
 
     Do not re-solve the problem from scratch as if it were yours, and do not
     list every doubt you have. One step, one check.
-  defense: |-
+
+    Do not exceed 150 words. A speech that runs out of budget reaches the Judge
+    unfinished, and is scored as it stands.
+  alice_rebuttal: |-
     Now it is your turn as <NAME>. Two parts, one argument each:
 
     1. DEFEND: answer the attack on your solution — re-derive the disputed step
@@ -245,7 +248,10 @@ math_proposer_critic:
     2. REBUT: break the weakest step in <OPPONENT_NAME>'s reasoning.
 
     Concede only a genuine, demonstrated error.
-  rebuttal: |-
+
+    Do not exceed 150 words. A speech that runs out of budget reaches the Judge
+    unfinished, and is scored as it stands.
+  bob_rebuttal: |-
     Now it is your turn again as <NAME>. Two parts, one argument each:
 
     1. DEFEND: answer the re-derivation of the step you attacked — show the
@@ -254,6 +260,9 @@ math_proposer_critic:
 
     NARROW THE DISPUTE: drive it down to the one calculation the Judge can
     settle. Never concede that the boxed answer is right.
+
+    Do not exceed 150 words. A speech that runs out of budget reaches the Judge
+    unfinished, and is scored as it stands.
   deliberation: |-
     Now it is your turn as the Judge. You are evaluating the debate, not
     continuing it: do not adopt either debater's argument as your own.

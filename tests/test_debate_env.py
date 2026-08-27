@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from dataclasses import replace as _replace
+
 from infra.backend.base import Backend, Sample, SamplingParams
 from infra.envs.base import Policy, Task
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
@@ -29,7 +31,7 @@ PROTOCOL = Protocol.parse(
 turns:
   - alice: [{name: proposal, kind: solution}]
   - bob:   [{name: critique}]
-  - alice: [{name: defense}]
+  - alice: [{name: alice_rebuttal}]
   - judge: [{name: verdict, kind: decision}]
 """
     )
@@ -749,8 +751,108 @@ def test_empty_speech_census_counts_a_swallowed_think_block():
     env.rollout(TaskSource().tasks(1), policy, group_size=1)
 
     info = env.last_rollout_info
-    assert info["trained_speeches"] == 2.0          # proposal + defense
-    assert info["empty_speeches"] == 1.0            # the defense was all think
-    assert info["empty_speeches_by_slot"] == {"defense": 1.0}
+    assert info["trained_speeches"] == 2.0          # proposal + alice_rebuttal
+    assert info["empty_speeches"] == 1.0            # the reply was all think
+    assert info["empty_speeches_by_slot"] == {"alice_rebuttal": 1.0}
     # The proposal closed its block, so its answer still reaches the grader.
     assert info["extracted_solution_slots"] == 1.0
+
+
+BUDGETED_PROTOCOL = Protocol.parse(
+    yaml.safe_load(
+        """
+turns:
+  - alice: [{name: proposal, kind: solution, max_total_tokens: 128}]
+  - bob:   [{name: critique, max_total_tokens: 64}]
+  - alice: [{name: alice_rebuttal, max_total_tokens: 64}]
+  - judge: [{name: verdict, kind: decision, max_total_tokens: 64}]
+"""
+    )
+)
+
+
+class CapHittingBackend(ScriptedBackend):
+    """Scripted, but reports the named speeches as cut at their cap."""
+
+    def __init__(self, script, truncated_indices):
+        super().__init__(script)
+        self._truncated = set(truncated_indices)
+        self._served = 0
+
+    def sample(self, prompts, params, n=1):
+        out = super().sample(prompts, params, n)
+        for group in out:
+            hit = self._served in self._truncated
+            self._served += 1
+            if hit:
+                for i, s in enumerate(group):
+                    group[i] = _replace(s, stop_reason="length")
+        return out
+
+
+def _budgeted_env(backend_script, truncated_indices, coeff=0.1):
+    from infra.envs.debate.rewards import ScoringConfig
+
+    backend = CapHittingBackend(backend_script, truncated_indices)
+    env = DebateEnv(
+        DebateEnvConfig(
+            protocol=BUDGETED_PROTOCOL,
+            prompt_file=PROMPT_FILE,
+            prompt_entry="math_proposer_critic",
+            trained_speakers=["alice"],
+            frozen_models={
+                "bob": ScriptedModel("bob", ["Your step 2 is wrong."] * 64),
+                "judge": ScriptedModel("judge", [GOOD_VERDICT] * 64),
+            },
+            judge=JudgeConfig(),
+            scoring=ScoringConfig(
+                shaping=[
+                    {
+                        "kind": "speech_overshoot_penalty",
+                        "coeff": coeff,
+                        "slots": ["critique", "alice_rebuttal"],
+                    }
+                ]
+            ),
+            fresh_positions=True,
+        ),
+        TaskSource(),
+        MathFamily(),
+    )
+    return env, backend
+
+
+def test_speech_overshoot_penalty_prices_the_slot_that_ran_out_of_budget():
+    """A speech cut at its cap reaches the judge mid-sentence. The hard cap
+    truncates it; this term is what tells the policy to fit."""
+    env, backend = _budgeted_env(["\\boxed{2}", "My reply runs long"], truncated_indices=[1])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+    (t,) = groups[0]
+    proposal, reply = t.datum_rewards
+    assert proposal == 1.0            # untruncated, and the term skips the solution slot
+    assert reply == pytest.approx(0.9)  # 1.0 - 0.1, paid once on the slot that overran
+
+
+def test_speech_overshoot_penalty_is_silent_when_every_speech_fits():
+    env, backend = _budgeted_env(["\\boxed{2}", "Short reply."], truncated_indices=[])
+    policy = Policy(backend, SamplingParams(max_tokens=128))
+    groups = env.rollout(TaskSource().tasks(1), policy, group_size=1)
+    (t,) = groups[0]
+    assert t.datum_rewards == [1.0, 1.0]
+
+
+def test_speech_overshoot_shaping_rejects_a_slot_with_no_budget():
+    """The twin of the think-cap refusal: with neither max_total_tokens nor
+    max_visible_tokens the slot can never run out, so the term would buy a
+    constant 0.0."""
+    from infra.envs.debate.rewards import ScoringConfig
+
+    with pytest.raises(ValueError, match="max_total_tokens"):
+        make_env(
+            ["alice"],
+            [GOOD_VERDICT],
+            scoring=ScoringConfig(
+                shaping=[{"kind": "speech_overshoot_penalty", "coeff": 0.1, "slots": ["proposal"]}]
+            ),
+        )

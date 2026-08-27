@@ -1,6 +1,8 @@
 # MATH proposer-critic debate RL (format per DESIGN-pc-format.md).
-# Flow: proposal (public, graded) -> critique -> defense -> rebuttal (critic's
-# last word, as in the old PC arm) -> judge deliberation (private) + verdict.
+# Flow: proposal (public, graded) -> critique -> alice_rebuttal ->
+# bob_rebuttal (critic's last word, as in the old PC arm) -> judge
+# deliberation (private) + verdict. Turns 2 and 3 are ONE move — defend your
+# own argument, rebut the other's — so they are named for their speaker.
 # Run: debate-rl --experiment-file configs/math_pc_debate.yaml --experiment <name>
 
 # Objective shared with the RLVR arm (configs/_qwen35_training.yaml).
@@ -18,8 +20,8 @@ _base_math_pc:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 1024, max_total_tokens: 3072}]
       - bob:   [{name: critique, max_think_tokens: 768, max_total_tokens: 1536}]
-      - alice: [{name: defense,  max_think_tokens: 768, max_total_tokens: 1536}]
-      - bob:   [{name: rebuttal, max_think_tokens: 768, max_total_tokens: 1536}]
+      - alice: [{name: alice_rebuttal, max_think_tokens: 768, max_total_tokens: 1536}]
+      - bob:   [{name: bob_rebuttal,   max_think_tokens: 768, max_total_tokens: 1536}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 768},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
@@ -110,7 +112,7 @@ math_pc_debate_logit:
 # Solo-proposal arm (DESIGN-pc-format.md row 10): the proposal is generated in
 # the task source's own RLVR context — no debate framing — so this arm and the
 # RLVR baseline share ONE proposal distribution and differ only in reward
-# channel. Later turns (defense) are debate-aware as usual.
+# channel. Later turns (alice_rebuttal) are debate-aware as usual.
 math_pc_solo:
   _extends: _base_math_pc
   first_speech_non_debate_aware: true
@@ -145,8 +147,27 @@ math_pc_l5:
     # baseline makes on the same problem. At 2048 the close landed mid
     # derivation and the public proposal opened on the tail of a cut-off
     # calculation. Lists deep-merge BY INDEX, so this replaces turn 0 only.
+    #
+    # Past the opening pair the caps are SPEECH budgets, not reasoning
+    # budgets. At the base's max_think 768 the reply slots were force-closed
+    # on nearly every sample and phase 2 published the unfinished scratchpad
+    # as the speech. The replies render with enable_thinking false and no
+    # think cap (null clears the parent's: a child cannot delete a key), so
+    # max_total_tokens IS the speech.
+    #
+    # The critique is an OPENING speech and keeps the proposal's 4000-token
+    # think phase; only its speech is capped, through max_visible_tokens.
+    # total = 4000 think + 2 forced-close tokens + 320 speech, rounded up.
+    #
+    # 320 tokens is the ceiling under the cue's 150-WORD limit, not the limit
+    # itself: LaTeX-dense speech ran ~1.6 tokens/word in a live rollout, so a
+    # compliant 150 words finishes well inside it and only a speech that
+    # ignores the cue runs out. Running out is what scoring.shaping prices.
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 4000, max_total_tokens: 5024}]
+      - bob:   [{name: critique, max_think_tokens: 4000, max_visible_tokens: 320, max_total_tokens: 4352}]
+      - alice: [{name: alice_rebuttal, enable_thinking: false, max_think_tokens: null, max_total_tokens: 320}]
+      - bob:   [{name: bob_rebuttal,   enable_thinking: false, max_think_tokens: null, max_total_tokens: 320}]
   dataset: {type: math, levels: 5, relaxed_extraction: true, seed: 0}
   # Budget-overshoot parity with the RLVR arm, which prices a force-closed
   # think phase at -0.1 via dataset.think_overshoot_penalty. That key is read
@@ -160,6 +181,14 @@ math_pc_l5:
     shaping:
       - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
       - {kind: think_overshoot_penalty, coeff: 0.1, slots: [proposal], flag: think_overshoot}
+      # Per-speech budget pricing on the non-solution turns, after Kenton et
+      # al. (2608.17776 §3.4): the word limit is stated in the cue AND paid for
+      # in the reward. Flat, on the same 0.1 as the overshoot terms: the
+      # feature is "this speech ran out of budget", so a speech that fits pays
+      # nothing however long it is, and one that is cut mid-sentence pays once.
+      # The proposal is exempt, as Alice's solution turn is there.
+      - {kind: speech_overshoot_penalty, coeff: 0.1, flag: truncated,
+         slots: [critique, alice_rebuttal, bob_rebuttal]}
 
 # ---------------------------------------------------------------------------
 # Scheduler workload — fresh-start Qwen3.5 L5 CISPO debate on verl.
@@ -247,14 +276,14 @@ mathl5_qwen35_pc_debate_cispo_verl:
       gpu_memory_utilization: 0.33
       # Derived, not guessed. run_debate.debate_gen_budgets cross-checks
       # response_length against every TRAINED seat's slot cap, and the largest
-      # is the proposal at 5024 (math_pc_l5); critique/defense/rebuttal are
+      # is the proposal at 5024 (math_pc_l5); critique/alice_rebuttal/bob_rebuttal are
       # 1536 and the judge is excluded (it generates on its own vLLM, so
       # response_length cannot truncate it). 5120, not 5024: the same check
       # covers training.eval_max_tokens, and the eval budget is shared with
       # the RLVR arm — matching the RLVR arm's own response_length.
       response_length: 5120
       # Worst-case trained-seat context is bob's REBUTTAL, the last trained
-      # generation, which sees base + proposal + critique + defense. Thinking
+      # generation, which sees base + proposal + critique + alice_rebuttal. Thinking
       # never enters it -- round.py:63, "stored; NEVER rendered into any
       # context" -- so think budgets do not compound across turns. Each speech
       # counts its FULL slot cap: a think phase that closes early leaves the
@@ -262,10 +291,13 @@ mathl5_qwen35_pc_debate_cispo_verl:
       #   base (system + L5 problem)        ~2144  (math_qwen35 prompt_length
       #                                             6144 - think_tokens 4000)
       #   proposal  visible worst case       5024
-      #   critique                           1536
-      #   defense                            1536
+      #   critique  (max_visible_tokens)      320
+      #   alice_rebuttal                      320
       #                                    -------
-      #                                     10240  -> round up
+      #                                      7808
+      # The reply slots now cap SPEECH, not the slot total, so what a later
+      # context can carry shrank. 11264 is kept as the ceiling: the memory
+      # envelope below is what a change here would have to re-smoke.
       prompt_length: 11264
       # prompt_length + response_length (11264 + 5024 = 16288). NEEDS A SMOKE:
       # this is the per-GPU memory envelope, including the GPU selected by the

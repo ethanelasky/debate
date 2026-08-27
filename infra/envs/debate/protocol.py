@@ -39,15 +39,33 @@ class Slot:
     max_think_tokens: Optional[int] = None
     max_visible_tokens: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    # Per-slot chat-template thinking, overriding the seat's own
+    # enable_thinking. A seat speaks in several slots and does not need the
+    # same reasoning budget in each: the opening speech can think while the
+    # reply is a short no-think move. None leaves the seat setting alone.
+    enable_thinking: Optional[bool] = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> "Slot":
         if "name" not in raw:
             raise ValueError(f"slot missing 'name': {raw}")
-        known = {"name", "kind", "visibility", "max_think_tokens", "max_visible_tokens", "max_total_tokens"}
+        known = {
+            "name",
+            "kind",
+            "visibility",
+            "max_think_tokens",
+            "max_visible_tokens",
+            "max_total_tokens",
+            "enable_thinking",
+        }
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"slot {raw['name']!r}: unknown key(s) {sorted(unknown)}")
+        enable_thinking = raw.get("enable_thinking")
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise ValueError(
+                f"slot {raw['name']!r}: enable_thinking must be a bool, got {enable_thinking!r}"
+            )
         slot = cls(
             name=str(raw["name"]),
             kind=Kind(raw.get("kind", "speech")),
@@ -55,6 +73,7 @@ class Slot:
             max_think_tokens=raw.get("max_think_tokens"),
             max_visible_tokens=raw.get("max_visible_tokens"),
             max_total_tokens=raw.get("max_total_tokens"),
+            enable_thinking=enable_thinking,
         )
         for attr in ("max_think_tokens", "max_visible_tokens", "max_total_tokens"):
             v = getattr(slot, attr)

@@ -19,11 +19,12 @@ Design (see DESIGN-debate-env.md + the round plan):
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol as TypingProtocol
 
-from infra.backend.base import Datum, Sample, SamplingParams
+from infra.backend.base import Datum, Sample, SamplingParams, visible_text
 from infra.envs.base import Policy, SlotLimits, _validate_predict_results, datum_from_sample
 from infra.envs.debate.protocol import CompiledSlot, Kind, Protocol, Visibility
 from infra.models.base import Model, ModelInput, ModelResponse, SamplingProfile, SpeechStructure
@@ -33,6 +34,12 @@ Message = dict[str, str]  # {"role": "system"|"user"|"assistant", "content": str
 
 def slot_limits(cs: CompiledSlot) -> SlotLimits:
     return SlotLimits(cs.slot.max_think_tokens, cs.slot.max_visible_tokens, cs.slot.max_total_tokens)
+
+
+def slot_chat_kwargs(cs: CompiledSlot) -> Optional[dict]:
+    if cs.slot.enable_thinking is None:
+        return None
+    return {"enable_thinking": bool(cs.slot.enable_thinking)}
 
 
 class PromptLibrary(TypingProtocol):
@@ -118,6 +125,9 @@ class GenRequest:
     # gate logprob capture on the structure (LocalModel) return the token
     # channel the judge-logit scan reads.
     decision: bool = False
+    # Slot-level chat-template kwargs, merged over the seat's own. Only
+    # trained seats render their own template, so a frozen seat rejects it.
+    chat_template_kwargs: Optional[dict] = None
 
 
 @dataclass
@@ -177,15 +187,27 @@ class PolicySeat(SeatRunner):
         self.policy = policy
 
     def generate(self, requests: list[GenRequest]) -> list[SlotResult]:
-        # One batched predict per distinct limit set (usually one).
+        # One batched predict per distinct (limit set, template override) —
+        # usually one. A slot that overrides enable_thinking renders under its
+        # own template, so it cannot share a batch with the seat default.
         results: list[Optional[SlotResult]] = [None] * len(requests)
-        by_limits: dict[SlotLimits, list[int]] = {}
+        by_batch: dict[tuple, list[int]] = {}
         for i, r in enumerate(requests):
-            by_limits.setdefault(r.limits, []).append(i)
+            by_batch.setdefault(
+                (r.limits, tuple(sorted((r.chat_template_kwargs or {}).items()))), []
+            ).append(i)
 
-        for limits, idxs in by_limits.items():
+        for (limits, kwargs_items), idxs in by_batch.items():
+            policy = self.policy
+            if kwargs_items:
+                # copy, not Policy(...): seat policies duck type in the tests.
+                policy = copy.copy(self.policy)
+                policy.chat_template_kwargs = {
+                    **(getattr(self.policy, "chat_template_kwargs", None) or {}),
+                    **dict(kwargs_items),
+                }
             convos = [requests[i].messages for i in idxs]
-            outs = self.policy.predict(convos, n=1, limits=limits)
+            outs = policy.predict(convos, n=1, limits=limits)
             _validate_predict_results(
                 outs,
                 requests=len(convos),
@@ -198,18 +220,24 @@ class PolicySeat(SeatRunner):
                     results[i] = SlotResult(text="", failed=True, fail_reason="fidelity")
                     continue
                 if s.regions is not None:
-                    # exact split from regions — no regex
+                    # exact split from regions — no regex. visible_text, not a
+                    # raw decode: a special-token string that survives here is
+                    # spliced into every later speaker's context, where the
+                    # chat template re-tokenizes it into a real turn boundary
+                    # mid-message.
                     think_spans = [r for r in s.regions if r.kind == "think"]
                     visible_spans = [r for r in s.regions if r.kind == "visible"]
-                    tok = self.policy.tokenizer
+                    tok = policy.tokenizer
                     thinking = (
-                        tok.decode([t for r in think_spans for t in s.tokens[r.start : r.end]]).strip()
+                        visible_text(
+                            tok, [t for r in think_spans for t in s.tokens[r.start : r.end]]
+                        ).strip()
                         or None
                     )
                     if thinking is not None:
                         thinking = thinking.removeprefix("<think>").strip()
-                    text = tok.decode(
-                        [t for r in visible_spans for t in s.tokens[r.start : r.end]]
+                    text = visible_text(
+                        tok, [t for r in visible_spans for t in s.tokens[r.start : r.end]]
                     ).strip()
                 else:
                     # No regions means no budget forcing on this slot, so an
@@ -218,7 +246,7 @@ class PolicySeat(SeatRunner):
                     # getattr, not attribute access: Policy duck types in the
                     # tests carry only predict(), the same allowance
                     # SingleTurnEnv.rollout makes for the `limits` kwarg.
-                    kwargs = getattr(self.policy, "chat_template_kwargs", None) or {}
+                    kwargs = getattr(policy, "chat_template_kwargs", None) or {}
                     thinking, text = _split_think(
                         s.text, thinking_opened=bool(kwargs.get("enable_thinking"))
                     )
@@ -248,6 +276,15 @@ class FrozenSeat(SeatRunner):
     def generate(self, requests: list[GenRequest]) -> list[SlotResult]:
         import warnings
 
+        if any(r.chat_template_kwargs for r in requests):
+            # A frozen seat generates on its own server under the model
+            # wrapper's template; a slot-level override would be dropped in
+            # silence, and the transcript would claim a setting that never ran.
+            raise ValueError(
+                f"seat {self.model.alias}: slot-level chat template kwargs "
+                "(enable_thinking) are supported on trained seats only; set "
+                "enable_thinking on the seat's model_settings instead"
+            )
         if not self._warned_limits:
             if any(r.limits.max_think_tokens or r.limits.max_visible_tokens for r in requests):
                 warnings.warn(f"seat {self.model.alias}: think/visible caps unenforceable on frozen API seats")
@@ -575,6 +612,7 @@ class DebateRound:
                     slot_limits(step),
                     json_schema=schema,
                     decision=decision,
+                    chat_template_kwargs=slot_chat_kwargs(step),
                 )
                 for i in live
             ]
@@ -672,6 +710,7 @@ class DebateRound:
                         slot_limits(step),
                         json_schema=json_schema,
                         decision=step.slot.kind == Kind.DECISION,
+                        chat_template_kwargs=slot_chat_kwargs(step),
                     )
                 )
             fresh = runner.generate(requests)

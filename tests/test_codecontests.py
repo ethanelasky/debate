@@ -380,8 +380,8 @@ def _pc_protocol():
             "turns": [
                 {"alice": [{"name": "proposal", "kind": "solution"}]},
                 {"bob": [{"name": "critique"}]},
-                {"alice": [{"name": "defense"}]},
-                {"bob": [{"name": "rebuttal"}]},
+                {"alice": [{"name": "alice_rebuttal"}]},
+                {"bob": [{"name": "bob_rebuttal"}]},
                 {"judge": [{"name": "verdict", "kind": "decision"}]},
             ]
         }

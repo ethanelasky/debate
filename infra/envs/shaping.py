@@ -40,9 +40,24 @@ def think_overshoot(sample: Any) -> bool:
     return any(r.kind == "forced_close" for r in (getattr(sample, "regions", None) or ()))
 
 
+def truncated(sample: Any) -> bool:
+    """The single definition of "this generation ran out of budget": the
+    backend normalized its stop reason to "length" rather than "stop".
+
+    Unlike ``think_overshoot`` this needs no regions, so it is knowable on any
+    seat that reports a stop reason. It says the speech did not finish, which
+    is the feature a per-speech budget term prices: a speech cut at its cap
+    reaches the judge mid-sentence.
+    """
+    return getattr(sample, "stop_reason", None) == "length"
+
+
 #: Features computable from a Sample alone, shared by both arms. Keyed by the
 #: flag name a term gates on.
-SAMPLE_FLAGS: dict[str, Callable[[Any], bool]] = {"think_overshoot": think_overshoot}
+SAMPLE_FLAGS: dict[str, Callable[[Any], bool]] = {
+    "think_overshoot": think_overshoot,
+    "truncated": truncated,
+}
 
 
 @dataclass(frozen=True)

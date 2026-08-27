@@ -13,7 +13,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
-from infra.backend.base import Backend, Datum, Region, Sample, SamplingParams
+from infra.backend.base import Backend, Datum, Region, Sample, SamplingParams, visible_text
+from infra.envs.shaping import truncated
 
 Message = dict[str, str]
 
@@ -300,7 +301,7 @@ class SingleTurnEnv(Env):
             info = {
                 **info,
                 "tokens": float(len(s.tokens)),
-                "truncated": float(s.stop_reason == "length"),
+                "truncated": float(truncated(s)),
                 "over_budget": float(over),
             }
             if over:
@@ -454,7 +455,7 @@ def budget_forced_sample(
                 Sample(
                     tokens=tokens,
                     logprobs=p1.logprobs + (cont.logprobs if cont else []),
-                    text=tokenizer.decode(tokens),
+                    text=visible_text(tokenizer, tokens),
                     stop_reason=cont.stop_reason if cont is not None else p1.stop_reason,
                     regions=(Region("visible", 0, len(tokens)),),
                 )
@@ -466,7 +467,7 @@ def budget_forced_sample(
                 Sample(
                     tokens=p1.tokens,
                     logprobs=p1.logprobs,
-                    text=tokenizer.decode(p1.tokens),
+                    text=visible_text(tokenizer, p1.tokens),
                     stop_reason="stop",
                     regions=(Region("think", 0, n1),),
                 )
@@ -487,7 +488,7 @@ def budget_forced_sample(
             Sample(
                 tokens=tokens,
                 logprobs=logprobs,
-                text=tokenizer.decode(tokens),
+                text=visible_text(tokenizer, tokens),
                 stop_reason=stop_reason,
                 regions=tuple(regions),
             )

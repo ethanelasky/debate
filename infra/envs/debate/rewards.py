@@ -290,8 +290,29 @@ class ThinkOvershootPenalty(FlagShaping):
     sign: ClassVar[int] = -1
 
 
+@dataclass
+class SpeechOvershootPenalty(FlagShaping):
+    """Per-slot penalty when the slot ran out of budget instead of finishing:
+    the sample's stop reason is "length", so the speech reaches the judge cut
+    mid-sentence.
+
+    This is the speech-side twin of ThinkOvershootPenalty, and it is priced the
+    same way for the same reason: a hard cap alone only truncates, and the
+    policy has no gradient telling it to fit. Kenton et al. (2608.17776 §3.4)
+    hold the non-solution turns to a word limit "via prompting and reward
+    penalties" for this reason — a limit stated in the cue and paid for in the
+    reward. The solution turn is exempt there and here: its budget is the RLVR
+    arm's, and its overshoot is already priced as think_overshoot."""
+
+    flag: str = "truncated"
+
+    kind: ClassVar[str] = "speech_overshoot_penalty"
+    sign: ClassVar[int] = -1
+
+
 SHAPING_REGISTRY = {
-    cls.kind: cls for cls in (LengthPenalty, FormatReward, ThinkOvershootPenalty)
+    cls.kind: cls
+    for cls in (LengthPenalty, FormatReward, ThinkOvershootPenalty, SpeechOvershootPenalty)
 }
 
 

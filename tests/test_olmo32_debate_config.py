@@ -26,8 +26,8 @@ def test_olmo32think_debate_splices_latest_debate_and_live_grpo_recipe():
     assert slots == [
         ("alice", "proposal", 1500),
         ("bob", "critique", 1500),
-        ("alice", "defense", 1500),
-        ("bob", "rebuttal", 1500),
+        ("alice", "alice_rebuttal", 1500),
+        ("bob", "bob_rebuttal", 1500),
         ("judge", "deliberation", 1000),
         ("judge", "verdict", 256),
     ]
@@ -107,8 +107,8 @@ def test_olmo32_instruct_aime_debate_twin():
     assert slots == [
         ("alice", "proposal", 1500),
         ("bob", "critique", 1500),
-        ("alice", "defense", 1500),
-        ("bob", "rebuttal", 300),
+        ("alice", "alice_rebuttal", 1500),
+        ("bob", "bob_rebuttal", 300),
         ("judge", "deliberation", 1000),
         ("judge", "verdict", 256),
     ]

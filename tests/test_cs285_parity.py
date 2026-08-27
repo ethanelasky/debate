@@ -311,8 +311,8 @@ def test_cs285_debate_cispo_is_a_controlled_recipe_derivation():
             assert trained_slots == [
                 ("alice", "proposal", 512),
                 ("bob", "critique", 300),
-                ("alice", "defense", 300),
-                ("bob", "rebuttal", 300),
+                ("alice", "alice_rebuttal", 300),
+                ("bob", "bob_rebuttal", 300),
             ]
         finally:
             if env is not None:

@@ -22,9 +22,9 @@ math_pc_olmo_l5:
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
                 {name: critique, max_total_tokens: 500}]
       - alice: [{name: scratchpad, visibility: private, max_total_tokens: 500},
-                {name: defense, max_total_tokens: 500}]
+                {name: alice_rebuttal, max_total_tokens: 500}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
-                {name: rebuttal, max_total_tokens: 500}]
+                {name: bob_rebuttal, max_total_tokens: 500}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
@@ -101,9 +101,9 @@ math_pc_olmo_l5_g8:
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
                 {name: critique, max_total_tokens: 500}]
       - alice: [{name: scratchpad, visibility: private, max_total_tokens: 500},
-                {name: defense, max_total_tokens: 500}]
+                {name: alice_rebuttal, max_total_tokens: 500}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 500},
-                {name: rebuttal, max_total_tokens: 500}]
+                {name: bob_rebuttal, max_total_tokens: 500}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
@@ -189,8 +189,8 @@ math_pc_olmo32think_cispo_os3:
     turns:
       - alice: [{name: proposal, kind: solution, max_think_tokens: 1000, max_total_tokens: 1500}]
       - bob:   [{name: critique, max_think_tokens: 1000, max_total_tokens: 1500}]
-      - alice: [{name: defense, max_think_tokens: 1000, max_total_tokens: 1500}]
-      - bob:   [{name: rebuttal, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - alice: [{name: alice_rebuttal, max_think_tokens: 1000, max_total_tokens: 1500}]
+      - bob:   [{name: bob_rebuttal, max_think_tokens: 1000, max_total_tokens: 1500}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
@@ -297,8 +297,8 @@ aime_pc_olmo32_cispo_os2:
     turns:
       - alice: [{name: proposal, kind: solution, max_total_tokens: 1500}]
       - bob:   [{name: critique, max_total_tokens: 1500}]
-      - alice: [{name: defense, max_total_tokens: 1500}]
-      - bob:   [{name: rebuttal, max_total_tokens: 300}]
+      - alice: [{name: alice_rebuttal, max_total_tokens: 1500}]
+      - bob:   [{name: bob_rebuttal, max_total_tokens: 300}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1000},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:

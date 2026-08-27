@@ -23,9 +23,11 @@ BOXREQ_ARM = "mathl5_qwen35_pc_debate_cispo_verl_boxreq"
 
 # runner_prompt_sha256 hashes the WHOLE prompt file, not the entry, so an edit
 # here moves the identity of every arm reading it and locks in-flight runs out
-# of --wandb-resume. Published by runs 0s44ib3q and 7dlmbk7i.
+# of --wandb-resume. 0a4369a1... was published by runs 0s44ib3q and 7dlmbk7i;
+# the reply-slot rename and the 150-word cue limit moved it deliberately, with
+# no run in flight.
 PUBLISHED_MATH_PROMPT_SHA = (
-    "0a4369a104abbb841ec818887c8fed5be132db2f881ce7491130a382032c8323"
+    "1cf564476cd3dc9b332987ed64024951fb262b945329b39ef2d4ede50a3e4a4b"
 )
 
 

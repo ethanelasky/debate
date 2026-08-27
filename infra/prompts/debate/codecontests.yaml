@@ -355,7 +355,7 @@ codecontests_proposer_critic:
 
     Keep traces SHORT and VERIFIABLE. Do not restate the problem.
     </output-format>
-  defense: |-
+  alice_rebuttal: |-
     Rebut the Critic's objections: contest their validity or their
     applicability to your program, tracing the disputed code on their claimed
     input concretely. Concede only a genuine, demonstrated failure.
@@ -363,7 +363,7 @@ codecontests_proposer_critic:
   # evidence requirement (its "if you find no further issues, say so plainly"
   # clause is dropped — a critic whose role is to prove the program wrong does
   # not concede).
-  rebuttal: |-
+  bob_rebuttal: |-
     Now it is your turn again as the CRITIC. Address the Proposer's latest
     defense and attack another load-bearing part of the program with a
     concrete check. Never concede the program is right. Back any bug claim

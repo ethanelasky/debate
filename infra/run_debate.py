@@ -169,6 +169,13 @@ def _protocol_payload(protocol: Protocol) -> list[dict]:
             "max_think_tokens": cs.slot.max_think_tokens,
             "max_visible_tokens": cs.slot.max_visible_tokens,
             "max_total_tokens": cs.slot.max_total_tokens,
+            # Present only when the slot overrides its seat: an arm that never
+            # sets it keeps the identity sha it already published.
+            **(
+                {"enable_thinking": bool(cs.slot.enable_thinking)}
+                if cs.slot.enable_thinking is not None
+                else {}
+            ),
         }
         for cs in protocol.compile()
     ]

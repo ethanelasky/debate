@@ -173,8 +173,8 @@ cs285_mathhard_debate_cispo:
     turns:
       - alice: [{name: proposal, kind: solution, max_total_tokens: 512}]
       - bob:   [{name: critique, max_total_tokens: 300}]
-      - alice: [{name: defense, max_total_tokens: 300}]
-      - bob:   [{name: rebuttal, max_total_tokens: 300}]
+      - alice: [{name: alice_rebuttal, max_total_tokens: 300}]
+      - bob:   [{name: bob_rebuttal, max_total_tokens: 300}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 384},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:

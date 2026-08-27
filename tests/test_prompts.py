@@ -26,8 +26,8 @@ PC_TOPOLOGY = {
     "turns": [
         {"alice": [{"name": "proposal", "kind": "solution"}]},
         {"bob": [{"name": "critique"}]},
-        {"alice": [{"name": "defense"}]},
-        {"bob": [{"name": "rebuttal"}]},
+        {"alice": [{"name": "alice_rebuttal"}]},
+        {"bob": [{"name": "bob_rebuttal"}]},
         {"judge": [{"name": "deliberation", "visibility": "private"},
                    {"name": "verdict", "kind": "decision"}]},
     ]
@@ -93,7 +93,7 @@ SOLO_PROPOSAL = {"turns": [{"alice": [{"name": "proposal", "kind": "solution"}]}
 
 def test_extends_merges_vars_over_parent(lib, tmp_path):
     assert set(lib.system) == {"alice", "bob", "judge"}
-    assert set(lib.slots) == {"plan", "scratchpad", "proposal", "critique", "defense", "rebuttal", "deliberation", "verdict"}
+    assert set(lib.slots) == {"plan", "scratchpad", "proposal", "critique", "alice_rebuttal", "bob_rebuttal", "deliberation", "verdict"}
 
     path = tmp_path / "p.yaml"
     path.write_text(MINIMAL_ENTRY)
@@ -280,8 +280,8 @@ def test_codecontests_verdict_slot_matches_competitive_parser():
 
 
 def test_validate_fails_on_missing_slot_template(lib, protocol):
-    lib.slots.pop("rebuttal")
-    with pytest.raises(ValueError, match="rebuttal"):
+    lib.slots.pop("bob_rebuttal")
+    with pytest.raises(ValueError, match="bob_rebuttal"):
         validate_prompts(lib, protocol)
 
 
@@ -382,8 +382,8 @@ def test_bindability_ignores_placeholders_covered_by_vars(protocol):
         slots={
             "proposal": "<POSITION>",
             "critique": "c",
-            "defense": "d",
-            "rebuttal": "r",
+            "alice_rebuttal": "d",
+            "bob_rebuttal": "r",
             "deliberation": "del",
             "verdict": "v",
         },
@@ -456,7 +456,7 @@ def test_preview_shows_block_placement():
     proto = Protocol.parse(
         _yaml.safe_load(
             "turns: [{alice: [{name: proposal, kind: solution}]}, {bob: [{name: critique}]},"
-            " {alice: [{name: defense}]}, {judge: [{name: verdict, kind: decision}]}]"
+            " {alice: [{name: alice_rebuttal}]}, {judge: [{name: verdict, kind: decision}]}]"
         )
     )
     lib = splice_task_prompts(

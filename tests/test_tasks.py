@@ -344,7 +344,7 @@ def test_math_debate_proposal_slot_equals_rlvr_user_message():
                     "turns": [
                         {"alice": [{"name": "proposal", "kind": "solution"}]},
                         {"bob": [{"name": "critique"}]},
-                        {"alice": [{"name": "defense"}]},
+                        {"alice": [{"name": "alice_rebuttal"}]},
                         {"judge": [{"name": "verdict", "kind": "decision"}]},
                     ]
                 }

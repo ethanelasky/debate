@@ -151,6 +151,21 @@ class OptimParams:
     grad_clip: float = 1.0
 
 
+THINK_MARKERS = ("<think>", "</think>")
+
+
+def visible_text(tokenizer, tokens: list[int]) -> str:
+    """Decode for TEXT consumers (speech splicing, transcripts). Special-token
+    strings must not survive into text that re-enters a chat template — they
+    re-tokenize into real turn boundaries mid-message. Think markers stay:
+    round.py splits on them."""
+    text = tokenizer.decode(tokens)
+    for special in getattr(tokenizer, "all_special_tokens", ()):
+        if special not in THINK_MARKERS:
+            text = text.replace(special, "")
+    return text
+
+
 class Backend(ABC):
     tokenizer: object  # HF tokenizer for the policy model (render + decode)
 

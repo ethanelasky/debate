@@ -34,7 +34,7 @@ from infra.envs.debate.rewards import (
     score,
     validate_scoring,
 )
-from infra.envs.shaping import think_overshoot
+from infra.envs.shaping import think_overshoot, truncated
 from infra.envs.debate.round import (
     DebateRound,
     DebateState,
@@ -279,7 +279,12 @@ class DebateEnv(Env):
         compiled = self.protocol.compile()
         slot_names = {cs.slot.name for cs in compiled}
         think_capped = {cs.slot.name for cs in compiled if cs.slot.max_think_tokens is not None}
-        flag_names = {"answer_format_valid", "think_overshoot"}
+        budgeted = {
+            cs.slot.name
+            for cs in compiled
+            if cs.slot.max_total_tokens is not None or cs.slot.max_visible_tokens is not None
+        }
+        flag_names = {"answer_format_valid", "think_overshoot", "truncated"}
         # Slots where a priced term gates on think_overshoot: _token_report
         # refuses to report a 0.0 there when the feature is unknowable.
         self._overshoot_priced_slots: set[str] = set()
@@ -312,6 +317,18 @@ class DebateEnv(Env):
                         "never be force-closed; the term would be a constant 0.0 there"
                     )
                 self._overshoot_priced_slots |= targeted
+            if term_flag == "truncated" and getattr(term, "coeff", 0.0):
+                targeted = slot_names if term_slots is None else set(term_slots)
+                # Same void, one slot feature over: with no budget to run out
+                # of, "the speech was cut at its cap" is a constant 0.0.
+                unbudgeted = sorted(targeted - budgeted)
+                if unbudgeted:
+                    raise ValueError(
+                        f"shaping term {kind} prices speech overshoot on slot(s) "
+                        f"{unbudgeted}, which declare neither max_total_tokens nor "
+                        "max_visible_tokens and so can never run out of budget; the "
+                        "term would be a constant 0.0 there"
+                    )
         self.display: dict[str, str] = {s: DISPLAY_NAMES[i] for i, s in enumerate(self.debaters)}
 
     def _inject_task_prompt_templates(self) -> None:
@@ -645,10 +662,13 @@ class DebateEnv(Env):
                         "reading the absence as 0.0 is the same value-shaped void "
                         "this term was added to close. Drop the term or train the seat."
                     )
-            # think_overshoot has ONE definition, shared with the RLVR arm
-            # (infra/envs/shaping.py). Present on EVERY slot, so a gating term
-            # reads 0.0 rather than a missing key.
-            flags: dict[str, float] = {"think_overshoot": float(think_overshoot(r.sample))}
+            # think_overshoot and truncated have ONE definition each, shared
+            # with the RLVR arm (infra/envs/shaping.py). Present on EVERY slot,
+            # so a gating term reads 0.0 rather than a missing key.
+            flags: dict[str, float] = {
+                "think_overshoot": float(think_overshoot(r.sample)),
+                "truncated": float(truncated(r.sample)),
+            }
             if r.slot.slot.kind == Kind.SOLUTION:
                 if r.answer_format_valid is None:
                     raise RuntimeError(

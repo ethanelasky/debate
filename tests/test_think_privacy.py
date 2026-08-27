@@ -143,9 +143,14 @@ def test_empty_speeches_are_counted_per_slot():
 
 
 def test_shipped_qwen_debate_arm_caps_every_trained_slot():
-    """The arm that runs on the pod: each trained slot leaves room to speak
-    after its think phase closes, and the proposal is the RLVR arm's own
-    generation budget."""
+    """The arm that runs on the pod: every trained slot can still speak, and
+    the proposal is the RLVR arm's own generation budget.
+
+    A thinking slot needs a think cap that leaves room after the close — with
+    no cap a 4B never emits </think> and the speech is empty. A slot that
+    renders with thinking OFF needs the opposite: no think cap at all, since
+    the two-phase path keys on the cap, not on the template, and would spend
+    the budget force-closing a think block the seat never opened."""
     from pathlib import Path
 
     from infra.config import load_experiment
@@ -155,10 +160,17 @@ def test_shipped_qwen_debate_arm_caps_every_trained_slot():
     rlvr = load_experiment(configs / "math_qwen35.yaml", "mathl5_qwen35_cispo")
 
     slots = {s["name"]: s for turn in exp["protocol"]["turns"] for sl in turn.values() for s in sl}
-    for name in ("proposal", "critique", "defense", "rebuttal"):
+    for name in ("proposal", "critique", "alice_rebuttal", "bob_rebuttal"):
         s = slots[name]
+        if s.get("enable_thinking") is False:
+            assert s.get("max_think_tokens") is None, name
+            assert s.get("max_visible_tokens") is None, name
+            assert s["max_total_tokens"] is not None, name
+            continue
         assert s["max_think_tokens"] is not None, name
         assert s["max_think_tokens"] < s["max_total_tokens"], name
+        speech = s.get("max_visible_tokens") or (s["max_total_tokens"] - s["max_think_tokens"])
+        assert speech > 0, name
     assert slots["proposal"]["max_think_tokens"] == rlvr["think_tokens"]
     assert (
         slots["proposal"]["max_total_tokens"]

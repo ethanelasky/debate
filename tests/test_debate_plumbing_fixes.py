@@ -11,19 +11,23 @@
   still wins);
 - trained seats must share the adapter path and match the training backend;
 - trained-seat protocol caps are cross-checked against verl response_length
-  (judge-seat caps excluded).
+  (judge-seat caps excluded);
+- a slot may override its seat's enable_thinking, and the speech text the
+  seat publishes carries no special-token strings.
 """
 
 import pytest
 import yaml
 
-from infra.backend.base import SamplingParams
+from infra.backend.base import Region, Sample, SamplingParams
+from infra.config import load_experiment
 from infra.envs.base import Policy, SlotLimits
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
+from infra.envs.debate.prompts import load_prompt_library
 from infra.envs.debate.protocol import Protocol
 from infra.envs.debate.rewards import ScoringConfig
-from infra.envs.debate.round import FrozenSeat, GenRequest
+from infra.envs.debate.round import FrozenSeat, GenRequest, PolicySeat
 from infra.envs.tasks.math import MathFamily
 from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.models.base import ModelSettings, SpeechStructure
@@ -31,7 +35,7 @@ from infra.models.factory import instantiate_model
 from infra.run_common import build_backend
 from infra.run_debate import debate_gen_budgets, validate_trained_seats
 
-from test_budget_sampling import TOK, run as budget_run
+from test_budget_sampling import SpecialTok, TOK, run as budget_run
 from test_debate_env import (
     PROMPT_FILE as MATH_PROMPT_FILE,
     PROTOCOL as MATH_PROTOCOL,
@@ -41,6 +45,8 @@ from test_debate_env import (
 )
 from test_env_extensions import GOOD_VERDICT, MBTaskSource, PROMPTS_YAML, PROTOCOL
 from test_frozen_seat_sampling import KwargRecordingModel
+
+REPO_CONFIG = "configs/math_pc_debate.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -427,3 +433,140 @@ def test_trained_slot_caps_within_response_length_pass(tmp_path, monkeypatch):
     # never touches the rollout engine
     budgets = debate_gen_budgets(CAPPED_PROTOCOL, {"alice": _trained("local")}, tr)
     build_backend(tr, "some/model", "run", gen_budgets=budgets)
+
+
+# 12 ------------------------------------ per-slot thinking; speech text hygiene
+
+
+class RegionPolicy:
+    """Policy seam for one budget-forced sample: think span then visible span.
+
+    Records the chat-template kwargs each predict call renders under — the
+    seat copies the policy for a slot override, and the copy shares this list.
+    """
+
+    def __init__(self, think: str, visible: str, chat_template_kwargs=None, regions=True):
+        self.tokenizer = SpecialTok()
+        self.chat_template_kwargs = chat_template_kwargs or {}
+        self.seen: list[dict] = []
+        self._think, self._visible, self._regions = think, visible, regions
+
+    def predict(self, convos, n=1, limits=None):
+        self.seen.append(dict(self.chat_template_kwargs))
+        think, visible = self.tokenizer.encode(self._think), self.tokenizer.encode(self._visible)
+        tokens = think + visible
+        regions = (
+            (Region("think", 0, len(think)), Region("visible", len(think), len(tokens)))
+            if self._regions
+            else None
+        )
+        return [
+            [
+                Sample(
+                    tokens=tokens,
+                    logprobs=[-0.1] * len(tokens),
+                    text=self._think + self._visible,
+                    stop_reason="stop",
+                    prompt_tokens=[1, 2],
+                    regions=regions,
+                )
+            ]
+            for _ in convos
+        ]
+
+
+def _speech_request(**kw):
+    return GenRequest(
+        messages=[{"role": "user", "content": "speak"}],
+        limits=SlotLimits(max_think_tokens=8, max_total_tokens=64),
+        **kw,
+    )
+
+
+def test_trained_seat_strips_special_tokens_out_of_the_region_split():
+    """The region decode feeds the speech that is spliced into every later
+    speaker's context; a surviving special-token string re-tokenizes there
+    into a real turn boundary mid-message."""
+    policy = RegionPolicy("<think>scratch<|im_end|>", "the speech<|im_end|>")
+    [res] = PolicySeat(policy).generate([_speech_request()])
+    assert res.text == "the speech"
+    assert res.thinking == "scratch"
+
+
+def test_slot_thinking_override_renders_under_its_own_template():
+    policy = RegionPolicy("<think>s", "v", chat_template_kwargs={"enable_thinking": True})
+    seat = PolicySeat(policy)
+    seat.generate(
+        [_speech_request(), _speech_request(chat_template_kwargs={"enable_thinking": False})]
+    )
+    assert policy.seen == [{"enable_thinking": True}, {"enable_thinking": False}]
+    # the seat's own policy is untouched: the override lives on a copy
+    assert policy.chat_template_kwargs == {"enable_thinking": True}
+
+
+def test_slot_thinking_override_drives_the_unterminated_think_split():
+    """No regions and no </think>: under the seat's thinking template every
+    token is private reasoning (an empty speech), but a slot that turns
+    thinking off is speaking, not thinking."""
+    policy = RegionPolicy(
+        "unterminated reasoning", "", chat_template_kwargs={"enable_thinking": True}, regions=False
+    )
+    seat = PolicySeat(policy)
+    [seat_default] = seat.generate([_speech_request()])
+    [slot_off] = seat.generate([_speech_request(chat_template_kwargs={"enable_thinking": False})])
+    assert (seat_default.thinking, seat_default.text) == ("unterminated reasoning", "")
+    assert (slot_off.thinking, slot_off.text) == (None, "unterminated reasoning")
+
+
+def test_frozen_seat_rejects_a_slot_level_thinking_override():
+    seat = FrozenSeat(KwargRecordingModel("judge", ["ok"]))
+    with pytest.raises(ValueError, match="trained seats only"):
+        seat.generate([_speech_request(chat_template_kwargs={"enable_thinking": False})])
+
+
+def test_shipped_verl_debate_replies_are_no_think_speeches():
+    """The reply slots were force-closed at max_think 768 on nearly every
+    sample, and phase 2 published the unfinished scratchpad as the speech."""
+    exp = load_experiment(REPO_CONFIG, "mathl5_qwen35_pc_debate_cispo_verl")
+    slots = {cs.slot.name: cs.slot for cs in Protocol.parse(exp["protocol"]).compile()}
+    for name in ("alice_rebuttal", "bob_rebuttal"):
+        assert slots[name].enable_thinking is False
+        assert slots[name].max_total_tokens == 320
+        # a leftover think cap would re-open two-phase forcing on a slot that
+        # no longer thinks
+        assert slots[name].max_think_tokens is None
+        assert not SlotLimits(
+            slots[name].max_think_tokens,
+            slots[name].max_visible_tokens,
+            slots[name].max_total_tokens,
+        ).two_phase
+    # the critique is an opening speech: full think phase, capped speech
+    assert slots["critique"].max_visible_tokens == 320
+    assert slots["critique"].max_think_tokens == 4000
+    # the proposal keeps the RLVR arm's rollout budget and its seat template
+    assert slots["proposal"].max_think_tokens == 4000
+    assert slots["proposal"].max_total_tokens == 5024
+    assert slots["proposal"].enable_thinking is None
+
+
+def test_shipped_verl_debate_prices_speech_overshoot_off_the_solution_turn():
+    """Kenton et al. hold the non-solution turns to the word limit stated in
+    their cue, and price exceeding it. The proposal is exempt on both counts:
+    its budget is the RLVR arm's, and its overshoot is already priced as
+    think_overshoot."""
+    exp = load_experiment(REPO_CONFIG, "mathl5_qwen35_pc_debate_cispo_verl")
+    terms = [t for t in exp["scoring"]["shaping"] if t["kind"] == "speech_overshoot_penalty"]
+    [term] = terms
+    assert set(term["slots"]) == {"critique", "alice_rebuttal", "bob_rebuttal"}
+    assert term["flag"] == "truncated"
+    assert term["coeff"] == 0.1  # the same flat price as the overshoot terms
+
+    library = load_prompt_library(
+        exp["prompt_config"]["file_path"],
+        exp["prompt_config"]["entry"],
+        Protocol.parse(exp["protocol"]),
+    )
+    # priced AND stated: a limit the policy is paid to respect but never told
+    # about is a trap, not a rule
+    for slot in term["slots"]:
+        assert "150 words" in library.slots[slot]

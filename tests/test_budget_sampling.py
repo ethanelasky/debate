@@ -130,3 +130,51 @@ def test_n_gt_1_phase_per_sample():
     k0 = [r.kind for r in samples[0].regions]
     k1 = [r.kind for r in samples[1].regions]
     assert k0 == ["think", "visible"] and k1 == ["think", "forced_close", "visible"]
+
+
+class SpecialTok(CharTok):
+    """Same exact-inverse codec, with a special-token vocabulary."""
+
+    all_special_tokens = ["<|im_end|>", "<think>", "</think>"]
+
+
+def run_special(script, limits, prompt="<think>"):
+    fn, calls = scripted_backend(script)
+    out = budget_forced_sample(
+        fn, SpecialTok(), [TOK.encode(prompt)], SamplingParams(max_tokens=500), limits
+    )
+    return out[0][0], calls
+
+
+def test_rebuilt_text_strips_special_tokens_after_forced_close():
+    """budget_forced_sample rebuilds Sample.text over the joined phases. A raw
+    decode here puts the EOS string back into text the debate round splices
+    into the next speaker's context, where the template re-tokenizes it into a
+    turn boundary mid-message."""
+    s, _ = run_special(
+        [[("reasoning without close", "length")], [("the answer<|im_end|>", "stop")]],
+        SlotLimits(max_think_tokens=30),
+    )
+    assert "<|im_end|>" not in s.text
+    assert s.text.endswith("the answer")
+    # the think markers are the split contract; they must survive
+    assert "</think>" in s.text
+
+
+def test_rebuilt_text_strips_special_tokens_on_the_all_visible_path():
+    s, _ = run_special(
+        [[("no thinking here<|im_end|>", "stop")]],
+        SlotLimits(max_think_tokens=50),
+        prompt="plain prompt",
+    )
+    assert s.text == "no thinking here"
+
+
+def test_rebuilt_text_strips_special_tokens_when_it_dies_in_think():
+    s, _ = run_special(
+        [[("still reasoning<|im_end|>" + chr(0), "stop")]],
+        SlotLimits(max_think_tokens=30),
+    )
+    assert [r.kind for r in s.regions] == ["think"]
+    assert "<|im_end|>" not in s.text
+    assert "still reasoning" in s.text

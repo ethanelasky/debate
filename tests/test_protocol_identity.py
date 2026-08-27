@@ -328,6 +328,9 @@ def test_rlvr_runner_identity_rejects_secret_bearing_model_url():
     "mutate",
     [
         lambda exp: exp["protocol"]["turns"][0]["alice"][0].update(max_total_tokens=300),
+        # Whether a slot speaks with a think phase changes what the seat is
+        # trained to produce, so it belongs in the identity.
+        lambda exp: exp["protocol"]["turns"][0]["alice"][0].update(enable_thinking=False),
         lambda exp: exp["prompt_config"].update(entry="other-entry"),
         lambda exp: exp["dataset"].update(relaxed_extraction=False),
         lambda exp: exp["judge_config"].update(retries=5),

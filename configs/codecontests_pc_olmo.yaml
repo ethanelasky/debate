@@ -45,9 +45,9 @@ codecontests_pc_olmo:
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 512},
                 {name: critique, max_total_tokens: 512}]
       - alice: [{name: scratchpad, visibility: private, max_total_tokens: 512},
-                {name: defense, max_total_tokens: 512}]
+                {name: alice_rebuttal, max_total_tokens: 512}]
       - bob:   [{name: scratchpad, visibility: private, max_total_tokens: 512},
-                {name: rebuttal, max_total_tokens: 512}]
+                {name: bob_rebuttal, max_total_tokens: 512}]
       - judge: [{name: deliberation, visibility: private, max_total_tokens: 1024},
                 {name: verdict, kind: decision, max_total_tokens: 256}]
   prompt_config:
