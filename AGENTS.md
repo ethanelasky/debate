@@ -175,9 +175,10 @@ implementation details that stay within an approved direction.
 ## Job scheduler (jobd)
 
 New long-running work goes through **jobd** (`~/code/jobd`, state in
-`~/.local/state/jobd`) rather than the manual `pod_create.sh` + rsync + idle-stop
-dance. It queues runs, holds immutable state, enforces the deadline, retries
-what fails, moves inputs and outputs, and retires idle pods. The manual path in
+`~/.local/state/jobd`). It owns pod creation — this repo has no launcher of
+its own any more — and there is no rsync-by-hand or idle-stop dance around it.
+It queues runs, holds immutable state, enforces the deadline, retries what
+fails, moves inputs and outputs, and retires idle pods. The manual path in
 `## Pods` below still describes what happens *on* a pod and remains accurate;
 jobd is what gets you there and what owns the lifecycle.
 

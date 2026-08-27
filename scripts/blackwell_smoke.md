@@ -43,9 +43,10 @@ storage bills separately and survives the pod.
 ## 0. Rent + restore (10 min box)
 
 ```bash
-# local — B200 instead of the H200 default; cu1300 image is REQUIRED
-# (provision fatals without a CUDA 13.x nvcc)
-GPU_TYPE="NVIDIA B200" bash scripts/pod_create.sh b200-smoke
+# local — jobd owns pod creation; the profile carries the GPU type and the
+# cu1300 image, which is REQUIRED (provision fatals without a CUDA 13.x nvcc).
+# `jobd info` prints the profiles and the fleet.
+jobd submit --profile debate-b200x2 -n b200-smoke -- bash scripts/env_bootstrap.sh
 ```
 
 - Volume caveat: the existing volume (verl env, `/workspace/hf`,
