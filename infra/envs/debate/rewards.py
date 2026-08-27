@@ -430,9 +430,24 @@ def build_shaping(cfgs: list[dict]) -> list[ShapingTerm]:
     terms: list[ShapingTerm] = []
     for cfg in cfgs or []:
         spec = dict(cfg)
+        # `name` is the merge identity (infra/config.deep_merge), not a term
+        # field: it lets a child narrow or `_drop` an inherited term instead of
+        # neutering it in place with coeff 0.0. A surviving `_drop` means the
+        # entry named nothing in the parent, which is a typo worth failing on
+        # rather than a silent no-op.
+        name = spec.pop("name", None)
+        if spec.pop("_drop", False):
+            raise ValueError(
+                f"shaping entry {name!r} is marked _drop but no inherited term "
+                f"has that name; nothing was removed"
+            )
         kind = spec.pop("kind", None)
         if kind not in SHAPING_REGISTRY:
-            raise ValueError(f"unknown shaping kind {kind!r}; known: {sorted(SHAPING_REGISTRY)}")
+            raise ValueError(
+                f"unknown shaping kind {kind!r}"
+                + (f" (entry {name!r})" if name else "")
+                + f"; known: {sorted(SHAPING_REGISTRY)}"
+            )
         terms.append(SHAPING_REGISTRY[kind](**spec))
     return terms
 

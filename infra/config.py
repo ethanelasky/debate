@@ -30,24 +30,86 @@ import yaml
 from infra.models.base import ModelSettings
 
 
+#: Marker on a named list entry meaning "remove the inherited entry with this
+#: name". Only meaningful in a by-name merge; by-index has no way to delete.
+DROP_KEY = "_drop"
+
+
+def _named(items: list) -> bool:
+    """True when every entry is a dict carrying a unique ``name``.
+
+    Uniqueness is required, not assumed: with a duplicate name a by-name merge
+    would silently pick one, and picking wrong changes a reward function.
+    """
+    if not items or not all(isinstance(i, dict) and "name" in i for i in items):
+        return False
+    names = [i["name"] for i in items]
+    return len(set(names)) == len(names)
+
+
+def _merge_named(base: list, override: list) -> list:
+    """Merge two named lists by NAME, preserving base order and appending new
+    names in override order.
+
+    This is what a list of TERMS wants -- ``scoring.shaping`` is a set keyed by
+    identity, where position means nothing. By-index cannot express removing a
+    term, narrowing one, or reordering, which is why arms accumulated dead
+    ``coeff: 0.0`` entries as position-holders.
+    """
+    out = [copy.deepcopy(i) for i in base]
+    index = {i["name"]: n for n, i in enumerate(out)}
+    for item in override:
+        name = item["name"]
+        if item.get(DROP_KEY):
+            if name in index:
+                out[index[name]] = None
+            continue
+        if name in index:
+            out[index[name]] = deep_merge(out[index[name]], item)
+        else:
+            index[name] = len(out)
+            out.append(copy.deepcopy(item))
+    return [i for i in out if i is not None]
+
+
 def deep_merge(base: dict, override: dict) -> dict:
-    """Override wins; nested dicts merge recursively; lists merge BY INDEX
-    (a child can override one field of debaters[0] without redeclaring it)."""
+    """Override wins; nested dicts merge recursively.
+
+    Lists merge one of three ways, chosen by their SHAPE, because this repo
+    uses lists for things that want different treatment:
+
+      * every entry a dict with a unique ``name``, on BOTH sides -> BY NAME.
+        Position means nothing in a list of terms, and by-index there cannot
+        express deletion or narrowing. ``{name: x, _drop: true}`` removes an
+        inherited entry.
+      * anything else -> BY INDEX, the original behaviour, so a child can still
+        override one field of ``debaters[0]`` without redeclaring it.
+
+    Lists of plain scalars stay BY INDEX too, deliberately. They look like
+    values you would want replaced, but the prompt libraries use them as
+    positional records: hendrycks_math_boxreq overrides block 0 of
+    ``judge_system`` and depends on the parent's evaluation-steps and
+    standard-of-proof blocks surviving at 1 and 2. To narrow a scalar field
+    like a term's ``slots``, ``_drop`` the named entry and restate it.
+    """
     result = copy.deepcopy(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = deep_merge(result[key], value)
         elif key in result and isinstance(result[key], list) and isinstance(value, list):
-            merged = copy.deepcopy(result[key])
-            for i, item in enumerate(value):
-                if i < len(merged):
-                    if isinstance(merged[i], dict) and isinstance(item, dict):
-                        merged[i] = deep_merge(merged[i], item)
+            if _named(result[key]) and _named(value):
+                result[key] = _merge_named(result[key], value)
+            else:
+                merged = copy.deepcopy(result[key])
+                for i, item in enumerate(value):
+                    if i < len(merged):
+                        if isinstance(merged[i], dict) and isinstance(item, dict):
+                            merged[i] = deep_merge(merged[i], item)
+                        else:
+                            merged[i] = copy.deepcopy(item)
                     else:
-                        merged[i] = copy.deepcopy(item)
-                else:
-                    merged.append(copy.deepcopy(item))
-            result[key] = merged
+                        merged.append(copy.deepcopy(item))
+                result[key] = merged
         else:
             result[key] = copy.deepcopy(value)
     return result

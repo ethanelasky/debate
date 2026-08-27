@@ -632,3 +632,21 @@ def test_words_and_tokens_are_not_interchangeable_on_the_same_slot():
 def test_an_unknown_counts_is_refused():
     with pytest.raises(ValueError, match="counts"):
         BudgetPenalty(coeff=0.002, limit=150, counts="tokens")
+
+
+def test_build_shaping_accepts_the_merge_identity_key():
+    """`name` addresses a term across _extends; it is not a term field."""
+    terms = build_shaping(
+        [{"name": "reply_word_budget", "kind": "budget_penalty", "coeff": 0.002,
+          "limit": 150, "slots": ["critique"]}]
+    )
+    assert len(terms) == 1 and isinstance(terms[0], BudgetPenalty)
+    assert terms[0].coeff == 0.002 and terms[0].slots == ["critique"]
+
+
+def test_a_drop_that_matched_nothing_is_an_error():
+    """A surviving `_drop` means the name did not exist in the parent, so the
+    author expected a removal that did not happen -- exactly the silent no-op
+    this mechanism replaced."""
+    with pytest.raises(ValueError, match="_drop"):
+        build_shaping([{"name": "typo_here", "_drop": True}])
