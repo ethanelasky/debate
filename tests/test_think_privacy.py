@@ -176,3 +176,33 @@ def test_shipped_qwen_debate_arm_caps_every_trained_slot():
         slots["proposal"]["max_total_tokens"]
         == rlvr["think_tokens"] + rlvr["max_completion_tokens"]
     )
+
+
+def test_word_count_comes_from_the_visible_speech_not_the_think_phase():
+    """The word limit prices what the OTHER debaters and the judge actually
+    read. ``SlotRecord.text`` is already think-stripped at record time, so the
+    count must come from there; taking it off the raw sample would charge a
+    seat for private reasoning nobody sees, and a 4000-token think phase would
+    swamp a 150-word limit on every rollout.
+    """
+    from infra.envs.debate.env import DebateEnv
+    from infra.envs.debate.protocol import Protocol
+    from infra.envs.debate.round import DebateState, SlotRecord
+
+    protocol = Protocol.parse(
+        {"turns": [{"bob": [{"name": "critique", "max_total_tokens": 320}]}]}
+    )
+    compiled = {cs.slot.name: cs for cs in protocol.compile()}
+
+    speech = "Step three is wrong because the discriminant is negative."  # 9 words
+    sample = _stub_sample("<think>" + "hidden " * 500 + "</think>" + speech)
+
+    state = DebateState(bindings={})
+    state.records = [SlotRecord(slot=compiled["critique"], text=speech, sample=sample)]
+
+    env = DebateEnv.__new__(DebateEnv)
+    env.config = SimpleNamespace(trained_speakers=["bob"])
+    env._overshoot_priced_slots = frozenset()
+
+    report = env._token_report(state)
+    assert report.counts[("bob", "critique")].visible_words == 9

@@ -943,6 +943,7 @@ class CodeContestsEnv(SingleTurnEnv):
         prompt_file: Optional[str] = None,
         soft_token_budget: Optional[int] = None,
         overshoot_penalty: float = 0.0,
+        overshoot_mode: str = "flat",
         min_cf_rating: Optional[int] = None,
         max_cf_rating: Optional[int] = None,
     ):
@@ -956,10 +957,17 @@ class CodeContestsEnv(SingleTurnEnv):
                 f"(got {min_cf_rating} > {max_cf_rating})"
             )
         self.rng = random.Random(seed)
-        # Flat penalty past the budget (see SingleTurnEnv). Inert unless the
-        # backend's response_length is set above the budget.
+        # Penalty past the budget (see SingleTurnEnv). Inert unless the
+        # backend's response_length is set above the budget. overshoot_mode
+        # picks flat (a constant trip) or proportional (per token over).
         self.soft_token_budget = soft_token_budget
         self.overshoot_penalty = overshoot_penalty
+        if overshoot_mode not in ("flat", "proportional"):
+            raise ValueError(
+                "codecontests: overshoot_mode must be 'flat' or 'proportional', "
+                f"got {overshoot_mode!r}"
+            )
+        self.overshoot_mode = overshoot_mode
         self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
         self.timeout_seconds = timeout_seconds
         self.correct_reward = correct_reward
@@ -1157,6 +1165,7 @@ class CodeContestsFamily(TaskFamily):
                 "prompt_file",
                 "soft_token_budget",
                 "overshoot_penalty",
+                "overshoot_mode",
                 "min_cf_rating",
                 "max_cf_rating",
             },
@@ -1189,6 +1198,7 @@ class CodeContestsFamily(TaskFamily):
             prompt_file=(str(ds["prompt_file"]) if ds.get("prompt_file") else None),
             soft_token_budget=(int(ds["soft_token_budget"]) if ds.get("soft_token_budget") else None),
             overshoot_penalty=float(ds.get("overshoot_penalty", 0.0)),
+            overshoot_mode=str(ds.get("overshoot_mode", "flat")),
             min_cf_rating=(
                 int(ds["min_cf_rating"]) if ds.get("min_cf_rating") is not None else None
             ),
@@ -1247,6 +1257,7 @@ class CodeContestsFamily(TaskFamily):
             "format_reward": repr(float(env.format_reward)),
             "soft_token_budget": _optional(env.soft_token_budget),
             "overshoot_penalty": repr(float(env.overshoot_penalty)),
+            "overshoot_mode": str(env.overshoot_mode),
             "min_cf_rating": _optional(
                 int(ds["min_cf_rating"])
                 if ds.get("min_cf_rating") is not None

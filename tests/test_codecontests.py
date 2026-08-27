@@ -1287,3 +1287,69 @@ def test_resolved_production_config_reaches_family_and_paired_env(tmp_path):
     tasks = env.tasks(55, split="test")
     assert len(tasks) == 2
     assert all(task.meta["gdm_inputs"] and task.meta["cco_inputs"] for task in tasks)
+
+
+def test_proportional_overshoot_scales_with_the_excess(tmp_path):
+    """The other half of overshoot_mode, and the reason it exists.
+
+    Under `flat` the two samples below are priced identically (the test above
+    pins that). Under `proportional` they differ by the ratio of their
+    excesses, which is what a group-relative optimizer can actually use: a flat
+    term reaches a CISPO advantage only through its variance inside the group,
+    so once every sample sits on one side of the budget it is a constant shift
+    the baseline removes.
+    """
+    from infra.backend.base import Sample
+
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT,
+                          soft_token_budget=10, overshoot_penalty=0.001,
+                          overshoot_mode="proportional")
+
+    class FakePolicy:
+        """One token over the budget, and ninety over."""
+        def predict(self, messages, n):
+            def mk(k):
+                return Sample(
+                    tokens=[0] * k, logprobs=[0.0] * k,
+                    text="```python\n" + SUM_SOLUTION + "\n```",
+                    stop_reason="stop", prompt_tokens=[0],
+                )
+            return [[mk(11), mk(100)] for _ in messages]
+
+    traj = sorted(groups_0 := env.rollout(
+        env.tasks(1, split="train"), FakePolicy(), group_size=2)[0],
+        key=lambda t: t.info["tokens"])
+    assert traj[0].info["overshoot_tokens"] == 1.0
+    assert traj[1].info["overshoot_tokens"] == 90.0
+    # 89 tokens of separation the flat term prices at zero.
+    assert traj[0].reward - traj[1].reward == pytest.approx(0.089)
+
+
+def test_a_sample_inside_the_budget_is_free_in_both_modes(tmp_path):
+    """The budget is what stops either mode becoming a shortness reward: below
+    it the term is exactly zero, so an empty sample earns nothing a compliant
+    one does not."""
+    from infra.backend.base import Sample
+
+    path = _write_jsonl(tmp_path / "train.jsonl", ROWS)
+    for mode in ("flat", "proportional"):
+        env = CodeContestsEnv(path=path, test_path=path, timeout_seconds=TIMEOUT,
+                              soft_token_budget=1000, overshoot_penalty=0.5,
+                              overshoot_mode=mode)
+
+        class FakePolicy:
+            def predict(self, messages, n):
+                def mk(k):
+                    return Sample(
+                        tokens=[0] * k, logprobs=[0.0] * k,
+                        text="```python\n" + SUM_SOLUTION + "\n```",
+                        stop_reason="stop", prompt_tokens=[0],
+                    )
+                return [[mk(5), mk(999)] for _ in messages]
+
+        groups = env.rollout(env.tasks(1, split="train"), FakePolicy(), group_size=2)
+        assert all(t.info["over_budget"] == 0.0 for t in groups[0]), mode
+        assert all(t.info["overshoot_tokens"] == 0.0 for t in groups[0]), mode
+        rewards = {t.reward for t in groups[0]}
+        assert len(rewards) == 1, f"{mode} priced length below the budget: {rewards}"

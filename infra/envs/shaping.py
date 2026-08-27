@@ -82,6 +82,78 @@ class FlagTerm:
         return self.sign * self.coeff * float(flags.get(self.flag) or 0.0)
 
 
+@dataclass(frozen=True)
+class BudgetTerm:
+    """``sign * coeff * excess(n, limit)``, optionally restricted to named slots.
+
+    The magnitude-valued twin of ``FlagTerm``, and it lives here for the same
+    reason that one does. Both arms price "this generation ran past its length
+    budget", and until this class they priced it with two implementations on two
+    config surfaces: ``soft_token_budget``/``overshoot_penalty`` in
+    ``SingleTurnEnv.rollout`` and a ``scoring.shaping`` entry on the debate
+    side. Nothing structural made them agree, and each was silently INERT on
+    the other arm -- ``SingleTurnEnv.rollout`` never executes for a debate
+    (DebateEnv extends Env with its own rollout), so a proposal budget set
+    there was accepted by config and did nothing at all. That is the same
+    value-shaped void ``dataset.think_overshoot_penalty`` fell into before the
+    flag predicates were hoisted here.
+
+    ``mode`` is the shape:
+
+    ``proportional`` charges per unit past ``limit`` -- Kenton et al.'s "soft
+        additive penalty proportional to the excess" (2608.17776 3.4).
+    ``flat`` charges ``coeff`` once for any overrun, however small.
+
+    Prefer ``proportional`` for anything a group-relative optimizer trains on.
+    A flat term reaches a CISPO advantage only through its variance INSIDE the
+    group, so on a group whose samples all sit on one side of the budget it is
+    a constant shift the baseline removes -- exactly zero signal. Its pressure
+    peaks near a 50% trip rate and switches off as the policy complies, which
+    is how the flat ``think_overshoot_penalty`` drove the RLVR arm's length to
+    collapse on 2026-08-27 and then went inert at step 32, leaving the policy
+    short with nothing holding it there.
+
+    ``limit`` is what keeps either shape from becoming a shortness reward:
+    below it the charge is exactly zero, so an empty generation earns nothing a
+    compliant one does not. A per-unit price with no limit is optimised by
+    saying nothing.
+    """
+
+    coeff: float
+    limit: int
+    mode: str = "proportional"
+    sign: int = -1
+    slots: Optional[Iterable[str]] = None
+
+    def __post_init__(self) -> None:
+        # A typo'd mode must not silently pick a shape: the two differ by a
+        # factor of the excess, and that difference decided a run.
+        if self.mode not in ("proportional", "flat"):
+            raise ValueError(
+                f"budget term mode must be 'proportional' or 'flat', got {self.mode!r}"
+            )
+        if self.limit < 0:
+            raise ValueError(f"budget term limit must be >= 0, got {self.limit}")
+
+    def matches(self, slot: Optional[str]) -> bool:
+        return self.slots is None or (slot is not None and slot in self.slots)
+
+    def excess(self, n: float) -> float:
+        """Units past the budget, which is the number a metric should report.
+        A boolean `over_budget` saturates at 1.0 the moment the limit is
+        crossed, so a batch drifting from barely-over to far-over looks
+        identical to a stable one."""
+        return float(max(0.0, float(n) - self.limit))
+
+    def delta(self, n: float, slot: Optional[str] = None) -> float:
+        if not self.coeff or not self.matches(slot):
+            return 0.0
+        over = self.excess(n)
+        if not over:
+            return 0.0
+        return self.sign * self.coeff * (1.0 if self.mode == "flat" else over)
+
+
 def sample_flags(sample: Any, names: Iterable[str]) -> dict[str, float]:
     """The named sample-level features as 0.0/1.0.
 

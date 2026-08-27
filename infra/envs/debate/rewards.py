@@ -13,7 +13,7 @@ from typing import ClassVar, Literal, Optional, Protocol
 from pydantic import BaseModel, Field
 
 from infra.envs.debate.judge import LogitStatus, SeatVerdict, Verdict
-from infra.envs.shaping import FlagTerm
+from infra.envs.shaping import BudgetTerm, FlagTerm
 from infra.models.base import ModelSettings, resolved_sampling_profile
 
 RewardMode = Literal["competitive", "collaborative"]
@@ -165,6 +165,14 @@ class SlotTokenCounts:
     visible: int
     total: int
     cap_total: Optional[int] = None
+    # Whitespace-delimited words in the slot's VISIBLE speech — the unit
+    # Kenton et al. state their limit in, and not derivable from `visible`:
+    # LaTeX-dense speech ran ~1.6 tokens/word in a live rollout while prose
+    # runs near 1.3, so a token-count proxy prices the same 150 words
+    # differently depending on how much math the speech happens to contain.
+    # Defaults to 0 so a term that does not read it is unaffected, and so the
+    # many test fixtures that build this by keyword keep working.
+    visible_words: int = 0
     # Env-computed per-slot features (e.g. answer_format_valid=1.0 when the
     # solution slot yielded the task family's strict answer candidate); read
     # by flag-gated shaping terms like format_reward.
@@ -227,6 +235,14 @@ class SlotTerm:
 
 @dataclass
 class LengthPenalty(SlotTerm):
+    """A per-token price on the whole slot, charged from the first token.
+
+    There is no threshold: every speech pays, and the cheapest speech is the
+    empty one. When what you want is a stated limit that is free to reach, the
+    term is ``BudgetPenalty`` below — the two are otherwise easy to
+    confuse, since both are linear.
+    """
+
     counts: Literal["think", "visible", "total"] = "total"
     per_slot: bool = True  # instance field here: this term alone can broadcast
     normalize: Optional[Literal["cap"]] = None
@@ -310,9 +326,103 @@ class SpeechOvershootPenalty(FlagShaping):
     sign: ClassVar[int] = -1
 
 
+@dataclass
+class BudgetPenalty(SlotTerm):
+    """A per-slot length budget: free up to ``limit``, charged past it.
+
+    What separates this from ``LengthPenalty`` is the THRESHOLD, not the shape
+    — that term is already linear. It prices length itself from the first
+    token, so every speech pays and the cheapest speech is the empty one. This
+    one prices only the excess past ``limit``, so complying is free and the
+    term is silent on slots that fit.
+
+    ``counts`` picks the quantity, and the two uses are different enough to be
+    worth naming:
+
+    ``words``  — the Kenton et al. (2608.17776 §3.4) word limit on the reply
+        slots, a budget stated in the prompt cue and charged for in the reward.
+        Words and not tokens because that is the unit the cue states and the
+        one the model can count; LaTeX-dense speech ran ~1.6 tokens/word here
+        against ~1.3 for prose, so a token proxy prices the same 150 words
+        differently depending on how much math a speech happens to contain.
+    ``think`` / ``visible`` / ``total`` — token budgets, for the SOLUTION slot.
+        The equivalent knob on the RLVR path is SingleTurnEnv's
+        ``soft_token_budget``, which a debate never reaches (DebateEnv extends
+        Env with its own rollout), so pricing a proposal's length has to happen
+        here or not at all — the same trap ``dataset.think_overshoot_penalty``
+        fell into, where the key was accepted and silently inert.
+
+    ``mode`` is the shape, and it is a config toggle because the choice between
+    the two is an empirical question this repo has now answered once, the
+    expensive way:
+
+    ``proportional`` (default, and what the paper specifies — "a soft additive
+        penalty proportional to the excess") charges ``coeff`` per word over.
+    ``flat`` charges ``coeff`` once for any overrun, however small.
+
+    Prefer ``proportional`` unless you are deliberately reproducing the flat
+    behaviour, because a flat term is largely invisible to a group-relative
+    optimizer. It reaches a CISPO advantage only through its variance INSIDE
+    the group, so on any group whose samples all land on one side of the
+    threshold it is a constant shift that the baseline removes — exactly zero
+    signal. Its pressure therefore peaks near a 50% trip rate and switches off
+    as the policy approaches either extreme. That is what the flat
+    ``think_overshoot_penalty`` did to the RLVR arm on 2026-08-27: it drove
+    length down until ``train/think_overshoot`` reached 0.000 at step 32, went
+    inert, and left the policy in a short regime with nothing holding it there.
+    Held-out correctness fell .699 -> .530 over the next ten steps. Charging
+    the excess keeps a per-sample gradient at every trip rate and removes the
+    cliff that made sitting far below the limit the safe play.
+
+    The excess is bounded by the slot's own hard token cap, so ``proportional``
+    needs no clamp; set ``coeff`` so a speech at that cap costs about what one
+    ``flat`` trip would.
+    """
+
+    limit: int = 150
+    mode: Literal["proportional", "flat"] = "proportional"
+    counts: Literal["words", "think", "visible", "total"] = "words"
+
+    kind: ClassVar[str] = "budget_penalty"
+
+    def __post_init__(self) -> None:
+        if self.counts not in ("words", "think", "visible", "total"):
+            raise ValueError(
+                f"{self.kind}: counts must be words/think/visible/total, "
+                f"got {self.counts!r}"
+            )
+        # Construct once here purely to VALIDATE, so a bad mode or limit is a
+        # config-time error naming the config's own spelling rather than a
+        # mid-rollout one. The shared term owns both validations, so the arms
+        # cannot drift on what they accept either.
+        try:
+            self._term()
+        except ValueError as exc:
+            raise ValueError(f"{self.kind}: {exc}") from exc
+
+    def _term(self) -> BudgetTerm:
+        """Built per call from the live fields rather than cached, matching
+        SingleTurnEnv._budget_term: `coeff` is a plain dataclass field and a
+        cached term would go on pricing a coefficient the config no longer
+        says."""
+        return BudgetTerm(coeff=self.coeff, limit=self.limit, mode=self.mode, sign=-1)
+
+    def value(self, counts: SlotTokenCounts) -> float:
+        n = counts.visible_words if self.counts == "words" else getattr(counts, self.counts)
+        # SlotTerm.apply has already filtered by slot, so this prices
+        # unconditionally and leaves slot matching to the one caller that owns it.
+        return self._term().delta(n)
+
+
 SHAPING_REGISTRY = {
     cls.kind: cls
-    for cls in (LengthPenalty, FormatReward, ThinkOvershootPenalty, SpeechOvershootPenalty)
+    for cls in (
+        LengthPenalty,
+        FormatReward,
+        ThinkOvershootPenalty,
+        SpeechOvershootPenalty,
+        BudgetPenalty,
+    )
 }
 
 

@@ -337,3 +337,72 @@ def test_paired_arms_declare_the_same_overshoot_coefficient():
     assert len(priced) == 1, "the debate arm must price overshoot exactly once"
     assert priced[0]["coeff"] == rlvr["dataset"]["think_overshoot_penalty"]
     assert priced[0]["slots"] == ["proposal"]
+
+
+# --------------------------------------------------- shared length budget
+
+
+def _budget_delta_rlvr(coeff: float, limit: int, mode: str, n_tokens: int) -> float:
+    """What SingleTurnEnv charges a sample of n_tokens."""
+    from infra.envs.shaping import BudgetTerm
+
+    class _Env(SingleTurnEnv):
+        def tasks(self, n, split="train"):
+            return []
+
+        def reward(self, task, text):
+            return 0.0, {}
+
+    env = _Env()
+    env.soft_token_budget = limit
+    env.overshoot_penalty = coeff
+    env.overshoot_mode = mode
+    term = env._budget_term()
+    assert isinstance(term, BudgetTerm)
+    return term.delta(n_tokens)
+
+
+def _budget_delta_debate(coeff: float, limit: int, mode: str, n_tokens: int) -> float:
+    """What the debate arm charges the SAME proposal, via scoring.shaping."""
+    from infra.envs.debate.rewards import (
+        BudgetPenalty,
+        RoundTokenReport,
+        SeatReward,
+        SlotTokenCounts,
+    )
+
+    report = RoundTokenReport(
+        counts={
+            ("alice", "proposal"): SlotTokenCounts(
+                think=0, visible=0, total=n_tokens, cap_total=None
+            )
+        }
+    )
+    delta = BudgetPenalty(
+        coeff=coeff, limit=limit, mode=mode, counts="total", slots=["proposal"]
+    ).apply({"alice": SeatReward(0.0, True, "win")}, report)
+    return delta.per_slot[("alice", "proposal")]
+
+
+@pytest.mark.parametrize("mode", ["flat", "proportional"])
+@pytest.mark.parametrize("n_tokens", [3999, 4000, 4001, 5024])
+def test_both_arms_price_a_length_budget_identically(mode, n_tokens):
+    """The RLVR arm spells this as dataset.soft_token_budget and the debate arm
+    as a scoring.shaping entry, because SingleTurnEnv.rollout never executes
+    for a debate. A stated budget must still buy the same signed delta on both.
+
+    Until infra/envs/shaping.BudgetTerm there were two implementations of
+    "past the budget" and this was asserted only by a config comment -- the
+    same gap that left dataset.think_overshoot_penalty accepted and inert on
+    the debate arm.
+    """
+    rlvr = _budget_delta_rlvr(0.0002, 4000, mode, n_tokens)
+    debate = _budget_delta_debate(0.0002, 4000, mode, n_tokens)
+    assert rlvr == pytest.approx(debate)
+
+
+def test_the_shared_budget_is_a_penalty_on_both_arms():
+    """Sign, not just magnitude: a term that paid a bonus on one arm and
+    charged on the other would satisfy an abs() comparison."""
+    assert _budget_delta_rlvr(0.0002, 4000, "proportional", 5024) < 0
+    assert _budget_delta_debate(0.0002, 4000, "proportional", 5024) < 0

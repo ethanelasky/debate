@@ -681,6 +681,11 @@ class DebateEnv(Env):
                 visible=visible,
                 total=len(r.sample.tokens),
                 cap_total=r.slot.slot.max_total_tokens,
+                # round.py already split the speech off the think phase from
+                # the regions, so r.text IS the visible speech and no second
+                # decode is needed here. Whitespace words, which is what a
+                # word limit in a prompt cue means to the model reading it.
+                visible_words=len((r.text or "").split()),
                 flags=flags,
             )
         return RoundTokenReport(counts=counts)

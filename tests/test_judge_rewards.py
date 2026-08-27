@@ -21,11 +21,13 @@ from infra.envs.debate.judge import (
     verdict_from_slot,
 )
 from infra.envs.debate.rewards import (
+    BudgetPenalty,
     LadderValues,
     LengthPenalty,
     RoundTokenReport,
     ScoringConfig,
     SlotTokenCounts,
+    SpeechOvershootPenalty,
     build_shaping,
     final_reward,
     ladder,
@@ -474,3 +476,159 @@ def test_build_shaping_from_yaml_style_dicts():
     assert terms[0].coeff == 0.0005 and terms[0].counts == "visible"
     with pytest.raises(ValueError):
         build_shaping([{"kind": "nope"}])
+
+
+# 11b ------------------------------------------- Kenton word limit (§3.4)
+
+
+def _words_report(a_speech: int, b_speech: int, a_closing: int = 0):
+    """Same shape as _report(), but the quantity the word limit prices."""
+    return RoundTokenReport(
+        counts={
+            ("Debater_A", "speech"): SlotTokenCounts(
+                think=100, visible=200, total=300, cap_total=600, visible_words=a_speech
+            ),
+            ("Debater_A", "closing"): SlotTokenCounts(
+                think=10, visible=40, total=50, cap_total=100, visible_words=a_closing
+            ),
+            ("Debater_B", "speech"): SlotTokenCounts(
+                think=0, visible=100, total=100, cap_total=600, visible_words=b_speech
+            ),
+        }
+    )
+
+
+def test_word_limit_charges_only_the_excess():
+    """"A soft additive penalty proportional to the excess" — so the charge is
+    the distance past the limit, not the length and not a flat trip."""
+    scored = score(_competitive_verdict(), "competitive")
+    term = BudgetPenalty(coeff=0.002, limit=150, slots=["speech"])
+    delta = term.apply(scored, _words_report(a_speech=200, b_speech=175))
+    assert delta.per_slot[("Debater_A", "speech")] == pytest.approx(-0.10)  # 50 over
+    assert delta.per_slot[("Debater_B", "speech")] == pytest.approx(-0.05)  # 25 over
+
+
+def test_a_speech_inside_the_limit_pays_nothing_however_long():
+    """No pressure below the limit: the term must not become a general
+    shortness reward, which is the gradient that collapsed the RLVR arm."""
+    scored = score(_competitive_verdict(), "competitive")
+    term = BudgetPenalty(coeff=0.002, limit=150, slots=["speech"])
+    delta = term.apply(scored, _words_report(a_speech=150, b_speech=1))
+    assert delta.per_slot[("Debater_A", "speech")] == 0.0
+    assert delta.per_slot[("Debater_B", "speech")] == 0.0
+
+
+def test_word_limit_separates_speeches_the_flat_term_prices_identically():
+    """The regression the proportional form exists to fix.
+
+    Under a 150-word cue with a 320-token ceiling, a 200-word speech and a
+    151-word speech both fit the cap, so ``truncated`` is False on both and the
+    flat term charges them the SAME (nothing). Priced on the excess they differ
+    by a factor of 50, which is the signal the cue was always asserting and the
+    reward never paid.
+    """
+    scored = score(_competitive_verdict(), "competitive")
+    flat = SpeechOvershootPenalty(coeff=0.1, slots=["speech"])
+    prop = BudgetPenalty(coeff=0.002, limit=150, slots=["speech"])
+    report = _words_report(a_speech=200, b_speech=151)
+
+    flat_delta = flat.apply(scored, report)
+    assert flat_delta.per_slot[("Debater_A", "speech")] == flat_delta.per_slot[
+        ("Debater_B", "speech")
+    ] == 0.0
+
+    prop_delta = prop.apply(scored, report)
+    assert prop_delta.per_slot[("Debater_A", "speech")] == pytest.approx(-0.10)
+    assert prop_delta.per_slot[("Debater_B", "speech")] == pytest.approx(-0.002)
+
+
+def test_flat_mode_charges_once_however_far_over():
+    """The other half of the toggle. Same limit, same coeff, same speeches —
+    only the shape differs, and under `flat` a 1-word overrun and a 50-word one
+    cost exactly the same. That indifference is the property that makes a flat
+    term invisible to a group-relative baseline."""
+    scored = score(_competitive_verdict(), "competitive")
+    term = BudgetPenalty(coeff=0.1, limit=150, mode="flat", slots=["speech"])
+    delta = term.apply(scored, _words_report(a_speech=200, b_speech=151))
+    assert delta.per_slot[("Debater_A", "speech")] == pytest.approx(-0.1)
+    assert delta.per_slot[("Debater_B", "speech")] == pytest.approx(-0.1)
+
+
+def test_flat_mode_still_free_inside_the_limit():
+    scored = score(_competitive_verdict(), "competitive")
+    term = BudgetPenalty(coeff=0.1, limit=150, mode="flat", slots=["speech"])
+    delta = term.apply(scored, _words_report(a_speech=150, b_speech=0))
+    assert delta.per_slot[("Debater_A", "speech")] == 0.0
+    assert delta.per_slot[("Debater_B", "speech")] == 0.0
+
+
+def test_an_unknown_mode_is_refused_rather_than_defaulted():
+    """The two shapes differ by a factor of the excess, so a typo must not
+    quietly pick one."""
+    with pytest.raises(ValueError, match="mode"):
+        BudgetPenalty(coeff=0.002, limit=150, mode="linear")
+    with pytest.raises(ValueError, match="mode"):
+        build_shaping([{"kind": "budget_penalty", "coeff": 0.002, "mode": "proprtional"}])
+
+
+def test_word_limit_exempts_the_solution_turn_by_slot_selection():
+    """Kenton exempts Alice's solution turn; here that is the `slots` list, so
+    a term aimed at the reply slots must leave the graded slot untouched."""
+    scored = score(_competitive_verdict(), "competitive")
+    term = BudgetPenalty(coeff=0.002, limit=150, slots=["closing"])
+    delta = term.apply(scored, _words_report(a_speech=999, b_speech=999, a_closing=200))
+    assert ("Debater_A", "speech") not in delta.per_slot
+    assert delta.per_slot == {("Debater_A", "closing"): pytest.approx(-0.10)}
+
+
+def test_word_limit_builds_from_yaml_style_dict():
+    terms = build_shaping(
+        [{"kind": "budget_penalty", "coeff": 0.002, "limit": 150, "slots": ["critique"]}]
+    )
+    assert len(terms) == 1 and isinstance(terms[0], BudgetPenalty)
+    assert terms[0].coeff == 0.002 and terms[0].limit == 150 and terms[0].slots == ["critique"]
+
+
+def test_budget_penalty_can_price_solution_slot_tokens():
+    """The answer-generation use. The RLVR path prices proposal length through
+    SingleTurnEnv's soft_token_budget, which a debate never reaches — DebateEnv
+    extends Env with its own rollout — so on this arm a proposal budget has to
+    be a slot term or it does not exist."""
+    scored = score(_competitive_verdict(), "competitive")
+    report = RoundTokenReport(
+        counts={
+            ("Debater_A", "speech"): SlotTokenCounts(
+                think=4000, visible=1024, total=5024, cap_total=5024, visible_words=200
+            ),
+            ("Debater_B", "speech"): SlotTokenCounts(
+                think=2000, visible=200, total=2200, cap_total=5024, visible_words=40
+            ),
+        }
+    )
+    term = BudgetPenalty(coeff=0.0002, limit=4000, counts="total", slots=["speech"])
+    delta = term.apply(scored, report)
+    assert delta.per_slot[("Debater_A", "speech")] == pytest.approx(-0.2048)  # 1024 over
+    assert delta.per_slot[("Debater_B", "speech")] == 0.0                     # inside
+
+
+def test_words_and_tokens_are_not_interchangeable_on_the_same_slot():
+    """Why `counts` exists rather than a token proxy for the word limit: the
+    same slot is 200 words and 5024 tokens, and a budget of 150 means very
+    different things depending on which one it reads."""
+    scored = score(_competitive_verdict(), "competitive")
+    report = RoundTokenReport(
+        counts={
+            ("Debater_A", "speech"): SlotTokenCounts(
+                think=4000, visible=1024, total=5024, cap_total=5024, visible_words=200
+            ),
+        }
+    )
+    by_words = BudgetPenalty(coeff=1.0, limit=150, counts="words", slots=["speech"])
+    by_visible = BudgetPenalty(coeff=1.0, limit=150, counts="visible", slots=["speech"])
+    assert by_words.apply(scored, report).per_slot[("Debater_A", "speech")] == -50.0
+    assert by_visible.apply(scored, report).per_slot[("Debater_A", "speech")] == -874.0
+
+
+def test_an_unknown_counts_is_refused():
+    with pytest.raises(ValueError, match="counts"):
+        BudgetPenalty(coeff=0.002, limit=150, counts="tokens")

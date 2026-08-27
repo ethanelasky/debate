@@ -499,6 +499,9 @@ class SymbolicMathEnv(SingleTurnEnv):
         relaxed_correct_bonus: float = 0.1,
         format_reward: float = 0.0,
         think_overshoot_penalty: float = 0.0,
+        soft_token_budget: Optional[int] = None,
+        overshoot_penalty: float = 0.0,
+        overshoot_mode: str = "flat",
     ):
         self.family = family
         self.rng = random.Random(seed)
@@ -514,6 +517,32 @@ class SymbolicMathEnv(SingleTurnEnv):
             raise ValueError(
                 "math_symbolic: think_overshoot_penalty must be >= 0 "
                 f"(it is subtracted), got {think_overshoot_penalty}"
+            )
+        # Length budget on the ANSWER GENERATION itself, priced by SingleTurnEnv.
+        # Distinct from think_overshoot_penalty above, which is a boolean on
+        # "the think phase was force-closed at its cap" and carries no magnitude
+        # -- budget_forced_sample injects </think> at the cap, so the sample
+        # physically cannot exceed it and there is nothing to be proportional to.
+        # This one has the magnitude, which is the whole reason it exists.
+        self.soft_token_budget = int(soft_token_budget) if soft_token_budget else None
+        self.overshoot_penalty = float(overshoot_penalty)
+        if self.overshoot_penalty < 0:
+            raise ValueError(
+                "math_symbolic: overshoot_penalty must be >= 0 "
+                f"(it is subtracted), got {overshoot_penalty}"
+            )
+        if overshoot_mode not in ("flat", "proportional"):
+            raise ValueError(
+                "math_symbolic: overshoot_mode must be 'flat' or 'proportional', "
+                f"got {overshoot_mode!r}"
+            )
+        self.overshoot_mode = overshoot_mode
+        if self.overshoot_penalty and self.soft_token_budget is None:
+            raise ValueError(
+                "math_symbolic: overshoot_penalty is set but soft_token_budget is "
+                "not, so the penalty can never fire. State the budget or drop the "
+                "penalty -- a priced term that silently never applies is the "
+                "value-shaped void this check exists to close."
             )
 
     def _task(self, row: dict[str, Any], split: str) -> Task:
@@ -598,6 +627,9 @@ class SymbolicMathFamily(TaskFamily):
                 "relaxed_correct_bonus",
                 "format_reward",
                 "think_overshoot_penalty",
+                "soft_token_budget",
+                "overshoot_penalty",
+                "overshoot_mode",
             },
             "math_symbolic",
         )
@@ -612,6 +644,9 @@ class SymbolicMathFamily(TaskFamily):
         think_overshoot_penalty = float(ds.get("think_overshoot_penalty", 0.0))
         if think_overshoot_penalty < 0:
             raise ValueError("math_symbolic: think_overshoot_penalty must be >= 0")
+        soft_token_budget = int(ds["soft_token_budget"]) if ds.get("soft_token_budget") else None
+        overshoot_penalty = float(ds.get("overshoot_penalty", 0.0))
+        overshoot_mode = str(ds.get("overshoot_mode", "flat"))
 
         dataset = _load_symbolic_dataset()
         if "train" not in dataset or "test" not in dataset:
@@ -626,6 +661,9 @@ class SymbolicMathFamily(TaskFamily):
             relaxed_correct_bonus=relaxed_correct_bonus,
             format_reward=format_reward,
             think_overshoot_penalty=think_overshoot_penalty,
+            soft_token_budget=soft_token_budget,
+            overshoot_penalty=overshoot_penalty,
+            overshoot_mode=overshoot_mode,
         )
         self._protocol_identity = {
             "family": "math_symbolic",
@@ -672,6 +710,9 @@ class SymbolicMathFamily(TaskFamily):
             "relaxed_correct_bonus": repr(relaxed_correct_bonus),
             "format_reward": repr(format_reward),
             "think_overshoot_penalty": repr(think_overshoot_penalty),
+            "soft_token_budget": "none" if soft_token_budget is None else str(soft_token_budget),
+            "overshoot_penalty": repr(overshoot_penalty),
+            "overshoot_mode": overshoot_mode,
             "training_seed": str(seed),
             **DEPENDENCY_VERSIONS,
         }

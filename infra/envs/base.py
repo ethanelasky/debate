@@ -11,10 +11,10 @@ import concurrent.futures
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from infra.backend.base import Backend, Datum, Region, Sample, SamplingParams, visible_text
-from infra.envs.shaping import truncated
+from infra.envs.shaping import BudgetTerm, truncated
 
 Message = dict[str, str]
 
@@ -179,18 +179,58 @@ class SingleTurnEnv(Env):
     # has no fidelity-kept samples.
     last_rollout_info: dict[str, int | float] = {}
 
-    #: Flat overshoot penalty. A sample longer than `soft_token_budget` loses
-    #: `overshoot_penalty` from its reward — a constant, NOT scaled by how far
-    #: over it went. The old repo ramped the penalty between a soft budget and
-    #: a hard limit (coef 0.10 at 4096/8192 cost a half-way overshoot 0.05);
-    #: flat is the deliberate change, so the gradient says "stay under the
-    #: budget" rather than "be marginally shorter".
+    #: Overshoot penalty on a sample longer than `soft_token_budget`.
+    #: `overshoot_mode` picks the shape. Both this and the debate arm's
+    #: `BudgetPenalty` resolve to ONE shaping.BudgetTerm, so a budget priced on
+    #: both arms cannot pick up a different shape or a different coefficient
+    #: convention on one of them:
+    #:
+    #:   "flat"         — a constant `overshoot_penalty`, NOT scaled by how far
+    #:                    over it went. The gradient says "stay under the
+    #:                    budget" rather than "be marginally shorter".
+    #:   "proportional" — `overshoot_penalty` per token past the budget, which
+    #:                    is what the old repo did (coef 0.10 ramped between a
+    #:                    4096 soft budget and an 8192 hard limit cost a
+    #:                    half-way overshoot 0.05). Restored as an option, not
+    #:                    as the default, so no existing arm changes shape.
+    #:
+    #: Prefer "proportional" for anything a group-relative optimizer trains on.
+    #: A flat term reaches a CISPO advantage only through its variance INSIDE
+    #: the group, so on a group whose samples all sit on one side of the budget
+    #: it is a constant shift the baseline removes — exactly zero signal. Its
+    #: pressure peaks near a 50% trip rate and switches off as the policy
+    #: complies, which is how the flat think_overshoot_penalty drove the RLVR
+    #: arm's length to collapse on 2026-08-27 and then went inert at step 32
+    #: with nothing holding the policy where it had been pushed.
+    #:
+    #: Whichever shape: the budget is what keeps this from becoming a general
+    #: shortness reward. Below it the term is exactly zero, so an empty sample
+    #: earns nothing that a compliant one does not. A per-token price with no
+    #: budget (the debate arm's LengthPenalty) is optimised by saying nothing.
     #:
     #: This does NOT change the sampler cap: generation still stops at the
     #: backend's response_length. It only prices length in the reward, so a
     #: budget above that cap can never fire. Off by default.
     soft_token_budget: Optional[int] = None
     overshoot_penalty: float = 0.0
+    overshoot_mode: Literal["flat", "proportional"] = "flat"
+
+    def _budget_term(self) -> Optional[BudgetTerm]:
+        """This env's length budget as the shared term, or None when off.
+
+        Built per call rather than cached on the instance because these three
+        attributes are plain fields that tests and callers reassign after
+        construction (tests/test_codecontests.py sets soft_token_budget = None
+        mid-test to measure the penalty by difference); a cached term would go
+        on pricing the old budget.
+        """
+        if not self.soft_token_budget:
+            return None
+        return BudgetTerm(
+            coeff=self.overshoot_penalty,
+            limit=self.soft_token_budget,
+            mode=self.overshoot_mode,
+        )
 
     #: Hard per-generation token caps for EVERY rollout this env runs — train
     #: and eval alike, since both go through this one rollout(). Injected by
@@ -297,15 +337,22 @@ class SingleTurnEnv(Env):
             # text; token counts live on the Sample. Applied BEFORE the
             # Trajectory and the record are built so both carry the same
             # penalized reward the optimizer sees.
-            over = bool(self.soft_token_budget and len(s.tokens) > self.soft_token_budget)
+            # ONE definition of "past the length budget", shared with the
+            # debate arm's BudgetPenalty (infra/envs/shaping.py). Both arms
+            # price a proposal's length; before this they did it with two
+            # implementations that a config comment asserted were equivalent,
+            # which is how soft_token_budget came to be accepted here and
+            # structurally inert over there.
+            term = self._budget_term()
+            excess = term.excess(len(s.tokens)) if term else 0.0
             info = {
                 **info,
                 "tokens": float(len(s.tokens)),
                 "truncated": float(truncated(s)),
-                "over_budget": float(over),
+                "over_budget": float(bool(excess)),
+                "overshoot_tokens": excess,
             }
-            if over:
-                reward -= self.overshoot_penalty
+            reward += term.delta(len(s.tokens)) if term else 0.0
             groups[gi].append(Trajectory(datums=[datum_from_sample(s)], reward=reward, info=info))
             records.append(
                 {
