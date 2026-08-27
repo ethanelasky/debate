@@ -287,6 +287,23 @@ memory; `free`/`nproc` are the host, not the cgroup).
 
 Working notes and worked numbers: `docs/hardware-model.md`.
 
+### The balance auto-tops-up; a short runway is not an emergency
+
+RunPod auto top-up is **on** for this account, and `jobd`'s own `auto_topup`
+is true. A low balance, or a short "runway" figure from `jobd validate`, is
+therefore a cost signal and not a deadline. It is not a reason to halt a run,
+cancel a job, decline to submit one, or stop mid-task to ask about money.
+Quote the number when a decision actually turns on it, then keep working.
+
+The number is also not what it appears to be: `jobd validate` computes burn
+across every pod on the account, including ones jobd did not create, so it
+over-reports the cost of the work in front of you.
+
+What auto top-up genuinely does not cover is a declined card — invisible from
+inside a session, and the failure it would cause (a pod terminated for
+non-payment takes its outputs with it) is the same one `require_reconstructible`
+and the output-collection path already exist to bound. Not a per-run concern.
+
 ## Evaluation protocol
 
 Token budgets derive from the training config (here: the protocol's per-slot
