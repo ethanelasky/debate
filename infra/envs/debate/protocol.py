@@ -114,10 +114,28 @@ class Protocol:
                 raise ValueError(f"turn {t} must be a non-empty mapping of speaker -> slots")
             turn: dict[str, list[Slot]] = {}
             for speaker, slots_raw in turn_raw.items():
+                # `null` DELETES this speaker's slots, and a turn left with no
+                # speakers drops out entirely. This is the only way a child can
+                # SHORTEN a protocol: config lists deep-merge BY INDEX and the
+                # merge only walks the override's entries, so declaring fewer
+                # turns leaves the parent's extra ones in place -- a 3-turn
+                # override of a 5-turn parent silently keeps the rebuttals and
+                # unions the judge into the alice_rebuttal turn. `null` is
+                # already the repo's idiom for clearing an inherited key (see
+                # max_think_tokens on the reply slots of math_pc_l5).
+                #
+                # An empty LIST is still an error, and so is an empty turn
+                # mapping: `[]` merges into a populated list as a no-op rather
+                # than clearing it, so writing it means the author expected a
+                # deletion that will not happen.
+                if slots_raw is None:
+                    continue
                 if not isinstance(slots_raw, list) or not slots_raw:
                     raise ValueError(f"turn {t} speaker {speaker!r}: slots must be a non-empty list")
                 # bare-string shorthand: `- speech` == `{name: speech}`
                 turn[str(speaker)] = [Slot.parse({"name": s} if isinstance(s, str) else s) for s in slots_raw]
+            if not turn:
+                continue
             turns.append(turn)
         proto = cls(turns=turns)
         proto.validate()

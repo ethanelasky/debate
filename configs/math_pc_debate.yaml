@@ -62,7 +62,7 @@ _base_math_pc:
     shaping:
       # +0.1 on the proposal DATUM (not the whole trajectory) when the answer
       # had a valid answer format — trajectory-specific reward via per-datum GRPO.
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
   # L3-4: the contested band for a 4B (L1-2 ran 71-88% correct -> debates
   # uncontested; L5-only sits near the always-wrong floor at this scale, the
   # old repo's own warning). L5 arm below for harder runs / the 9B.
@@ -179,15 +179,15 @@ math_pc_l5:
   # (lists deep-merge BY INDEX); edit the two together.
   scoring:
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
-      - {kind: think_overshoot_penalty, coeff: 0.1, slots: [proposal], flag: think_overshoot}
+      - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {name: proposal_think_overshoot, kind: think_overshoot_penalty, coeff: 0.1, slots: [proposal], flag: think_overshoot}
       # Per-speech budget pricing on the non-solution turns, after Kenton et
       # al. (2608.17776 §3.4): the word limit is stated in the cue AND paid for
       # in the reward. Flat, on the same 0.1 as the overshoot terms: the
       # feature is "this speech ran out of budget", so a speech that fits pays
       # nothing however long it is, and one that is cut mid-sentence pays once.
       # The proposal is exempt, as Alice's solution turn is there.
-      - {kind: speech_overshoot_penalty, coeff: 0.1, flag: truncated,
+      - {name: reply_truncation, kind: speech_overshoot_penalty, coeff: 0.1, flag: truncated,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
 
 # ---------------------------------------------------------------------------
@@ -411,14 +411,14 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton:
   _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8
   scoring:
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
-      - {kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
-      - {kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
+      - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {name: proposal_think_overshoot, kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
+      - {name: reply_truncation, kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
       # mode is stated rather than left to the default: it is the whole
       # intervention, and `mode: flat` at coeff 0.1 reproduces the behaviour
       # this arm exists to replace, which makes the ablation a one-word edit.
-      - {kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
+      - {name: reply_word_budget, kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
 
 # Debate warm-started from the RLVR control's step 20. Ethan, 2026-08-27.
@@ -493,11 +493,35 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget:
   _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
   scoring:
     shaping:
-      - {kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
-      - {kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
-      - {kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
+      - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
+      - {name: proposal_think_overshoot, kind: think_overshoot_penalty, coeff: 0.0, slots: [proposal], flag: think_overshoot}
+      - {name: reply_truncation, kind: speech_overshoot_penalty, coeff: 0.0, flag: truncated,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
-      - {kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
+      - {name: reply_word_budget, kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
-      - {kind: budget_penalty, coeff: 0.0002, limit: 4000, mode: proportional,
+      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.0002, limit: 4000, mode: proportional,
          counts: total, slots: [proposal]}
+
+# Proposal -> critique -> judge: the rebuttal round removed. `null` deletes a
+# speaker's slots; declaring fewer turns would leave the parent's in place,
+# since turns are positional records and still merge by index.
+#
+# Alice never answers the critique, and under the current cue Bob attacks
+# every proposal including correct ones. So this asks whether the judge can
+# tell a sound attack from a manufactured one unaided.
+math_pc_no_rebuttals:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+  protocol:
+    turns:
+      - {}
+      - {}
+      - alice: null
+      - bob: null
+  scoring:
+    # Narrowing `slots` in place would merge by index and leave the deleted
+    # slots behind, so the inherited term is dropped and restated.
+    shaping:
+      - {name: reply_truncation, _drop: true}
+      - {name: reply_word_budget, _drop: true}
+      - {name: critique_word_budget, kind: budget_penalty, coeff: 0.002,
+         limit: 150, mode: proportional, slots: [critique]}

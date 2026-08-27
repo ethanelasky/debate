@@ -856,3 +856,55 @@ def test_speech_overshoot_shaping_rejects_a_slot_with_no_budget():
                 shaping=[{"kind": "speech_overshoot_penalty", "coeff": 0.1, "slots": ["proposal"]}]
             ),
         )
+
+
+# ------------------------------------------- shortening an inherited protocol
+
+
+def test_null_slots_delete_a_speaker_and_an_emptied_turn_drops():
+    """`null` is how a child SHORTENS a protocol, and it is the only way.
+
+    Config lists deep-merge BY INDEX and the merge walks only the override's
+    entries, so declaring fewer turns leaves the parent's extra ones in place:
+    a 3-turn override of this 5-turn parent keeps both rebuttals and unions the
+    judge into the alice_rebuttal turn. `null` already means "clear the
+    inherited key" elsewhere in these configs (max_think_tokens on the reply
+    slots of math_pc_l5), so it means the same here.
+    """
+    proto = Protocol.parse(
+        {
+            "turns": [
+                {"alice": [{"name": "proposal", "kind": "solution", "max_total_tokens": 64}]},
+                {"bob": [{"name": "critique", "max_total_tokens": 32}]},
+                {"alice": None},
+                {"bob": None},
+                {"judge": [{"name": "verdict", "kind": "decision", "max_total_tokens": 16}]},
+            ]
+        }
+    )
+    assert [cs.slot.name for cs in proto.compile()] == ["proposal", "critique", "verdict"]
+    # The judge turn keeps its own identity rather than being merged into the
+    # turn a deleted speaker vacated.
+    assert [cs.speaker for cs in proto.compile()] == ["alice", "bob", "judge"]
+
+
+def test_a_turn_keeps_its_other_speakers_when_one_is_deleted():
+    proto = Protocol.parse(
+        {
+            "turns": [
+                {"alice": [{"name": "proposal", "kind": "solution", "max_total_tokens": 64}]},
+                {"bob": [{"name": "critique", "max_total_tokens": 32}], "alice": None},
+                {"judge": [{"name": "verdict", "kind": "decision", "max_total_tokens": 16}]},
+            ]
+        }
+    )
+    assert [cs.slot.name for cs in proto.compile()] == ["proposal", "critique", "verdict"]
+
+
+def test_an_empty_slot_list_is_still_an_error():
+    """`[]` merges into a populated list as a NO-OP rather than clearing it, so
+    an author who writes it is expecting a deletion that will not happen."""
+    with pytest.raises(ValueError, match="non-empty list"):
+        Protocol.parse({"turns": [{"alice": []}]})
+    with pytest.raises(ValueError, match="non-empty mapping"):
+        Protocol.parse({"turns": [{}]})
