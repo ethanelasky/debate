@@ -70,7 +70,7 @@ jobs:
       # Fill this after the implementation is committed. The repo input
       # excludes .git, so the driver refuses a placeholder rather than
       # publishing invented provenance.
-      SOURCE_COMMIT=__SOURCE_COMMIT__
+      SOURCE_COMMIT=eda6b5ec888f7e01e224a092ef7df3a4169f1f17
       printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
         || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
 
