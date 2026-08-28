@@ -2,12 +2,11 @@
 every OpenAI-compatible provider (Fireworks, OpenRouter, DashScope, local
 vLLM/LM Studio servers).
 
-Salvaged from ~/ai-debate/ai_infra/models/openai_model.py. Kept: client
-construction, the request core, decision-logprob capture, reasoning-model
-detection, server-side n>1, response extraction. Dropped: the sampling
-capability/validation machinery (wrappers now just place the sampling kwargs
-they support and ignore the rest), tool-call plumbing, token-fidelity
-enforcement, BoN/probe hooks.
+Covers client construction, the request core, decision-logprob capture,
+reasoning-model detection, server-side n>1, and response extraction.
+Deliberately absent: sampling capability/validation machinery (wrappers just
+place the sampling kwargs they support and ignore the rest), tool-call
+plumbing, token-fidelity enforcement, best-of-n/probe hooks.
 """
 
 from __future__ import annotations

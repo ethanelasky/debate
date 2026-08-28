@@ -460,16 +460,15 @@ def render_context(
 def create_retry_feedback(
     failed_text: str, retry_attempt: int, schema: str, seat_names: list[str]
 ) -> str:
-    """Error-feedback user message for an unparseable-verdict retry, ported
-    from the old repo's Judge._create_retry_prompt (ai_debate/debate/judge.py,
-    working tree). The scaffolding (PARSING ERROR header, previous-response
-    snippet capped at 500 chars, format-block framing, closing "Ensure" list)
-    and the collaborative branch keep the old wording verbatim. The
-    competitive example lines substitute THIS round's seat display names — the
-    old winner-shape constants were byte-copies of the old math arm's decision
-    instruction ('"Debater A" ... the Proposer's boxed answer'), whose seat
-    naming and win semantics do not exist here; the confidence / Tie /
-    no-other-keys bullets and the closing sentence are kept verbatim."""
+    """Error-feedback user message for an unparseable-verdict retry. The
+    wording here is FROZEN — do not reword. The scaffolding (PARSING ERROR
+    header, previous-response snippet capped at 500 chars, format-block
+    framing, closing "Ensure" list) and the collaborative branch are verbatim
+    as calibrated. The competitive example lines substitute THIS round's seat
+    display names, because the fixed winner-shape constants they replaced
+    carried seat naming and win semantics that do not exist here; the
+    confidence / Tie / no-other-keys bullets and the closing sentence stay
+    verbatim."""
     error_msg = (
         f"PARSING ERROR: Your previous verdict could not be parsed. "
         f"This is retry attempt {retry_attempt}.\n\n"

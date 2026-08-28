@@ -1,17 +1,17 @@
 """Process-wide per-provider concurrency / deadline / retry gate.
 
-Salvaged from ~/ai-debate/ai_infra/models/provider_gate.py, slimmed. One
-registry keyed by provider name replaces the hand-rolled per-wrapper
-ThreadPoolExecutors, backoff decorators, and the module-global DashScope rate
+One registry keyed by provider name, in place of per-wrapper
+ThreadPoolExecutors, backoff decorators, and a module-global DashScope rate
 limiter. Wrappers call ``run_batched_predict`` for batch fan-out and
 ``call_with_retry`` around the raw API call, supplying their own retryability
-predicates; only the budgets come from here. Dropped: token-fidelity hooks,
-provenance/metrics callbacks.
+predicates; only the budgets come from here. Deliberately absent:
+token-fidelity hooks, provenance/metrics callbacks.
 
-The defaults reproduce the old wrappers' effective limits: fan-out widths per
-provider, unbounded process-wide concurrency (the old executors were built per
-predict() call, so they never capped anything across rounds), no driver-level
-deadline (timeouts lived in the HTTP clients and stay there), and each
+The defaults reproduce the effective limits these runs were calibrated under:
+fan-out widths per provider, unbounded process-wide concurrency (executors
+were built per predict() call, so they never capped anything across rounds),
+no driver-level deadline (timeouts live in the HTTP clients and stay there),
+and each
 wrapper's backoff budget verbatim. SDK-internal retries/timeouts are
 deliberately not modeled here.
 

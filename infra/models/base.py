@@ -1,10 +1,10 @@
 """Inference-model layer: types + Model ABC.
 
-Salvaged from ~/ai-debate/ai_infra/models/model.py, slimmed. Kept: the batch
-predict() contract, ModelInput/ModelResponse, the YAML-facing ModelSettings
-(field-compatible with existing experiment YAMLs), sampling profiles.
-Dropped: the SAMPLING_CAPABILITIES declaration machinery, effective-sampling
-provenance stamping, BoN scoring, probe hyperparams, generation-ledger fields.
+Covers the batch predict() contract, ModelInput/ModelResponse, the
+YAML-facing ModelSettings (field-compatible with existing experiment YAMLs),
+and sampling profiles. Deliberately absent: SAMPLING_CAPABILITIES declaration
+machinery, effective-sampling provenance stamping, best-of-n scoring, probe
+hyperparams, generation-ledger fields.
 """
 
 from __future__ import annotations

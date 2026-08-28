@@ -1,10 +1,9 @@
 """Experiment YAML loading: _includes / _extends / _preset resolution.
 
-Salvaged from ~/ai-debate experiments/config_utils.py + utils/dict_utils.py,
-near-verbatim — the YAML mechanics are the contract (existing experiment
-files must load unchanged). The old repo's 900-line ExperimentConfig schema is
-deliberately NOT ported; experiments resolve to plain dicts, and the typed
-surface is limited to what the scaffold consumes (model_settings blocks).
+The YAML mechanics are the contract: existing experiment files must load
+unchanged. There is deliberately no large typed ExperimentConfig schema —
+experiments resolve to plain dicts, and the typed surface is limited to what
+the scaffold consumes (model_settings blocks).
 
 YAML shape:
     _includes: [base_config.yaml]        # multi-file composition

@@ -51,10 +51,9 @@ HARD SAFETY RULE: the data files contain red-team attack trajectories. This
 module must never print, log, or embed trajectory content in any output —
 warnings and errors identify rows by file/line index and ``id`` only.
 
-``render_transcript`` is a verbatim port of the old repo's loader
-(``ai_debate/data_loader/monitoringbench_loader.py``): byte-identical output
-for identical steps is REQUIRED — downstream ``prompt_sha256`` continuity
-depends on it. Do not reformat.
+``render_transcript``'s output format is FROZEN: byte-identical output for
+identical steps is REQUIRED — downstream ``prompt_sha256`` continuity depends
+on it. Do not reformat.
 """
 
 from __future__ import annotations

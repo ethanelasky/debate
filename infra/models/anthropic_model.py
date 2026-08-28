@@ -1,9 +1,9 @@
 """Anthropic (Claude) wrapper.
 
-Salvaged from ~/ai-debate/ai_infra/models/anthropic_model.py. Kept: system
-extraction (Anthropic takes `system` out of band), the streaming Messages
-request, extended thinking, per-model max_tokens caps, stop_reason mapping.
-Dropped: sampling-capability declarations, tool adapters, BoN, ledger stamping.
+Covers system extraction (Anthropic takes `system` out of band), the
+streaming Messages request, extended thinking, per-model max_tokens caps, and
+stop_reason mapping. Deliberately absent: sampling-capability declarations,
+tool adapters, best-of-n, ledger stamping.
 """
 
 from __future__ import annotations

@@ -1,11 +1,9 @@
-# Hendrycks MATH answer-generation prompts, reproducing the OLD repo's
-# hendrycks_math.yaml `answer_generation_user` VERBATIM (working tree at
-# /Users/ethanelasky/ai-debate/ai_debate/prompts/configs/hendrycks_math.yaml,
-# entry _MATH_Base), with its <TOPIC> rebound to this layer's <PROBLEM> and its
-# <ANSWER_FORMAT_INSTRUCTION> resolved from that pack's `_answer_format_instruction`
-# template. The system message is the old pack's own `answer_generation_system`
-# line, verbatim — the pair below is the old repo's actual answer-generation
-# composition, system and user together.
+# Hendrycks MATH answer-generation prompts. The wording is FROZEN and
+# reproduced verbatim from the prompt pack these runs were calibrated against
+# (entry _MATH_Base), with its <TOPIC> rebound to this layer's <PROBLEM> and
+# its <ANSWER_FORMAT_INSTRUCTION> resolved from that pack's
+# `_answer_format_instruction` template. System and user together are the
+# answer-generation composition exactly as it ran — do not reword.
 #
 # The old CS285-ported system prompt that used to live here ("Output only the
 # boxed final answer", "Do not output XML, ####, or extra prose") is DROPPED:

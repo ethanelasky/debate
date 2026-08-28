@@ -1,8 +1,7 @@
 """Random model: gibberish speeches and coin-flip verdicts. Test fixture only.
 
-Salvaged from ~/ai-debate/ai_infra/models/random_model.py, slimmed to the
-Debater_A/Debater_B name family. Judge outputs carry a JSON verdict envelope
-because the judge path parses the winner out of `speech`.
+Limited to the Debater_A/Debater_B name family. Judge outputs carry a JSON
+verdict envelope because the judge path parses the winner out of `speech`.
 """
 
 from __future__ import annotations

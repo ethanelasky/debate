@@ -120,8 +120,8 @@ class OpenRouterModel(OpenAIModel):
             api_key=resolved_api_key,
             timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
             default_headers={
-                "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://github.com/ai-debate"),
-                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "ai-debate"),
+                "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://github.com/ethanelasky/debate"),
+                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "debate"),
             },
         )
         self.endpoint = endpoint

@@ -62,9 +62,9 @@ class Trajectory:
 class Policy:
     """Chat-template rendering over backend.sample().
 
-    Presents a batch predict() so multi-turn env code (the salvaged debate
-    round loop) can treat it like the old repo's Model interface. Samples come
-    back with prompt_tokens attached so envs can build Datums directly.
+    Presents a batch predict() so multi-turn env code (the debate round loop)
+    can treat it like a Model. Samples come back with prompt_tokens attached so
+    envs can build Datums directly.
     """
 
     def __init__(self, backend: Backend, params: SamplingParams, chat_template_kwargs: dict | None = None):

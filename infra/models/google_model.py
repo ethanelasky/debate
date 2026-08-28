@@ -1,9 +1,9 @@
 """Google Gemini wrapper (google-genai SDK).
 
-Salvaged from ~/ai-debate/ai_infra/models/google_model.py. Kept: client setup,
-the generate_content request/response core, thought-summary capture, and
-safety-block detection (blocked prompt or candidate -> failed=True).
-Dropped: sampling-capability declarations, tool adapters, ledger stamping.
+Covers client setup, the generate_content request/response core,
+thought-summary capture, and safety-block detection (blocked prompt or
+candidate -> failed=True). Deliberately absent: sampling-capability
+declarations, tool adapters, ledger stamping.
 """
 
 from __future__ import annotations

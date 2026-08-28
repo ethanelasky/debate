@@ -1,10 +1,8 @@
 """CodeContests task family: competitive programming problems verified by
 running the candidate program against stdin/stdout test cases.
 
-Ported from the old repo (ai_debate/data_loader/codecontests_loader.py and
-ai_debate/experiments/verifiers/codecontests_verifier.py), slimmed: rows are
-held in memory (no lazy-JSONL dict) and there is no container sandbox — the
-runner is a plain subprocess.
+Rows are held in memory (no lazy-JSONL dict) and there is no container
+sandbox — the runner is a plain subprocess.
 
 ===========================================================================
 HOW THE TWO ARMS USE THIS FILE
@@ -148,7 +146,7 @@ WHICH DATASET, AND WHY THREE OF THEM EXIST
   CodeContests+ (ByteDance-Seed)  — a third regeneration, ~27 cases with
       validated true-positive/true-negative rates. NOT used: 951 GB across
       five configs (46 GB for the smallest), and it is not what the earlier
-      inference runs used. See docs/codecontests-dataset-provenance.md.
+      inference runs used.
 
 The short version: DeepMind = small and free, CCO = strong and affordable at
 eval scale. The design trains on the cheap suite and measures with both.
@@ -1166,8 +1164,7 @@ class CodeContestsFamily(TaskFamily):
         if not path:
             raise ValueError(
                 "codecontests requires dataset.path: the preprocessed CodeContests JSONL "
-                "(rows with name/description/inputs/outputs). Known source: the old repo's "
-                "ai_debate/data/codecontests/{train,test}.jsonl"
+                "(rows with name/description/inputs/outputs)"
             )
         self.timeout_seconds = int(ds.get("timeout_seconds", self.timeout_seconds))
         env = CodeContestsEnv(

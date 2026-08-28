@@ -105,7 +105,7 @@ writing the line with nobody reading it. For a run that dies at 3am to reach a
 human, something outside the session has to consume that line. Nothing does
 yet — that is unbuilt, not merely unconfigured.
 
-## Ground rules (ported from ai-debate's AGENTS.md where they transfer)
+## Ground rules
 
 - Never delete outputs or artifacts without approval — including "temp" ones;
   caches with verified sources are the exception, state it when you clear one.
@@ -114,8 +114,7 @@ yet — that is unbuilt, not merely unconfigured.
 - Substantial multi-file implementation is delegated to implementer subagents
   with tightly scoped prompts — exact files, cited decisions, focused tests,
   no commits; the orchestrating session scopes work, adjudicates findings, and
-  commits. Small single-file fixes may be done directly. (Softened from
-  ai-debate's absolute orchestrator-never-implements rule.)
+  commits. Small single-file fixes may be done directly.
 - A passing test oracle is NOT conformance evidence when the oracle's own
   strength is in question (it was authored alongside the code it gates, or
   drives fakes/synthetic bindings): probe the behavior against the spec with
@@ -285,8 +284,6 @@ binds — when raising a knob changes nothing, there is usually a second limit
 underneath. Read limits in their own currency (address space is not resident
 memory; `free`/`nproc` are the host, not the cgroup).
 
-Working notes and worked numbers: `docs/hardware-model.md`.
-
 ### The balance auto-tops-up; a short runway is not an emergency
 
 RunPod auto top-up is **on** for this account, and `jobd`'s own `auto_topup`
@@ -319,8 +316,3 @@ report matched curves before claiming a win.
 Keys live in `.env` (never committed). Never print key values; enumerate
 names only when verifying. If a needed key is absent, say so and ask — do not
 guess alternate names.
-
-<!-- Deliberately NOT ported from ai-debate's AGENTS.md (specific to that
-repo): Obsidian vault protocol, worktree-only rule + main-checkout hook,
-RunPod/verl AI_DEBATE_* runbook, serve_and_eval.sh, run.csv schema notes,
-docs/agents_reference.md pointers. -->

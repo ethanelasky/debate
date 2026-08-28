@@ -1,5 +1,4 @@
-"""GRPO group-relative advantages. Ported from ~/ai-debate
-train/core/advantages.py (itself verl-parity-verified against sft-control).
+"""GRPO group-relative advantages, verl-parity-verified against sft-control.
 
     advantage_i = (reward_i - group_mean) / (group_std + epsilon)
 
