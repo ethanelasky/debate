@@ -406,3 +406,42 @@ def test_the_shared_budget_is_a_penalty_on_both_arms():
     charged on the other would satisfy an abs() comparison."""
     assert _budget_delta_rlvr(0.0002, 4000, "proportional", 5024) < 0
     assert _budget_delta_debate(0.0002, 4000, "proportional", 5024) < 0
+
+
+def test_pooled_held_out_doubles_the_eval_pool_without_touching_train():
+    """A dev/test split buys model selection on one and an unbiased report on
+    the other. Tracking a metric across a trajectory needs neither, and pays
+    for the ceremony in power: 83 rows give a binomial SE near .05, wider than
+    every arm difference measured on this campaign.
+
+    Pooling must not quietly move rows out of train, and must remain disjoint
+    from it — a bigger eval that leaked training rows would be worse than the
+    small one it replaced.
+    """
+    from infra.envs.tasks import get_family
+
+    fam = get_family("aime")
+    plain = fam.source({"seed": 0})
+    n_train, n_dev, n_test = len(plain.train_rows), len(plain.dev_rows), len(plain.test_rows)
+
+    pooled = fam.source({"seed": 0, "pool_held_out": True})
+    assert len(pooled.dev_rows) == n_dev + n_test
+    assert len(pooled.train_rows) == n_train, "pooling must not consume train rows"
+    assert not (
+        {r["problem"] for r in pooled.dev_rows} & {r["problem"] for r in pooled.train_rows}
+    ), "pooled eval overlaps train"
+
+
+def test_pooling_moves_the_protocol_identity():
+    """The identity pins what a number means. Doubling the eval pool changes
+    what dev/* measures, so two runs reporting different pools must not hash
+    the same."""
+    from infra.envs.tasks import get_family
+
+    fam = get_family("aime")
+    fam.source({"seed": 0})
+    plain = fam.protocol_identity()
+    fam.source({"seed": 0, "pool_held_out": True})
+    pooled = fam.protocol_identity()
+    assert plain["dev_count"] != pooled["dev_count"]
+    assert plain["split_sha256"] != pooled["split_sha256"]

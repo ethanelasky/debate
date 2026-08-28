@@ -47,6 +47,7 @@ class AimeEnv(SingleTurnEnv):
         relaxed_correct_bonus: float = 0.1,
         think_overshoot_penalty: float = 0.0,
         prompt_file: str | None = None,
+        pool_held_out: bool = False,
     ):
         self.rng = random.Random(seed)
         self.prompts = load_generation_prompts(resolve_prompt_file(prompt_file, PROMPT_FILE))
@@ -74,6 +75,14 @@ class AimeEnv(SingleTurnEnv):
         # stay byte-identical to the campaign's historical eval split.
         k = min(len(self.test_rows), max(1, len(self.train_rows) // 10))
         self.dev_rows, self.train_rows = self.train_rows[:k], self.train_rows[k:]
+        # A dev/test split buys model selection on one and an unbiased report
+        # on the other. Tracking a metric across a training trajectory needs
+        # neither, and pays for the ceremony in statistical power: 83 dev rows
+        # give a binomial SE near .05, which is wider than every arm difference
+        # measured so far. Pooling both held-out carves is 176 rows and ~.035.
+        # Off by default so existing arms keep their historical dev split.
+        if pool_held_out:
+            self.dev_rows = self.dev_rows + self.test_rows
         if len(self.train_rows) < 2 or not self.test_rows:
             raise RuntimeError(
                 f"aime env: too few rows (train={len(self.train_rows)}, test={len(self.test_rows)})"
@@ -102,6 +111,7 @@ class AimeFamily(TaskFamily):
                 "correct_reward",
                 "format_reward",
                 "relaxed_correct_bonus",
+                "pool_held_out",
             },
             "aime",
         )
@@ -118,6 +128,7 @@ class AimeFamily(TaskFamily):
             relaxed_correct_bonus=float(ds.get("relaxed_correct_bonus", 0.1)),
             think_overshoot_penalty=float(ds.get("think_overshoot_penalty", 0.0)),
             prompt_file=str(prompt_path),
+            pool_held_out=bool(ds.get("pool_held_out", False)),
         )
         self._protocol_identity = _numeric_protocol_identity(
             env,
