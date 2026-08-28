@@ -18,7 +18,7 @@ rollouts through the same Policy. Hybrid-thinking models (Qwen3.x) render an
 empty <think></think> block at False and open <think> at True; the toggle is
 verified against the tokenizer at launch (see _check_thinking_toggle) rather
 than trusted, because a template that ignores the kwarg drops it in silence —
-the same latent failure the OpenRouter seats hit (MB_DEBATE_PLAN 2026-08-02).
+the same latent failure the OpenRouter seats hit (2026-08-02).
 Omit the key for models without a thinking mode.
 
 `think_tokens` (optional; requires enable_thinking: true, mutually exclusive

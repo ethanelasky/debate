@@ -21,7 +21,7 @@ def task_prompts(name: str):
 MATH_YAML = "infra/prompts/debate/hendrycks_math.yaml"
 CODECONTESTS_YAML = "infra/prompts/debate/codecontests.yaml"
 
-# DESIGN-debate-env.md §1, proposer_critic_2round.
+# proposer_critic_2round.
 PC_TOPOLOGY = {
     "turns": [
         {"alice": [{"name": "proposal", "kind": "solution"}]},

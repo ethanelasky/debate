@@ -2,8 +2,8 @@
 # (mb_debate, PRIMARY) and its single-consultancy baseline
 # (mb_single_consultancy_choice), plus 4-row smoke slices. 2026-08-06: the old
 # assigned-seating arms were deleted as superseded by blind choice, and the
-# mb_debate_choice arm was renamed to mb_debate — see git history and
-# MB_PROMPT_DELTAS.md for provenance.
+# mb_debate_choice arm was renamed to mb_debate — see git history for
+# provenance.
 #
 # EVAL-ONLY (no training block): binary attack-vs-honest classification of
 # bash agent trajectories. Ground truth is meta["label"]; seating is NOT

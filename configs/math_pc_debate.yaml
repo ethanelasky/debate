@@ -1,4 +1,4 @@
-# MATH proposer-critic debate RL (format per DESIGN-pc-format.md).
+# MATH proposer-critic debate RL.
 # Flow: proposal (public, graded) -> critique -> alice_rebuttal ->
 # bob_rebuttal (critic's last word, as in the old PC arm) -> judge
 # deliberation (private) + verdict. Turns 2 and 3 are ONE move — defend your
@@ -109,10 +109,10 @@ math_pc_debate_logit:
   scoring:
     confidence_source: logit
 
-# Solo-proposal arm (DESIGN-pc-format.md row 10): the proposal is generated in
-# the task source's own RLVR context — no debate framing — so this arm and the
-# RLVR baseline share ONE proposal distribution and differ only in reward
-# channel. Later turns (alice_rebuttal) are debate-aware as usual.
+# Solo-proposal arm: the proposal is generated in the task source's own RLVR
+# context — no debate framing — so this arm and the RLVR baseline share ONE
+# proposal distribution and differ only in reward channel. Later turns
+# (alice_rebuttal) are debate-aware as usual.
 math_pc_solo:
   _extends: _base_math_pc
   first_speech_non_debate_aware: true

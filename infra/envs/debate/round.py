@@ -1,7 +1,7 @@
 """Debate turn loop: context assembly (rules 2-3), per-speaker rendering
 (rule 4), batched generation over a group of simultaneous debates.
 
-Design (see DESIGN-debate-env.md + the round plan):
+Design:
 - ONE immutable slot-record store per debate; every reader's message list is a
   pure function of it. No per-reader transcript copies.
 - Rendering orders records by REVEAL time, not flat index: others' turn-t

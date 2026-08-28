@@ -1,4 +1,4 @@
-"""Implementer-A infra extensions, offline (MB_MIGRATION_SPEC.md):
+"""Infra extensions, offline:
 
 - per-task bindings merged into _build_state (uppercase-key/str-value/core-key
   validation with all errors listed);

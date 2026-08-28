@@ -1,7 +1,7 @@
 """DebateEnv: protocol-driven debate rollouts as an Env.
 
-One rollout path (train + eval). Reward is judge-only (DESIGN-debate-env.md
-§5); gt correctness from solution slots lands in info as metrics.
+One rollout path (train + eval). Reward is judge-only; gt correctness from
+solution slots lands in info as metrics.
 
 Trajectory granularity: one Trajectory per (debate, trained seat); datums are
 that seat's slot datums in flat order. Rewards are per-datum
@@ -222,7 +222,7 @@ class DebateEnv(Env):
                 raise ValueError(
                     "first_speech_non_debate_aware requires the opening solution slot to be "
                     f"public (got {first.slot.visibility.value}): the solo speech must enter "
-                    "the transcript as a public record (DESIGN-pc-format.md row 10)"
+                    "the transcript as a public record"
                 )
 
         if not config.fresh_positions and config.position_binder is None:
