@@ -1,4 +1,4 @@
-"""Implementer-E Rev-2 infra knobs (MB_MIGRATION_SPEC.md, REV 2 items 2/3/7):
+"""Rev-2 infra knobs:
 
 - preamble stages (`pre_debate` shared + `pre_debate_<role>` individual), each
   rendered as its OWN leading user message for the speakers it serves

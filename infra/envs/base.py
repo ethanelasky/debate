@@ -24,7 +24,7 @@ FORCED_CLOSE_TEXT = "</think>\n\n"
 
 @dataclass(frozen=True)
 class SlotLimits:
-    """The three hard per-slot token caps (DESIGN-debate-env.md §3)."""
+    """The three hard per-slot token caps."""
 
     max_think_tokens: Optional[int] = None
     max_visible_tokens: Optional[int] = None

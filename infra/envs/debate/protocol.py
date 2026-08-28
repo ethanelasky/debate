@@ -1,4 +1,4 @@
-"""Turn protocol: the declarative debate structure (DESIGN-debate-env.md §1).
+"""Turn protocol: the declarative debate structure.
 
 Five rules, restated as code:
   1. A protocol is ordered turns; each turn maps speakers to ordered slots.

@@ -7,9 +7,8 @@ read.
 
 ``scripts.mb_solo_monitor`` imports ``infra.envs.tasks.monitoringbench``
 (implementer B's module). These tests must not require that module: if it is
-absent, a contract-faithful shim (MBRow / render_transcript / load_rows, per
-MB_MIGRATION_SPEC.md "Module contract") is installed into ``sys.modules``
-before the script is imported. When the real module exists, it is used.
+absent, a contract-faithful shim (MBRow / render_transcript / load_rows) is
+installed into ``sys.modules`` before the script is imported. When the real module exists, it is used.
 """
 
 from __future__ import annotations

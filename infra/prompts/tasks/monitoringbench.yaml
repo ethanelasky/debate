@@ -5,7 +5,7 @@
 # extraction (2026-08-06) of what previously lived inside
 # infra/prompts/debate/monitoringbench.yaml's mb_debate entry as
 # blind_system / blind_assessment / pre_debate (wording unchanged; see that
-# file's history and MB_PROMPT_DELTAS.md for its provenance).
+# file's history for its provenance).
 #
 # THIS FILE IS THE SINGLE SOURCE for the MB blind view, for BOTH arms — the
 # same convention as math.yaml / codecontests.yaml (schema: ../README.md). The

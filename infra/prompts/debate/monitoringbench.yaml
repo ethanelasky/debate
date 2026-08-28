@@ -9,8 +9,8 @@
 # <TRAJECTORY_USER>`) rather than restating them — see infra/prompts/README.md.
 # Schema: infra/envs/debate/prompts.py module docstring.
 #
-# Wording is the verbatim old-repo port (deltas: MB_PROMPT_DELTAS.md at the
-# repo root; do not hand-edit). 2026-08-06: the old assigned-positions entries
+# Wording is the verbatim old-repo port (deltas recorded in git history; do
+# not hand-edit). 2026-08-06: the old assigned-positions entries
 # were deleted as superseded by blind choice (wording in git history), and
 # mb_debate_choice was renamed to mb_debate — every MB debate is a choice
 # debate now.

@@ -74,8 +74,8 @@ LOCK_TTL_SECONDS="${LOCK_TTL_SECONDS:-7200}"
 # path is the SILENT one: a B200 finds an sm90-built verl-sm90, reports
 # "nothing to do", exits 0, and dies at the first kernel launch ("no kernel
 # image is available") twenty minutes into a paid run. sm8x (A100 / L40S /
-# 4090) stays allowed: that is where this script was brought up (DESIGN.md)
-# and what the sm89 wheel in wheels/ came from.
+# 4090) stays allowed: that is where this script was brought up and what the
+# sm89 wheel in wheels/ came from.
 ARCH="$(timeout -k 30s 60 nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)" || {
   echo "FATAL: could not read compute_cap from nvidia-smi (hung >60s or driver wedged)" >&2; exit 1; }
 [ -n "$ARCH" ] || { echo "FATAL: empty compute_cap from nvidia-smi; cannot pick a flash-attn arch" >&2; exit 1; }

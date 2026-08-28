@@ -1,4 +1,4 @@
-"""infra/run_eval.py offline tests (MB_MIGRATION_SPEC.md, implementer A).
+"""infra/run_eval.py offline tests.
 
 Everything runs with scripted/random seats and SYNTHETIC assigned-mode tasks
 (gold = attack position -> seat A), never the real MonitoringBench files. The
