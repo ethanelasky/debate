@@ -12,6 +12,7 @@ enforcement, BoN/probe hooks.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -33,14 +34,93 @@ from infra.models.provider_gate import call_with_retry, run_batched_predict
 
 DEFAULT_MAX_NEW_TOKENS = 10000
 HARD_CAP_MAX_NEW_TOKENS = 127500
+STRUCTURED_OUTPUT_SCHEMA_NAME = "verdict"
+TRANSIENT_RESPONSES_ERROR_CODES = frozenset(
+    {"server_error", "rate_limit_exceeded", "vector_store_timeout"}
+)
 
 
-class IncompleteResponseAPIError(Exception):
-    """Responses API returned status='incomplete' (hit max_output_tokens).
+def _safe_response_detail(value: Any) -> Any:
+    """Small, credential-free projection of Responses error/detail objects."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {key: value[key] for key in ("code", "message", "reason") if key in value}
+    detail = {
+        key: getattr(value, key)
+        for key in ("code", "message", "reason")
+        if getattr(value, key, None) is not None
+    }
+    return detail or str(value)
+
+
+class ResponsesResultAPIError(Exception):
+    """A syntactically successful Responses call produced no usable result."""
+
+    def __init__(self, provenance: dict[str, Any], generation_id: Optional[str] = None):
+        self.raw_response = json.dumps(provenance, sort_keys=True)
+        self.generation_id = generation_id
+        super().__init__(self.raw_response)
+
+
+class IncompleteResponseAPIError(ResponsesResultAPIError):
+    """Responses API returned status='incomplete' without usable output.
 
     Deliberately not an openai.APIError: that constructor's signature varies
     across SDK versions, and this is an internal control-flow signal.
     """
+
+    def __init__(self, endpoint: str, details: Any, generation_id: Optional[str] = None):
+        safe_details = _safe_response_detail(details)
+        self.reason = (
+            safe_details.get("reason") if isinstance(safe_details, dict) else None
+        )
+        super().__init__(
+            {
+                "type": "responses_incomplete",
+                "endpoint": endpoint,
+                "status": "incomplete",
+                "incomplete_details": safe_details,
+            },
+            generation_id,
+        )
+
+
+class ResponsesStatusAPIError(ResponsesResultAPIError):
+    """Responses returned a nonterminal/failed status instead of completed."""
+
+    def __init__(
+        self, endpoint: str, status: Any, error: Any, generation_id: Optional[str] = None
+    ):
+        safe_error = _safe_response_detail(error)
+        self.status = status
+        self.error_code = (
+            safe_error.get("code") if isinstance(safe_error, dict) else None
+        )
+        super().__init__(
+            {
+                "type": "responses_status",
+                "endpoint": endpoint,
+                "status": status,
+                "error": safe_error,
+            },
+            generation_id,
+        )
+
+
+class ResponsesRefusalAPIError(ResponsesResultAPIError):
+    """Responses returned explicit refusal content instead of judge output."""
+
+    def __init__(self, endpoint: str, refusal: str, generation_id: Optional[str] = None):
+        super().__init__(
+            {
+                "type": "responses_refusal",
+                "endpoint": endpoint,
+                "status": "completed",
+                "refusal": refusal,
+            },
+            generation_id,
+        )
 
 
 class OpenAIModel(Model):
@@ -160,9 +240,28 @@ class OpenAIModel(Model):
                 exception=self._RETRY_EXCEPTION,
                 giveup=self._retry_giveup,
             )
-        except IncompleteResponseAPIError:
-            # Output-limit hit: callers may retry with a shorter prompt.
-            raise
+        except ResponsesResultAPIError as e:
+            # Incomplete/refusal results give up immediately; failed statuses
+            # arrive here only after exhausting the provider retry budget.
+            # Degrade only this batch item so DebateRound invalidates it rather
+            # than scoring it as a wrong verdict, while siblings continue.
+            self.logger.warning("%s", e)
+            return [
+                ModelResponse(
+                    prompt=prompt_text,
+                    raw_response=e.raw_response,
+                    failed=True,
+                    stop_reason=(
+                        "length"
+                        if isinstance(e, IncompleteResponseAPIError)
+                        and e.reason == "max_output_tokens"
+                        else None
+                    ),
+                    served_provider=self.PROVIDER,
+                    generation_id=e.generation_id,
+                )
+                for _ in range(num_return_sequences)
+            ]
         except (ValueError, NotImplementedError):
             # Config errors (n>1 on an API that can't do it) are programmer
             # mistakes, not transient failures.
@@ -171,7 +270,16 @@ class OpenAIModel(Model):
             self.logger.warning(
                 "%s calling '%s': %s", type(e).__name__, self.endpoint, e
             )
-            return [ModelResponse(failed=True) for _ in range(num_return_sequences)]
+            detail = f"{type(e).__name__}: {e}"
+            return [
+                ModelResponse(
+                    prompt=prompt_text,
+                    raw_response=detail,
+                    failed=True,
+                    served_provider=self.PROVIDER,
+                )
+                for _ in range(num_return_sequences)
+            ]
 
         responses: list[ModelResponse] = []
         if self._uses_responses_api():
@@ -217,6 +325,7 @@ class OpenAIModel(Model):
         **kwargs,
     ) -> Any:
         response_format = kwargs.pop("response_format", None)
+        json_schema = kwargs.pop("json_schema", None)
         reasoning_effort = kwargs.pop("reasoning_effort", None)
         temperature = kwargs.pop("temperature", None)
         top_p = kwargs.pop("top_p", None)
@@ -236,11 +345,35 @@ class OpenAIModel(Model):
                     request["temperature"] = temperature
                 if top_p is not None:
                     request["top_p"] = top_p
+            if json_schema is not None and self.supports_json_schema():
+                # Responses Structured Outputs use text.format, not the
+                # Chat Completions response_format envelope.
+                request["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": STRUCTURED_OUTPUT_SCHEMA_NAME,
+                        "schema": json_schema,
+                        "strict": True,
+                    }
+                }
             response = self.client.responses.create(**request)
-            if getattr(response, "status", None) == "incomplete":
+            status = getattr(response, "status", None)
+            generation_id = getattr(response, "id", None)
+            if status == "incomplete":
                 raise IncompleteResponseAPIError(
-                    f"incomplete response from '{self.endpoint}' "
-                    f"(details={getattr(response, 'incomplete_details', None)!r})"
+                    self.endpoint,
+                    getattr(response, "incomplete_details", None),
+                    generation_id,
+                )
+            refusal = self._extract_responses_refusal(response)
+            if refusal is not None:
+                raise ResponsesRefusalAPIError(self.endpoint, refusal, generation_id)
+            if status != "completed":
+                raise ResponsesStatusAPIError(
+                    self.endpoint,
+                    status,
+                    getattr(response, "error", None),
+                    generation_id,
                 )
             return response
 
@@ -258,6 +391,19 @@ class OpenAIModel(Model):
             request["temperature"] = temperature
         if top_p is not None:
             request["top_p"] = top_p
+        if (
+            json_schema is not None
+            and response_format is None
+            and self.supports_json_schema()
+        ):
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": STRUCTURED_OUTPUT_SCHEMA_NAME,
+                    "schema": json_schema,
+                    "strict": True,
+                },
+            }
         if response_format:
             request["response_format"] = response_format
         try:
@@ -271,11 +417,28 @@ class OpenAIModel(Model):
 
     @staticmethod
     def _retry_giveup(e: Exception) -> bool:
-        # Deterministically hitting max_output_tokens is not retryable.
-        return isinstance(e, IncompleteResponseAPIError) or not any(
-            name in type(e).__name__
-            for name in ("APIError", "APIConnectionError", "RateLimitError", "BadRequestError")
-        )
+        # Cap hits, refusals, and 400s are deterministic for an unchanged
+        # request. A failed/nonterminal Responses status can be transient and
+        # consumes the normal provider retry budget.
+        if isinstance(
+            e,
+            (IncompleteResponseAPIError, ResponsesRefusalAPIError, openai.BadRequestError),
+        ):
+            return True
+        if isinstance(e, ResponsesStatusAPIError):
+            if e.status in ("queued", "in_progress"):
+                return False
+            return not (
+                e.status == "failed"
+                and e.error_code in TRANSIENT_RESPONSES_ERROR_CODES
+            )
+        if isinstance(e, (openai.APITimeoutError, openai.APIConnectionError)):
+            return False
+        if isinstance(e, openai.RateLimitError):
+            return False
+        if isinstance(e, openai.APIStatusError):
+            return not (500 <= e.status_code < 600)
+        return True
 
     # -- response assembly -------------------------------------------------
 
@@ -390,6 +553,24 @@ class OpenAIModel(Model):
             self.logger.warning("failed to extract text from '%s' response", self.endpoint)
         return text
 
+    @staticmethod
+    def _extract_responses_refusal(response: Any) -> Optional[str]:
+        """Return explicit Responses refusal content, including SDK objects."""
+
+        def field(value: Any, name: str) -> Any:
+            return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+        for item in getattr(response, "output", None) or []:
+            parts = field(item, "content") or []
+            # Be liberal about a provider returning the refusal as a top-level
+            # output item even though the OpenAI schema nests it in a message.
+            for part in [item, *parts]:
+                if field(part, "type") != "refusal":
+                    continue
+                refusal = field(part, "refusal")
+                return refusal if isinstance(refusal, str) else str(refusal or "refused")
+        return None
+
     # -- endpoint capability probes ---------------------------------------
 
     @staticmethod
@@ -414,6 +595,80 @@ class OpenAIModel(Model):
 
     def _supports_decision_logprobs(self) -> bool:
         return not self._uses_responses_api()
+
+    @classmethod
+    def _endpoint_supports_json_schema(cls, endpoint: Optional[str]) -> bool:
+        # Structured Outputs started at gpt-4o-2024-08-06 (and the mini
+        # 2024-07-18 snapshot). Stable aliases and subsequent model families
+        # support it; earlier snapshots and gpt-4-turbo do not.
+        name = (endpoint or "").lower()
+
+        def dated_snapshot(prefix: str, minimum: str) -> bool:
+            snapshot = name.removeprefix(prefix)
+            is_date = (
+                len(snapshot) == 10
+                and snapshot[:4].isdigit()
+                and snapshot[4] == "-"
+                and snapshot[5:7].isdigit()
+                and snapshot[7] == "-"
+                and snapshot[8:].isdigit()
+            )
+            return is_date and snapshot >= minimum
+
+        if name == "gpt-4o-mini":
+            return True
+        if name.startswith("gpt-4o-mini-"):
+            return dated_snapshot("gpt-4o-mini-", "2024-07-18")
+        if name == "gpt-4o":
+            return True
+        if name.startswith("gpt-4o-"):
+            return dated_snapshot("gpt-4o-", "2024-08-06")
+
+        def family_or_dated_snapshot(family: str) -> bool:
+            if name == family:
+                return True
+            if not name.startswith(f"{family}-"):
+                return False
+            snapshot = name.removeprefix(f"{family}-")
+            return (
+                len(snapshot) == 10
+                and snapshot[:4].isdigit()
+                and snapshot[4] == "-"
+                and snapshot[5:7].isdigit()
+                and snapshot[7] == "-"
+                and snapshot[8:].isdigit()
+            )
+
+        if any(
+            family_or_dated_snapshot(family)
+            for family in ("gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano")
+        ):
+            return True
+        if name.startswith("gpt-5"):
+            return True
+        # Explicit allowlist: several Responses-capable o-series variants do
+        # not support Structured Outputs (notably o1-mini and
+        # o3-deep-research).
+        return any(
+            family_or_dated_snapshot(family)
+            for family in ("o1", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini")
+        )
+
+    def supports_json_schema(self) -> bool:
+        """Whether this adapter consumes DebateRound's ``json_schema`` kwarg.
+
+        The direct OpenAI implementation handles supported Responses
+        endpoints. Some OpenAI-compatible subclasses replace ``call_openai``
+        and do not forward the schema. LocalModel is the exception: its
+        factored request builder consumes the same kwarg for vLLM.
+        """
+        if callable(getattr(self, "build_request_kwargs", None)):
+            # LocalModel's vLLM request builder grammar-constrains json_schema.
+            return True
+        return (
+            type(self).call_openai is OpenAIModel.call_openai
+            and self._endpoint_supports_json_schema(self.endpoint)
+        )
 
     # -- misc --------------------------------------------------------------
 

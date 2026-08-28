@@ -1,0 +1,107 @@
+# Frozen step-40 MATH judge comparison.
+#
+# Phase 1 generates each debater speech once from the merged
+# debate-kenton-rlvrs20 step-40 policy. Phase 2 replaces both debater seats
+# with PlaybackModel and judges the byte-identical transcript with either the
+# stock Qwen3.5-4B judge or GPT-5.6 Luna. The driver hard-checks the rendered
+# first-judge context hash for every task before it accepts an arm.
+#
+# These are eval-only arms: there is no training block or optimizer. Alice and
+# Bob are marked trained only to route seed generation through PolicySeat's
+# exact two-phase budget-forcing path; the driver supplies a read-only vLLM
+# completions backend at temperature zero. Replay replaces them with
+# PlaybackModel. The servers are deliberately disjoint in the jobd spec:
+# policy on B200-0 and stock judge on B200-1. Luna is replayed later from the
+# collected cache.
+
+_math_judge_pair_base:
+  protocol:
+    turns:
+      - alice: [{name: proposal, kind: solution, max_think_tokens: 4000, max_total_tokens: 5024}]
+      - bob: [{name: critique, max_think_tokens: 4000, max_visible_tokens: 320, max_total_tokens: 4352}]
+      - alice: [{name: alice_rebuttal, enable_thinking: false, max_total_tokens: 320}]
+      - bob: [{name: bob_rebuttal, enable_thinking: false, max_total_tokens: 320}]
+      - judge:
+          - {name: deliberation, visibility: private, max_total_tokens: 768}
+          - {name: verdict, kind: decision, max_total_tokens: 256}
+  prompt_config:
+    file_path: infra/prompts/debate/hendrycks_math_boxreq_firstspeech.yaml
+    entry: math_proposer_critic_boxreq_firstspeech
+  fresh_positions: true
+  flip: false
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: /workspace/models/qwen35-debate-rlvrs20-s40
+        alias: step40-proposer-alice
+        base_url: http://127.0.0.1:8790/v1
+        enable_thinking: true
+        # build_env validates trained rollout sampling at 1/1; the paired
+        # driver is eval and supplies its Policy at the eval profile, 0/1.
+        sampling:
+          train: {temperature: 1.0, top_p: 1.0}
+          eval: {temperature: 0.0, top_p: 1.0}
+    bob:
+      trained: true
+      model_settings:
+        model_type: local
+        model_file_path: /workspace/models/qwen35-debate-rlvrs20-s40
+        alias: step40-critic-bob
+        base_url: http://127.0.0.1:8790/v1
+        enable_thinking: true
+        sampling:
+          train: {temperature: 1.0, top_p: 1.0}
+          eval: {temperature: 0.0, top_p: 1.0}
+    judge:
+      trained: false
+      model_settings:
+        model_type: local
+        model_file_path: Qwen/Qwen3.5-4B
+        alias: qwen35-4b-judge
+        base_url: http://127.0.0.1:8788/v1
+        # Deliberately absent: LocalModel did not forward the historical
+        # enable_thinking:false knob. The diagnosed run therefore used the
+        # server-default Qwen chat template; this replay preserves that actual
+        # behavior and records it in the seed manifest.
+        sampling:
+          train: {temperature: 0.0, top_p: 1.0}
+          eval: {temperature: 0.0, top_p: 1.0}
+  judge_config: {schema_name: competitive, retries: 4}
+  scoring: {scoring: continuous, confidence_source: json}
+  dataset:
+    type: math
+    levels: 5
+    seed: 0
+    eval_subset_size: 512
+    prompt_file: infra/prompts/tasks/math_nocot.yaml
+    relaxed_extraction: true
+
+math_judge_pair_qwen:
+  _extends: _math_judge_pair_base
+
+math_judge_pair_luna:
+  _extends: _math_judge_pair_base
+  protocol:
+    # Responses max_output_tokens includes hidden reasoning. These larger
+    # judge-only caps keep low-effort Luna from inheriting Qwen's 768/256
+    # envelope; they do not enter or alter the rendered judge context.
+    turns:
+      - {}
+      - {}
+      - {}
+      - {}
+      - judge:
+          - {name: deliberation, visibility: private, max_total_tokens: 1536}
+          - {name: verdict, kind: decision, max_total_tokens: 512}
+  agents:
+    judge:
+      model_settings:
+        model_type: openai
+        model_file_path: gpt-5.6-luna
+        alias: gpt-5.6-luna-judge
+        base_url: null
+        reasoning_effort: low
+        # GPT-5 reasoning Responses do not expose temperature/top_p; the
+        # inherited profile is inert and provenance reports provider-native.

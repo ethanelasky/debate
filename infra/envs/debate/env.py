@@ -239,21 +239,18 @@ class DebateEnv(Env):
                     f"{type(task_source).__name__} does not provide them"
                 )
 
-        # Grammar forcing (decision_json_schema) is only consumed by LocalModel
-        # judges; API/tinker judges silently drop json_schema, so verdict
-        # quality then rests entirely on parse retries.
+        # Warn from the model's declared request capability, not its concrete
+        # class: both local vLLM and APIs with Structured Outputs can consume
+        # decision_json_schema, while other adapters still drop it.
         if config.judge.schema_name == "competitive":
             judge_model = config.frozen_models.get(self.judge_speaker)
             if judge_model is not None:
-                try:
-                    from infra.models.local_model import LocalModel
-                except Exception:  # noqa: BLE001 - optional dep; treat as non-local
-                    LocalModel = None
-                if LocalModel is None or not isinstance(judge_model, LocalModel):
+                supports_json_schema = getattr(judge_model, "supports_json_schema", None)
+                if not callable(supports_json_schema) or not supports_json_schema():
                     warnings.warn(
                         f"judge model {type(judge_model).__name__} does not consume "
-                        "json_schema: grammar-forced verdicts are unavailable for this "
-                        "judge type and verdict quality depends on judge.retries",
+                        "json_schema: structured verdicts are unavailable for this "
+                        "judge adapter and verdict quality depends on judge.retries",
                         RuntimeWarning,
                         stacklevel=2,
                     )

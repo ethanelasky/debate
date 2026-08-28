@@ -1,0 +1,238 @@
+profile: debate-b200x2
+jobs:
+  - name: math-judge-pair-step40-qwen
+    gpus: 2
+    gpu_type: NVIDIA B200
+    # Deliberately differ from the profile's 32-CPU default. jobd enables a
+    # profile's hardware alternates only when every rebound field still equals
+    # the profile default; this harmless origin pin therefore prevents the
+    # debate-h200x2 alternate from applying while retaining the B200 setup.
+    cpus: 31
+    priority: 10
+    timeout_s: 21600
+    stall_after_s: 3600
+    max_attempts: 1
+    env: [HF_TOKEN]
+    inputs:
+      - local: ~/code/debate-judge-pair-source
+        remote: /workspace/debate
+        exclude:
+          - .git
+          - .venv
+          - venv
+          - __pycache__
+          - "*.pyc"
+          - .pytest_cache
+          - .mypy_cache
+          - .ruff_cache
+          - node_modules
+          - wandb
+          - outputs
+          - "*.egg-info"
+          - .DS_Store
+          - wheels
+          - artifacts
+          - .env
+          - .env.*
+      - local: ~/code/debate/artifacts/rlvr-cispo-sub8-kenton/checkpoints/step-00020
+        remote: /workspace/rlvr-s20-adapter
+      - local: ~/code/debate/artifacts/debate-kenton-rlvrs20/checkpoints/step-00040
+        remote: /workspace/debate-s40-adapter
+    outputs:
+      - remote: /workspace/debate/outputs/math_judge_pair_step40
+        local: ~/code/debate/outputs/math_judge_pair_step40
+    command: |-
+      set -euo pipefail
+      export POD_IDLE_STOP=0
+      export HF_HUB_DISABLE_XET=1
+      unset HF_HUB_ENABLE_HF_TRANSFER
+      export HF_HOME=/workspace/hf
+      PY=""
+      for v in verl-b200 verl-sm90; do
+        if [ -x "/workspace/envs/$v/bin/python" ]; then PY="/workspace/envs/$v/bin/python"; break; fi
+      done
+      test -n "$PY" || { echo "FATAL: no verl env under /workspace/envs" >&2; exit 1; }
+      export PATH="$(dirname "$PY"):$PATH"
+      cd /workspace/debate
+      export PYTHONPATH=/workspace/debate:${PYTHONPATH:-}
+      if find /workspace/debate -type f \( -name '.env' -o -name '.env.*' \) -print -quit | grep -q .; then
+        echo "FATAL: secret .env file reached the clean source input" >&2
+        exit 1
+      fi
+
+      nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+      GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader)
+      test "$(printf '%s\n' "$GPU_NAMES" | wc -l | tr -d ' ')" = 2 \
+        || { echo "FATAL: expected exactly two GPUs" >&2; exit 1; }
+      test "$(printf '%s\n' "$GPU_NAMES" | grep -c 'NVIDIA B200')" = 2 \
+        || { echo "FATAL: approved only for 2x NVIDIA B200; refusing fallback hardware" >&2; exit 1; }
+
+      # Fill this after the implementation is committed. The repo input
+      # excludes .git, so the driver refuses a placeholder rather than
+      # publishing invented provenance.
+      SOURCE_COMMIT=__SOURCE_COMMIT__
+      printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+        || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
+
+      # Exact lineage: stock -> RLVR step 20 -> debate step 40. Both inputs are
+      # world-size-2 FSDP checkpoints; step 40 cannot be merged into stock.
+      BASE_REV=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+      BASE_SNAP="$HF_HOME/hub/models--Qwen--Qwen3.5-4B/snapshots/$BASE_REV"
+      if [ ! -f "$BASE_SNAP/config.json" ]; then
+        DOWNLOADED=$(hf download Qwen/Qwen3.5-4B --revision "$BASE_REV")
+        test "$DOWNLOADED" = "$BASE_SNAP" \
+          || { echo "FATAL: hf returned unexpected stock snapshot $DOWNLOADED" >&2; exit 1; }
+      fi
+      test "$(basename "$BASE_SNAP")" = "$BASE_REV"
+      test -f "$BASE_SNAP/config.json" || { echo "FATAL: pinned stock Qwen unavailable" >&2; exit 1; }
+      test -f /workspace/rlvr-s20-adapter/model_world_size_2_rank_0.pt
+      test -f /workspace/rlvr-s20-adapter/model_world_size_2_rank_1.pt
+      test -f /workspace/debate-s40-adapter/model_world_size_2_rank_0.pt
+      test -f /workspace/debate-s40-adapter/model_world_size_2_rank_1.pt
+      "$PY" - <<'PY'
+      from pathlib import Path
+      expected = {
+          "model_world_size_2_rank_0.pt",
+          "model_world_size_2_rank_1.pt",
+      }
+      for directory in (
+          Path("/workspace/rlvr-s20-adapter"),
+          Path("/workspace/debate-s40-adapter"),
+      ):
+          actual = {p.name for p in directory.glob("model_world_size_*_rank_*.pt")}
+          if actual != expected:
+              raise SystemExit(
+                  f"FATAL: unexpected merger shard set in {directory}: "
+                  f"expected {sorted(expected)}, got {sorted(actual)}"
+              )
+      PY
+      check_sha256() {
+        file=$1; expected=$2
+        actual=$(sha256sum "$file" | awk '{print $1}')
+        test "$actual" = "$expected" \
+          || { echo "FATAL: SHA256 mismatch for $file: $actual" >&2; exit 1; }
+      }
+      check_sha256 /workspace/rlvr-s20-adapter/model_world_size_2_rank_0.pt eccebdc69c251f8a1e9e7b14b07f858a5bb50cb06021876e275bfda49b7fa23e
+      check_sha256 /workspace/rlvr-s20-adapter/model_world_size_2_rank_1.pt 229e3b2d95d69e34006f13e8010563b499a86d2792adc7b3a5b3837b4aa9210e
+      check_sha256 /workspace/rlvr-s20-adapter/lora_train_meta.json 349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab
+      check_sha256 /workspace/debate-s40-adapter/model_world_size_2_rank_0.pt 9c607d11511141742e81bf0baf0ad2cc2d27c34e8878a330770c568bb105088d
+      check_sha256 /workspace/debate-s40-adapter/model_world_size_2_rank_1.pt 505abe346f95e15fed7dad02a308094777a8e7240839ac08b4d40bf291c00149
+      check_sha256 /workspace/debate-s40-adapter/lora_train_meta.json 349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab
+
+      OUT=/workspace/debate/outputs/math_judge_pair_step40
+      mkdir -p "$OUT"
+      RLVR_MERGED=/workspace/models/qwen35-rlvr-sub8-s20
+      POLICY_MERGED=/workspace/models/qwen35-debate-rlvrs20-s40
+      mkdir -p /workspace/models
+      "$PY" scripts/merge_lora_ckpt.py \
+        --ckpt /workspace/rlvr-s20-adapter --base "$BASE_SNAP" --out "$RLVR_MERGED" \
+        2>&1 | tee "$OUT/merge-rlvr-s20.log"
+      grep -q 'applied 346 deltas; unmatched: 0' "$OUT/merge-rlvr-s20.log" \
+        || { echo "FATAL: RLVR merge invariant failed" >&2; exit 1; }
+      "$PY" scripts/merge_lora_ckpt.py \
+        --ckpt /workspace/debate-s40-adapter --base "$RLVR_MERGED" --out "$POLICY_MERGED" \
+        2>&1 | tee "$OUT/merge-debate-s40.log"
+      grep -q 'applied 346 deltas; unmatched: 0' "$OUT/merge-debate-s40.log" \
+        || { echo "FATAL: debate merge invariant failed" >&2; exit 1; }
+      test -f "$POLICY_MERGED/config.json"
+
+      "$PY" - <<'PY'
+      import socket
+      sockets = []
+      for port in (8788, 8790):
+          sock = socket.socket()
+          try:
+              sock.bind(("127.0.0.1", port))
+          except OSError as exc:
+              raise SystemExit(f"FATAL: port {port} is not free: {exc}")
+          sockets.append(sock)
+      for sock in sockets:
+          sock.close()
+      PY
+
+      # One TP1 server per B200. BF16 weights are ~8 GB/model; long-context KV
+      # is the binding allocation. 0.80 leaves ~36 GB/device outside vLLM.
+      # max-num-seqs=64 matches the driver's I/O fanout and never spans GPUs.
+      POLICY_PID=""
+      JUDGE_PID=""
+      POLICY_PGID=""
+      JUDGE_PGID=""
+      cleanup() {
+        trap - EXIT TERM INT
+        for pgid in "$POLICY_PGID" "$JUDGE_PGID"; do
+          if [ -n "$pgid" ]; then kill -9 -- "-$pgid" 2>/dev/null || true; fi
+        done
+        for pid in "$POLICY_PID" "$JUDGE_PID"; do
+          if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null || true; fi
+        done
+      }
+      on_signal() { cleanup; exit 130; }
+      trap cleanup EXIT
+      trap on_signal TERM INT
+
+      CUDA_VISIBLE_DEVICES=0 setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
+        --model "$POLICY_MERGED" --port 8790 --seed 0 \
+        --dtype bfloat16 \
+        --gpu-memory-utilization 0.80 --max-model-len 16384 --max-num-seqs 64 \
+        --enable-prefix-caching > "$OUT/policy_server.log" 2>&1 9>&- &
+      POLICY_PID=$!
+      POLICY_PGID=$POLICY_PID
+      kill -0 "$POLICY_PID" 2>/dev/null \
+        || { echo "FATAL: policy server did not survive launch" >&2; exit 3; }
+      CUDA_VISIBLE_DEVICES=1 setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
+        --model "$BASE_SNAP" --served-model-name Qwen/Qwen3.5-4B --port 8788 --seed 0 \
+        --dtype bfloat16 \
+        --gpu-memory-utilization 0.80 --max-model-len 16384 --max-num-seqs 64 \
+        --enable-prefix-caching > "$OUT/qwen_judge_server.log" 2>&1 9>&- &
+      JUDGE_PID=$!
+      JUDGE_PGID=$JUDGE_PID
+      kill -0 "$JUDGE_PID" 2>/dev/null \
+        || { echo "FATAL: judge server did not survive launch" >&2; exit 3; }
+
+      wait_server() {
+        pid=$1; port=$2; log=$3; name=$4; deadline=$((SECONDS + 1800)); heartbeat=$((SECONDS + 300))
+        until curl -sf "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; do
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "FATAL: $name server exited" >&2; tail -120 "$log" >&2; exit 3
+          fi
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "FATAL: $name startup timeout" >&2; tail -120 "$log" >&2; exit 3
+          fi
+          if [ "$SECONDS" -ge "$heartbeat" ]; then
+            echo "waiting for $name server (${SECONDS}s elapsed)"
+            heartbeat=$((SECONDS + 300))
+          fi
+          sleep 10
+        done
+      }
+      wait_server "$POLICY_PID" 8790 "$OUT/policy_server.log" policy
+      wait_server "$JUDGE_PID" 8788 "$OUT/qwen_judge_server.log" judge
+
+      verify_model_id() {
+        port=$1; expected=$2
+        curl -fsS -m 60 "http://127.0.0.1:$port/v1/models" \
+          | "$PY" -c 'import json,sys; expected=sys.argv[1]; ids=[x["id"] for x in json.load(sys.stdin)["data"]]; assert expected in ids, (expected, ids)' "$expected"
+      }
+      verify_model_id 8790 "$POLICY_MERGED"
+      verify_model_id 8788 Qwen/Qwen3.5-4B
+
+      probe_token_ids() {
+        "$PY" - "$1" "$2" <<'PY'
+      import json, sys, urllib.request
+      port, model = sys.argv[1:]
+      body = {"model": model, "prompt": [1, 2], "max_tokens": 4,
+              "return_token_ids": True, "include_stop_str_in_output": True}
+      request = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/completions",
+          data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+      with urllib.request.urlopen(request, timeout=60) as response:
+          choice = json.load(response)["choices"][0]
+      assert choice["prompt_token_ids"] == [1, 2], choice
+      assert isinstance(choice["token_ids"], list), choice
+      PY
+      }
+      probe_token_ids 8790 "$POLICY_MERGED"
+      probe_token_ids 8788 Qwen/Qwen3.5-4B
+
+      "$PY" scripts/math_judge_pair.py \
+        --arms qwen --out "$OUT" --source-commit "$SOURCE_COMMIT" --workers 64

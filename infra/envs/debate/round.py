@@ -116,10 +116,9 @@ class DebateState:
 class GenRequest:
     messages: list[Message]
     limits: SlotLimits
-    # Decision slots only: a JSON Schema the server should constrain decoding
-    # to (vLLM response_format). Free-text judges ramble past their token cap
-    # instead of emitting the verdict object; grammar-forcing is the only cap
-    # that binds.
+    # Decision slots only: a JSON Schema for adapters with constrained output
+    # support (vLLM response_format or API Structured Outputs). Free-text
+    # judges can ramble past their token cap instead of emitting the verdict.
     json_schema: Optional[dict] = None
     # Decision slots generate under SpeechStructure.DECISION so wrappers that
     # gate logprob capture on the structure (LocalModel) return the token
@@ -727,6 +726,20 @@ class DebateRound:
 
     def _ingest(self, state: DebateState, step: CompiledSlot, res: SlotResult) -> None:
         if res.failed:
+            if res.response is not None and res.response.failed:
+                # Frozen API failures otherwise disappear behind the generic
+                # state.failed label. Retain only bounded operational fields —
+                # never the prompt or credentials — so evaluation drivers can
+                # distinguish cap, refusal, provider-status, and transport
+                # failures without treating any of them as a wrong verdict.
+                state.meta["model_failure"] = {
+                    "slot": f"{step.speaker}/{step.slot.name}@{step.turn}",
+                    "fail_reason": res.fail_reason,
+                    "stop_reason": res.response.stop_reason,
+                    "raw_response": res.response.raw_response,
+                    "served_provider": res.response.served_provider,
+                    "generation_id": res.response.generation_id,
+                }
             state.failed = f"{step.speaker}/{step.slot.name}: {res.fail_reason}"
             return
         text, truncated = res.text, False
