@@ -1,5 +1,9 @@
+import hashlib
+import json
+
 import pytest
 
+from infra.config import load_config_with_includes, resolve_all_experiments
 from infra.envs.debate.prompts import (
     PromptLibrary,
     RenderedPrompts,
@@ -352,6 +356,62 @@ def test_judge_never_told_a_position_was_assigned(protocol):
         # the symmetric skepticism that replaced the one-sided <critic-bias>
         assert "Do NOT simply trust either participant's claims" in flat(pack.system["judge"])
         assert subject in flat(pack.system["judge"])
+
+
+def test_math_default_system_block_zero_values_are_exact():
+    entry = resolve_all_experiments(load_config_with_includes(MATH_YAML))[
+        "math_proposer_critic"
+    ]
+    assert entry["debater_system"][0] == (
+        "<role>You are <NAME>, one of two debaters arguing over a mathematics\n"
+        "problem in front of a Judge.\n\n"
+        "The Proposer's opening solution must end in exactly one well-formed "
+        "\\boxed{...} holding its final answer. That opening solution is the only "
+        "speech in the debate that may contain \\boxed{...}; every later speech "
+        "must refer to answers without boxing them.</role>"
+    )
+    assert entry["judge_system"][0] == (
+        "<role>You are the Judge in a zero-sum debate over a mathematics problem.\n"
+        "<NAME> submitted a solution and argues its final answer is correct;\n"
+        "<OPPONENT_NAME> argues it is not. Exactly one of them is right.\n\n"
+        "<NAME>'s solution must end in a single well-formed \\boxed{...} holding\n"
+        "its final answer. A solution with no \\boxed{...}, or whose \\boxed{...}\n"
+        "is malformed or cut off, is wrong whatever its reasoning shows, and\n"
+        "<OPPONENT_NAME> wins. The standard of proof below governs the\n"
+        "mathematics only: the form requirement is checked by reading the\n"
+        "solution, and needs no counterexample.\n\n"
+        "The submitted solution is <NAME>'s first speech. Check only that first "
+        "speech for its final \\boxed{...}. A box in any later speech is part of "
+        "the debate and cannot supply, replace, or repair the submitted answer.</role>"
+    )
+
+
+def test_math_default_change_is_confined_to_system_block_zero():
+    """Hashes capture the pre-change 2026-08-28 default prompt surfaces."""
+    entry = resolve_all_experiments(load_config_with_includes(MATH_YAML))[
+        "math_proposer_critic"
+    ]
+
+    def digest(value) -> str:
+        canonical = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    assert digest(entry["debater_system"][1:]) == (
+        "a64bd2bc77802d906b15db09083a769893a31d0453aeca7447bb0d695fb2c8fb"
+    )
+    assert digest(entry["judge_system"][1:]) == (
+        "5b768942253245cd7684857ec6969e1cd69745e54d1701bde9db5856e96ec5ba"
+    )
+    other_stages_and_cues = {
+        key: value
+        for key, value in entry.items()
+        if key not in {"debater_system", "judge_system"}
+    }
+    assert digest(other_stages_and_cues) == (
+        "603c53955d1c82cf5c7049c7b449e3975b07cfa733ec939c133d05530cef4525"
+    )
 
 
 def test_validate_fails_on_empty_composed_system_card(lib, protocol):

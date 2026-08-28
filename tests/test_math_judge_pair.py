@@ -211,10 +211,14 @@ def test_record_cache_keeps_debater_speech_when_seed_judge_failed(tmp_path: Path
 def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     qwen = load_experiment(CONFIG, "math_judge_pair_qwen")
     luna = load_experiment(CONFIG, "math_judge_pair_luna")
-    assert qwen["prompt_config"] == {
-        "file_path": "infra/prompts/debate/hendrycks_math_boxreq_firstspeech.yaml",
-        "entry": "math_proposer_critic_boxreq_firstspeech",
+    expected_prompt = {
+        "file_path": "infra/prompts/debate/hendrycks_math.yaml",
+        "entry": "math_proposer_critic",
     }
+    assert qwen["prompt_config"] == expected_prompt
+    assert luna["prompt_config"] == expected_prompt
+    assert pair.PROMPT == SCRIPT.parents[1] / expected_prompt["file_path"]
+    assert pair.PROMPT_ENTRY == expected_prompt["entry"]
     assert qwen["agents"]["alice"]["trained"] is True
     assert qwen["agents"]["bob"]["trained"] is True
     assert qwen["agents"]["alice"]["model_settings"]["sampling"]["eval"] == {

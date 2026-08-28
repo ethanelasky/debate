@@ -67,8 +67,8 @@ def test_duplicate_names_fall_back_to_by_index():
 
 def test_scalar_lists_stay_by_index_because_prompts_rely_on_it():
     """These look like values you would want replaced, and making them so broke
-    the prompt packs: hendrycks_math_boxreq overrides block 0 of judge_system
-    and needs the parent's evaluation-steps block to survive at index 1.
+    prompt packs that override block 0 of a system stage and need later
+    evaluation blocks to survive at their inherited indices.
 
     Narrowing a scalar field is expressed by dropping the named entry that
     owns it and restating it, not by shortening the list in place.

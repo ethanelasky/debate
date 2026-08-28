@@ -87,10 +87,10 @@ def deep_merge(base: dict, override: dict) -> dict:
 
     Lists of plain scalars stay BY INDEX too, deliberately. They look like
     values you would want replaced, but the prompt libraries use them as
-    positional records: hendrycks_math_boxreq overrides block 0 of
-    ``judge_system`` and depends on the parent's evaluation-steps and
-    standard-of-proof blocks surviving at 1 and 2. To narrow a scalar field
-    like a term's ``slots``, ``_drop`` the named entry and restate it.
+    positional records: a child may override block 0 of a system stage while
+    depending on later evaluation blocks surviving at 1 and 2. To narrow a
+    scalar field like a term's ``slots``, ``_drop`` the named entry and
+    restate it.
     """
     result = copy.deepcopy(base)
     for key, value in override.items():

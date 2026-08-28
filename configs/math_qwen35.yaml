@@ -124,7 +124,7 @@ qwen35_fmt_warmup_l3:
 
 # RLVR baseline for the warm-start comparison. Ethan, 2026-08-27.
 #
-# Pairs with mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm: same merged
+# Pairs with mathl5_qwen35_pc_debate_cispo_verl_sub8_warm: same merged
 # weights, same sub8 pool, same CISPO objective, and the debate PROTOCOL is the
 # only intervention. Both arms read `model` from the identical pod-local
 # directory produced by scripts/merge_lora_ckpt.py, so the two start from

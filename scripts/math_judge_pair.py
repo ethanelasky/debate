@@ -54,8 +54,8 @@ from infra.run_debate import build_env, split_agents  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "infra/jobd/math_judge_pair_step40_config.yaml"
-PROMPT = REPO / "infra/prompts/debate/hendrycks_math_boxreq_firstspeech.yaml"
-PROMPT_ENTRY = "math_proposer_critic_boxreq_firstspeech"
+PROMPT = REPO / "infra/prompts/debate/hendrycks_math.yaml"
+PROMPT_ENTRY = "math_proposer_critic"
 EXPERIMENTS = {
     "qwen": "math_judge_pair_qwen",
     "luna": "math_judge_pair_luna",

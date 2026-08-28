@@ -310,14 +310,7 @@ mathl5_qwen35_pc_debate_cispo_verl:
         - "++actor_rollout_ref.model.lora.merge=True"
     lora_rank: 32   # one shared rank-32 adapter across both trained seats
 
-# Judge-enforced answer format; identical otherwise.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl
-  prompt_config:
-    file_path: infra/prompts/debate/hendrycks_math_boxreq.yaml
-    entry: math_proposer_critic_boxreq
-
-# Judge-enforced answer format, on the sub8 carve. Ethan, 2026-08-26.
+# Debate on the sub8 carve. Ethan, 2026-08-26.
 #
 # Pairs with mathl5_qwen35_cispo_sub8 (wandb 5ib0lvxe, 200 steps): that is the
 # only COMPLETED filtered RLVR arm, so sub8 is what makes this debate arm
@@ -336,11 +329,11 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq:
 # dataset key is NOT inert here.
 #
 # Overshoot is priced through scoring.shaping, inherited from math_pc_l5.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq
+mathl5_qwen35_pc_debate_cispo_verl_sub8:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl
   dataset: {train_filter_file: configs/filters/l5_sub8_qwen35.json}
 
-# Warm-started counterpart of the sub8 boxreq arm. Ethan, 2026-08-27.
+# Warm-started counterpart of the sub8 arm. Ethan, 2026-08-27.
 #
 # alice and bob start from the format warmup folded into base weights:
 # qwen35_fmt_warmup_l3, ORIGINAL lineage `final` (step 40). Held-out AMC at
@@ -366,8 +359,8 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8:
 # same defect the inherited "++actor_rollout_ref.model.lora.merge=True" override
 # exists for. A warmup adapter loaded rather than merged would be partly absent
 # from the rollouts it is supposed to shape.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8
+mathl5_qwen35_pc_debate_cispo_verl_sub8_warm:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8
   agents:
     alice:
       model_settings:
@@ -378,7 +371,7 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm:
 
 # Kenton word limit priced PROPORTIONALLY, from vanilla Qwen. Ethan, 2026-08-27.
 #
-# Two changes from the sub8 boxreq parent, both about how length is priced.
+# Two changes from the sub8 parent, both about how length is priced.
 #
 # 1. The word limit becomes proportional to the excess, which is what Kenton et
 #    al. (2608.17776 3.4) actually specify: "a soft additive penalty
@@ -407,8 +400,8 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_warm:
 #
 # Starts from stock Qwen/Qwen3.5-4B: no model_file_path override, so this does
 # NOT inherit the fmt-warmup checkpoint the _warm arms used.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8
+mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8
   scoring:
     shaping:
       - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
@@ -457,8 +450,8 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton:
 # NOTE this checkpoint is FSDP2-SHARDED across 2 ranks (the RLVR arm trains on
 # 2 GPUs); scripts/merge_lora_ckpt.py reassembles the DTensors, and reading
 # rank 0 alone would merge half of every LoRA matrix without erroring.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_rlvrs20:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_rlvrs20:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton
   agents:
     alice:
       model_settings:
@@ -489,8 +482,8 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_rlvrs20:
 # Index 4 APPENDS to the parent's four shaping entries (lists deep-merge BY
 # INDEX, and an index past the end appends). The word budget on the reply slots
 # is inherited unchanged at index 3.
-mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton
   scoring:
     shaping:
       - {name: proposal_format, kind: format_reward, coeff: 0.1, slots: [proposal], flag: answer_format_valid}
@@ -510,7 +503,7 @@ mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton_propbudget:
 # every proposal including correct ones. So this asks whether the judge can
 # tell a sound attack from a manufactured one unaided.
 math_pc_no_rebuttals:
-  _extends: mathl5_qwen35_pc_debate_cispo_verl_boxreq_sub8_kenton
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton
   protocol:
     turns:
       - {}
