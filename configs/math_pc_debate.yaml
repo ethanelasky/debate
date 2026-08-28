@@ -525,3 +525,30 @@ math_pc_no_rebuttals:
       - {name: reply_word_budget, _drop: true}
       - {name: critique_word_budget, kind: budget_penalty, coeff: 0.002,
          limit: 150, mode: proportional, slots: [critique]}
+
+# No-rebuttals debate warm-started from the RLVR control's step 130, with a
+# proportional budget on the proposal. Ethan, 2026-08-28.
+#
+# The combination neither earlier arm had: rlvrs20 warm-started but left the
+# solution turn unpriced and its truncation eroded .024 -> .145 in 20 steps;
+# propbudget priced the proposal but started cold. The format reward cannot
+# substitute -- answer_format_valid is satisfied by a sample that boxes and
+# then truncates, which is exactly what the control did at end-of-run.
+#
+# Step 130 and not 20: with the control finished, 130 is its best checkpoint
+# (.783 correct, .000 truncated, full margin to the cap) where step 20 was
+# .711/.024. Steps 190 and final sit inside the truncation blowup and must
+# not be used.
+mathl5_qwen35_pc_debate_norebut_propbudget_rlvr130:
+  _extends: math_pc_no_rebuttals
+  agents:
+    alice:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s130
+    bob:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s130
+  scoring:
+    shaping:
+      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.0002,
+         limit: 4000, mode: proportional, counts: total, slots: [proposal]}
