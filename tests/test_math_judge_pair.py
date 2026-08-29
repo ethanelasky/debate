@@ -22,7 +22,7 @@ from infra.envs.debate.round import (
     SlotRecord,
     render_context,
 )
-from infra.models.base import Model, ModelInput, ModelResponse
+from infra.models.base import Model, ModelInput, ModelResponse, SpeechStructure
 from infra.models.playback_model import PlaybackModel, context_key
 CONFIG = "infra/jobd/math_judge_pair_step40_config.yaml"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/math_judge_pair.py"
@@ -280,6 +280,39 @@ def test_manifest_verification_rejects_source_hash_drift() -> None:
         pair.verify_manifest_inputs(expected, current)
 
 
+def test_cache_verification_allows_replay_code_and_judge_transport_to_advance() -> None:
+    seed = pair.expected_manifest_inputs("a" * 40, {"split_sha256": "dataset"})
+    current = json.loads(json.dumps(seed))
+    current["source_commit"] = "b" * 40
+    current["judge_generation_by_arm"]["qwen"]["transport"] = "new-transport"
+
+    pair.verify_cache_identity(seed, current)
+    drifted = json.loads(json.dumps(current))
+    drifted["prompt_sha256"] = "changed"
+    with pytest.raises(RuntimeError, match="seed cache identity prompt_sha256"):
+        pair.verify_cache_identity(seed, drifted)
+
+    provenance = pair.replay_manifest(
+        seed={
+            **seed,
+            "cache_sha256": "cache",
+            "cache_records": 708,
+            "ordered_task_ids_sha256": "tasks",
+        },
+        seed_manifest_sha256="manifest",
+        current=current,
+    )
+    assert provenance["schema"] == pair.REPLAY_MANIFEST_SCHEMA
+    assert provenance["seed"] == {
+        "source_commit": "a" * 40,
+        "manifest_sha256": "manifest",
+        "cache_sha256": "cache",
+        "cache_records": 708,
+        "ordered_task_ids_sha256": "tasks",
+    }
+    assert provenance["replay"]["source_commit"] == "b" * 40
+
+
 def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     identity = pair.expected_manifest_inputs("a" * 40, {"split_sha256": "dataset"})
     assert identity["comparison_unit"] == "native_judge_stack"
@@ -296,6 +329,230 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert pair.CHECKPOINT_SHA256["debate_step40_lora_train_meta"] == (
         "349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab"
     )
+    assert identity["judge_generation_by_arm"]["qwen"]["transport"] == (
+        "raw_vllm_chat_completions_json_v1"
+    )
+
+
+def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
+    calls = []
+    schema = {
+        "type": "object",
+        "properties": {"winner": {"type": "string"}},
+        "required": ["winner"],
+    }
+
+    def post(body):
+        calls.append(body)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"winner":"Debater_A","confidence":1}',
+                        "reasoning_content": "checked the opening",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    model = pair.RawVLLMChatModel(
+        alias="raw-qwen",
+        endpoint="Qwen/Qwen3.5-4B",
+        base_url="http://127.0.0.1:8788/v1/",
+        post_fn=post,
+    )
+    [response] = model.predict(
+        [[ModelInput(role="user", content="judge this")]],
+        max_new_tokens=256,
+        speech_structure=SpeechStructure.DECISION,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=20,
+        json_schema=schema,
+    )
+    assert calls == [
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "messages": [{"role": "user", "content": "judge this"}],
+            "max_tokens": 256,
+            "logprobs": True,
+            "top_logprobs": 5,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "schema": schema},
+            },
+            "top_k": 20,
+        }
+    ]
+    assert response.speech == '{"winner":"Debater_A","confidence":1}'
+    assert response.thinking == "checked the opening"
+    assert response.stop_reason == "stop"
+    assert response.failed is False
+
+
+def test_raw_vllm_judge_retries_only_transport_and_retryable_http_statuses() -> None:
+    calls = []
+    sleeps = []
+
+    def transient(body):
+        calls.append(body)
+        if len(calls) < 3:
+            raise urllib.error.URLError("temporary")
+        return {"choices": []}
+
+    model = pair.RawVLLMChatModel(
+        alias="raw-qwen",
+        endpoint="qwen",
+        base_url="http://unused/v1",
+        post_fn=transient,
+        sleep_fn=sleeps.append,
+    )
+    assert model._post({"request": 1}) == {"choices": []}
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+
+    bad_calls = []
+
+    def bad_request(body):
+        bad_calls.append(body)
+        raise urllib.error.HTTPError(
+            "http://unused/v1/chat/completions",
+            400,
+            "bad",
+            {},
+            io.BytesIO(b"bad request"),
+        )
+
+    model._post_override = bad_request
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        model._post({"request": 2})
+    assert len(bad_calls) == 1
+
+    model._post_override = lambda body: []
+    with pytest.raises(RuntimeError, match="expected object"):
+        model._post({"request": 3})
+
+
+def test_qwen_arm_replaces_only_the_judge_transport() -> None:
+    _, env = pair.build_arm_env("qwen")
+    try:
+        assert isinstance(
+            env.config.frozen_models[env.judge_speaker], pair.RawVLLMChatModel
+        )
+        assert env.config.frozen_models[env.judge_speaker].base_url == (
+            "http://127.0.0.1:8788/v1"
+        )
+    finally:
+        env.family.close()
+
+
+def test_playback_clears_only_nonoperative_debater_template_controls(
+    tmp_path: Path,
+) -> None:
+    protocol = Protocol.parse(
+        {
+            "turns": [
+                {"alice": [{"name": "proposal", "kind": "solution"}]},
+                {"bob": [{"name": "critique"}]},
+                {"alice": [{"name": "alice_rebuttal", "enable_thinking": False}]},
+                {"bob": [{"name": "bob_rebuttal", "enable_thinking": False}]},
+                {
+                    "judge": [
+                        {"name": "deliberation", "visibility": "private"},
+                        {"name": "verdict", "kind": "decision"},
+                    ]
+                },
+            ]
+        }
+    )
+    prompts = RenderedPrompts(
+        PromptLibrary(
+            system={"alice": "Alice.", "bob": "Bob.", "judge": "Judge."},
+            slots={
+                "proposal": "Propose.",
+                "critique": "Critique.",
+                "alice_rebuttal": "Reply.",
+                "bob_rebuttal": "Reply.",
+                "deliberation": "Think.",
+                "verdict": "Return JSON.",
+            },
+        )
+    )
+    bindings = {
+        speaker: {
+            "NAME": speaker,
+            "OPPONENT_NAME": "other",
+            "TOPIC": "problem",
+            "POSITION": "5",
+            "OPPONENT_POSITION": "not 5",
+        }
+        for speaker in ("alice", "bob", "judge")
+    }
+    speech = {
+        "proposal": r"work \boxed{5}",
+        "critique": "critique",
+        "alice_rebuttal": "alice reply",
+        "bob_rebuttal": "bob reply",
+    }
+    seed_state = DebateState(bindings=bindings)
+    entries = []
+    original_compiled = protocol.compile()
+    for slot in original_compiled[:4]:
+        messages = render_context(seed_state, slot, prompts)
+        entries.append({"key": context_key(messages), "speech": speech[slot.slot.name]})
+        seed_state.records.append(SlotRecord(slot=slot, text=speech[slot.slot.name]))
+
+    cache = tmp_path / "cache.jsonl"
+    cache.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    alice = PlaybackModel(alias="alice", cache_path=cache)
+    bob = PlaybackModel(alias="bob", cache_path=cache)
+    env = SimpleNamespace(
+        protocol=protocol,
+        debaters=["alice", "bob"],
+        config=SimpleNamespace(
+            protocol=protocol,
+            frozen_models={"alice": alice, "bob": bob},
+        ),
+    )
+    original_first_judge = original_compiled[4]
+    original_context = context_key(
+        render_context(seed_state, original_first_judge, prompts)
+    )
+
+    assert pair.prepare_playback_protocol(env) == 2
+    replay_compiled = env.protocol.compile()
+    assert all(slot.slot.enable_thinking is None for slot in replay_compiled[:4])
+    assert replay_compiled[4].slot == original_first_judge.slot
+    assert context_key(render_context(seed_state, replay_compiled[4], prompts)) == (
+        original_context
+    )
+
+    judge = _StopSequenceJudge(
+        [
+            ModelResponse(speech="reasoning", stop_reason="stop"),
+            ModelResponse(
+                speech='{"winner":"Debater_A","confidence":1}',
+                stop_reason="stop",
+            ),
+        ]
+    )
+    round_ = DebateRound(
+        env.protocol,
+        {
+            "alice": FrozenSeat(alice),
+            "bob": FrozenSeat(bob),
+            "judge": FrozenSeat(judge),
+        },
+        prompts,
+        verdict_parser=_parse_test_verdict,
+    )
+    replay_state = DebateState(bindings=bindings)
+    round_.run([replay_state])
+    assert replay_state.failed is None
+    assert alice.hits + bob.hits == 4
 
 
 def test_native_judge_stack_failure_is_run_invalidating_but_parse_failure_is_not() -> None:

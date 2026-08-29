@@ -13,7 +13,7 @@ Pod phase (policy B200-0, stock Qwen judge B200-1)::
 Local Luna replay (loads OPENAI_API_KEY from .env)::
 
     python scripts/math_judge_pair.py --reuse-cache outputs/math_judge_pair_step40 \
-        --arms luna --out outputs/math_judge_pair_step40
+        --arms luna --out outputs/math_judge_pair_step40_luna
 
 Phase-1 judge output is never scored. All metrics are reconstructed from each
 arm's transcript rows. The oracle says Alice wins iff her OPENING solution is
@@ -28,6 +28,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import logging
 import math
 import re
 import subprocess
@@ -38,6 +39,7 @@ import urllib.request
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -50,6 +52,8 @@ from infra.envs.debate.protocol import Kind, Protocol  # noqa: E402
 from infra.envs.debate.round import DebateState, render_context  # noqa: E402
 from infra.envs.tasks.math import problem_key  # noqa: E402
 from infra.models.playback_model import PlaybackModel, context_key  # noqa: E402
+from infra.models.base import Model, SpeechStructure  # noqa: E402
+from infra.models.local_model import LocalModel  # noqa: E402
 from infra.run_debate import build_env, split_agents  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -62,6 +66,19 @@ EXPERIMENTS = {
 }
 EXPECTED_DEV_TASKS = 177
 MANIFEST_SCHEMA = "math-judge-pair-v2"
+REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v1"
+CACHE_IDENTITY_KEYS = (
+    "comparison_unit",
+    "config_path",
+    "config_sha256",
+    "prompt_path",
+    "prompt_entry",
+    "prompt_sha256",
+    "protocol_sha256_by_arm",
+    "dataset_protocol_identity",
+    "model_checkpoint_identity",
+    "debater_generation",
+)
 BASE_MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
 CHECKPOINT_SHA256 = {
     "rlvr_step20_rank0": "eccebdc69c251f8a1e9e7b14b07f858a5bb50cb06021876e275bfda49b7fa23e",
@@ -220,6 +237,126 @@ class VLLMCompletionsBackend(Backend):
         raise NotImplementedError("judge-pair backend is inference-only")
 
 
+def _response_namespace(value: Any) -> Any:
+    """Turn raw JSON into the attribute shape OpenAIModel already parses."""
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{key: _response_namespace(child) for key, child in value.items()}
+        )
+    if isinstance(value, list):
+        return [_response_namespace(child) for child in value]
+    return value
+
+
+class RawVLLMChatModel(LocalModel):
+    """LocalModel request/parser semantics over raw vLLM response JSON.
+
+    The installed OpenAI SDK successfully received HTTP 200 from vLLM but
+    failed while constructing its Pydantic response object.  This diagnostic
+    keeps LocalModel's request body and OpenAIModel's response assembly while
+    removing only that SDK deserialization layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        alias: str,
+        endpoint: str,
+        base_url: str,
+        is_debater: bool = False,
+        reasoning_effort: str | None = None,
+        post_fn: Any = None,
+        retry_attempts: int = 4,
+        sleep_fn: Any = time.sleep,
+    ):
+        Model.__init__(self, alias=alias, is_debater=is_debater)
+        if not base_url:
+            raise ValueError("raw vLLM chat transport requires an explicit base_url")
+        self.endpoint = endpoint
+        self.base_url = base_url.rstrip("/")
+        self.reasoning_effort = reasoning_effort
+        self._post_override = post_fn
+        self.retry_attempts = retry_attempts
+        self._sleep = sleep_fn
+        self.logger = logging.getLogger(__name__)
+
+    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.retry_attempts <= 0:
+            raise ValueError("retry_attempts must be positive")
+        endpoint = f"{self.base_url}/chat/completions"
+        for attempt in range(self.retry_attempts):
+            try:
+                if self._post_override is not None:
+                    response = self._post_override(body)
+                else:
+                    request = urllib.request.Request(
+                        endpoint,
+                        data=json.dumps(body).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(request, timeout=7200) as raw:
+                        response = json.load(raw)
+                if not isinstance(response, dict):
+                    raise RuntimeError(
+                        f"malformed JSON response from {endpoint}: expected object, "
+                        f"got {type(response).__name__}"
+                    )
+                return response
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:600]
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                if not retryable or attempt + 1 == self.retry_attempts:
+                    suffix = " after retries exhausted" if retryable else ""
+                    raise RuntimeError(
+                        f"HTTP {exc.code} from {endpoint}{suffix}: {detail}"
+                    ) from None
+            except (urllib.error.URLError, TimeoutError) as exc:
+                if attempt + 1 == self.retry_attempts:
+                    detail = getattr(exc, "reason", exc)
+                    raise RuntimeError(
+                        f"transport retries exhausted for {endpoint}: {detail}"
+                    ) from None
+            self._sleep(min(8.0, 2.0**attempt))
+        raise AssertionError("unreachable retry loop")
+
+    def call_openai(
+        self,
+        messages: list[dict[str, Any]],
+        speech_structure: SpeechStructure,
+        max_new_tokens: int,
+        num_return_sequences: int = 1,
+        **kwargs,
+    ) -> Any:
+        body = self.build_request_kwargs(
+            messages=messages,
+            speech_structure=speech_structure,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=num_return_sequences,
+            **kwargs,
+        )
+        # The SDK merges extra_body into the JSON payload. Do the same before
+        # posting directly so top_k/min_p/repetition_penalty stay identical.
+        extra = body.pop("extra_body", None)
+        if extra:
+            overlap = set(body) & set(extra)
+            if overlap:
+                raise ValueError(f"vLLM extra_body collides with request keys: {sorted(overlap)}")
+            body.update(extra)
+        return _response_namespace(self._post(body))
+
+    def copy(self, is_debater: bool | None = None, **kwargs) -> "RawVLLMChatModel":
+        return RawVLLMChatModel(
+            alias=kwargs.get("alias", self.alias),
+            endpoint=self.endpoint,
+            base_url=self.base_url,
+            is_debater=self.is_debater if is_debater is None else is_debater,
+            reasoning_effort=self.reasoning_effort,
+            post_fn=self._post_override,
+            retry_attempts=self.retry_attempts,
+            sleep_fn=self._sleep,
+        )
+
+
 def canonical_sha256(value: Any) -> str:
     payload = json.dumps(
         value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -287,7 +424,76 @@ def load_arm(arm: str) -> dict:
 def build_arm_env(arm: str):
     exp = load_arm(arm)
     trained, frozen = split_agents(exp)
-    return exp, build_env(exp, trained, frozen)
+    env = build_env(exp, trained, frozen)
+    if arm == "qwen":
+        settings = exp["agents"][env.judge_speaker]["model_settings"]
+        env.config.frozen_models[env.judge_speaker] = RawVLLMChatModel(
+            alias=settings["alias"],
+            endpoint=settings["model_file_path"],
+            base_url=settings["base_url"],
+            is_debater=False,
+        )
+    return exp, env
+
+
+def prepare_playback_protocol(env) -> int:
+    """Clear only debater template controls that playback cannot execute.
+
+    PlaybackModel returns already-generated speech and never applies a chat
+    template. FrozenSeat correctly rejects slot-level template kwargs for a
+    live frozen model; carrying them into playback therefore trips a guard on
+    metadata with no operation behind it. All context-visible protocol fields
+    remain byte-for-byte identical.
+    """
+    missing = [
+        speaker
+        for speaker in env.debaters
+        if not isinstance(env.config.frozen_models.get(speaker), PlaybackModel)
+    ]
+    if missing:
+        raise ValueError(
+            "playback protocol preparation requires PlaybackModel for every "
+            f"debater, got live seats {missing}"
+        )
+
+    def visible_shape(protocol: Protocol) -> list[tuple[Any, ...]]:
+        return [
+            (
+                cs.index,
+                cs.turn,
+                cs.speaker,
+                cs.seq,
+                cs.slot.name,
+                cs.slot.kind,
+                cs.slot.visibility,
+                cs.slot.max_think_tokens,
+                cs.slot.max_visible_tokens,
+                cs.slot.max_total_tokens,
+            )
+            for cs in protocol.compile()
+        ]
+
+    original = env.protocol
+    cleared = 0
+    turns: list[dict[str, list[Any]]] = []
+    for turn in original.turns:
+        replay_turn: dict[str, list[Any]] = {}
+        for speaker, slots in turn.items():
+            replay_slots = []
+            for slot in slots:
+                if speaker in env.debaters and slot.enable_thinking is not None:
+                    slot = replace(slot, enable_thinking=None)
+                    cleared += 1
+                replay_slots.append(slot)
+            replay_turn[speaker] = replay_slots
+        turns.append(replay_turn)
+    replay = Protocol(turns=turns)
+    replay.validate()
+    if visible_shape(replay) != visible_shape(original):
+        raise AssertionError("playback protocol changed context-visible slot semantics")
+    env.protocol = replay
+    env.config.protocol = replay
+    return cleared
 
 
 def task_id_from_meta(meta: dict[str, Any]) -> str:
@@ -805,6 +1011,7 @@ def expected_manifest_inputs(
                 "verdict_cap": 256,
                 "chat_template": "server_default",
                 "historical_enable_thinking_false_forwarded": False,
+                "transport": "raw_vllm_chat_completions_json_v1",
             },
             "luna": {
                 "model": "gpt-5.6-luna",
@@ -824,6 +1031,47 @@ def verify_manifest_inputs(manifest: dict[str, Any], current: dict[str, Any]) ->
                 f"PAIRING DRIFT: seed manifest {key} differs from current source "
                 f"({manifest.get(key)!r} != {value!r})"
             )
+
+
+def verify_cache_identity(manifest: dict[str, Any], current: dict[str, Any]) -> None:
+    """Verify everything that could change the 708 recorded debater speeches.
+
+    The replay implementation and judge transport may advance after phase 1;
+    neither generated the cache and neither is allowed to masquerade as part
+    of its provenance. Their commits are recorded separately instead.
+    """
+    for key in CACHE_IDENTITY_KEYS:
+        if manifest.get(key) != current.get(key):
+            raise RuntimeError(
+                f"PAIRING DRIFT: seed cache identity {key} differs from current "
+                f"source ({manifest.get(key)!r} != {current.get(key)!r})"
+            )
+
+
+def replay_manifest(
+    *,
+    seed: dict[str, Any],
+    seed_manifest_sha256: str,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": REPLAY_MANIFEST_SCHEMA,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": {
+            "source_commit": seed.get("source_commit"),
+            "manifest_sha256": seed_manifest_sha256,
+            "cache_sha256": seed.get("cache_sha256"),
+            "cache_records": seed.get("cache_records"),
+            "ordered_task_ids_sha256": seed.get("ordered_task_ids_sha256"),
+        },
+        "replay": {
+            "source_commit": current["source_commit"],
+            "judge_generation_by_arm": current["judge_generation_by_arm"],
+        },
+        "verified_cache_identity": {
+            key: current[key] for key in CACHE_IDENTITY_KEYS
+        },
+    }
 
 
 def _cache_path(reuse: str | None, out_dir: Path) -> Path:
@@ -879,6 +1127,10 @@ def main() -> None:
         )
         out_dir = Path(args.out)
         cache_path = _cache_path(args.reuse_cache, out_dir)
+        if args.reuse_cache and out_dir.resolve() == cache_path.parent.resolve():
+            raise ValueError(
+                "--out must differ from the immutable --reuse-cache artifact directory"
+            )
         print(
             json.dumps(
                 {
@@ -908,7 +1160,7 @@ def main() -> None:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if manifest.get("schema") != MANIFEST_SCHEMA:
                 raise RuntimeError(f"unsupported seed manifest schema {manifest.get('schema')!r}")
-            verify_manifest_inputs(manifest, source_identity)
+            verify_cache_identity(manifest, source_identity)
             if manifest.get("ordered_task_ids") != task_ids:
                 raise RuntimeError("PAIRING DRIFT: current ordered dev task IDs differ from seed manifest")
             if manifest.get("ordered_task_labels") != task_labels:
@@ -971,9 +1223,17 @@ def main() -> None:
                     if st.failed is not None
                 ],
             }
-            _write_json(out_dir / "seed_manifest.json", manifest)
+            manifest_path = out_dir / "seed_manifest.json"
+            _write_json(manifest_path, manifest)
     finally:
         seed_env.family.close()
+
+    replay_provenance = replay_manifest(
+        seed=manifest,
+        seed_manifest_sha256=file_sha256(manifest_path),
+        current=source_identity,
+    )
+    _write_json(out_dir / "replay_manifest.json", replay_provenance)
 
     for arm in arms:
         print(f"arm {arm}: replaying {len(task_ids)} exact debates", file=sys.stderr)
@@ -998,6 +1258,7 @@ def main() -> None:
             env.config.trained_speakers = []
             env.config.trained_sampling = {}
             env.config.trained_chat_kwargs = {}
+            cleared_playback_template_controls = prepare_playback_protocol(env)
             env.rollout(arm_tasks, policy=None, group_size=1)
             contexts = first_judge_context_hashes(env, env.last_states, arm_ids)
             hits = sum(
@@ -1026,6 +1287,9 @@ def main() -> None:
                         "comparison_unit": "native_judge_stack",
                         "valid": False,
                         "arm": arm,
+                        "seed_source_commit": manifest.get("source_commit"),
+                        "replay_source_commit": source_identity["source_commit"],
+                        "seed_cache_sha256": manifest.get("cache_sha256"),
                         "failure_count": len(stack_failures),
                         "failures": stack_failures,
                     },
@@ -1036,6 +1300,12 @@ def main() -> None:
                 )
             summary = summarize_arm(rows)
             summary["judge_generation"] = source_identity["judge_generation_by_arm"][arm]
+            summary["seed_source_commit"] = manifest.get("source_commit")
+            summary["replay_source_commit"] = source_identity["source_commit"]
+            summary["seed_cache_sha256"] = manifest.get("cache_sha256")
+            summary["cleared_nonoperative_playback_template_controls"] = (
+                cleared_playback_template_controls
+            )
             _write_json(out_dir / f"{arm}.summary.json", summary)
         finally:
             env.family.close()
@@ -1043,6 +1313,9 @@ def main() -> None:
     qwen_path, luna_path = out_dir / "qwen.transcripts.jsonl", out_dir / "luna.transcripts.jsonl"
     if qwen_path.exists() and luna_path.exists():
         pair = paired_summary(_read_jsonl(qwen_path), _read_jsonl(luna_path))
+        pair["seed_source_commit"] = manifest.get("source_commit")
+        pair["replay_source_commit"] = source_identity["source_commit"]
+        pair["seed_cache_sha256"] = manifest.get("cache_sha256")
         _write_json(out_dir / "paired_summary.json", pair)
         print(json.dumps(pair, indent=2))
     print(f"artifacts: {out_dir}", file=sys.stderr)
