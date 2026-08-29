@@ -289,12 +289,12 @@ def test_qwen_replay_job_uses_verified_cache_smoke_and_raw_transport() -> None:
     assert job["inputs"][1]["exclude"] == []
     assert job["outputs"] == [
         {
-            "remote": "/workspace/debate/outputs/math_judge_pair_qwen_replay_presence15",
-            "local": "~/code/debate/outputs/math_judge_pair_qwen_replay_presence15",
+            "remote": "/workspace/debate/outputs/math_judge_pair_qwen_replay_presence10",
+            "local": "~/code/debate/outputs/math_judge_pair_qwen_replay_presence10",
         }
     ]
     command = job["command"]
-    assert "SOURCE_COMMIT=730bda54339123180e3af3d86c99d47f45d374bd" in command
+    assert "SOURCE_COMMIT=baa90d8a4548e13f767b3d1a3b19cbd7f38dd67c" in command
     assert "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e" in command
     assert "f440837265144a8193623cb05a59ed3b658efdcac5f2ae4318137d6b287a1a4d" in command
     assert "CUDA_VISIBLE_DEVICES=1" in command
