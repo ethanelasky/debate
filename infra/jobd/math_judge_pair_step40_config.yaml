@@ -69,8 +69,8 @@ _math_judge_pair_base:
         # repetition. Keep temperature zero for deterministic evaluation while
         # applying that decoding-only guard to both resolved profiles.
         sampling:
-          train: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.5}
-          eval: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.5}
+          train: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.0}
+          eval: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.0}
   judge_config: {schema_name: competitive, retries: 4}
   scoring: {scoring: continuous, confidence_source: json}
   dataset:
