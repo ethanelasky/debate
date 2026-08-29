@@ -1,6 +1,6 @@
 profile: debate-b200x2
 jobs:
-  - name: math-judge-pair-step40-qwen-replay-raw
+  - name: math-judge-pair-step40-qwen-replay-2048-512
     gpus: 2
     gpu_type: NVIDIA B200
     # Pin the requested origin profile: changing a rebound field disables the
@@ -37,8 +37,8 @@ jobs:
         remote: /workspace/math-judge-seed
         exclude: []
     outputs:
-      - remote: /workspace/debate/outputs/math_judge_pair_qwen_replay
-        local: ~/code/debate/outputs/math_judge_pair_qwen_replay
+      - remote: /workspace/debate/outputs/math_judge_pair_qwen_replay_2048_512
+        local: ~/code/debate/outputs/math_judge_pair_qwen_replay_2048_512
     command: |-
       set -euo pipefail
       export POD_IDLE_STOP=0
@@ -58,7 +58,7 @@ jobs:
         exit 1
       fi
 
-      SOURCE_COMMIT=76773c370616f5f20527b0f112402c02cce68259
+      SOURCE_COMMIT=c33452c290a53dc4577d299bc4fbf675505ac464
       printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
         || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
 
@@ -87,7 +87,7 @@ jobs:
       test -f "$BASE_SNAP/config.json" \
         || { echo "FATAL: pinned stock Qwen unavailable" >&2; exit 1; }
 
-      OUT_ROOT=/workspace/debate/outputs/math_judge_pair_qwen_replay
+      OUT_ROOT=/workspace/debate/outputs/math_judge_pair_qwen_replay_2048_512
       mkdir -p "$OUT_ROOT"
       "$PY" - <<'PY'
       import socket
@@ -167,7 +167,7 @@ jobs:
       import json, sys
       summary = json.load(open(sys.argv[1]))
       assert summary["n_attempted"] == 177, summary
-      assert summary["replay_source_commit"] == "76773c370616f5f20527b0f112402c02cce68259", summary
+      assert summary["replay_source_commit"] == "c33452c290a53dc4577d299bc4fbf675505ac464", summary
       assert summary["seed_cache_sha256"] == "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e", summary
       assert summary["cleared_nonoperative_playback_template_controls"] == 2, summary
       PY
