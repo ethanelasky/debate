@@ -618,6 +618,9 @@ class DebateRound:
             results = runner.generate(requests)
             if len(results) != len(requests):
                 raise RuntimeError(f"seat {step.speaker}: {len(results)} results for {len(requests)} requests")
+            if decision:
+                for i, res in zip(live, results):
+                    self._record_decision_attempt(states[i], step, res, retry_index=0)
             if step.slot.kind == Kind.DECISION and self.verdict_parser is not None:
                 results = self._retry_unparseable(step, states, live, results, runner)
             if (
@@ -721,8 +724,42 @@ class DebateRound:
             for j, res in zip(bad, fresh):
                 retries[j] += 1
                 res.retries = retries[j]
+                if step.slot.kind == Kind.DECISION:
+                    self._record_decision_attempt(
+                        states[live[j]], step, res, retry_index=retries[j]
+                    )
                 results[j] = res
         return results
+
+    @staticmethod
+    def _record_decision_attempt(
+        state: DebateState,
+        step: CompiledSlot,
+        result: SlotResult,
+        *,
+        retry_index: int,
+    ) -> None:
+        """Retain bounded, prompt-free provenance for decision attempts.
+
+        One entry is appended per initial verdict result and retry. The
+        configured verdict retry count bounds the list; the projection
+        deliberately excludes response text, prompts, raw payloads, and IDs.
+        """
+        stop_reason = None
+        if result.response is not None:
+            stop_reason = result.response.stop_reason
+        elif result.sample is not None:
+            stop_reason = result.sample.stop_reason
+        state.meta.setdefault("decision_attempts", []).append(
+            {
+                "slot": step.slot.name,
+                "speaker": step.speaker,
+                "turn": step.turn,
+                "kind": step.slot.kind.value,
+                "retry_index": retry_index,
+                "stop_reason": stop_reason,
+            }
+        )
 
     def _ingest(self, state: DebateState, step: CompiledSlot, res: SlotResult) -> None:
         if res.failed:

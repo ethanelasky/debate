@@ -15,8 +15,14 @@ from infra.backend.base import SamplingParams
 from infra.envs.base import Policy, SlotLimits
 from infra.envs.debate.prompts import PromptLibrary, RenderedPrompts
 from infra.envs.debate.protocol import Protocol
-from infra.envs.debate.round import DebateState, SlotRecord, render_context
-from infra.models.base import ModelInput
+from infra.envs.debate.round import (
+    DebateRound,
+    DebateState,
+    FrozenSeat,
+    SlotRecord,
+    render_context,
+)
+from infra.models.base import Model, ModelInput, ModelResponse
 from infra.models.playback_model import PlaybackModel, context_key
 CONFIG = "infra/jobd/math_judge_pair_step40_config.yaml"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/math_judge_pair.py"
@@ -326,6 +332,251 @@ def test_transcript_consumes_debate_state_model_failure_provenance() -> None:
     )
     row = pair.state_transcript(SimpleNamespace(), state, "task-a")
     assert row["model_failure"] == failure
+
+
+def test_transcript_preserves_each_judge_slot_stop_reason() -> None:
+    protocol = Protocol.parse(
+        {
+            "turns": [
+                {
+                    "judge": [
+                        {"name": "deliberation", "visibility": "private"},
+                        {"name": "verdict", "kind": "decision"},
+                    ]
+                }
+            ]
+        }
+    )
+    deliberation, verdict = protocol.compile()
+    state = DebateState(
+        bindings={"judge": {"NAME": "Judge"}},
+        records=[
+            SlotRecord(
+                slot=deliberation,
+                text="reasoning",
+                response=ModelResponse(speech="reasoning", stop_reason="length"),
+            ),
+            SlotRecord(
+                slot=verdict,
+                text='{"winner":"Debater_A","confidence":1}',
+                response=ModelResponse(speech="verdict", stop_reason="stop"),
+            ),
+        ],
+    )
+    row = pair.state_transcript(SimpleNamespace(), state, "task-a")
+    assert [(record["slot"], record["stop_reason"]) for record in row["records"]] == [
+        ("deliberation", "length"),
+        ("verdict", "stop"),
+    ]
+
+
+class _StopSequenceJudge(Model):
+    def __init__(self, responses: list[ModelResponse]):
+        super().__init__(alias="sequence-judge", is_debater=False)
+        self.responses = list(responses)
+
+    def predict(self, inputs, **kwargs):
+        assert len(inputs) == 1
+        return [self.responses.pop(0)]
+
+
+def _parse_test_verdict(text: str):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) and "winner" in value else None
+
+
+def _run_real_judge_round(
+    responses: list[ModelResponse], *, verdict_retries: int = 1
+) -> tuple[DebateState, dict]:
+    protocol = Protocol.parse(
+        {
+            "turns": [
+                {
+                    "judge": [
+                        {"name": "deliberation", "visibility": "private"},
+                        {"name": "verdict", "kind": "decision"},
+                    ]
+                }
+            ]
+        }
+    )
+    prompts = RenderedPrompts(
+        PromptLibrary(
+            system={"judge": "Judge the debate."},
+            slots={"deliberation": "Think.", "verdict": "Return the verdict."},
+        )
+    )
+    state = DebateState(
+        bindings={
+            "judge": {
+                "NAME": "Debater_A",
+                "OPPONENT_NAME": "Debater_B",
+                "TOPIC": "problem",
+                "POSITION": "5",
+                "OPPONENT_POSITION": "not 5",
+            }
+        }
+    )
+    round_ = DebateRound(
+        protocol,
+        {"judge": FrozenSeat(_StopSequenceJudge(responses))},
+        prompts,
+        verdict_parser=_parse_test_verdict,
+        verdict_retries=verdict_retries,
+        judge_schema="competitive",
+    )
+    round_.run([state])
+    return state, pair.state_transcript(SimpleNamespace(), state, "task-a")
+
+
+def test_real_round_retains_discarded_capped_verdict_before_successful_retry() -> None:
+    valid = '{"winner":"Debater_A","confidence":1}'
+    state, row = _run_real_judge_round(
+        [
+            ModelResponse(speech="reasoning", stop_reason="stop"),
+            ModelResponse(speech="not valid JSON", stop_reason="length"),
+            ModelResponse(speech=valid, stop_reason="stop"),
+        ]
+    )
+    assert state.failed is None
+    assert state.records[-1].text == valid
+    assert state.records[-1].retries == 1
+    assert row["decision_attempts"] == [
+        {
+            "slot": "verdict",
+            "speaker": "judge",
+            "turn": 0,
+            "kind": "decision",
+            "retry_index": 0,
+            "stop_reason": "length",
+        },
+        {
+            "slot": "verdict",
+            "speaker": "judge",
+            "turn": 0,
+            "kind": "decision",
+            "retry_index": 1,
+            "stop_reason": "stop",
+        },
+    ]
+    failure = pair.native_judge_stack_failures([row])[0]
+    assert failure["judge_cap_decision_attempts"][0]["retry_index"] == 0
+    assert "judge_cap_slots" not in failure
+
+
+def test_real_round_all_capped_verdict_attempts_survive_failed_final_ingest() -> None:
+    state, row = _run_real_judge_round(
+        [
+            ModelResponse(speech="reasoning", stop_reason="stop"),
+            ModelResponse(speech="not valid JSON", stop_reason="length"),
+            ModelResponse(
+                speech="",
+                raw_response='{"type":"responses_incomplete"}',
+                failed=True,
+                stop_reason="length",
+            ),
+        ]
+    )
+    assert state.failed == "judge/verdict: model_failed"
+    assert [record.slot.slot.name for record in state.records] == ["deliberation"]
+    verdict_attempts = [
+        attempt for attempt in row["decision_attempts"] if attempt["slot"] == "verdict"
+    ]
+    assert [attempt["retry_index"] for attempt in verdict_attempts] == [0, 1]
+    assert [attempt["stop_reason"] for attempt in verdict_attempts] == ["length", "length"]
+    failure = pair.native_judge_stack_failures([row])[0]
+    assert [
+        attempt["retry_index"] for attempt in failure["judge_cap_decision_attempts"]
+    ] == [0, 1]
+
+
+def test_real_round_exhausted_uncapped_invalid_verdict_is_capability_outcome() -> None:
+    state, raw_row = _run_real_judge_round(
+        [
+            ModelResponse(speech="reasoning", stop_reason="stop"),
+            ModelResponse(speech="not valid JSON", stop_reason="stop"),
+            ModelResponse(speech="still not valid JSON", stop_reason="stop"),
+        ]
+    )
+    assert state.failed == "verdict_unparseable"
+    assert [record.slot.slot.name for record in state.records] == ["deliberation"]
+    assert [attempt["stop_reason"] for attempt in raw_row["decision_attempts"]] == [
+        "stop",
+        "stop",
+    ]
+    row = pair.score_transcript(raw_row)
+    assert row["judge"]["outcome"] == "unparseable"
+    assert pair.native_judge_stack_failures([row]) == []
+    summary = pair.summarize_arm([row])
+    assert summary["outcomes"] == {"unparseable": 1}
+    assert summary["n_binary_scored"] == 0
+
+
+def _scored_judge_row(
+    *, deliberation_stop: str = "stop", verdict_text: str, verdict_stop: str
+) -> dict:
+    row = _row(opening=r"Therefore, \boxed{5}", gt=5, verdict=verdict_text)
+    row["records"].insert(
+        -1,
+        {
+            "speaker": "judge",
+            "kind": "speech",
+            "slot": "deliberation",
+            "turn": 0,
+            "text": "reasoning",
+            "stop_reason": deliberation_stop,
+        },
+    )
+    row["records"][-1]["turn"] = 0
+    row["records"][-1]["stop_reason"] = verdict_stop
+    return pair.score_transcript(row)
+
+
+def test_deliberation_cap_invalidates_native_judge_stack() -> None:
+    row = _scored_judge_row(
+        deliberation_stop="length",
+        verdict_text='{"winner":"Debater_A","confidence":1}',
+        verdict_stop="stop",
+    )
+    failure = pair.native_judge_stack_failures([row])[0]
+    assert failure["judge_cap_slots"] == [
+        {
+            "slot": "deliberation",
+            "turn": 0,
+            "kind": "speech",
+            "stop_reason": "length",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("verdict_text", "expected_outcome"),
+    [
+        ("not valid JSON", "unparseable"),
+        ('{"winner":"Debater_A","confidence":1}', "winner"),
+    ],
+)
+def test_verdict_cap_invalidates_even_parseable_json(
+    verdict_text: str, expected_outcome: str
+) -> None:
+    row = _scored_judge_row(verdict_text=verdict_text, verdict_stop="length")
+    assert row["judge"]["outcome"] == expected_outcome
+    failure = pair.native_judge_stack_failures([row])[0]
+    assert [slot["slot"] for slot in failure["judge_cap_slots"]] == ["verdict"]
+    with pytest.raises(RuntimeError, match="arm accuracy invalid"):
+        pair.summarize_arm([row])
+
+
+def test_non_length_unparseable_verdict_remains_judge_capability_outcome() -> None:
+    row = _scored_judge_row(verdict_text="not valid JSON", verdict_stop="stop")
+    assert row["judge"]["outcome"] == "unparseable"
+    assert pair.native_judge_stack_failures([row]) == []
+    summary = pair.summarize_arm([row])
+    assert summary["outcomes"] == {"unparseable": 1}
+    assert summary["n_binary_scored"] == 0
 
 
 def test_opening_without_relaxed_number_is_protocol_invalid() -> None:

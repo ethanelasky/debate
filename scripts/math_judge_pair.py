@@ -454,6 +454,11 @@ def state_transcript(env, state: DebateState, task_id: str) -> dict[str, Any]:
             "answer_format_valid": rec.answer_format_valid,
             "retries": rec.retries,
             "truncated": rec.truncated,
+            "stop_reason": (
+                rec.response.stop_reason
+                if rec.response is not None
+                else (rec.sample.stop_reason if rec.sample is not None else None)
+            ),
         }
         for rec in state.records
     ]
@@ -466,6 +471,7 @@ def state_transcript(env, state: DebateState, task_id: str) -> dict[str, Any]:
         },
         "failed": state.failed,
         "model_failure": state.meta.get("model_failure"),
+        "decision_attempts": list(state.meta.get("decision_attempts") or []),
         "records": records,
     }
 
@@ -540,7 +546,12 @@ def score_transcript(row: dict[str, Any]) -> dict[str, Any]:
     )
 
     prediction = None
-    outcome = "failed" if row.get("failed") else "missing"
+    failed = row.get("failed")
+    outcome = (
+        "unparseable"
+        if failed == "verdict_unparseable"
+        else ("failed" if failed else "missing")
+    )
     confidence = None
     decision = next(
         (rec for rec in reversed(row.get("records", [])) if rec.get("kind") == Kind.DECISION.value),
@@ -619,14 +630,48 @@ def native_judge_stack_failures(rows: list[dict[str, Any]]) -> list[dict[str, An
         fallback_fatal = any(
             marker in lowered for marker in ("model_failed", "transport", "refusal", "cap")
         )
-        if metadata is not None or fallback_fatal:
-            failures.append(
-                {
-                    "task_id": row.get("task_id"),
-                    "state_failed": row.get("failed"),
-                    "model_failure": metadata,
-                }
-            )
+        judge_cap_slots = [
+            {
+                "slot": record.get("slot"),
+                "turn": record.get("turn"),
+                "kind": record.get("kind"),
+                "stop_reason": "length",
+            }
+            for record in row.get("records", [])
+            if record.get("speaker") == "judge"
+            and record.get("slot") in {"deliberation", "verdict"}
+            and record.get("stop_reason") == "length"
+        ]
+        judge_cap_decision_attempts = [
+            {
+                "slot": attempt.get("slot"),
+                "speaker": attempt.get("speaker"),
+                "turn": attempt.get("turn"),
+                "kind": attempt.get("kind"),
+                "retry_index": attempt.get("retry_index"),
+                "stop_reason": "length",
+            }
+            for attempt in row.get("decision_attempts", [])
+            if attempt.get("speaker") == "judge"
+            and attempt.get("slot") in {"deliberation", "verdict"}
+            and attempt.get("stop_reason") == "length"
+        ]
+        if (
+            metadata is not None
+            or fallback_fatal
+            or judge_cap_slots
+            or judge_cap_decision_attempts
+        ):
+            failure = {
+                "task_id": row.get("task_id"),
+                "state_failed": row.get("failed"),
+                "model_failure": metadata,
+            }
+            if judge_cap_slots:
+                failure["judge_cap_slots"] = judge_cap_slots
+            if judge_cap_decision_attempts:
+                failure["judge_cap_decision_attempts"] = judge_cap_decision_attempts
+            failures.append(failure)
     return failures
 
 
