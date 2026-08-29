@@ -1108,15 +1108,19 @@ def main() -> None:
     source_commit = resolve_source_commit(args.source_commit)
     seed_exp, seed_env = build_arm_env("qwen")
     try:
-        tasks = seed_env.tasks(10**9, split="dev")
+        pool_tasks = seed_env.tasks(10**9, split="dev")
+        if len(pool_tasks) != EXPECTED_DEV_TASKS:
+            raise RuntimeError(
+                f"expected all {EXPECTED_DEV_TASKS} held-out MATH-L5 dev tasks, "
+                f"got {len(pool_tasks)}"
+            )
+        pool_task_ids = ordered_task_ids(pool_tasks)
+        pool_task_labels = ordered_task_labels(pool_tasks, pool_task_ids)
+        tasks = pool_tasks
         if args.limit is not None:
             if args.limit <= 0:
                 raise ValueError("--limit must be positive")
             tasks = tasks[: args.limit]
-        elif len(tasks) != EXPECTED_DEV_TASKS:
-            raise RuntimeError(
-                f"expected all {EXPECTED_DEV_TASKS} held-out MATH-L5 dev tasks, got {len(tasks)}"
-            )
         task_ids = ordered_task_ids(tasks)
         task_labels = ordered_task_labels(tasks, task_ids)
         dataset_protocol_identity = seed_env.family.protocol_identity()
@@ -1161,20 +1165,22 @@ def main() -> None:
             if manifest.get("schema") != MANIFEST_SCHEMA:
                 raise RuntimeError(f"unsupported seed manifest schema {manifest.get('schema')!r}")
             verify_cache_identity(manifest, source_identity)
-            if manifest.get("ordered_task_ids") != task_ids:
+            # A smoke may replay a prefix, but it still verifies the entire
+            # immutable seed/cache against the current held-out pool first.
+            if manifest.get("ordered_task_ids") != pool_task_ids:
                 raise RuntimeError("PAIRING DRIFT: current ordered dev task IDs differ from seed manifest")
-            if manifest.get("ordered_task_labels") != task_labels:
+            if manifest.get("ordered_task_labels") != pool_task_labels:
                 raise RuntimeError("PAIRING DRIFT: current ordered task labels differ from seed manifest")
-            if manifest.get("ordered_task_labels_sha256") != canonical_sha256(task_labels):
+            if manifest.get("ordered_task_labels_sha256") != canonical_sha256(pool_task_labels):
                 raise RuntimeError("PAIRING DRIFT: seed manifest task-label hash is invalid")
             if file_sha256(cache_path) != manifest.get("cache_sha256"):
                 raise RuntimeError("PAIRING DRIFT: cache.jsonl hash differs from seed manifest")
             cache_entries = _read_jsonl(cache_path)
-            expected_records = expected_cache_records(
-                seed_env, len(tasks), full_run=args.limit is None
+            full_cache_records = expected_cache_records(
+                seed_env, len(pool_tasks), full_run=True
             )
-            verify_cache_shape(cache_entries, expected_records)
-            if manifest.get("cache_records") != expected_records:
+            verify_cache_shape(cache_entries, full_cache_records)
+            if manifest.get("cache_records") != full_cache_records:
                 raise RuntimeError("PAIRING DRIFT: seed manifest cache record count is not protocol-derived")
         else:
             print(f"phase 1: generating {len(tasks)} frozen-policy debates; seed judge output discarded", file=sys.stderr)
@@ -1246,7 +1252,7 @@ def main() -> None:
             arm_labels = ordered_task_labels(arm_tasks, arm_ids)
             if env.family.protocol_identity() != manifest["dataset_protocol_identity"]:
                 raise RuntimeError("PAIRING DRIFT: arm dataset protocol identity differs")
-            if arm_labels != manifest["ordered_task_labels"]:
+            if arm_labels != task_labels:
                 raise RuntimeError("PAIRING DRIFT: arm ordered task labels differ")
             for speaker in env.debaters:
                 env.config.frozen_models[speaker] = PlaybackModel(
@@ -1267,11 +1273,13 @@ def main() -> None:
                 if speaker in env.debaters and isinstance(model, PlaybackModel)
             )
             verify_pairing(
-                expected_ids=manifest["ordered_task_ids"],
+                expected_ids=task_ids,
                 actual_ids=arm_ids,
-                expected_contexts=manifest["first_judge_context_hashes"],
+                expected_contexts=manifest["first_judge_context_hashes"][: len(task_ids)],
                 actual_contexts=contexts,
-                expected_playback_hits=int(manifest["cache_records"]),
+                expected_playback_hits=expected_cache_records(
+                    env, len(arm_tasks), full_run=args.limit is None
+                ),
                 actual_playback_hits=hits,
             )
             rows = [
