@@ -70,7 +70,7 @@ jobs:
       # The repo input is the clean detached worktree at this exact runtime
       # commit. It excludes .git, so the driver records the pinned identity
       # supplied here instead of trying to infer provenance on the pod.
-      SOURCE_COMMIT=5e97ddb9f6554a3a874ebddf76ad93232acebb5b
+      SOURCE_COMMIT=8294145ed74b90fb839f17d5ee270457637fb61e
       printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
         || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
 
