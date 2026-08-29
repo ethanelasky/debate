@@ -65,9 +65,12 @@ _math_judge_pair_base:
         # second template-level think stream made stock Qwen loop for the full
         # 16,384-token cap instead of completing that slot.
         enable_thinking: false
+        # Qwen's model card recommends presence penalty to reduce endless
+        # repetition. Keep temperature zero for deterministic evaluation while
+        # applying that decoding-only guard to both resolved profiles.
         sampling:
-          train: {temperature: 0.0, top_p: 1.0}
-          eval: {temperature: 0.0, top_p: 1.0}
+          train: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.5}
+          eval: {temperature: 0.0, top_p: 1.0, presence_penalty: 1.5}
   judge_config: {schema_name: competitive, retries: 4}
   scoring: {scoring: continuous, confidence_source: json}
   dataset:

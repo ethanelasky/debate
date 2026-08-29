@@ -240,6 +240,8 @@ def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     assert qwen["agents"]["judge"]["model_settings"]["model_file_path"] == "Qwen/Qwen3.5-4B"
     assert qwen["agents"]["judge"]["model_settings"]["enable_thinking"] is False
     assert qwen["agents"]["judge"]["model_settings"]["sampling"]["train"]["temperature"] == 0.0
+    assert qwen["agents"]["judge"]["model_settings"]["sampling"]["train"]["presence_penalty"] == 1.5
+    assert qwen["agents"]["judge"]["model_settings"]["sampling"]["eval"]["presence_penalty"] == 1.5
     assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [16384, 512]
     assert luna["agents"]["judge"]["model_settings"]["model_file_path"] == "gpt-5.6-luna"
     assert luna["agents"]["judge"]["model_settings"]["reasoning_effort"] == "low"
@@ -378,6 +380,7 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert identity["judge_generation_by_arm"]["qwen"]["chat_template_kwargs"] == {
         "enable_thinking": False
     }
+    assert identity["judge_generation_by_arm"]["qwen"]["presence_penalty"] == 1.5
     assert identity["judge_generation_by_arm"]["qwen"]["deliberation_cap"] == 16384
     assert identity["judge_generation_by_arm"]["qwen"]["verdict_cap"] == 512
     assert identity["judge_generation_by_arm"]["luna"] == {
@@ -453,6 +456,7 @@ def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
         speech_structure=SpeechStructure.DECISION,
         temperature=0.0,
         top_p=1.0,
+        presence_penalty=1.5,
         top_k=20,
         json_schema=schema,
     )
@@ -465,6 +469,7 @@ def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
             "top_logprobs": 5,
             "temperature": 0.0,
             "top_p": 1.0,
+            "presence_penalty": 1.5,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {"name": "verdict", "schema": schema},
