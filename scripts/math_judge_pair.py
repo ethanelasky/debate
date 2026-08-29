@@ -67,7 +67,7 @@ EXPERIMENTS = {
 }
 EXPECTED_DEV_TASKS = 177
 MANIFEST_SCHEMA = "math-judge-pair-v2"
-REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v2"
+REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v3"
 CACHE_IDENTITY_KEYS = (
     "comparison_unit",
     "config_path",
@@ -1049,8 +1049,8 @@ def expected_manifest_inputs(
                 "model": "Qwen/Qwen3.5-4B",
                 "temperature": 0.0,
                 "top_p": 1.0,
-                "deliberation_cap": 768,
-                "verdict_cap": 256,
+                "deliberation_cap": 2048,
+                "verdict_cap": 512,
                 "chat_template": "server_default",
                 "historical_enable_thinking_false_forwarded": False,
                 "transport": "raw_vllm_chat_completions_json_v1",
@@ -1080,9 +1080,10 @@ def verify_manifest_inputs(manifest: dict[str, Any], current: dict[str, Any]) ->
 def verify_cache_identity(manifest: dict[str, Any], current: dict[str, Any]) -> None:
     """Verify everything that could change the 708 recorded debater speeches.
 
-    The replay implementation and judge transport may advance after phase 1;
-    neither generated the cache and neither is allowed to masquerade as part
-    of its provenance. Their commits are recorded separately instead.
+    Judge settings and the replay implementation may advance after phase 1;
+    neither generated the cache. Full protocol/config hashes remain in seed
+    and replay provenance, while the later 708-key PlaybackModel gate proves
+    every current debater context still maps to the immutable recorded speech.
     """
     for key in CACHE_IDENTITY_KEYS:
         if manifest.get(key) != current.get(key):
@@ -1090,13 +1091,6 @@ def verify_cache_identity(manifest: dict[str, Any], current: dict[str, Any]) -> 
                 f"PAIRING DRIFT: seed cache identity {key} differs from current "
                 f"source ({manifest.get(key)!r} != {current.get(key)!r})"
             )
-    seed_protocol = (manifest.get("protocol_sha256_by_arm") or {}).get("qwen")
-    current_protocol = (current.get("protocol_sha256_by_arm") or {}).get("qwen")
-    if seed_protocol != current_protocol:
-        raise RuntimeError(
-            "PAIRING DRIFT: seed cache identity qwen seed protocol differs from "
-            f"current source ({seed_protocol!r} != {current_protocol!r})"
-        )
 
 
 def replay_manifest(
@@ -1125,7 +1119,7 @@ def replay_manifest(
         },
         "verified_cache_identity": {
             **{key: current[key] for key in CACHE_IDENTITY_KEYS},
-            "qwen_seed_protocol_sha256": current["protocol_sha256_by_arm"]["qwen"],
+            "debater_context_gate": "708_content_addressed_playback_keys_v1",
         },
     }
 

@@ -240,7 +240,7 @@ def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     assert qwen["agents"]["judge"]["model_settings"]["model_file_path"] == "Qwen/Qwen3.5-4B"
     assert "enable_thinking" not in qwen["agents"]["judge"]["model_settings"]
     assert qwen["agents"]["judge"]["model_settings"]["sampling"]["train"]["temperature"] == 0.0
-    assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [768, 256]
+    assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [2048, 512]
     assert luna["agents"]["judge"]["model_settings"]["model_file_path"] == "gpt-5.6-luna"
     assert luna["agents"]["judge"]["model_settings"]["reasoning_effort"] == "low"
     assert luna["agents"]["judge"]["model_settings"]["base_url"] is None
@@ -320,6 +320,7 @@ def test_cache_verification_allows_replay_code_and_judge_settings_to_advance() -
     current["source_commit"] = "b" * 40
     current["config_sha256"] = "new-config"
     current["judge_generation_by_arm"]["qwen"]["transport"] = "new-transport"
+    current["protocol_sha256_by_arm"]["qwen"] = "roomier-qwen-judge-protocol"
     current["protocol_sha256_by_arm"]["luna"] = "uncapped-luna-protocol"
 
     pair.verify_cache_identity(seed, current)
@@ -327,11 +328,6 @@ def test_cache_verification_allows_replay_code_and_judge_settings_to_advance() -
     drifted["prompt_sha256"] = "changed"
     with pytest.raises(RuntimeError, match="seed cache identity prompt_sha256"):
         pair.verify_cache_identity(seed, drifted)
-    drifted = json.loads(json.dumps(current))
-    drifted["protocol_sha256_by_arm"]["qwen"] = "changed-seed-protocol"
-    with pytest.raises(RuntimeError, match="qwen seed protocol"):
-        pair.verify_cache_identity(seed, drifted)
-
     provenance = pair.replay_manifest(
         seed={
             **seed,
@@ -354,8 +350,8 @@ def test_cache_verification_allows_replay_code_and_judge_settings_to_advance() -
     }
     assert provenance["replay"]["source_commit"] == "b" * 40
     assert provenance["replay"]["config_sha256"] == "new-config"
-    assert provenance["verified_cache_identity"]["qwen_seed_protocol_sha256"] == (
-        current["protocol_sha256_by_arm"]["qwen"]
+    assert provenance["verified_cache_identity"]["debater_context_gate"] == (
+        "708_content_addressed_playback_keys_v1"
     )
 
 
@@ -378,6 +374,8 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert identity["judge_generation_by_arm"]["qwen"]["transport"] == (
         "raw_vllm_chat_completions_json_v1"
     )
+    assert identity["judge_generation_by_arm"]["qwen"]["deliberation_cap"] == 2048
+    assert identity["judge_generation_by_arm"]["qwen"]["verdict_cap"] == 512
     assert identity["judge_generation_by_arm"]["luna"] == {
         "model": "gpt-5.6-luna",
         "reasoning_effort": "low",
