@@ -1,6 +1,6 @@
 profile: debate-b200x2
 jobs:
-  - name: math-judge-pair-step40-qwen-replay-single-reasoning
+  - name: math-judge-pair-step40-qwen-replay-presence15
     gpus: 2
     gpu_type: NVIDIA B200
     # Pin the requested origin profile: changing a rebound field disables the
@@ -37,8 +37,8 @@ jobs:
         remote: /workspace/math-judge-seed
         exclude: []
     outputs:
-      - remote: /workspace/debate/outputs/math_judge_pair_qwen_replay_single_reasoning
-        local: ~/code/debate/outputs/math_judge_pair_qwen_replay_single_reasoning
+      - remote: /workspace/debate/outputs/math_judge_pair_qwen_replay_presence15
+        local: ~/code/debate/outputs/math_judge_pair_qwen_replay_presence15
     command: |-
       set -euo pipefail
       export POD_IDLE_STOP=0
@@ -58,7 +58,7 @@ jobs:
         exit 1
       fi
 
-      SOURCE_COMMIT=16e3df82a2ebb1e092a59470a6d226c0dbf9016f
+      SOURCE_COMMIT=730bda54339123180e3af3d86c99d47f45d374bd
       printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
         || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
 
@@ -87,7 +87,7 @@ jobs:
       test -f "$BASE_SNAP/config.json" \
         || { echo "FATAL: pinned stock Qwen unavailable" >&2; exit 1; }
 
-      OUT_ROOT=/workspace/debate/outputs/math_judge_pair_qwen_replay_single_reasoning
+      OUT_ROOT=/workspace/debate/outputs/math_judge_pair_qwen_replay_presence15
       mkdir -p "$OUT_ROOT"
       "$PY" - <<'PY'
       import socket
@@ -167,7 +167,7 @@ jobs:
       import json, sys
       summary = json.load(open(sys.argv[1]))
       assert summary["n_attempted"] == 177, summary
-      assert summary["replay_source_commit"] == "16e3df82a2ebb1e092a59470a6d226c0dbf9016f", summary
+      assert summary["replay_source_commit"] == "730bda54339123180e3af3d86c99d47f45d374bd", summary
       assert summary["seed_cache_sha256"] == "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e", summary
       assert summary["cleared_nonoperative_playback_template_controls"] == 2, summary
       PY
