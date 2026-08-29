@@ -54,6 +54,7 @@ from infra.envs.tasks.math import problem_key  # noqa: E402
 from infra.models.playback_model import PlaybackModel, context_key  # noqa: E402
 from infra.models.base import Model, SpeechStructure  # noqa: E402
 from infra.models.local_model import LocalModel  # noqa: E402
+from infra.models.openai_model import OpenAIModel  # noqa: E402
 from infra.run_debate import build_env, split_agents  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -66,15 +67,13 @@ EXPERIMENTS = {
 }
 EXPECTED_DEV_TASKS = 177
 MANIFEST_SCHEMA = "math-judge-pair-v2"
-REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v1"
+REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v2"
 CACHE_IDENTITY_KEYS = (
     "comparison_unit",
     "config_path",
-    "config_sha256",
     "prompt_path",
     "prompt_entry",
     "prompt_sha256",
-    "protocol_sha256_by_arm",
     "dataset_protocol_identity",
     "model_checkpoint_identity",
     "debater_generation",
@@ -357,6 +356,41 @@ class RawVLLMChatModel(LocalModel):
         )
 
 
+class _UncappedResponsesResource:
+    """Responses resource that omits the caller's synthetic token ceiling."""
+
+    def __init__(self, resource: Any):
+        self._resource = resource
+
+    def create(self, **kwargs: Any) -> Any:
+        kwargs.pop("max_output_tokens", None)
+        return self._resource.create(**kwargs)
+
+
+class _UncappedOpenAIClient:
+    """Transparent client proxy whose Responses calls carry no output cap."""
+
+    def __init__(self, client: Any):
+        self._client = client
+        self.responses = _UncappedResponsesResource(client.responses)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+class UncappedResponsesOpenAIModel(OpenAIModel):
+    """OpenAI Responses model with ``max_output_tokens`` genuinely omitted."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        if not self._uses_responses_api():
+            raise ValueError(
+                "uncapped Responses transport requires a Responses model, "
+                f"got {self.endpoint}"
+            )
+        self.client = _UncappedOpenAIClient(self.client)
+
+
 def canonical_sha256(value: Any) -> str:
     payload = json.dumps(
         value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -431,6 +465,14 @@ def build_arm_env(arm: str):
             alias=settings["alias"],
             endpoint=settings["model_file_path"],
             base_url=settings["base_url"],
+            is_debater=False,
+        )
+    elif arm == "luna":
+        settings = exp["agents"][env.judge_speaker]["model_settings"]
+        env.config.frozen_models[env.judge_speaker] = UncappedResponsesOpenAIModel(
+            alias=settings["alias"],
+            endpoint=settings["model_file_path"],
+            reasoning_effort=settings["reasoning_effort"],
             is_debater=False,
         )
     return exp, env
@@ -1017,8 +1059,10 @@ def expected_manifest_inputs(
                 "model": "gpt-5.6-luna",
                 "reasoning_effort": "low",
                 "temperature": "provider_native_not_exposed",
-                "deliberation_cap": 1536,
-                "verdict_cap": 512,
+                "deliberation_cap": None,
+                "verdict_cap": None,
+                "max_output_tokens": "omitted",
+                "transport": "openai_responses_uncapped_v1",
             },
         },
     }
@@ -1046,6 +1090,13 @@ def verify_cache_identity(manifest: dict[str, Any], current: dict[str, Any]) -> 
                 f"PAIRING DRIFT: seed cache identity {key} differs from current "
                 f"source ({manifest.get(key)!r} != {current.get(key)!r})"
             )
+    seed_protocol = (manifest.get("protocol_sha256_by_arm") or {}).get("qwen")
+    current_protocol = (current.get("protocol_sha256_by_arm") or {}).get("qwen")
+    if seed_protocol != current_protocol:
+        raise RuntimeError(
+            "PAIRING DRIFT: seed cache identity qwen seed protocol differs from "
+            f"current source ({seed_protocol!r} != {current_protocol!r})"
+        )
 
 
 def replay_manifest(
@@ -1063,13 +1114,18 @@ def replay_manifest(
             "cache_sha256": seed.get("cache_sha256"),
             "cache_records": seed.get("cache_records"),
             "ordered_task_ids_sha256": seed.get("ordered_task_ids_sha256"),
+            "config_sha256": seed.get("config_sha256"),
+            "protocol_sha256_by_arm": seed.get("protocol_sha256_by_arm"),
         },
         "replay": {
             "source_commit": current["source_commit"],
+            "config_sha256": current["config_sha256"],
+            "protocol_sha256_by_arm": current["protocol_sha256_by_arm"],
             "judge_generation_by_arm": current["judge_generation_by_arm"],
         },
         "verified_cache_identity": {
-            key: current[key] for key in CACHE_IDENTITY_KEYS
+            **{key: current[key] for key in CACHE_IDENTITY_KEYS},
+            "qwen_seed_protocol_sha256": current["protocol_sha256_by_arm"]["qwen"],
         },
     }
 

@@ -84,17 +84,16 @@ math_judge_pair_qwen:
 math_judge_pair_luna:
   _extends: _math_judge_pair_base
   protocol:
-    # Responses max_output_tokens includes hidden reasoning. These larger
-    # judge-only caps keep low-effort Luna from inheriting Qwen's 768/256
-    # envelope; they do not enter or alter the rendered judge context.
+    # Luna is deliberately uncapped: its Responses requests omit
+    # max_output_tokens rather than substituting a large synthetic ceiling.
     turns:
       - {}
       - {}
       - {}
       - {}
       - judge:
-          - {name: deliberation, visibility: private, max_total_tokens: 1536}
-          - {name: verdict, kind: decision, max_total_tokens: 512}
+          - {name: deliberation, visibility: private, max_total_tokens: null}
+          - {name: verdict, kind: decision, max_total_tokens: null}
   agents:
     judge:
       model_settings:

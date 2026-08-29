@@ -244,7 +244,7 @@ def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     assert luna["agents"]["judge"]["model_settings"]["model_file_path"] == "gpt-5.6-luna"
     assert luna["agents"]["judge"]["model_settings"]["reasoning_effort"] == "low"
     assert luna["agents"]["judge"]["model_settings"]["base_url"] is None
-    assert [slot["max_total_tokens"] for slot in luna["protocol"]["turns"][4]["judge"]] == [1536, 512]
+    assert [slot.get("max_total_tokens") for slot in luna["protocol"]["turns"][4]["judge"]] == [None, None]
 
 
 def test_job_spec_requires_two_b200s_and_pins_every_merge_input() -> None:
@@ -314,16 +314,22 @@ def test_manifest_verification_rejects_source_hash_drift() -> None:
         pair.verify_manifest_inputs(expected, current)
 
 
-def test_cache_verification_allows_replay_code_and_judge_transport_to_advance() -> None:
+def test_cache_verification_allows_replay_code_and_judge_settings_to_advance() -> None:
     seed = pair.expected_manifest_inputs("a" * 40, {"split_sha256": "dataset"})
     current = json.loads(json.dumps(seed))
     current["source_commit"] = "b" * 40
+    current["config_sha256"] = "new-config"
     current["judge_generation_by_arm"]["qwen"]["transport"] = "new-transport"
+    current["protocol_sha256_by_arm"]["luna"] = "uncapped-luna-protocol"
 
     pair.verify_cache_identity(seed, current)
     drifted = json.loads(json.dumps(current))
     drifted["prompt_sha256"] = "changed"
     with pytest.raises(RuntimeError, match="seed cache identity prompt_sha256"):
+        pair.verify_cache_identity(seed, drifted)
+    drifted = json.loads(json.dumps(current))
+    drifted["protocol_sha256_by_arm"]["qwen"] = "changed-seed-protocol"
+    with pytest.raises(RuntimeError, match="qwen seed protocol"):
         pair.verify_cache_identity(seed, drifted)
 
     provenance = pair.replay_manifest(
@@ -343,8 +349,14 @@ def test_cache_verification_allows_replay_code_and_judge_transport_to_advance() 
         "cache_sha256": "cache",
         "cache_records": 708,
         "ordered_task_ids_sha256": "tasks",
+        "config_sha256": seed["config_sha256"],
+        "protocol_sha256_by_arm": seed["protocol_sha256_by_arm"],
     }
     assert provenance["replay"]["source_commit"] == "b" * 40
+    assert provenance["replay"]["config_sha256"] == "new-config"
+    assert provenance["verified_cache_identity"]["qwen_seed_protocol_sha256"] == (
+        current["protocol_sha256_by_arm"]["qwen"]
+    )
 
 
 def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
@@ -366,6 +378,42 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert identity["judge_generation_by_arm"]["qwen"]["transport"] == (
         "raw_vllm_chat_completions_json_v1"
     )
+    assert identity["judge_generation_by_arm"]["luna"] == {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low",
+        "temperature": "provider_native_not_exposed",
+        "deliberation_cap": None,
+        "verdict_cap": None,
+        "max_output_tokens": "omitted",
+        "transport": "openai_responses_uncapped_v1",
+    }
+
+
+def test_uncapped_responses_proxy_omits_only_max_output_tokens() -> None:
+    calls = []
+
+    class Resource:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return "response"
+
+    client = pair._UncappedOpenAIClient(SimpleNamespace(responses=Resource(), marker="kept"))
+    result = client.responses.create(
+        model="gpt-5.6-luna",
+        input=[{"role": "user", "content": "judge"}],
+        max_output_tokens=512,
+        reasoning={"effort": "low"},
+    )
+
+    assert result == "response"
+    assert calls == [
+        {
+            "model": "gpt-5.6-luna",
+            "input": [{"role": "user", "content": "judge"}],
+            "reasoning": {"effort": "low"},
+        }
+    ]
+    assert client.marker == "kept"
 
 
 def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
@@ -481,6 +529,47 @@ def test_qwen_arm_replaces_only_the_judge_transport() -> None:
         )
     finally:
         env.family.close()
+
+
+def test_luna_arm_omits_output_cap_on_the_real_model_path(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _, env = pair.build_arm_env("luna")
+    calls = []
+
+    class Resource:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                id="response-test",
+                output_text='{"winner":"Debater_A","confidence":1.0}',
+                output=[],
+            )
+
+    try:
+        model = env.config.frozen_models[env.judge_speaker]
+        assert isinstance(model, pair.UncappedResponsesOpenAIModel)
+        model.client.responses._resource = Resource()
+        response = model.predict(
+            [[ModelInput(role="user", content="Judge this debate.")]],
+            max_new_tokens=7,
+            speech_structure=SpeechStructure.DECISION,
+            json_schema={
+                "type": "object",
+                "properties": {"winner": {"type": "string"}},
+                "required": ["winner"],
+                "additionalProperties": False,
+            },
+        )[0]
+    finally:
+        env.family.close()
+
+    assert response.failed is False
+    assert len(calls) == 1
+    assert "max_output_tokens" not in calls[0]
+    assert calls[0]["model"] == "gpt-5.6-luna"
+    assert calls[0]["reasoning"] == {"effort": "low"}
+    assert calls[0]["text"]["format"]["type"] == "json_schema"
 
 
 def test_playback_clears_only_nonoperative_debater_template_controls(
