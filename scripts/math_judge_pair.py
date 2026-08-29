@@ -1049,7 +1049,7 @@ def expected_manifest_inputs(
                 "model": "Qwen/Qwen3.5-4B",
                 "temperature": 0.0,
                 "top_p": 1.0,
-                "deliberation_cap": 2048,
+                "deliberation_cap": 16384,
                 "verdict_cap": 512,
                 "chat_template": "server_default",
                 "historical_enable_thinking_false_forwarded": False,

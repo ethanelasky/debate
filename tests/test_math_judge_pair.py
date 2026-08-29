@@ -240,7 +240,7 @@ def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     assert qwen["agents"]["judge"]["model_settings"]["model_file_path"] == "Qwen/Qwen3.5-4B"
     assert "enable_thinking" not in qwen["agents"]["judge"]["model_settings"]
     assert qwen["agents"]["judge"]["model_settings"]["sampling"]["train"]["temperature"] == 0.0
-    assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [2048, 512]
+    assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [16384, 512]
     assert luna["agents"]["judge"]["model_settings"]["model_file_path"] == "gpt-5.6-luna"
     assert luna["agents"]["judge"]["model_settings"]["reasoning_effort"] == "low"
     assert luna["agents"]["judge"]["model_settings"]["base_url"] is None
@@ -374,7 +374,7 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert identity["judge_generation_by_arm"]["qwen"]["transport"] == (
         "raw_vllm_chat_completions_json_v1"
     )
-    assert identity["judge_generation_by_arm"]["qwen"]["deliberation_cap"] == 2048
+    assert identity["judge_generation_by_arm"]["qwen"]["deliberation_cap"] == 16384
     assert identity["judge_generation_by_arm"]["qwen"]["verdict_cap"] == 512
     assert identity["judge_generation_by_arm"]["luna"] == {
         "model": "gpt-5.6-luna",

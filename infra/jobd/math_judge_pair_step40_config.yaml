@@ -22,7 +22,7 @@ _math_judge_pair_base:
       - alice: [{name: alice_rebuttal, enable_thinking: false, max_total_tokens: 320}]
       - bob: [{name: bob_rebuttal, enable_thinking: false, max_total_tokens: 320}]
       - judge:
-          - {name: deliberation, visibility: private, max_total_tokens: 2048}
+          - {name: deliberation, visibility: private, max_total_tokens: 16384}
           - {name: verdict, kind: decision, max_total_tokens: 512}
   prompt_config:
     file_path: infra/prompts/debate/hendrycks_math.yaml
