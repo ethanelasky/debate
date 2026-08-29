@@ -79,9 +79,7 @@ jobs:
       BASE_REV=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
       BASE_SNAP="$HF_HOME/hub/models--Qwen--Qwen3.5-4B/snapshots/$BASE_REV"
       if [ ! -f "$BASE_SNAP/config.json" ]; then
-        DOWNLOADED=$(hf download Qwen/Qwen3.5-4B --revision "$BASE_REV")
-        test "$DOWNLOADED" = "$BASE_SNAP" \
-          || { echo "FATAL: hf returned unexpected stock snapshot $DOWNLOADED" >&2; exit 1; }
+        hf download Qwen/Qwen3.5-4B --revision "$BASE_REV" >/dev/null
       fi
       test "$(basename "$BASE_SNAP")" = "$BASE_REV"
       test -f "$BASE_SNAP/config.json" || { echo "FATAL: pinned stock Qwen unavailable" >&2; exit 1; }

@@ -260,6 +260,12 @@ def test_job_spec_requires_two_b200s_and_pins_every_merge_input() -> None:
     assert "unexpected merger shard set" in command
     assert "expected exactly two GPUs" in command
     assert "approved only for 2x NVIDIA B200" in command
+    # hf 1.28+ decorates successful stdout with a status line before the
+    # snapshot path. Do not treat presentation output as path identity; the
+    # pinned BASE_SNAP/config.json check immediately below is the oracle.
+    assert 'hf download Qwen/Qwen3.5-4B --revision "$BASE_REV" >/dev/null' in command
+    assert "DOWNLOADED=$(hf download" not in command
+    assert 'test -f "$BASE_SNAP/config.json"' in command
 
 
 def test_manifest_verification_rejects_source_hash_drift() -> None:
