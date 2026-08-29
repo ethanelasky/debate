@@ -1,0 +1,174 @@
+profile: debate-b200x2
+jobs:
+  - name: math-judge-pair-step40-qwen-replay-raw
+    gpus: 2
+    gpu_type: NVIDIA B200
+    # Pin the requested origin profile: changing a rebound field disables the
+    # profile's H200 alternate, so this replay cannot silently change hardware.
+    cpus: 31
+    priority: 10
+    timeout_s: 14400
+    stall_after_s: 1800
+    max_attempts: 1
+    max_infra_attempts: 1
+    env: [HF_TOKEN]
+    inputs:
+      - local: ~/code/debate-judge-pair-source
+        remote: /workspace/debate
+        exclude:
+          - .git
+          - .venv
+          - venv
+          - __pycache__
+          - "*.pyc"
+          - .pytest_cache
+          - .mypy_cache
+          - .ruff_cache
+          - node_modules
+          - wandb
+          - outputs
+          - "*.egg-info"
+          - .DS_Store
+          - wheels
+          - artifacts
+          - .env
+          - .env.*
+      - local: ~/code/debate/outputs/math_judge_pair_step40/math_judge_pair_step40
+        remote: /workspace/math-judge-seed
+        exclude: []
+    outputs:
+      - remote: /workspace/debate/outputs/math_judge_pair_qwen_replay
+        local: ~/code/debate/outputs/math_judge_pair_qwen_replay
+    command: |-
+      set -euo pipefail
+      export POD_IDLE_STOP=0
+      export HF_HUB_DISABLE_XET=1
+      unset HF_HUB_ENABLE_HF_TRANSFER
+      export HF_HOME=/workspace/hf
+      PY=""
+      for v in verl-b200 verl-sm90; do
+        if [ -x "/workspace/envs/$v/bin/python" ]; then PY="/workspace/envs/$v/bin/python"; break; fi
+      done
+      test -n "$PY" || { echo "FATAL: no verl env under /workspace/envs" >&2; exit 1; }
+      export PATH="$(dirname "$PY"):$PATH"
+      cd /workspace/debate
+      export PYTHONPATH=/workspace/debate:${PYTHONPATH:-}
+      if find /workspace/debate -type f \( -name '.env' -o -name '.env.*' \) -print -quit | grep -q .; then
+        echo "FATAL: secret .env file reached the clean source input" >&2
+        exit 1
+      fi
+
+      SOURCE_COMMIT=76773c370616f5f20527b0f112402c02cce68259
+      printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+        || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
+
+      check_sha256() {
+        file=$1; expected=$2
+        actual=$(sha256sum "$file" | awk '{print $1}')
+        test "$actual" = "$expected" \
+          || { echo "FATAL: SHA256 mismatch for $file: $actual" >&2; exit 1; }
+      }
+      check_sha256 /workspace/math-judge-seed/cache.jsonl \
+        575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e
+      check_sha256 /workspace/math-judge-seed/seed_manifest.json \
+        f440837265144a8193623cb05a59ed3b658efdcac5f2ae4318137d6b287a1a4d
+
+      GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader)
+      test "$(printf '%s\n' "$GPU_NAMES" | wc -l | tr -d ' ')" = 2 \
+        || { echo "FATAL: expected exactly two GPUs" >&2; exit 1; }
+      test "$(printf '%s\n' "$GPU_NAMES" | grep -c 'NVIDIA B200')" = 2 \
+        || { echo "FATAL: approved only for 2x NVIDIA B200" >&2; exit 1; }
+
+      BASE_REV=851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+      BASE_SNAP="$HF_HOME/hub/models--Qwen--Qwen3.5-4B/snapshots/$BASE_REV"
+      if [ ! -f "$BASE_SNAP/config.json" ]; then
+        hf download Qwen/Qwen3.5-4B --revision "$BASE_REV" >/dev/null
+      fi
+      test -f "$BASE_SNAP/config.json" \
+        || { echo "FATAL: pinned stock Qwen unavailable" >&2; exit 1; }
+
+      OUT_ROOT=/workspace/debate/outputs/math_judge_pair_qwen_replay
+      mkdir -p "$OUT_ROOT"
+      "$PY" - <<'PY'
+      import socket
+      sock = socket.socket()
+      try:
+          sock.bind(("127.0.0.1", 8788))
+      except OSError as exc:
+          raise SystemExit(f"FATAL: port 8788 is not free: {exc}")
+      finally:
+          sock.close()
+      PY
+
+      JUDGE_PID=""
+      cleanup() {
+        trap - EXIT TERM INT
+        if [ -n "$JUDGE_PID" ]; then
+          kill -9 -- "-$JUDGE_PID" 2>/dev/null || true
+          kill -9 "$JUDGE_PID" 2>/dev/null || true
+        fi
+      }
+      on_signal() { cleanup; exit 130; }
+      trap cleanup EXIT
+      trap on_signal TERM INT
+
+      CUDA_VISIBLE_DEVICES=1 setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
+        --model "$BASE_SNAP" --served-model-name Qwen/Qwen3.5-4B --port 8788 --seed 0 \
+        --dtype bfloat16 --gpu-memory-utilization 0.80 \
+        --max-model-len 16384 --max-num-seqs 64 --enable-prefix-caching \
+        > "$OUT_ROOT/qwen_judge_server.log" 2>&1 9>&- &
+      JUDGE_PID=$!
+      kill -0 "$JUDGE_PID" 2>/dev/null \
+        || { echo "FATAL: judge server did not survive launch" >&2; exit 3; }
+
+      deadline=$((SECONDS + 1800))
+      heartbeat=$((SECONDS + 300))
+      until curl -sf http://127.0.0.1:8788/v1/models >/dev/null 2>&1; do
+        if ! kill -0 "$JUDGE_PID" 2>/dev/null; then
+          echo "FATAL: judge server exited" >&2
+          tail -120 "$OUT_ROOT/qwen_judge_server.log" >&2
+          exit 3
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+          echo "FATAL: judge startup timeout" >&2
+          tail -120 "$OUT_ROOT/qwen_judge_server.log" >&2
+          exit 3
+        fi
+        if [ "$SECONDS" -ge "$heartbeat" ]; then
+          echo "waiting for judge server (${SECONDS}s elapsed)"
+          heartbeat=$((SECONDS + 300))
+        fi
+        sleep 10
+      done
+
+      curl -fsS -m 60 http://127.0.0.1:8788/v1/models \
+        | "$PY" -c 'import json,sys; ids=[x["id"] for x in json.load(sys.stdin)["data"]]; assert "Qwen/Qwen3.5-4B" in ids, ids'
+
+      # Exercise one real debate through playback + raw JSON judge transport
+      # before committing the server to all 177 tasks.
+      "$PY" scripts/math_judge_pair.py \
+        --arms qwen \
+        --reuse-cache /workspace/math-judge-seed \
+        --out "$OUT_ROOT/smoke" \
+        --source-commit "$SOURCE_COMMIT" \
+        --limit 1
+      test -f "$OUT_ROOT/smoke/qwen.summary.json"
+      test "$(wc -l < "$OUT_ROOT/smoke/qwen.transcripts.jsonl" | tr -d ' ')" = 1
+      echo QWEN_REPLAY_SMOKE_VERIFIED
+
+      "$PY" scripts/math_judge_pair.py \
+        --arms qwen \
+        --reuse-cache /workspace/math-judge-seed \
+        --out "$OUT_ROOT/full" \
+        --source-commit "$SOURCE_COMMIT"
+      test -f "$OUT_ROOT/full/qwen.summary.json"
+      test "$(wc -l < "$OUT_ROOT/full/qwen.transcripts.jsonl" | tr -d ' ')" = 177
+      "$PY" - "$OUT_ROOT/full/qwen.summary.json" <<'PY'
+      import json, sys
+      summary = json.load(open(sys.argv[1]))
+      assert summary["n_attempted"] == 177, summary
+      assert summary["replay_source_commit"] == "76773c370616f5f20527b0f112402c02cce68259", summary
+      assert summary["seed_cache_sha256"] == "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e", summary
+      assert summary["cleared_nonoperative_playback_template_controls"] == 2, summary
+      PY
+      echo QWEN_REPLAY_FULL_VERIFIED

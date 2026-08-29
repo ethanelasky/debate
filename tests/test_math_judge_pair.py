@@ -27,6 +27,10 @@ from infra.models.playback_model import PlaybackModel, context_key
 CONFIG = "infra/jobd/math_judge_pair_step40_config.yaml"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/math_judge_pair.py"
 JOB_SPEC = Path(__file__).resolve().parents[1] / "infra/jobd/math_judge_pair_step40.yaml"
+REPLAY_JOB_SPEC = (
+    Path(__file__).resolve().parents[1]
+    / "infra/jobd/math_judge_pair_qwen_replay.yaml"
+)
 _SPEC = importlib.util.spec_from_file_location("math_judge_pair", SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 pair = importlib.util.module_from_spec(_SPEC)
@@ -266,6 +270,36 @@ def test_job_spec_requires_two_b200s_and_pins_every_merge_input() -> None:
     assert 'hf download Qwen/Qwen3.5-4B --revision "$BASE_REV" >/dev/null' in command
     assert "DOWNLOADED=$(hf download" not in command
     assert 'test -f "$BASE_SNAP/config.json"' in command
+
+
+def test_qwen_replay_job_uses_verified_cache_smoke_and_raw_transport() -> None:
+    spec = yaml.safe_load(REPLAY_JOB_SPEC.read_text(encoding="utf-8"))
+    job = spec["jobs"][0]
+    assert spec["profile"] == "debate-b200x2"
+    assert (job["gpus"], job["gpu_type"], job["cpus"]) == (
+        2,
+        "NVIDIA B200",
+        31,
+    )
+    assert job["max_attempts"] == 1
+    assert job["max_infra_attempts"] == 1
+    assert job["env"] == ["HF_TOKEN"]
+    assert job["inputs"][1]["exclude"] == []
+    assert job["outputs"] == [
+        {
+            "remote": "/workspace/debate/outputs/math_judge_pair_qwen_replay",
+            "local": "~/code/debate/outputs/math_judge_pair_qwen_replay",
+        }
+    ]
+    command = job["command"]
+    assert "SOURCE_COMMIT=76773c370616f5f20527b0f112402c02cce68259" in command
+    assert "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e" in command
+    assert "f440837265144a8193623cb05a59ed3b658efdcac5f2ae4318137d6b287a1a4d" in command
+    assert "CUDA_VISIBLE_DEVICES=1" in command
+    assert "--limit 1" in command
+    assert command.index("--limit 1") < command.index("--out \"$OUT_ROOT/full\"")
+    assert "QWEN_REPLAY_SMOKE_VERIFIED" in command
+    assert "QWEN_REPLAY_FULL_VERIFIED" in command
 
 
 def test_manifest_verification_rejects_source_hash_drift() -> None:
