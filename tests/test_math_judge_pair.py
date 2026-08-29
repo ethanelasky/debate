@@ -238,7 +238,7 @@ def test_config_pins_models_caps_prompt_and_disjoint_local_endpoints() -> None:
     assert qwen["agents"]["alice"]["model_settings"]["base_url"].endswith(":8790/v1")
     assert qwen["agents"]["judge"]["model_settings"]["base_url"].endswith(":8788/v1")
     assert qwen["agents"]["judge"]["model_settings"]["model_file_path"] == "Qwen/Qwen3.5-4B"
-    assert "enable_thinking" not in qwen["agents"]["judge"]["model_settings"]
+    assert qwen["agents"]["judge"]["model_settings"]["enable_thinking"] is False
     assert qwen["agents"]["judge"]["model_settings"]["sampling"]["train"]["temperature"] == 0.0
     assert [slot["max_total_tokens"] for slot in qwen["protocol"]["turns"][4]["judge"]] == [16384, 512]
     assert luna["agents"]["judge"]["model_settings"]["model_file_path"] == "gpt-5.6-luna"
@@ -375,6 +375,9 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
     assert identity["judge_generation_by_arm"]["qwen"]["transport"] == (
         "raw_vllm_chat_completions_json_v1"
     )
+    assert identity["judge_generation_by_arm"]["qwen"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
     assert identity["judge_generation_by_arm"]["qwen"]["deliberation_cap"] == 16384
     assert identity["judge_generation_by_arm"]["qwen"]["verdict_cap"] == 512
     assert identity["judge_generation_by_arm"]["luna"] == {
@@ -441,6 +444,7 @@ def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
         alias="raw-qwen",
         endpoint="Qwen/Qwen3.5-4B",
         base_url="http://127.0.0.1:8788/v1/",
+        enable_thinking=False,
         post_fn=post,
     )
     [response] = model.predict(
@@ -466,6 +470,7 @@ def test_raw_vllm_judge_keeps_local_request_and_response_semantics() -> None:
                 "json_schema": {"name": "verdict", "schema": schema},
             },
             "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
     ]
     assert response.speech == '{"winner":"Debater_A","confidence":1}'
@@ -526,6 +531,7 @@ def test_qwen_arm_replaces_only_the_judge_transport() -> None:
         assert env.config.frozen_models[env.judge_speaker].base_url == (
             "http://127.0.0.1:8788/v1"
         )
+        assert env.config.frozen_models[env.judge_speaker].enable_thinking is False
     finally:
         env.family.close()
 

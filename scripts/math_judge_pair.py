@@ -264,6 +264,7 @@ class RawVLLMChatModel(LocalModel):
         base_url: str,
         is_debater: bool = False,
         reasoning_effort: str | None = None,
+        enable_thinking: bool | None = None,
         post_fn: Any = None,
         retry_attempts: int = 4,
         sleep_fn: Any = time.sleep,
@@ -274,6 +275,7 @@ class RawVLLMChatModel(LocalModel):
         self.endpoint = endpoint
         self.base_url = base_url.rstrip("/")
         self.reasoning_effort = reasoning_effort
+        self.enable_thinking = enable_thinking
         self._post_override = post_fn
         self.retry_attempts = retry_attempts
         self._sleep = sleep_fn
@@ -341,6 +343,10 @@ class RawVLLMChatModel(LocalModel):
             if overlap:
                 raise ValueError(f"vLLM extra_body collides with request keys: {sorted(overlap)}")
             body.update(extra)
+        if self.enable_thinking is not None:
+            body["chat_template_kwargs"] = {
+                "enable_thinking": self.enable_thinking
+            }
         return _response_namespace(self._post(body))
 
     def copy(self, is_debater: bool | None = None, **kwargs) -> "RawVLLMChatModel":
@@ -350,6 +356,7 @@ class RawVLLMChatModel(LocalModel):
             base_url=self.base_url,
             is_debater=self.is_debater if is_debater is None else is_debater,
             reasoning_effort=self.reasoning_effort,
+            enable_thinking=self.enable_thinking,
             post_fn=self._post_override,
             retry_attempts=self.retry_attempts,
             sleep_fn=self._sleep,
@@ -465,6 +472,7 @@ def build_arm_env(arm: str):
             alias=settings["alias"],
             endpoint=settings["model_file_path"],
             base_url=settings["base_url"],
+            enable_thinking=settings["enable_thinking"],
             is_debater=False,
         )
     elif arm == "luna":
@@ -1051,8 +1059,7 @@ def expected_manifest_inputs(
                 "top_p": 1.0,
                 "deliberation_cap": 16384,
                 "verdict_cap": 512,
-                "chat_template": "server_default",
-                "historical_enable_thinking_false_forwarded": False,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "transport": "raw_vllm_chat_completions_json_v1",
             },
             "luna": {

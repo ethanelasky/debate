@@ -61,10 +61,10 @@ _math_judge_pair_base:
         model_file_path: Qwen/Qwen3.5-4B
         alias: qwen35-4b-judge
         base_url: http://127.0.0.1:8788/v1
-        # Deliberately absent: LocalModel did not forward the historical
-        # enable_thinking:false knob. The diagnosed run therefore used the
-        # server-default Qwen chat template; this replay preserves that actual
-        # behavior and records it in the seed manifest.
+        # The protocol already provides a private deliberation slot. Opening a
+        # second template-level think stream made stock Qwen loop for the full
+        # 16,384-token cap instead of completing that slot.
+        enable_thinking: false
         sampling:
           train: {temperature: 0.0, top_p: 1.0}
           eval: {temperature: 0.0, top_p: 1.0}
