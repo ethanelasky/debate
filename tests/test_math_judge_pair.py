@@ -288,6 +288,7 @@ def test_qwen_replay_job_uses_verified_cache_smoke_and_raw_transport() -> None:
     spec = yaml.safe_load(REPLAY_JOB_SPEC.read_text(encoding="utf-8"))
     job = spec["jobs"][0]
     assert spec["profile"] == "debate-b200x2"
+    assert job["name"] == "math-judge-pair-step40-taskonly-segmented-qwen-replay"
     assert (job["gpus"], job["gpu_type"], job["cpus"]) == (
         2,
         "NVIDIA B200",
@@ -299,14 +300,14 @@ def test_qwen_replay_job_uses_verified_cache_smoke_and_raw_transport() -> None:
     assert job["inputs"][1]["exclude"] == []
     assert job["outputs"] == [
         {
-            "remote": "/workspace/debate/outputs/math_judge_pair_qwen_replay_p15_f001",
-            "local": "~/code/debate/outputs/math_judge_pair_qwen_replay_p15_f001",
+            "remote": "/workspace/debate/outputs/math_judge_pair_qwen_replay_taskonly_segmented",
+            "local": "~/code/debate/outputs/math_judge_pair_qwen_replay_taskonly_segmented",
         }
     ]
     command = job["command"]
-    assert "SOURCE_COMMIT=744e6fdb7fc2259a00134a2b051da3ebbbb92e5a" in command
-    assert "575ab0346d90c22d9715eba7182dea46c08ee01e156075e790e2b5a13988aa8e" in command
-    assert "f440837265144a8193623cb05a59ed3b658efdcac5f2ae4318137d6b287a1a4d" in command
+    assert "SOURCE_COMMIT=94646a84eeabf76e47c51ef507054a21ccbdf03b" in command
+    assert "928671898d260fef720c5dc28fefa91ca9dc66c40db5285a1aec278420c242a3" in command
+    assert "f586eb461aaefea79bea4268e09c40b89a559441b801712f7ff5e5c2dd5494af" in command
     assert "CUDA_VISIBLE_DEVICES=1" in command
     assert "--max-model-len 32768" in command
     assert "--limit 1" in command
