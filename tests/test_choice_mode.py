@@ -399,15 +399,17 @@ def test_blind_context_is_verbatim_then_reframed_for_the_author(prompt_file):
     # slot — its cue as user content, its answer as the first assistant turn.
     # The solo messages are never replayed; the cue is byte-identical to the
     # blind instructions, which is what keeps the reframing honest.
-    assert [m["role"] for m in msgs] == ["system", "user", "user", "user", "assistant", "user"]
+    assert [m["role"] for m in msgs] == [
+        "system", "user", "user", "user", "assistant", "user", "user"
+    ]
     assert msgs[0]["content"] == "NEUTRAL DEBATE SYSTEM."
     assert msgs[1]["content"] == TRAJ_MESSAGE
     assert msgs[2]["content"] == "You are Debater_A, a debater."
     assert msgs[3]["content"] == INSTR_MESSAGE
     assert msgs[4]["content"] == "fine <answer>benign</answer>"
     assert "BOB-OPENING" in msgs[5]["content"]
-    assert "Rebut, Debater_A" in msgs[5]["content"]
-    assert MB_POSITION_HONEST in msgs[5]["content"]  # chosen position bound into the cue
+    assert "Rebut, Debater_A" in msgs[6]["content"]
+    assert MB_POSITION_HONEST in msgs[6]["content"]  # chosen position bound into the cue
     # exactly one system message, by construction: the solo messages carried none
     assert sum(m["role"] == "system" for m in msgs) == 1
 
@@ -449,11 +451,12 @@ def test_judge_context_gets_traj_and_role_messages(prompt_file):
 
     verdict = slots[4]
     msgs = render_context(st, verdict, prompts)
-    assert [m["role"] for m in msgs] == ["system", "user", "user", "user"]
+    assert [m["role"] for m in msgs] == ["system", *("user",) * 7]
     assert msgs[1]["content"] == TRAJ_MESSAGE
     assert msgs[2]["content"] == f"Assigned: {MB_POSITION_ATTACK} vs {MB_POSITION_HONEST}"
-    for speech in ("A-BLIND", "B-OPENING", "A-REBUT", "B-REBUT"):
-        assert speech in msgs[3]["content"]
+    for message, speech in zip(msgs[3:7], ("A-BLIND", "B-OPENING", "A-REBUT", "B-REBUT")):
+        assert speech in message["content"]
+    assert all(speech not in msgs[7]["content"] for speech in ("A-BLIND", "B-OPENING", "A-REBUT", "B-REBUT"))
 
 
 # ------------------------------------------------------------- bindability
@@ -690,10 +693,12 @@ def test_sc_choice_contexts(prompt_file):
     st.records.append(SlotRecord(slot=develop, text="DEVELOP"))
     verdict = slots[2]
     msgs = render_context(st, verdict, prompts)
-    assert [m["role"] for m in msgs] == ["system", "user", "user", "user"]
+    assert [m["role"] for m in msgs] == ["system", *("user",) * 5]
     assert msgs[1]["content"] == TRAJ_MESSAGE
     assert msgs[2]["content"] == f"The consultant chose: {MB_POSITION_ATTACK}"
-    assert "DEVELOP" in msgs[3]["content"]
+    assert "hm <answer>attack</answer>" in msgs[3]["content"]
+    assert "DEVELOP" in msgs[4]["content"]
+    assert "DEVELOP" not in msgs[5]["content"]
 
 
 # --------------------------------------------------------- run_eval plumbing

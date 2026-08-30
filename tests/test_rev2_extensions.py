@@ -290,8 +290,8 @@ def test_attributed_speech_placeholder_wraps_the_speech():
         "Debater_B", "opening", "raw speech", reader="alice", author="bob",
         reader_bindings={"OPPONENT_NAME": "Debater_B"},
     )
-    # the closing tag lands AFTER the speech, demarcating it from the cue that
-    # joins the same pending user message
+    # the closing tag lands AFTER the speech; render_context then keeps this
+    # attributed speech in a user message separate from the instruction cue
     assert out == "Debater_B said:\n\n<speech>\nraw speech\n</speech>"
     # single-pass substitution: placeholder-looking text inside the speech is
     # inserted verbatim, never re-expanded
@@ -312,19 +312,16 @@ def test_absent_and_empty_keys_render_byte_identically(prompt_file):
         assert _ctx(plain, index) == _ctx(empty, index)
 
 
-def test_backward_compat_golden_context(prompt_file):
-    """Byte-exact current-behavior lock for a no-knobs library."""
+def test_attributed_speeches_and_cues_have_distinct_message_boundaries(prompt_file):
+    """Byte-exact boundary lock for a no-knobs library."""
     plain = load_prompt_library(prompt_file, "mb_plain", PROTOCOL)
     assert _ctx(plain, 5) == [
         {"role": "system", "content": "Judge Debater_A vs Debater_B."},
-        {
-            "role": "user",
-            "content": "Debater_A said:\nalice opening text\n\n"
-            "Debater_B said:\nbob opening text\n\n"
-            "Debater_A said:\nalice rebuttal text\n\n"
-            "Debater_B said:\nbob rebuttal text\n\n"
-            "Deliberate.",
-        },
+        {"role": "user", "content": "Debater_A said:\nalice opening text"},
+        {"role": "user", "content": "Debater_B said:\nbob opening text"},
+        {"role": "user", "content": "Debater_A said:\nalice rebuttal text"},
+        {"role": "user", "content": "Debater_B said:\nbob rebuttal text"},
+        {"role": "user", "content": "Deliberate."},
         {"role": "assistant", "content": "judge deliberation text"},
         {"role": "user", "content": "Output your JSON verdict."},
     ]
@@ -481,8 +478,9 @@ def test_docent_speaker_views_reflect_preamble_and_attribution(prompt_file):
     judge_pre_msg = views["view:judge"].messages[1]
     assert judge_pre_msg.role == "user"
     assert flat(judge_pre_msg) == f"Judge preamble block one.\n\nTrajectory: {BACKGROUND}"
-    content = flat(views["view:judge"].messages[2])
-    assert "The first debater (Debater_A) argued:\n\nalice opening" in content
-    assert "The second debater (Debater_B) argued:\n\nbob opening" in content
+    contents = [flat(message) for message in views["view:judge"].messages]
+    assert "The first debater (Debater_A) argued:\n\nalice opening" in contents[2]
+    assert "The second debater (Debater_B) argued:\n\nbob opening" in contents[3]
+    assert contents[2] != contents[3]
     # views mirror what the generating model actually saw
     assert [(m.role, flat(m)) for m in views["view:judge"].messages[:-1]] == judge.calls[-1]

@@ -66,7 +66,7 @@ EXPERIMENTS = {
     "luna": "math_judge_pair_luna",
 }
 EXPECTED_DEV_TASKS = 177
-MANIFEST_SCHEMA = "math-judge-pair-v2"
+MANIFEST_SCHEMA = "math-judge-pair-v3"
 REPLAY_MANIFEST_SCHEMA = "math-judge-pair-replay-v3"
 CACHE_IDENTITY_KEYS = (
     "comparison_unit",
@@ -1058,6 +1058,9 @@ def expected_manifest_inputs(
             "top_p": 1.0,
             "opening_context": "task_source_messages_verbatim",
             "first_speech_non_debate_aware": True,
+            "context_message_boundaries": (
+                "attributed_speeches_and_instruction_cues_are_separate_user_messages_v1"
+            ),
         },
         "judge_generation_by_arm": {
             "qwen": {

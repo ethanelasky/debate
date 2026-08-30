@@ -9,10 +9,11 @@ Design:
   reader's own turn-t assistant messages — so each speaker's rendered context
   is a strict prefix of its later ones (modulo ephemeral aging out, which is
   the semantics).
-- Alternation: every slot has an instruction cue rendered as user content
-  immediately before its assistant generation; others' public speeches buffer
-  into the same pending user message. By construction: one system message,
-  strict user/assistant alternation, always ending on user.
+- Message boundaries: every public speech by another speaker is its own user
+  message, and every slot instruction is its own user message immediately
+  before that speaker's assistant generation. Consecutive user messages are
+  deliberate: they keep attributed speech distinct from the instruction cue.
+  Every context has one leading system message and ends on user.
 - The judge is not a special case: its stream is the attributed public
   transcript; only its prompt templates differ.
 """
@@ -400,12 +401,12 @@ def render_context(
     state: DebateState, current: CompiledSlot, prompts: PromptLibrary
 ) -> list[Message]:
     """Rule 4. Invariants: one system message first; ends on a user message
-    (the current slot's instruction cue); transcript-derived content strictly
-    alternates user/assistant. Configured preamble messages render as SEPARATE
-    user messages right after the system message, before any transcript
-    content — consecutive user messages at the context head are deliberate
-    (message-boundary prompt caches can then reuse the byte-stable shared
-    message across seats; frozen API seats accept repeated roles).
+    (the current slot's instruction cue). Configured preambles, attributed
+    speeches, and instruction cues each render as SEPARATE user messages.
+    Consecutive user messages are deliberate: the boundary distinguishes what
+    another debater said from what the current speaker must do, and lets
+    message-boundary prompt caches reuse byte-stable shared content. Frozen API
+    seats accept repeated roles.
 
     Exception: with first_slot_messages set, the FIRST compiled slot is
     GENERATED under the task source's own messages verbatim — no debate
@@ -429,27 +430,40 @@ def render_context(
     msgs: list[Message] = [{"role": "system", "content": prompts.system(S, state.bindings[S])}]
     for pm in prompts.preamble_messages(S, state.bindings[S]):
         msgs.append({"role": "user", "content": pm})
-    pending: list[str] = []
     for rec in visible:
         if rec.slot.speaker == S:
-            pending.append(prompts.instruction(rec.slot.slot.name, S, state.bindings[S]))
-            msgs.append({"role": "user", "content": "\n\n".join(pending)})
-            pending = []
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": prompts.instruction(
+                        rec.slot.slot.name, S, state.bindings[S]
+                    ),
+                }
+            )
             msgs.append({"role": "assistant", "content": rec.text})
         else:
             author = rec.slot.speaker
-            pending.append(
-                prompts.attributed(
-                    state.bindings[author]["NAME"],
-                    rec.slot.slot.name,
-                    rec.text,
-                    reader=S,
-                    author=author,
-                    reader_bindings=state.bindings[S],
-                )
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": prompts.attributed(
+                        state.bindings[author]["NAME"],
+                        rec.slot.slot.name,
+                        rec.text,
+                        reader=S,
+                        author=author,
+                        reader_bindings=state.bindings[S],
+                    ),
+                }
             )
-    pending.append(prompts.instruction(current.slot.name, S, state.bindings[S]))
-    msgs.append({"role": "user", "content": "\n\n".join(pending)})
+    msgs.append(
+        {
+            "role": "user",
+            "content": prompts.instruction(
+                current.slot.name, S, state.bindings[S]
+            ),
+        }
+    )
     return msgs
 
 

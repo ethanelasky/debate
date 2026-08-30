@@ -382,6 +382,9 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
         "task_source_messages_verbatim"
     )
     assert identity["debater_generation"]["first_speech_non_debate_aware"] is True
+    assert identity["debater_generation"]["context_message_boundaries"] == (
+        "attributed_speeches_and_instruction_cues_are_separate_user_messages_v1"
+    )
     assert pair.CHECKPOINT_SHA256["rlvr_step20_lora_train_meta"] == (
         "349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab"
     )
