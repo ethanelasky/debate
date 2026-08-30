@@ -459,6 +459,11 @@ def load_arm(arm: str) -> dict:
         raise ValueError(
             f"{arm}: seed generation must route alice/bob through PolicySeat, got {sorted(trained)}"
         )
+    if exp.get("first_speech_non_debate_aware") is not True:
+        raise ValueError(
+            f"{arm}: paired evaluation requires a task-only first speech; "
+            "set first_speech_non_debate_aware: true"
+        )
     return exp
 
 
@@ -1051,6 +1056,8 @@ def expected_manifest_inputs(
             "backend": "vllm_raw_completions_budget_forced_v1",
             "temperature": 0.0,
             "top_p": 1.0,
+            "opening_context": "task_source_messages_verbatim",
+            "first_speech_non_debate_aware": True,
         },
         "judge_generation_by_arm": {
             "qwen": {

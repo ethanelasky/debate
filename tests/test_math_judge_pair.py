@@ -370,6 +370,10 @@ def test_manifest_identity_pins_dataset_model_and_adapter_sources() -> None:
         "stock_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
         "adapter_sha256": pair.CHECKPOINT_SHA256,
     }
+    assert identity["debater_generation"]["opening_context"] == (
+        "task_source_messages_verbatim"
+    )
+    assert identity["debater_generation"]["first_speech_non_debate_aware"] is True
     assert pair.CHECKPOINT_SHA256["rlvr_step20_lora_train_meta"] == (
         "349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab"
     )
