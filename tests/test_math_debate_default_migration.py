@@ -43,6 +43,17 @@ def test_useful_descendants_resolve_through_the_default_prompt_only() -> None:
     assert "math_proposer_critic_" + legacy_marker not in prompt_entries
 
 
+def test_default_pc_debate_descendants_use_task_only_openings() -> None:
+    entries = resolve_all_experiments(load_config_with_includes(CONFIG))
+
+    for name in ("math_pc_debate", *DESCENDANTS):
+        assert load_experiment(CONFIG, name)["first_speech_non_debate_aware"] is True
+
+    # The former solo alias is now the default PC-debate behavior, so keeping
+    # another experiment name would falsely imply two scientific arms.
+    assert "math_pc_solo" not in entries
+
+
 def test_retired_prompt_variants_are_absent() -> None:
     marker = "box" + "req"
     second_marker = "first" + "speech"

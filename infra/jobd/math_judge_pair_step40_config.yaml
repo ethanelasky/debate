@@ -29,6 +29,9 @@ _math_judge_pair_base:
     entry: math_proposer_critic
   fresh_positions: true
   flip: false
+  # Match the default PC-debate invariant: the cached proposal is generated
+  # from the task source's messages, before Alice learns it will be debated.
+  first_speech_non_debate_aware: true
   agents:
     alice:
       trained: true

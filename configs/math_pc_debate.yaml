@@ -28,6 +28,10 @@ _base_math_pc:
     file_path: infra/prompts/debate/hendrycks_math.yaml
     entry: math_proposer_critic
   fresh_positions: true
+  # The proposer submits a solution before learning that it will be debated.
+  # Use the task source's messages verbatim for slot 0 so PC debate and RLVR
+  # share the same proposal distribution; later turns are debate-aware.
+  first_speech_non_debate_aware: true
   agents:
     alice:
       trained: true
@@ -108,14 +112,6 @@ math_pc_debate_logit:
   _extends: _base_math_pc
   scoring:
     confidence_source: logit
-
-# Solo-proposal arm: the proposal is generated in the task source's own RLVR
-# context — no debate framing — so this arm and the RLVR baseline share ONE
-# proposal distribution and differ only in reward channel. Later turns
-# (alice_rebuttal) are debate-aware as usual.
-math_pc_solo:
-  _extends: _base_math_pc
-  first_speech_non_debate_aware: true
 
 # Loss ablations: same debate, different objective.
 math_pc_reinforce:
@@ -212,15 +208,11 @@ mathl5_qwen35_pc_debate_cispo_verl:
   # Protocol from math_pc_l5; objective from the shared base (later parent
   # wins), so loss/kl_coef cannot drift from the RLVR arm.
   _extends: [math_pc_l5, _qwen35_train_base]
-  # Proposal USER MESSAGE, byte-identical to the RLVR arm's rollout prompt:
-  # the pack's <ANSWER_GEN_USER> splice renders this file into the proposal
-  # slot, so with math.yaml here the two arms would differ in prompt as well as
-  # in protocol, and neither arm's dev curve could be attributed.
-  #
-  # The SYSTEM CARD still differs, and deliberately is not claimed to match:
-  # first_speech_non_debate_aware defaults False (infra/envs/debate/env.py), so
-  # the proposer generates knowing a critic is coming. math_pc_solo is the arm
-  # that closes that gap; this is not it. State the layer a claim holds at.
+  # Proposal context, byte-identical to the RLVR arm's rollout prompt. The PC
+  # base renders the task source's system and user messages verbatim for slot
+  # 0; Alice receives the debate card only on her later rebuttal turn. Keeping
+  # this file aligned with the RLVR arm therefore keeps the whole opening
+  # context—not merely the user message—on one proposal distribution.
   dataset: {prompt_file: infra/prompts/tasks/math_nocot.yaml}
   # dev/test instrument, byte-identical to mathl5_qwen35_cispo's eval_dataset
   # in configs/math_qwen35.yaml — change the two together or the arms stop

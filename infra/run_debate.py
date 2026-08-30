@@ -115,10 +115,10 @@ def validate_experiment(exp: dict) -> None:
     """Reject config keys no runner reads, before anything is built.
 
     Without this a typo reads a default in silence — a misspelled
-    `first_speech_non_debate_aware` trains the standard arm for 100 steps and
-    reports it as the solo-context one. Nested blocks with typed constructors
-    (judge_config, scoring, model_settings, dataset) already reject their own
-    unknown keys; this covers the dict-shaped remainder.
+    `first_speech_non_debate_aware` can train a debate-aware opening for 100
+    steps while reporting it as the task-only one. Nested blocks with typed
+    constructors (judge_config, scoring, model_settings, dataset) already
+    reject their own unknown keys; this covers the dict-shaped remainder.
 
     Error direction: adding a new `exp.get("new_key")` read to this file means
     adding "new_key" here too, or every run dies at launch with a one-line fix.

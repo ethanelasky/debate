@@ -1022,6 +1022,24 @@ def test_full_cache_gate_is_protocol_derived_and_pinned_to_708() -> None:
         env.family.close()
 
 
+def test_seed_opening_context_is_the_task_source_verbatim() -> None:
+    _, env = pair.build_arm_env("qwen")
+    try:
+        [task] = env.tasks(1, split="dev")
+        state = env._build_state(task, flipped=False)
+        opening = env.protocol.compile()[0]
+
+        assert env.config.first_speech_non_debate_aware is True
+        assert state.meta["solo_first_speech"] is True
+        assert render_context(state, opening, env.prompts) == task.messages
+        assert task.messages[0] == {
+            "role": "system",
+            "content": "You are an expert mathematician.",
+        }
+    finally:
+        env.family.close()
+
+
 def test_vllm_backend_preserves_exact_tokens_through_forced_two_phase() -> None:
     class NonInvertibleTokenizer:
         eos_token_id = 0
