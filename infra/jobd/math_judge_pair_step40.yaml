@@ -1,6 +1,6 @@
 profile: debate-b200x2
 jobs:
-  - name: math-judge-pair-step40-taskonly-qwen
+  - name: math-judge-pair-step40-taskonly-segmented-qwen
     gpus: 2
     gpu_type: NVIDIA B200
     # Deliberately differ from the profile's 32-CPU default. jobd enables a
@@ -39,8 +39,8 @@ jobs:
       - local: ~/code/debate/artifacts/debate-kenton-rlvrs20/checkpoints/step-00040
         remote: /workspace/debate-s40-adapter
     outputs:
-      - remote: /workspace/debate/outputs/math_judge_pair_step40_taskonly
-        local: ~/code/debate/outputs/math_judge_pair_step40_taskonly
+      - remote: /workspace/debate/outputs/math_judge_pair_step40_taskonly_segmented
+        local: ~/code/debate/outputs/math_judge_pair_step40_taskonly_segmented
     command: |-
       set -euo pipefail
       export POD_IDLE_STOP=0
@@ -70,7 +70,7 @@ jobs:
       # The repo input is the clean detached worktree at this exact runtime
       # commit. It excludes .git, so the driver records the pinned identity
       # supplied here instead of trying to infer provenance on the pod.
-      SOURCE_COMMIT=0de445edcdaf5823714a20f4c83dde9af6579aad
+      SOURCE_COMMIT=94646a84eeabf76e47c51ef507054a21ccbdf03b
       printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
         || { echo "FATAL: SOURCE_COMMIT must be an immutable 40-hex commit" >&2; exit 1; }
 
@@ -117,7 +117,7 @@ jobs:
       check_sha256 /workspace/debate-s40-adapter/model_world_size_2_rank_1.pt 505abe346f95e15fed7dad02a308094777a8e7240839ac08b4d40bf291c00149
       check_sha256 /workspace/debate-s40-adapter/lora_train_meta.json 349f62eff696826bc2adec7661a8559b44883e6d137cff5a31cd64adf6a9e8ab
 
-      OUT=/workspace/debate/outputs/math_judge_pair_step40_taskonly
+      OUT=/workspace/debate/outputs/math_judge_pair_step40_taskonly_segmented
       mkdir -p "$OUT"
       RLVR_MERGED=/workspace/models/qwen35-rlvr-sub8-s20
       POLICY_MERGED=/workspace/models/qwen35-debate-rlvrs20-s40

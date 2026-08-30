@@ -255,7 +255,7 @@ def test_job_spec_requires_two_b200s_and_pins_every_merge_input() -> None:
     spec = yaml.safe_load(JOB_SPEC.read_text(encoding="utf-8"))
     job = spec["jobs"][0]
     assert spec["profile"] == "debate-b200x2"
-    assert job["name"] == "math-judge-pair-step40-taskonly-qwen"
+    assert job["name"] == "math-judge-pair-step40-taskonly-segmented-qwen"
     assert job["gpus"] == 2
     assert job["gpu_type"] == "NVIDIA B200"
     # This differs from the profile's 32-CPU default on purpose: jobd treats
@@ -265,12 +265,12 @@ def test_job_spec_requires_two_b200s_and_pins_every_merge_input() -> None:
     assert job["env"] == ["HF_TOKEN"]
     assert job["outputs"] == [
         {
-            "remote": "/workspace/debate/outputs/math_judge_pair_step40_taskonly",
-            "local": "~/code/debate/outputs/math_judge_pair_step40_taskonly",
+            "remote": "/workspace/debate/outputs/math_judge_pair_step40_taskonly_segmented",
+            "local": "~/code/debate/outputs/math_judge_pair_step40_taskonly_segmented",
         }
     ]
     command = job["command"]
-    assert "SOURCE_COMMIT=0de445edcdaf5823714a20f4c83dde9af6579aad" in command
+    assert "SOURCE_COMMIT=94646a84eeabf76e47c51ef507054a21ccbdf03b" in command
     for digest in pair.CHECKPOINT_SHA256.values():
         assert digest in command
     assert "unexpected merger shard set" in command
