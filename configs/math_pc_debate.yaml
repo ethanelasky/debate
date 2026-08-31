@@ -487,6 +487,20 @@ mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget:
       - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.0002, limit: 4000, mode: proportional,
          counts: total, slots: [proposal]}
 
+# The same RLVR-step-20 warm start, with the proposal-length intervention from
+# the cold propbudget arm. Ethan, 2026-08-31. This keeps the first 4000 total
+# proposal tokens free and charges 0.0002 per excess token; at the 5024 hard
+# cap the maximum charge is 0.2048. The reply word budgets are inherited.
+mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget_rlvrs20:
+  _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget
+  agents:
+    alice:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+    bob:
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+
 # Proposal -> critique -> judge: the rebuttal round removed. `null` deletes a
 # speaker's slots; declaring fewer turns would leave the parent's in place,
 # since turns are positional records and still merge by index.
