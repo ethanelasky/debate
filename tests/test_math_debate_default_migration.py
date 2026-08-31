@@ -129,3 +129,9 @@ def test_renamed_job_specs_have_coherent_commands_and_output_roots() -> None:
             "local": f"~/code/debate/outputs/{output_slug}/docent",
             "every_s": 1800.0,
         }
+
+    ab_rerun = json.loads(
+        (ROOT / "infra" / "jobd" / "debate_kenton_rlvrs20.json").read_text()
+    )["jobs"][0]
+    assert ab_rerun["gpu_type"] == "NVIDIA B200"
+    assert ab_rerun["max_attempts"] == 1

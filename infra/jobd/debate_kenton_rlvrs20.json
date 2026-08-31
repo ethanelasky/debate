@@ -4,6 +4,7 @@
     {
       "name": "debate-ab-cleanctx-rlvrs20",
       "gpus": 2,
+      "gpu_type": "NVIDIA B200",
       "priority": 10,
       "timeout_s": 172800,
       "max_attempts": 1,
