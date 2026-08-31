@@ -100,9 +100,9 @@ def test_renamed_job_specs_have_coherent_commands_and_output_roots() -> None:
         ),
         "debate_kenton_rlvrs20.json": (
             "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_rlvrs20",
-            "rlvrs20",
-            "debate-sub8-kenton-rlvrs20",
-            "debate_sub8_kenton_rlvrs20",
+            "ab-cleanctx-01",
+            "debate-ab-cleanctx-rlvrs20",
+            "debate_ab_cleanctx_rlvrs20",
         ),
         "debate_kenton_propbudget.json": (
             "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget",
