@@ -101,9 +101,9 @@ def test_renamed_job_specs_have_coherent_commands_and_output_roots() -> None:
         ),
         "debate_kenton_rlvrs20.json": (
             "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget_rlvrs20",
-            "ab-cleanctx-propbudget-01",
-            "debate-ab-cleanctx-propbudget-rlvrs20",
-            "debate_ab_cleanctx_propbudget_rlvrs20",
+            "ab-cleanctx-propbudget-c002-01",
+            "debate-ab-cleanctx-propbudget-c002-rlvrs20",
+            "debate_ab_cleanctx_propbudget_c002_rlvrs20",
         ),
         "debate_kenton_propbudget.json": (
             "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget",
@@ -147,7 +147,7 @@ def test_warm_start_ab_arm_prices_alice_proposal_excess_proportionally() -> None
     assert terms["proposal_token_budget"] == {
         "name": "proposal_token_budget",
         "kind": "budget_penalty",
-        "coeff": 0.0002,
+        "coeff": 0.002,
         "limit": 4000,
         "mode": "proportional",
         "counts": "total",

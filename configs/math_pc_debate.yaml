@@ -467,9 +467,9 @@ mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_rlvrs20:
 # think_overshoot_penalty went inert; proportional keeps 200-vs-1024 tokens of
 # excess distinguishable, so there is gradient the whole way down.
 #
-# coeff 0.0002: a proposal pinned at the 5024 cap pays 0.205 against a +/-1
-# ladder, ~10% of the win-loss span. Below 4000 the term is exactly zero, so
-# this prices overrun and never rewards brevity for its own sake.
+# coeff 0.002: a proposal pinned at the 5024 cap pays 2.048 against a +/-1
+# ladder, matching the full win-loss span. Below 4000 the term is exactly zero,
+# so this prices overrun and never rewards brevity for its own sake.
 #
 # Index 4 APPENDS to the parent's four shaping entries (lists deep-merge BY
 # INDEX, and an index past the end appends). The word budget on the reply slots
@@ -484,13 +484,13 @@ mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget:
          slots: [critique, alice_rebuttal, bob_rebuttal]}
       - {name: reply_word_budget, kind: budget_penalty, coeff: 0.002, limit: 150, mode: proportional,
          slots: [critique, alice_rebuttal, bob_rebuttal]}
-      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.0002, limit: 4000, mode: proportional,
+      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.002, limit: 4000, mode: proportional,
          counts: total, slots: [proposal]}
 
 # The same RLVR-step-20 warm start, with the proposal-length intervention from
 # the cold propbudget arm. Ethan, 2026-08-31. This keeps the first 4000 total
-# proposal tokens free and charges 0.0002 per excess token; at the 5024 hard
-# cap the maximum charge is 0.2048. The reply word budgets are inherited.
+# proposal tokens free and charges 0.002 per excess token; at the 5024 hard
+# cap the maximum charge is 2.048. The reply word budgets are inherited.
 mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget_rlvrs20:
   _extends: mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget
   agents:
@@ -549,5 +549,5 @@ mathl5_qwen35_pc_debate_norebut_propbudget_rlvr130:
         model_file_path: /workspace/models/qwen35-rlvr-sub8-s130
   scoring:
     shaping:
-      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.0002,
+      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.002,
          limit: 4000, mode: proportional, counts: total, slots: [proposal]}
