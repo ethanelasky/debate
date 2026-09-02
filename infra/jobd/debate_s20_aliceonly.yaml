@@ -1,0 +1,60 @@
+profile: debate-b200x2
+jobs:
+  - name: debate-s20-aliceonly-smoke
+    gpus: 2
+    gpu_type: NVIDIA B200
+    priority: 10
+    timeout_s: 21600
+    max_attempts: 1
+    inputs:
+      - local: ~/code/debate-aliceonly-source
+        remote: /workspace/debate
+        exclude: &source_excludes
+          - .git
+          - .venv
+          - venv
+          - __pycache__
+          - '*.pyc'
+          - .pytest_cache
+          - .mypy_cache
+          - .ruff_cache
+          - node_modules
+          - wandb
+          - outputs
+          - '*.egg-info'
+          - .DS_Store
+          - wheels
+          - artifacts
+      - &step20_input
+        local: ~/code/debate/artifacts/rlvr-cispo-sub8-kenton/checkpoints/step-00020
+        remote: /workspace/rlvr-s20-adapter
+    outputs:
+      - remote: /workspace/debate/transcripts
+        local: ~/code/debate/outputs/debate_s20_aliceonly_smoke/transcripts
+      - remote: /workspace/debate/docent
+        local: ~/code/debate/outputs/debate_s20_aliceonly_smoke/docent
+    command: bash scripts/run_s20_aliceonly_job.sh smoke
+
+  - name: debate-s20-aliceonly
+    depends_on: [debate-s20-aliceonly-smoke]
+    gpus: 2
+    gpu_type: NVIDIA B200
+    priority: 10
+    timeout_s: 172800
+    max_attempts: 1
+    inputs:
+      - local: ~/code/debate-aliceonly-source
+        remote: /workspace/debate
+        exclude: *source_excludes
+      - *step20_input
+    outputs:
+      - remote: /workspace/checkpoints/mathl5_qwen35_pc_debate_norebut_propbudget_rlvrs20_alice/s20-aliceonly-01/
+        local: ~/code/debate/artifacts/debate-s20-aliceonly/checkpoints
+        every_s: 1800.0
+      - remote: /workspace/debate/transcripts
+        local: ~/code/debate/outputs/debate_s20_aliceonly/transcripts
+        every_s: 1800.0
+      - remote: /workspace/debate/docent
+        local: ~/code/debate/outputs/debate_s20_aliceonly/docent
+        every_s: 1800.0
+    command: bash scripts/run_s20_aliceonly_job.sh full

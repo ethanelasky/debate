@@ -1,0 +1,14 @@
+_includes: [../../configs/math_pc_debate.yaml]
+
+# A live-path gate for the proposer-only arm. It changes only run size and
+# disables held-out evaluation; protocol, models, prompts, rewards, and the
+# frozen-policy routing are inherited byte-for-byte from the full arm.
+mathl5_qwen35_pc_debate_norebut_propbudget_rlvrs20_alice_smoke:
+  _extends: mathl5_qwen35_pc_debate_norebut_propbudget_rlvrs20_alice
+  training:
+    steps: 1
+    batch_size: 2
+    group_size: 2
+    eval_every: 0
+    final_test_eval: false
+    save_every: 1

@@ -16,6 +16,8 @@
   seat publishes carries no special-token strings.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import yaml
 
@@ -27,7 +29,7 @@ from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.prompts import load_prompt_library
 from infra.envs.debate.protocol import Protocol
 from infra.envs.debate.rewards import ScoringConfig
-from infra.envs.debate.round import FrozenSeat, GenRequest, PolicySeat
+from infra.envs.debate.round import FrozenPolicySeat, FrozenSeat, GenRequest, PolicySeat
 from infra.envs.tasks.math import MathFamily
 from infra.envs.tasks.monitoringbench import MonitoringBenchFamily
 from infra.models.base import ModelSettings, SpeechStructure
@@ -491,6 +493,114 @@ def test_trained_seat_strips_special_tokens_out_of_the_region_split():
     [res] = PolicySeat(policy).generate([_speech_request()])
     assert res.text == "the speech"
     assert res.thinking == "scratch"
+
+
+def test_frozen_policy_seat_keeps_budgeted_sample_but_drops_training_datum():
+    """A local frozen seat must keep Policy's two-phase audit evidence while
+    making it impossible for the optimizer to consume Bob's token regions."""
+    policy = RegionPolicy("<think>scratch", "the critique")
+    [res] = FrozenPolicySeat(policy).generate([_speech_request()])
+
+    assert res.sample is not None
+    assert [region.kind for region in res.sample.regions] == ["think", "visible"]
+    assert res.thinking == "scratch"
+    assert res.text == "the critique"
+    assert res.datum is None
+
+
+def test_build_env_routes_frozen_policy_away_from_model_factory(monkeypatch):
+    """The frozen Bob endpoint is a distinct Policy backend; constructing a
+    normal local Model here would silently fall back to the one-cap API path."""
+    import infra.run_debate as run_debate
+
+    experiment = {
+        "protocol": {
+            "turns": [
+                {"alice": [{"name": "proposal", "kind": "solution", "max_total_tokens": 64}]},
+                {"bob": [{"name": "critique", "max_think_tokens": 32, "max_visible_tokens": 16, "max_total_tokens": 48}]},
+                {"judge": [{"name": "verdict", "kind": "decision", "max_total_tokens": 32}]},
+            ]
+        },
+        "prompt_config": {"file_path": "unused.yaml", "entry": "unused"},
+        "agents": {
+            "alice": {
+                "trained": True,
+                "model_settings": {
+                    "model_type": "local",
+                    "model_file_path": "/models/s20",
+                    "alias": "alice",
+                    "sampling": {"train": {"temperature": 1.0, "top_p": 1.0}},
+                },
+            },
+            "bob": {
+                "trained": False,
+                "frozen_policy": True,
+                "model_settings": {
+                    "model_type": "local",
+                    "model_file_path": "/models/s20",
+                    "base_url": "http://127.0.0.1:8789/v1",
+                    "alias": "bob",
+                    "enable_thinking": True,
+                    "sampling": {"train": {"temperature": 1.0, "top_p": 1.0}},
+                },
+            },
+            "judge": {
+                "model_settings": {
+                    "model_type": "local",
+                    "model_file_path": "judge",
+                    "base_url": "http://127.0.0.1:8788/v1",
+                    "alias": "judge",
+                }
+            },
+        },
+        "dataset": {"type": "math"},
+    }
+    trained, frozen = run_debate.split_agents(experiment)
+    instantiated = []
+    backends = []
+
+    monkeypatch.setattr(
+        run_debate,
+        "instantiate_model",
+        lambda settings, **kwargs: instantiated.append(settings.alias) or object(),
+    )
+
+    class ReadOnlyBackend:
+        tokenizer = object()
+
+        def __init__(self, **kwargs):
+            backends.append(kwargs)
+
+    class Family:
+        def source(self, settings):
+            return object()
+
+        def close(self):
+            raise AssertionError("successful build must not close the family")
+
+    monkeypatch.setattr(run_debate, "VLLMCompletionsBackend", ReadOnlyBackend)
+    monkeypatch.setattr(run_debate, "get_family", lambda name: Family())
+    monkeypatch.setattr(
+        run_debate,
+        "DebateEnv",
+        lambda config, task_source, family, **kwargs: SimpleNamespace(config=config),
+    )
+
+    env = run_debate.build_env(experiment, trained, frozen)
+    assert instantiated == ["judge"]
+    assert set(env.config.frozen_models) == {"judge"}
+    assert set(env.config.frozen_policies) == {"bob"}
+    assert env.config.frozen_policies["bob"].chat_template_kwargs == {
+        "enable_thinking": True
+    }
+    assert env.config.frozen_policies["bob"].params.max_tokens == 48
+    assert backends == [
+        {
+            "base_url": "http://127.0.0.1:8789/v1",
+            "model": "/models/s20",
+            "tokenizer_path": "/models/s20",
+        }
+    ]
 
 
 def test_slot_thinking_override_renders_under_its_own_template():

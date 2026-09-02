@@ -6,11 +6,14 @@ import json
 import subprocess
 from pathlib import Path
 
+import yaml
+
 from infra.config import (
     load_config_with_includes,
     load_experiment,
     resolve_all_experiments,
 )
+from infra.envs.debate.protocol import Protocol
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,8 @@ PROMPT_CONFIG = {
     "file_path": "infra/prompts/debate/hendrycks_math.yaml",
     "entry": "math_proposer_critic",
 }
+ALICE_ONLY = "mathl5_qwen35_pc_debate_norebut_propbudget_rlvrs20_alice"
+ALICE_ONLY_SMOKE = ALICE_ONLY + "_smoke"
 DESCENDANTS = (
     "mathl5_qwen35_pc_debate_cispo_verl_sub8",
     "mathl5_qwen35_pc_debate_cispo_verl_sub8_warm",
@@ -28,6 +33,7 @@ DESCENDANTS = (
     "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget",
     "mathl5_qwen35_pc_debate_cispo_verl_sub8_kenton_propbudget_rlvrs20",
     "math_pc_no_rebuttals",
+    ALICE_ONLY,
 )
 
 
@@ -156,3 +162,103 @@ def test_warm_start_ab_arm_prices_alice_proposal_excess_proportionally() -> None
     assert experiment["agents"]["alice"]["model_settings"]["model_file_path"] == (
         "/workspace/models/qwen35-rlvr-sub8-s20"
     )
+
+
+def test_step20_no_rebuttal_arm_trains_only_alice_against_a_frozen_bob() -> None:
+    experiment = load_experiment(
+        CONFIG,
+        ALICE_ONLY,
+    )
+    compiled = Protocol.parse(experiment["protocol"]).compile()
+
+    assert [slot.slot.name for slot in compiled] == [
+        "proposal",
+        "critique",
+        "deliberation",
+        "verdict",
+    ]
+    assert experiment["first_speech_non_debate_aware"] is True
+    assert [
+        speaker
+        for speaker, agent in experiment["agents"].items()
+        if agent.get("trained")
+    ] == ["alice"]
+
+    alice = experiment["agents"]["alice"]
+    bob = experiment["agents"]["bob"]
+    assert alice["model_settings"]["model_file_path"] == (
+        "/workspace/models/qwen35-rlvr-sub8-s20"
+    )
+    assert bob["trained"] is False
+    assert bob["frozen_policy"] is True
+    assert bob["model_settings"]["model_file_path"] == (
+        "/workspace/models/qwen35-rlvr-sub8-s20"
+    )
+    assert bob["model_settings"]["base_url"] == "http://127.0.0.1:8789/v1"
+
+    slots = {slot.slot.name: slot.slot for slot in compiled}
+    assert slots["critique"].max_think_tokens == 4000
+    assert slots["critique"].max_visible_tokens == 320
+    terms = {term["name"]: term for term in experiment["scoring"]["shaping"]}
+    assert terms["proposal_token_budget"] == {
+        "name": "proposal_token_budget",
+        "kind": "budget_penalty",
+        "coeff": 0.002,
+        "limit": 4000,
+        "mode": "proportional",
+        "counts": "total",
+        "slots": ["proposal"],
+    }
+
+
+def test_alice_only_live_smoke_changes_run_size_not_scientific_protocol() -> None:
+    full = load_experiment(CONFIG, ALICE_ONLY)
+    smoke = load_experiment(
+        ROOT / "infra" / "jobd" / "debate_s20_aliceonly_smoke.yaml",
+        ALICE_ONLY_SMOKE,
+    )
+
+    for key in (
+        "protocol",
+        "prompt_config",
+        "agents",
+        "judge_config",
+        "scoring",
+        "dataset",
+        "fresh_positions",
+        "flip",
+        "first_speech_non_debate_aware",
+    ):
+        assert smoke.get(key) == full.get(key)
+    assert smoke["training"] == {
+        **full["training"],
+        "steps": 1,
+        "batch_size": 2,
+        "group_size": 2,
+        "eval_every": 0,
+        "final_test_eval": False,
+        "save_every": 1,
+    }
+
+
+def test_alice_only_full_job_is_gated_on_the_live_routing_smoke() -> None:
+    spec = yaml.safe_load(
+        (ROOT / "infra" / "jobd" / "debate_s20_aliceonly.yaml").read_text()
+    )
+    smoke, full = spec["jobs"]
+
+    assert smoke["name"] == "debate-s20-aliceonly-smoke"
+    assert smoke["command"] == "bash scripts/run_s20_aliceonly_job.sh smoke"
+    assert full["name"] == "debate-s20-aliceonly"
+    assert full["depends_on"] == [smoke["name"]]
+    assert full["command"] == "bash scripts/run_s20_aliceonly_job.sh full"
+    assert all(job["max_attempts"] == 1 for job in (smoke, full))
+    assert all(job["gpu_type"] == "NVIDIA B200" for job in (smoke, full))
+    assert all(
+        job["inputs"][0]["local"] == "~/code/debate-aliceonly-source"
+        for job in (smoke, full)
+    )
+    assert smoke["inputs"][1] == full["inputs"][1] == {
+        "local": "~/code/debate/artifacts/rlvr-cispo-sub8-kenton/checkpoints/step-00020",
+        "remote": "/workspace/rlvr-s20-adapter",
+    }

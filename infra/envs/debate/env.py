@@ -38,6 +38,7 @@ from infra.envs.shaping import think_overshoot, truncated
 from infra.envs.debate.round import (
     DebateRound,
     DebateState,
+    FrozenPolicySeat,
     FrozenSeat,
     PolicySeat,
     SeatRunner,
@@ -95,6 +96,9 @@ class DebateEnvConfig:
     prompt_entry: str
     trained_speakers: list[str]                 # subset of debater speakers; [] = pure eval
     frozen_models: dict[str, Model]             # speaker -> model (must cover judge + untrained debaters)
+    # Frozen local policies use the same raw-token, two-phase generation path
+    # as trained seats, but live on an independent inference-only backend.
+    frozen_policies: dict[str, Policy] = field(default_factory=dict)
     # Per-trained-seat overrides applied on top of the rollout policy (one
     # shared adapter, per-seat sampling params / chat-template kwargs, e.g.
     # enable_thinking differing between proposer and critic).
@@ -191,7 +195,19 @@ class DebateEnv(Env):
         unknown = set(config.trained_speakers) - set(self.debaters)
         if unknown:
             raise ValueError(f"trained_speakers not in protocol: {sorted(unknown)}")
-        missing = set(speakers) - set(config.trained_speakers) - set(config.frozen_models)
+        overlap = set(config.frozen_policies) & (
+            set(config.trained_speakers) | set(config.frozen_models)
+        )
+        if overlap:
+            raise ValueError(
+                f"speakers assigned to multiple execution paths: {sorted(overlap)}"
+            )
+        missing = (
+            set(speakers)
+            - set(config.trained_speakers)
+            - set(config.frozen_models)
+            - set(config.frozen_policies)
+        )
         if missing:
             raise ValueError(f"speakers without models: {sorted(missing)}")
         # The logit confidence channel is only P(sampled continuation) under an
@@ -420,6 +436,8 @@ class DebateEnv(Env):
                         cfg.trained_chat_kwargs.get(speaker, policy.chat_template_kwargs),
                     )
                 seats[speaker] = PolicySeat(seat_policy)
+            elif speaker in cfg.frozen_policies:
+                seats[speaker] = FrozenPolicySeat(cfg.frozen_policies[speaker])
             else:
                 seats[speaker] = FrozenSeat(
                     cfg.frozen_models[speaker], sampling=cfg.frozen_sampling.get(speaker)

@@ -254,6 +254,25 @@ class PolicySeat(SeatRunner):
         return [r if r is not None else SlotResult(text="", failed=True, fail_reason="missing") for r in results]
 
 
+class FrozenPolicySeat(PolicySeat):
+    """Frozen local policy with the trained seat's exact token-budget path.
+
+    Unlike ``FrozenSeat``'s provider-level chat call, this runner uses raw
+    token-prefix continuation through ``Policy``.  That preserves private
+    think caps, forced-close masking, and visible-speech caps.  The generated
+    sample is retained for auditable token accounting, but its datum is
+    discarded so no optimizer can consume the frozen seat's tokens.
+    """
+
+    trained = False
+
+    def generate(self, requests: list[GenRequest]) -> list[SlotResult]:
+        results = super().generate(requests)
+        for result in results:
+            result.datum = None
+        return results
+
+
 class FrozenSeat(SeatRunner):
     """Frozen seat over a debate.models Model. max_think/max_visible are
     unenforceable on API seats — warn once; honor max_total only."""

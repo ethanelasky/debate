@@ -551,3 +551,35 @@ mathl5_qwen35_pc_debate_norebut_propbudget_rlvr130:
     shaping:
       - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.002,
          limit: 4000, mode: proportional, counts: total, slots: [proposal]}
+
+# Proposal-only training from the RLVR control's step 20. Ethan, 2026-09-02.
+#
+# Flow is proposal -> critique -> judge: math_pc_no_rebuttals removes both
+# rebuttals. Alice alone is optimized. Bob is served from an independent,
+# adapter-free copy of the same merged step-20 checkpoint for the entire run;
+# `frozen_policy` selects raw token-prefix continuation so his inherited
+# 4000-think / 320-visible critique contract remains identical to a trained
+# local seat. Merely marking Bob untrained while sampling him through Alice's
+# rollout engine would not freeze him: Alice's adapter updates would change
+# both roles.
+mathl5_qwen35_pc_debate_norebut_propbudget_rlvrs20_alice:
+  _extends: math_pc_no_rebuttals
+  agents:
+    alice:
+      trained: true
+      model_settings:
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+    bob:
+      trained: false
+      frozen_policy: true
+      model_settings:
+        model_type: local
+        model_file_path: /workspace/models/qwen35-rlvr-sub8-s20
+        alias: critic-bob
+        base_url: http://127.0.0.1:8789/v1
+        enable_thinking: true
+        sampling: {train: {temperature: 1.0, top_p: 1.0}}
+  scoring:
+    shaping:
+      - {name: proposal_token_budget, kind: budget_penalty, coeff: 0.002,
+         limit: 4000, mode: proportional, counts: total, slots: [proposal]}

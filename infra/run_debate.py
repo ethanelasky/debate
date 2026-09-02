@@ -32,7 +32,9 @@ import os
 from pathlib import Path
 
 from infra.backend.base import SamplingParams
+from infra.backend.vllm_readonly import VLLMCompletionsBackend
 from infra.config import load_experiment, parse_model_settings, reject_unknown_keys
+from infra.envs.base import Policy
 from infra.envs.debate.env import DebateEnv, DebateEnvConfig
 from infra.envs.debate.judge import JudgeConfig
 from infra.envs.debate.rewards import ScoringConfig
@@ -85,7 +87,7 @@ EXPERIMENT_KEYS = {
     "plan_tokens",
 }
 
-AGENT_KEYS = {"trained", "model_settings"}
+AGENT_KEYS = {"trained", "frozen_policy", "model_settings"}
 
 
 def _docent_run_dir(run_name: str, *, launch_namespace: str) -> str:
@@ -130,6 +132,10 @@ def validate_experiment(exp: dict) -> None:
     for speaker, agent in (exp.get("agents") or {}).items():
         if isinstance(agent, dict):
             reject_unknown_keys(agent, AGENT_KEYS, f"agents.{speaker}")
+            if agent.get("trained") and agent.get("frozen_policy"):
+                raise ValueError(
+                    f"agents.{speaker} cannot be both trained and frozen_policy"
+                )
     tr = exp.get("training") or {}
     reject_unknown_keys(tr, TRAINING_KEYS, "training")
     reject_unknown_keys(tr.get("verl") or {}, VERL_KEYS, "training.verl")
@@ -223,7 +229,17 @@ def debate_protocol_identity(
     eval_pool = dict(exp.get("eval_dataset") or {})
     eval_limits = dict(exp.get("eval_slot_limits") or {})
     agents = {
-        speaker: {"trained": speaker in trained, **_model_payload(settings)}
+        speaker: {
+            "trained": speaker in trained,
+            **(
+                {"frozen_policy": True}
+                if ((exp.get("agents") or {}).get(speaker) or {}).get(
+                    "frozen_policy"
+                )
+                else {}
+            ),
+            **_model_payload(settings),
+        }
         for speaker, settings in sorted((trained | frozen).items())
     }
     payload = {
@@ -337,9 +353,22 @@ def debate_gen_budgets(protocol: Protocol, trained: dict[str, ModelSettings], tr
 def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, ModelSettings]) -> DebateEnv:
     protocol = _resolved_protocol(exp)
 
+    frozen_policy_speakers = {
+        speaker
+        for speaker, agent in (exp.get("agents") or {}).items()
+        if isinstance(agent, dict) and agent.get("frozen_policy")
+    }
+    unknown_frozen_policies = frozen_policy_speakers - set(frozen)
+    if unknown_frozen_policies:
+        raise ValueError(
+            "frozen_policy speakers must be untrained agents: "
+            f"{sorted(unknown_frozen_policies)}"
+        )
+
     frozen_models = {
         speaker: instantiate_model(settings, is_debater=speaker != "judge", binding="train")
         for speaker, settings in frozen.items()
+        if speaker not in frozen_policy_speakers
     }
     # FrozenSeat forwards these per predict call — the factory bakes sampling
     # into tinker seats only, so without this the local/API seats sample at
@@ -358,6 +387,46 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
     caps_by_speaker: dict[str, list] = {}
     for cs in protocol.compile():
         caps_by_speaker.setdefault(cs.speaker, []).append(cs.slot.max_total_tokens)
+
+    frozen_policies: dict[str, Policy] = {}
+    for speaker in sorted(frozen_policy_speakers):
+        settings = frozen[speaker]
+        if settings.model_type is not ModelType.LOCAL:
+            raise ValueError(
+                f"frozen_policy seat {speaker!r} requires model_type 'local', "
+                f"got {settings.model_type.name.lower()!r}"
+            )
+        if not settings.model_file_path or not settings.base_url:
+            raise ValueError(
+                f"frozen_policy seat {speaker!r} requires model_file_path and base_url"
+            )
+        caps = caps_by_speaker.get(speaker, [])
+        if not caps or any(cap is None for cap in caps):
+            raise ValueError(
+                f"frozen_policy seat {speaker!r} requires max_total_tokens on every slot"
+            )
+        profile = resolved_sampling_profile(settings, "train")
+        backend = VLLMCompletionsBackend(
+            base_url=settings.base_url,
+            model=settings.model_file_path,
+            tokenizer_path=settings.model_file_path,
+        )
+        frozen_policies[speaker] = Policy(
+            backend,
+            SamplingParams(
+                max_tokens=max(caps),
+                temperature=(
+                    profile.temperature if profile.temperature is not None else 1.0
+                ),
+                top_p=profile.top_p if profile.top_p is not None else 1.0,
+            ),
+            (
+                {"enable_thinking": bool(settings.enable_thinking)}
+                if settings.enable_thinking is not None
+                else None
+            ),
+        )
+
     trained_sampling: dict[str, SamplingParams] = {}
     trained_chat_kwargs: dict[str, dict] = {}
     for speaker, settings in trained.items():
@@ -389,6 +458,7 @@ def build_env(exp: dict, trained: dict[str, ModelSettings], frozen: dict[str, Mo
             prompt_entry=exp["prompt_config"]["entry"],
             trained_speakers=list(trained),
             frozen_models=frozen_models,
+            frozen_policies=frozen_policies,
             trained_sampling=trained_sampling,
             trained_chat_kwargs=trained_chat_kwargs,
             frozen_sampling=frozen_sampling,

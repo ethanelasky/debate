@@ -13,7 +13,7 @@
 #      ${var:?message} expansions below, not a code this script chooses
 #   2  unknown mode, invalid launch namespace, unresolvable judge config, or
 #      legacy checkpoint layout
-#   3  judge vLLM failed to start, serve, or free its port
+#   3  a frozen local vLLM service failed to start, serve, or free its port
 #   4  runtime validation, editable install, or dependency preflight failed
 #   5  a trainer is already running, another pod_run.sh holds the launch lock,
 #      or the pod is mid-teardown (a watchdog has committed to stopping it)
@@ -463,11 +463,10 @@ else
   fi
 fi
 
-# Kills the judge's whole process group. A parent-only kill leaves the
-# VLLM::EngineCore children alive holding their GPU allocation, so the next
-# start dies in CUDA OOM against a server nobody can see (seen in production).
-# No-op unless we started a judge ourselves.
-kill_judge() {
+# Kills every frozen local service's whole process group. A parent-only kill
+# leaves VLLM::EngineCore children alive holding their GPU allocation, so the
+# next start dies in CUDA OOM against a server nobody can see.
+kill_local_services() {
   # `|| true` on both kills: this function is the EXIT trap, and a kill of an
   # already-dead process is the LAST command of its && list. Under errexit that
   # failure would abort the trap before `return 0`, and the trap's own non-zero
@@ -475,6 +474,8 @@ kill_judge() {
   # surface to the operator as rc 1.
   [ -n "${JUDGE_PGID:-}" ] && kill -9 -"$JUDGE_PGID" 2>/dev/null || true
   [ -n "${JUDGE_PID:-}" ] && kill -9 "$JUDGE_PID" 2>/dev/null || true
+  [ -n "${FROZEN_POLICY_PGID:-}" ] && kill -9 -"$FROZEN_POLICY_PGID" 2>/dev/null || true
+  [ -n "${FROZEN_POLICY_PID:-}" ] && kill -9 "$FROZEN_POLICY_PID" 2>/dev/null || true
   return 0
 }
 
@@ -611,16 +612,76 @@ PYEOF
   { IFS= read -r JUDGE_MODEL; IFS= read -r JUDGE_PORT; } <<< "$JUDGE_CFG"
   echo "== judge from config: $JUDGE_MODEL on port $JUDGE_PORT =="
 
+  # A frozen_policy debater is not an API-style frozen seat: it uses the same
+  # raw-token Policy path as a trained seat so max_think_tokens and
+  # max_visible_tokens remain enforceable, but points at an independent vLLM
+  # whose weights never receive adapter updates. This launcher intentionally
+  # supports one such debater; more would require an explicit GPU-placement
+  # and memory contract rather than silently stacking servers.
+  FROZEN_POLICY_CFG="$("$PY" - "$CONFIG" "$EXP" <<'PYEOF'
+import sys
+from urllib.parse import urlparse
+
+from infra.config import load_experiment
+from infra.envs.debate.protocol import Protocol
+
+exp = load_experiment(sys.argv[1], sys.argv[2])
+proto_spec = exp["protocol"]
+if isinstance(proto_spec, str):
+    proto_spec = exp["_protocols"][proto_spec]
+protocol = Protocol.parse(proto_spec)
+judge = protocol.decision_slot.speaker if protocol.decision_slot is not None else None
+rows = []
+for speaker, agent in (exp.get("agents") or {}).items():
+    if not isinstance(agent, dict) or not agent.get("frozen_policy"):
+        continue
+    if speaker == judge:
+        raise SystemExit("the judge cannot use agents.*.frozen_policy")
+    if agent.get("trained"):
+        raise SystemExit(f"frozen_policy seat {speaker!r} is also marked trained")
+    settings = agent.get("model_settings") or {}
+    if str(settings.get("model_type", "")).lower() != "local":
+        raise SystemExit(f"frozen_policy seat {speaker!r} must use model_type: local")
+    model, url = settings.get("model_file_path"), settings.get("base_url")
+    parsed = urlparse(url or "")
+    if not model or parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
+        raise SystemExit(
+            f"frozen_policy seat {speaker!r} requires a local http base_url with an explicit port and model_file_path"
+        )
+    if any("\t" in str(value) or "\n" in str(value) for value in (speaker, model)):
+        raise SystemExit("frozen_policy service fields may not contain tabs or newlines")
+    rows.append((speaker, model, parsed.port))
+if len(rows) > 1:
+    raise SystemExit(
+        f"pod_run.sh supports exactly one frozen_policy debater, got {[row[0] for row in rows]}"
+    )
+if rows:
+    print("\t".join(map(str, rows[0])))
+PYEOF
+)" || {
+    echo "FATAL: invalid frozen_policy service config for $CONFIG:$EXP (see error above)" >&2
+    exit 2
+  }
+  FROZEN_POLICY_SPEAKER=""
+  FROZEN_POLICY_MODEL=""
+  FROZEN_POLICY_PORT=""
+  if [ -n "$FROZEN_POLICY_CFG" ]; then
+    IFS=$'\t' read -r FROZEN_POLICY_SPEAKER FROZEN_POLICY_MODEL FROZEN_POLICY_PORT <<< "$FROZEN_POLICY_CFG"
+    if [ "$FROZEN_POLICY_PORT" = "$JUDGE_PORT" ]; then
+      echo "FATAL: frozen_policy seat $FROZEN_POLICY_SPEAKER and judge share port $JUDGE_PORT" >&2
+      exit 2
+    fi
+    echo "== frozen policy from config: $FROZEN_POLICY_SPEAKER uses $FROZEN_POLICY_MODEL on port $FROZEN_POLICY_PORT =="
+  fi
+
   # Health = a REAL 1-token completion, not /v1/models: an api_server whose
-  # EngineCore was killed keeps answering metadata while every generate fails
-  # (burned 8 zero-datum steps on 2026-08-03 — all debates died at the judge).
-  # An error body and an empty choices[] both contain the string "choices", so
-  # the payload is parsed and choices[0].text required rather than grepped.
-  # Startup probe only: a pre-existing judge is never adopted (see sweep above).
-  judge_ok() {
-    curl -fsS -m 30 "http://127.0.0.1:$JUDGE_PORT/v1/completions" \
+  # EngineCore was killed keeps answering metadata while every generate fails.
+  # Startup probes only: pre-existing services are never adopted (sweep above).
+  completion_service_ok() {
+    local model="$1" port="$2"
+    curl -fsS -m 30 "http://127.0.0.1:$port/v1/completions" \
       -H 'Content-Type: application/json' \
-      -d "{\"model\": \"$JUDGE_MODEL\", \"prompt\": \"1+1=\", \"max_tokens\": 1}" \
+      -d "{\"model\": \"$model\", \"prompt\": \"1+1=\", \"max_tokens\": 1}" \
       | python3 -c "
 import json, sys
 try:
@@ -630,15 +691,21 @@ except Exception:
 c = d.get('choices') or []
 sys.exit(0 if c and isinstance(c[0], dict) and c[0].get('text') is not None else 1)"
   }
+  judge_ok() { completion_service_ok "$JUDGE_MODEL" "$JUDGE_PORT"; }
+  frozen_policy_ok() {
+    [ -z "$FROZEN_POLICY_SPEAKER" ] \
+      || completion_service_ok "$FROZEN_POLICY_MODEL" "$FROZEN_POLICY_PORT"
+  }
   # Binds 0.0.0.0 like the server does: a 127.0.0.1-only probe passes while
   # something else holds the wildcard bind the server needs.
   port_free() {
+    local port="$1"
     python3 -c "
 import socket, sys
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
-    s.bind(('0.0.0.0', $JUDGE_PORT))
+    s.bind(('0.0.0.0', $port))
 except OSError:
     sys.exit(1)
 finally:
@@ -646,10 +713,17 @@ finally:
   }
   # A still-bound port is an unreaped survivor of the sweep: starting anyway
   # gives a server that dies on bind while judge_ok passes against the zombie.
-  for _ in 1 2 3 4 5; do port_free && break; sleep 2; done
-  if ! port_free; then
+  for _ in 1 2 3 4 5; do port_free "$JUDGE_PORT" && break; sleep 2; done
+  if ! port_free "$JUDGE_PORT"; then
     echo "FATAL: port $JUDGE_PORT still bound after killing stale judge processes; find the holder (ps aux | grep -i vllm) and kill it, then re-run" >&2
     exit 3
+  fi
+  if [ -n "$FROZEN_POLICY_SPEAKER" ]; then
+    for _ in 1 2 3 4 5; do port_free "$FROZEN_POLICY_PORT" && break; sleep 2; done
+    if ! port_free "$FROZEN_POLICY_PORT"; then
+      echo "FATAL: port $FROZEN_POLICY_PORT for frozen_policy seat $FROZEN_POLICY_SPEAKER is still bound after the stale-process sweep" >&2
+      exit 3
+    fi
   fi
   echo "== starting judge vLLM server =="
   # The usual reason we are here is "the judge died mid-run"; truncating its log
@@ -668,7 +742,8 @@ finally:
   # JUDGE_MAX_LEN: 16384 fits every judge served so far, but vLLM refuses to
   # boot when it exceeds the model's own position limit — a 4096-ctx judge
   # (Qwen2.5-Math parity arms) needs JUDGE_MAX_LEN=4096 at launch.
-  setsid nohup "$PY" -m vllm.entrypoints.openai.api_server \
+  setsid nohup env CUDA_VISIBLE_DEVICES="${DEBATE_JUDGE_CUDA_VISIBLE_DEVICES:-0}" \
+    "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$JUDGE_MODEL" --port "$JUDGE_PORT" \
     --gpu-memory-utilization 0.18 --max-model-len "${JUDGE_MAX_LEN:-16384}" \
     --max-num-seqs 32 --enable-prefix-caching \
@@ -680,10 +755,40 @@ finally:
   if [ -z "$JUDGE_PGID" ] || [ "$JUDGE_PGID" = "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then
     JUDGE_PGID=""
   fi
-  trap kill_judge EXIT
-  # Bounded, liveness-checked wait. A missing/gated weight pull or a CUDA-OOM
-  # start kills the server outright, and an unbounded `until judge_ok` then
-  # bills the pod indefinitely against a process that no longer exists.
+  trap kill_local_services EXIT
+
+  if [ -n "$FROZEN_POLICY_SPEAKER" ]; then
+    test -f "$FROZEN_POLICY_MODEL/config.json" || {
+      echo "FATAL: frozen_policy model $FROZEN_POLICY_MODEL has no config.json" >&2
+      exit 3
+    }
+    FROZEN_POLICY_LOG="$POD_RUN_STATE_DIR/frozen_policy_${FROZEN_POLICY_SPEAKER}.log"
+    if [ -f "$FROZEN_POLICY_LOG" ]; then
+      mv -f "$FROZEN_POLICY_LOG" "$FROZEN_POLICY_LOG.prev"
+    fi
+    echo "== starting frozen_policy vLLM for $FROZEN_POLICY_SPEAKER on GPU ${DEBATE_FROZEN_POLICY_CUDA_VISIBLE_DEVICES:-1} =="
+    # 0.12 of a 183-GiB B200 is ~22 GiB: enough for Qwen3.5-4B weights plus
+    # this 8k-ish critique context, while keeping it on the GPU opposite the
+    # 0.18 judge. The 0.33 verl rollout engine and measured 48.25-GiB training
+    # peak remain the larger allocations on each device.
+    setsid nohup env CUDA_VISIBLE_DEVICES="${DEBATE_FROZEN_POLICY_CUDA_VISIBLE_DEVICES:-1}" \
+      "$PY" -m vllm.entrypoints.openai.api_server \
+      --model "$FROZEN_POLICY_MODEL" --port "$FROZEN_POLICY_PORT" \
+      --gpu-memory-utilization "${DEBATE_FROZEN_POLICY_GPU_MEMORY_UTILIZATION:-0.12}" \
+      --max-model-len "${DEBATE_FROZEN_POLICY_MAX_LEN:-16384}" \
+      --max-num-seqs 32 --enable-prefix-caching \
+      > "$FROZEN_POLICY_LOG" 2>&1 9>&- &
+    FROZEN_POLICY_PID=$!
+    FROZEN_POLICY_PGID="$(ps -o pgid= -p "$FROZEN_POLICY_PID" 2>/dev/null | tr -d ' ' || true)"
+    if [ -z "$FROZEN_POLICY_PGID" ] || [ "$FROZEN_POLICY_PGID" = "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then
+      FROZEN_POLICY_PGID=""
+    fi
+  fi
+
+  # Bounded, liveness-checked wait for both services. They boot concurrently
+  # on separate GPUs, so adding a frozen critic does not serially double the
+  # cold-start delay. A dead process aborts immediately rather than billing to
+  # the deadline.
   # The default must cover a COLD start, not just a cold HF pull: on a fresh
   # B200 pod the 4B download is followed by torch.compile (~80s), an AOT
   # compile, a warmup run (~80s) and CUDA-graph capture, which together put
@@ -692,22 +797,36 @@ finally:
   # this value is; the deadline only bounds an alive-but-wedged engine.
   JUDGE_BOOT_TIMEOUT_S="${JUDGE_BOOT_TIMEOUT_S:-1800}"
   JUDGE_DEADLINE=$(( SECONDS + JUDGE_BOOT_TIMEOUT_S ))
-  until judge_ok; do
+  until judge_ok && frozen_policy_ok; do
     if ! kill -0 "$JUDGE_PID" 2>/dev/null; then
       echo "FATAL: judge vLLM (pid $JUDGE_PID) exited before serving; last 40 lines of $JUDGE_LOG:" >&2
       tail -40 "$JUDGE_LOG" >&2 || true
-      kill_judge
+      kill_local_services
+      exit 3
+    fi
+    if [ -n "$FROZEN_POLICY_SPEAKER" ] && ! kill -0 "$FROZEN_POLICY_PID" 2>/dev/null; then
+      echo "FATAL: frozen_policy vLLM for $FROZEN_POLICY_SPEAKER (pid $FROZEN_POLICY_PID) exited before serving; last 40 lines of $FROZEN_POLICY_LOG:" >&2
+      tail -40 "$FROZEN_POLICY_LOG" >&2 || true
+      kill_local_services
       exit 3
     fi
     if [ "$SECONDS" -ge "$JUDGE_DEADLINE" ]; then
-      echo "FATAL: judge vLLM alive but not answering /v1/completions on 127.0.0.1:$JUDGE_PORT after ${JUDGE_BOOT_TIMEOUT_S}s (raise JUDGE_BOOT_TIMEOUT_S for a cold pod); check $JUDGE_LOG (last 40 lines below) and nvidia-smi for a wedged engine" >&2
+      echo "FATAL: frozen local services alive but not all answering /v1/completions after ${JUDGE_BOOT_TIMEOUT_S}s (raise JUDGE_BOOT_TIMEOUT_S for a cold pod)" >&2
+      echo "== judge log: $JUDGE_LOG ==" >&2
       tail -40 "$JUDGE_LOG" >&2 || true
-      kill_judge
+      if [ -n "$FROZEN_POLICY_SPEAKER" ]; then
+        echo "== frozen policy log: $FROZEN_POLICY_LOG ==" >&2
+        tail -40 "$FROZEN_POLICY_LOG" >&2 || true
+      fi
+      kill_local_services
       exit 3
     fi
     sleep 5
   done
   echo "== judge server up =="
+  if [ -n "$FROZEN_POLICY_SPEAKER" ]; then
+    echo "== frozen_policy server for $FROZEN_POLICY_SPEAKER up =="
+  fi
 fi
 
 # Wait for the watchdog to say it is ARMED whenever idle-stop is in force. The
